@@ -10,7 +10,7 @@ public sealed class LsmStorageInner : IDisposable
     private static readonly MemoryOwner _tombStone = new(Memory<byte>.Empty);
 
     private readonly ReaderWriterLockSlim _rwLock = new();
-    internal readonly StorageState _state;
+    internal StorageState _state;
     private readonly long _memTableSizeLimit;
     private int _memTableId = 0;
 
@@ -37,13 +37,12 @@ public sealed class LsmStorageInner : IDisposable
         // to ensure the mutable MemTable and immutable ones are consistent together.
 
         _rwLock.EnterReadLock();
-        
-        var snapshot = _state.ImmutableMemTables;
-        var currentMemTable = _state.CurrentMemTable;
+
+        var snapshot = _state.Clone();
 
         try
         {
-            if (currentMemTable!.TryGet(key, out value))
+            if (snapshot.CurrentMemTable.TryGet(key, out value))
             {
                 return true;
             }
@@ -56,7 +55,7 @@ public sealed class LsmStorageInner : IDisposable
         // If any new immutable MemTable(s) was created after this call then we just ignore it, as 
         // the newly created MemTable(s).
 
-        foreach (var memTable in snapshot)
+        foreach (var memTable in snapshot.ImmutableMemTables)
         {
             if (memTable.TryGet(key, out value))
             {
@@ -145,14 +144,94 @@ public sealed class LsmStorageInner : IDisposable
     }
 
     /// <summary>
+    /// Returns all the values currently stored in memory.
+    /// </summary>
+    /// <remarks>Uses a merge iterator.</remarks>
+    /// <returns></returns>
+    public IEnumerable<KeyValuePair<ReadOnlyMemory<byte>, ReadOnlyMemory<byte>>> Scan()
+    {
+        List<IEnumerator<KeyValuePair<ReadOnlyMemory<byte>, ReadOnlyMemory<byte>>>> iterators = [];
+
+        // Only the current MemTable needs to be synchronized.
+
+        _rwLock.EnterReadLock();
+
+        try
+        {
+            var snapshot = _state.Clone();
+            var currentIterator = _state.CurrentMemTable.Scan().GetEnumerator();
+            if (currentIterator.MoveNext())
+            {
+                iterators.Add(currentIterator);
+            }
+        }
+        finally
+        {
+            _rwLock.ExitReadLock();
+        }
+
+        foreach (var memTable in _state.ImmutableMemTables)
+        {
+            var iterator = memTable.Scan().GetEnumerator();
+            if (iterator.MoveNext())
+            {
+                iterators.Add(iterator);
+            }
+        }
+
+        while (iterators.Count > 0)
+        {
+            // Assume the smallest is the element from the first iterator
+            KeyValuePair<ReadOnlyMemory<byte>, ReadOnlyMemory<byte>> smallest = iterators[0].Current;
+
+            var smallestIndex = 0;
+
+            for (var i = 1; i < iterators.Count; i++)
+            {
+                var iterator = iterators[i];
+            
+                var current = iterator.Current;
+
+                switch (ByteArrayComparer.Instance.Compare(smallest.Key, current.Key))
+                {
+                    // Discard the entry since there is the same key from a more recent table
+                    case 0:
+                        if (!iterator.MoveNext())
+                        {
+                            iterators.RemoveAt(i);
+                            i--;
+                        }
+                        break;
+
+                    case > 0:
+                        smallestIndex = i;
+                        smallest = current;
+                        break;
+                }
+            }
+
+            // Consume the smallest element
+            if (!iterators[smallestIndex].MoveNext())
+            {
+                iterators.RemoveAt(smallestIndex);
+            }
+
+            yield return smallest;
+        }        
+    }
+
+    /// <summary>
     /// Freeze the current MemTable to an immutable MemTable. This method is not synchronized and should be called
     /// by other synchronized methods.
     /// </summary>
     private void FreezeMemTable()
     {
         var _previousMemTable = _state.CurrentMemTable;
-        _state.CurrentMemTable = new MemTable(NextMemTableId());
-        _state.ImmutableMemTables = _state.ImmutableMemTables.Push(_previousMemTable);
+        _state = new StorageState
+        {
+            CurrentMemTable = new MemTable(NextMemTableId()),
+            ImmutableMemTables = _state.ImmutableMemTables.Push(_previousMemTable)
+        };
     }
 
     public void Dispose()

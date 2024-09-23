@@ -2,7 +2,7 @@
 
 namespace Silex;
 
-public interface IMemTable
+public interface IMemTable : IIterator
 {
     /// <summary>
     /// Gets the size of the <see cref="MemTable"/>.

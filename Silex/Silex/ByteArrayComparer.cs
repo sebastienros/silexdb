@@ -1,17 +1,22 @@
 ﻿namespace Silex;
 
-public class ByteArrayComparer : EqualityComparer<ReadOnlyMemory<byte>>
+public class ByteArrayComparer : EqualityComparer<ReadOnlyMemory<byte>>, IComparer<ReadOnlyMemory<byte>>
 {
     public static readonly ByteArrayComparer Instance = new();
 
-    public override bool Equals(ReadOnlyMemory<byte> first, ReadOnlyMemory<byte> second)
+    public int Compare(ReadOnlyMemory<byte> x, ReadOnlyMemory<byte> y)
     {
-        if (first.Length != second.Length)
+        return x.Span.SequenceCompareTo(y.Span);
+    }
+
+    public override bool Equals(ReadOnlyMemory<byte> x, ReadOnlyMemory<byte> y)
+    {
+        if (x.Length != y.Length)
         {
             return false;
         }
 
-        return first.Span.SequenceEqual(second.Span);
+        return x.Span.SequenceEqual(y.Span);
     }
 
     public override int GetHashCode(ReadOnlyMemory<byte> obj)

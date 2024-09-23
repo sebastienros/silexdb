@@ -3,23 +3,23 @@
 namespace Silex;
 
 /// <summary>
-/// An instance of <see cref="MemTable"/> contains a list of key value pairs of bytes to be stored.
+/// An instance of <see cref="MemTable"/> contains a sorted list of key value pairs of bytes to be stored.
 /// The memory that is passed is not duplicated, but deallocated when not used anymore. The ownership is delegated.
 /// </summary>
 /// <remarks>
-/// The current implementation is not thread-safe when writes are involved. Thread-safety is handled in higher-level
-/// components as they know when a MemTable is frozen or used concurrently in read/write.
+/// The current implementation is not thread-safe when writes are involved. Thread-safety is handled in <see cref="LsmStorageInner"/>
+/// as it knows when a MemTable is frozen or used concurrently in read/write.
 /// The dictionary supports multiple readers concurrently, as long as the collection is not modified, meaning the 
 /// higher-level component needs to lock reads during writes.
 /// 
 /// A MemTable doesn't hold an entry that was read from the store. It is not a reads cache.
 /// 
 /// A MemTable usually has a size limit and it will be frozen to an immutable MemTable when it reaches the size limit.
-/// This logic is part of the managing components.
+/// This logic is part of <see cref="LsmStorageInner"/>.
 /// </remarks>
 public sealed class MemTable : IDisposable, IMemTable
 {
-    private readonly Dictionary<ReadOnlyMemory<byte>, MemTableEntry> _map = new(ByteArrayComparer.Instance);
+    private readonly SortedDictionary<ReadOnlyMemory<byte>, MemTableEntry> _map = new(ByteArrayComparer.Instance);
     private long _size;
     private bool _disposing;
     private readonly int _id;
@@ -105,6 +105,20 @@ public sealed class MemTable : IDisposable, IMemTable
         }
 
         _map.Clear();
+    }
+
+    public IEnumerable<KeyValuePair<ReadOnlyMemory<byte>, ReadOnlyMemory<byte>>> Scan()
+    {
+        // Snapshot of the key/values so we don't lock.
+        // Use a read lock when for the mutable MemTable such that no other key is added while we clone it.
+        // Once Scan is invoked the iterator doesn't need to be synchronized since we cloned its elements.
+
+        var clone = _map.ToArray();
+
+        foreach (var entry in clone)
+        {
+            yield return new(entry.Key, entry.Value.Memory);
+        }
     }
 
     ~MemTable()

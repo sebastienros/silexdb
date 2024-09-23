@@ -5,7 +5,7 @@ namespace Silex;
 /// <summary>
 /// Stores the current structure of the LSM storage engine. All the logic is maintained in <see cref="LsmStorageInner"/>.
 /// </summary>
-internal class StorageState
+internal struct StorageState
 {
     public StorageState(StorageOptions _)
     {
@@ -17,4 +17,13 @@ internal class StorageState
     public ImmutableStack<IMemTable> ImmutableMemTables { get; set; } = [];
 
     public required IMemTable CurrentMemTable { get; set; }
+
+    public StorageState Clone()
+    {
+        return new StorageState
+        {
+            CurrentMemTable = CurrentMemTable,
+            ImmutableMemTables = ImmutableMemTables
+        };
+    }
 }
