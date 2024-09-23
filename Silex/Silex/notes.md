@@ -1,0 +1,2 @@
+- The operations in MemTable can be synchronous as only background operations like disk-flushing, or explicit calls to read the filesystem are async.
+- Check ByteArrayComparer performance
