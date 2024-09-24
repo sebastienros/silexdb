@@ -1,3 +1,4 @@
 - The operations in MemTable can be synchronous as only background operations like disk-flushing, or explicit calls to read the filesystem are async.
 - Check ByteArrayComparer performance.
 - LsmStorageInner may be optimized with a better strategy.
+- Using a SkipList in MemTable would make the Scan operation with bounds faster as not all keys would have to be scanned.

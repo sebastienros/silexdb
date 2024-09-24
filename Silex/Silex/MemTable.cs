@@ -107,16 +107,32 @@ public sealed class MemTable : IDisposable, IMemTable
         _map.Clear();
     }
 
-    public IEnumerable<KeyValuePair<ReadOnlyMemory<byte>, ReadOnlyMemory<byte>>> Scan()
+    public IEnumerable<KeyValuePair<ReadOnlyMemory<byte>, ReadOnlyMemory<byte>>> Scan(ReadOnlyMemory<byte> minValue = default, ReadOnlyMemory<byte> maxValue = default)
     {
         // Snapshot of the key/values so we don't lock.
         // Use a read lock when for the mutable MemTable such that no other key is added while we clone it.
         // Once Scan is invoked the iterator doesn't need to be synchronized since we cloned its elements.
+        // Deleted records need to be returned such that the merge iterator can decide if the entry should
+        // be skipped.
+        // A SkipList would be faster at iterating values between bounds.
+        // Using Array.BinarySearch doesn't prevent cloning to an Array, and might be tricky to handle since the bounds might
+        // not be in the collection
 
         var clone = _map.ToArray();
 
         foreach (var entry in clone)
         {
+            if (!minValue.IsEmpty && minValue.Span.SequenceCompareTo(entry.Key.Span) > 0)
+            {
+                continue;
+            }
+
+            if (!maxValue.IsEmpty && maxValue.Span.SequenceCompareTo(entry.Key.Span) < 0)
+            {
+                // No more elements since the list is ordered
+                yield break;
+            }
+
             yield return new(entry.Key, entry.Value.Memory);
         }
     }

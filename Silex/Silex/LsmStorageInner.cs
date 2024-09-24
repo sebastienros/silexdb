@@ -2,10 +2,12 @@
 
 namespace Silex;
 
+using StorageRecord = KeyValuePair<ReadOnlyMemory<byte>, ReadOnlyMemory<byte>>;
+
 /// <summary>
 /// The inner storage engine. It handles thread-safety for the <see cref="StorageState"/>.
 /// </summary>
-public sealed class LsmStorageInner : IDisposable
+public sealed class LsmStorageInner : IDisposable, IIterator
 {
     private static readonly MemoryOwner _tombStone = new(Memory<byte>.Empty);
 
@@ -148,9 +150,9 @@ public sealed class LsmStorageInner : IDisposable
     /// </summary>
     /// <remarks>Uses a merge iterator.</remarks>
     /// <returns></returns>
-    public IEnumerable<KeyValuePair<ReadOnlyMemory<byte>, ReadOnlyMemory<byte>>> Scan()
+    public IEnumerable<StorageRecord> Scan(ReadOnlyMemory<byte> minValue = default, ReadOnlyMemory<byte> maxValue = default)
     {
-        List<IEnumerator<KeyValuePair<ReadOnlyMemory<byte>, ReadOnlyMemory<byte>>>> iterators = [];
+        List<IEnumerator<StorageRecord>> iterators = [];
 
         // Only the current MemTable needs to be synchronized.
 
@@ -159,7 +161,7 @@ public sealed class LsmStorageInner : IDisposable
         try
         {
             var snapshot = _state.Clone();
-            var currentIterator = _state.CurrentMemTable.Scan().GetEnumerator();
+            var currentIterator = _state.CurrentMemTable.Scan(minValue, maxValue).GetEnumerator();
             if (currentIterator.MoveNext())
             {
                 iterators.Add(currentIterator);
@@ -172,7 +174,7 @@ public sealed class LsmStorageInner : IDisposable
 
         foreach (var memTable in _state.ImmutableMemTables)
         {
-            var iterator = memTable.Scan().GetEnumerator();
+            var iterator = memTable.Scan(minValue, maxValue).GetEnumerator();
             if (iterator.MoveNext())
             {
                 iterators.Add(iterator);
@@ -182,7 +184,7 @@ public sealed class LsmStorageInner : IDisposable
         while (iterators.Count > 0)
         {
             // Assume the smallest is the element from the first iterator
-            KeyValuePair<ReadOnlyMemory<byte>, ReadOnlyMemory<byte>> smallest = iterators[0].Current;
+            StorageRecord smallest = iterators[0].Current;
 
             var smallestIndex = 0;
 
@@ -216,7 +218,11 @@ public sealed class LsmStorageInner : IDisposable
                 iterators.RemoveAt(smallestIndex);
             }
 
-            yield return smallest;
+            // Don't return the entry if it's been deleted
+            if (smallest.Value.Length != 0)
+            {
+                yield return smallest;
+            }            
         }        
     }
 

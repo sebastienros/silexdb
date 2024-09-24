@@ -11,11 +11,6 @@ public class ByteArrayComparer : EqualityComparer<ReadOnlyMemory<byte>>, ICompar
 
     public override bool Equals(ReadOnlyMemory<byte> x, ReadOnlyMemory<byte> y)
     {
-        if (x.Length != y.Length)
-        {
-            return false;
-        }
-
         return x.Span.SequenceEqual(y.Span);
     }
 

@@ -161,24 +161,21 @@ public class SilexTests
 
         var list = storage.Scan().ToList();
 
-        // a->1, b->del, c->4, d->5, e->4
+        // a->1, c->4, d->5, e->4 and b->del should be discarded
 
-        Assert.Equal(5, list.Count);
+        Assert.Equal(4, list.Count);
 
         Assert.Equal('a', BitConverter.ToChar(list[0].Key.Span));
         Assert.Equal(1, list[0].Value.Span[0]);
 
-        Assert.Equal('b', BitConverter.ToChar(list[1].Key.Span));
-        Assert.Equal(0, list[1].Value.Span.Length);
+        Assert.Equal('c', BitConverter.ToChar(list[1].Key.Span));
+        Assert.Equal(4, list[1].Value.Span[0]);
 
-        Assert.Equal('c', BitConverter.ToChar(list[2].Key.Span));
-        Assert.Equal(4, list[2].Value.Span[0]);
+        Assert.Equal('d', BitConverter.ToChar(list[2].Key.Span));
+        Assert.Equal(5, list[2].Value.Span[0]);
 
-        Assert.Equal('d', BitConverter.ToChar(list[3].Key.Span));
-        Assert.Equal(5, list[3].Value.Span[0]);
-
-        Assert.Equal('e', BitConverter.ToChar(list[4].Key.Span));
-        Assert.Equal(4, list[4].Value.Span[0]);
+        Assert.Equal('e', BitConverter.ToChar(list[3].Key.Span));
+        Assert.Equal(4, list[3].Value.Span[0]);
     }
 
     [Theory]
@@ -261,7 +258,41 @@ public class SilexTests
         }
     }
 
-    private static LsmStorageInner FillImmutableMemTables(int entries = 100, int valueSize = 10, int memTableSizeLimit = 100)
+    [Theory]
+    [InlineData(null, null)]
+    [InlineData(0, 0)]
+    [InlineData(1, 1)]
+    [InlineData(1, 5)]
+    [InlineData(5, 10)]
+    [InlineData(null, 5)]
+    [InlineData(5, null)]
+    public void ScanWithBoundsShouldFilterResults(int? lowerBound, int? upperBound)
+    {
+        var count = 10;
+
+        var storage = FillImmutableMemTables(entries: count, memTableSizeLimit: 1.KiB());
+        var lowerBytes = lowerBound == null ? null : BitConverter.GetBytes(lowerBound.Value);
+        var upperBytes = upperBound == null ? null : BitConverter.GetBytes(upperBound.Value);
+
+        var entries = storage.Scan(lowerBytes, upperBytes);
+
+        if (lowerBytes != null)
+        {
+            Assert.All(entries, e => Assert.True(ByteArrayComparer.Instance.Compare(lowerBytes, e.Key) <= 0));
+        }
+
+        if (upperBytes != null)
+        {
+            Assert.All(entries, e => Assert.True(ByteArrayComparer.Instance.Compare(upperBytes, e.Key) >= 0));
+        }
+
+        if (lowerBytes == null && upperBytes == null)
+        {
+            Assert.Equal(count, entries.Count());
+        }
+    }
+
+    private static LsmStorageInner FillImmutableMemTables(int entries = 100, int valueSize = 10, long memTableSizeLimit = 100)
     {
         var storageOptions = new StorageOptions { MemTableSizeLimit = memTableSizeLimit };
         var storage = new LsmStorageInner(storageOptions);
