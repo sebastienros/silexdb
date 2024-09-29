@@ -1,4 +1,5 @@
-﻿using System.Buffers;
+﻿using Silex.MemTables;
+using System.Buffers;
 
 namespace Silex;
 
@@ -69,7 +70,7 @@ public sealed class LsmStorageInner : IDisposable, IIterator
     }
 
     /// <summary>
-    /// Puts a value with the specified key. If one already exists it is replaced.
+    /// Puts a value with the specified key in the current <see cref="IMemTable">. If one already exists it is replaced.
     /// </summary>
     /// <param name="key"></param>
     /// <param name="value"></param>
@@ -79,7 +80,7 @@ public sealed class LsmStorageInner : IDisposable, IIterator
     }
 
     /// <summary>
-    /// Puts a value with the specified key. If one already exists it is replaced.
+    /// Puts a value with the specified key in the current <see cref="IMemTable">. If one already exists it is replaced.
     /// </summary>
     /// <param name="key"></param>
     /// <param name="value"></param>
@@ -103,7 +104,7 @@ public sealed class LsmStorageInner : IDisposable, IIterator
     }
 
     /// <summary>
-    /// Deletes the specified key.
+    /// Adds a delete operation for the specified key.
     /// </summary>
     /// <param name="key"></param>
     public void Delete(ReadOnlyMemory<byte> key)
@@ -154,76 +155,78 @@ public sealed class LsmStorageInner : IDisposable, IIterator
     {
         List<IEnumerator<StorageRecord>> iterators = [];
 
-        // Only the current MemTable needs to be synchronized.
+        // In theory only the current MemTable needs to be synchronized,
+        // but we need to keep the mutable MemTable iterator around to compare with immutable ones.
+        // A solution to shorten the read-lock would be to copy the mutable MemTable keys. 
 
         _rwLock.EnterReadLock();
 
         try
         {
-            var snapshot = _state.Clone();
             var currentIterator = _state.CurrentMemTable.Scan(minValue, maxValue).GetEnumerator();
+            
             if (currentIterator.MoveNext())
             {
                 iterators.Add(currentIterator);
+            }
+
+            foreach (var memTable in _state.ImmutableMemTables)
+            {
+                var iterator = memTable.Scan(minValue, maxValue).GetEnumerator();
+                if (iterator.MoveNext())
+                {
+                    iterators.Add(iterator);
+                }
+            }
+
+            while (iterators.Count > 0)
+            {
+                // Assume the smallest is the element from the first iterator
+                StorageRecord smallest = iterators[0].Current;
+
+                var smallestIndex = 0;
+
+                for (var i = 1; i < iterators.Count; i++)
+                {
+                    var iterator = iterators[i];
+
+                    var current = iterator.Current;
+
+                    switch (ByteArrayComparer.Instance.Compare(smallest.Key, current.Key))
+                    {
+                        // Discard the entry since there is the same key from a more recent table
+                        case 0:
+                            if (!iterator.MoveNext())
+                            {
+                                iterators.RemoveAt(i);
+                                i--;
+                            }
+                            break;
+
+                        case > 0:
+                            smallestIndex = i;
+                            smallest = current;
+                            break;
+                    }
+                }
+
+                // Consume the smallest element
+                if (!iterators[smallestIndex].MoveNext())
+                {
+                    iterators.RemoveAt(smallestIndex);
+                }
+
+                // Don't return the entry if it's been deleted
+                if (smallest.Value.Length != 0)
+                {
+                    yield return smallest;
+                }
             }
         }
         finally
         {
             _rwLock.ExitReadLock();
         }
-
-        foreach (var memTable in _state.ImmutableMemTables)
-        {
-            var iterator = memTable.Scan(minValue, maxValue).GetEnumerator();
-            if (iterator.MoveNext())
-            {
-                iterators.Add(iterator);
-            }
-        }
-
-        while (iterators.Count > 0)
-        {
-            // Assume the smallest is the element from the first iterator
-            StorageRecord smallest = iterators[0].Current;
-
-            var smallestIndex = 0;
-
-            for (var i = 1; i < iterators.Count; i++)
-            {
-                var iterator = iterators[i];
-            
-                var current = iterator.Current;
-
-                switch (ByteArrayComparer.Instance.Compare(smallest.Key, current.Key))
-                {
-                    // Discard the entry since there is the same key from a more recent table
-                    case 0:
-                        if (!iterator.MoveNext())
-                        {
-                            iterators.RemoveAt(i);
-                            i--;
-                        }
-                        break;
-
-                    case > 0:
-                        smallestIndex = i;
-                        smallest = current;
-                        break;
-                }
-            }
-
-            // Consume the smallest element
-            if (!iterators[smallestIndex].MoveNext())
-            {
-                iterators.RemoveAt(smallestIndex);
-            }
-
-            // Don't return the entry if it's been deleted
-            if (smallest.Value.Length != 0)
-            {
-                yield return smallest;
-            }            
-        }        
     }
 
     /// <summary>

@@ -1,15 +1,14 @@
 namespace Silex.Test;
 
-using Newtonsoft.Json.Linq;
 using System.Globalization;
 using Xunit.Abstractions;
 
-public class SilexTests
+public class StorageTests
 {
     private readonly StorageOptions _defaultStorageOptions = new();
     private readonly ITestOutputHelper _output;
 
-    public SilexTests(ITestOutputHelper output)
+    public StorageTests(ITestOutputHelper output)
     {
         _output = output;
     }

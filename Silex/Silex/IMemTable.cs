@@ -1,4 +1,5 @@
-﻿using System.Buffers;
+﻿using Silex.MemTables;
+using System.Buffers;
 
 namespace Silex;
 

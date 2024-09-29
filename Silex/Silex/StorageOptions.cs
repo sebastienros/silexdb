@@ -1,5 +1,7 @@
 ﻿namespace Silex;
 
+using Silex.MemTables;
+
 public class StorageOptions
 {
     /// <summary>64MiB</summary>

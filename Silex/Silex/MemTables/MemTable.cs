@@ -1,6 +1,7 @@
-﻿using System.Buffers;
+﻿using Silex.Collections;
+using System.Buffers;
 
-namespace Silex;
+namespace Silex.MemTables;
 
 /// <summary>
 /// An instance of <see cref="MemTable"/> contains a sorted list of key value pairs of bytes to be stored.
@@ -17,9 +18,9 @@ namespace Silex;
 /// A MemTable usually has a size limit and it will be frozen to an immutable MemTable when it reaches the size limit.
 /// This logic is part of <see cref="LsmStorageInner"/>.
 /// </remarks>
-public sealed class MemTable : IDisposable, IMemTable
+internal sealed class MemTable : IDisposable, IMemTable
 {
-    private readonly SortedDictionary<ReadOnlyMemory<byte>, MemTableEntry> _map = new(ByteArrayComparer.Instance);
+    private readonly SkipList<ReadOnlyMemory<byte>, MemTableEntry> _map = new(ByteArrayComparer.Instance);
     private long _size;
     private bool _disposing;
     private readonly int _id;
@@ -73,12 +74,12 @@ public sealed class MemTable : IDisposable, IMemTable
         };
 
         // Retrieve the previous value to keep its size consistent.
-        if (_map.Remove(key, out var previousValue))
+        if (_map.TryRemove(key, out var previousValue))
         {
             _size -= previousValue.Size + key.Length;
             previousValue.MemoryOwner.Dispose();
         }
-     
+
         _map.Add(key, memoryEntry);
         _size += bufferSize + key.Length;
         return;
@@ -99,9 +100,9 @@ public sealed class MemTable : IDisposable, IMemTable
 
     private void DisposeInternal()
     {
-        foreach (var memory in _map.Values)
+        foreach (var entry in _map)
         {
-            memory.MemoryOwner.Dispose();
+            entry.Value.MemoryOwner.Dispose();
         }
 
         _map.Clear();
@@ -109,18 +110,16 @@ public sealed class MemTable : IDisposable, IMemTable
 
     public IEnumerable<KeyValuePair<ReadOnlyMemory<byte>, ReadOnlyMemory<byte>>> Scan(ReadOnlyMemory<byte> minValue = default, ReadOnlyMemory<byte> maxValue = default)
     {
-        // Snapshot of the key/values so we don't lock.
+        // We don't handle concurrency, like for instance doing a snapshot of the keys. The caller is responsible for preventing writes while there is a
+        // scan if it knows this MemTable is the mutable.
         // Use a read lock when for the mutable MemTable such that no other key is added while we clone it.
-        // Once Scan is invoked the iterator doesn't need to be synchronized since we cloned its elements.
         // Deleted records need to be returned such that the merge iterator can decide if the entry should
         // be skipped.
-        // A SkipList would be faster at iterating values between bounds.
-        // Using Array.BinarySearch doesn't prevent cloning to an Array, and might be tricky to handle since the bounds might
-        // not be in the collection
 
-        var clone = _map.ToArray();
+        // We can't use a Array.BinarySearch without needing to clone the keys in an array since SortedDictionary can't use a position based
+        // index, only be enumerated. A SkipList would be faster.
 
-        foreach (var entry in clone)
+        foreach (var entry in _map)
         {
             if (!minValue.IsEmpty && minValue.Span.SequenceCompareTo(entry.Key.Span) > 0)
             {
