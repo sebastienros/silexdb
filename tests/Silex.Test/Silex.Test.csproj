@@ -23,7 +23,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\Silex\Silex.csproj" />
+    <ProjectReference Include="..\..\src\Silex\Silex.csproj" />
   </ItemGroup>
 
   <ItemGroup>
