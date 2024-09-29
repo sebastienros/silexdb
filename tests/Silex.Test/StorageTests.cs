@@ -270,25 +270,30 @@ public class StorageTests
         var count = 10;
 
         var storage = FillImmutableMemTables(entries: count, memTableSizeLimit: 1.KiB());
-        var lowerBytes = lowerBound == null ? null : BitConverter.GetBytes(lowerBound.Value);
-        var upperBytes = upperBound == null ? null : BitConverter.GetBytes(upperBound.Value);
+        ReadOnlyMemory<byte> lowerBytes = lowerBound == null ? ReadOnlyMemory<byte>.Empty : BitConverter.GetBytes(lowerBound.Value);
+        ReadOnlyMemory<byte> upperBytes = upperBound == null ? ReadOnlyMemory<byte>.Empty : BitConverter.GetBytes(upperBound.Value);
+
+        var expectedKeys = Enumerable.Range(1, count);
 
         var entries = storage.Scan(lowerBytes, upperBytes);
 
-        if (lowerBytes != null)
+        if (lowerBound.HasValue)
         {
+            expectedKeys = expectedKeys.Where(x => x >= lowerBound);
+
             Assert.All(entries, e => Assert.True(ByteArrayComparer.Instance.Compare(lowerBytes, e.Key) <= 0));
         }
 
-        if (upperBytes != null)
+        if (upperBound.HasValue)
         {
+            expectedKeys = expectedKeys.Where(x => x <= upperBound);
+
             Assert.All(entries, e => Assert.True(ByteArrayComparer.Instance.Compare(upperBytes, e.Key) >= 0));
         }
 
-        if (lowerBytes == null && upperBytes == null)
-        {
-            Assert.Equal(count, entries.Count());
-        }
+        var actualKeys = storage.Scan(lowerBytes, upperBytes).Select(x => BitConverter.ToInt32(x.Key.Span)).ToArray();
+
+        Assert.Equal(expectedKeys, actualKeys);
     }
 
     private static LsmStorageInner FillImmutableMemTables(int entries = 100, int valueSize = 10, long memTableSizeLimit = 100)

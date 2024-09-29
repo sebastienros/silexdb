@@ -1,5 +1,8 @@
-﻿using System.Collections;
+﻿using System;
+using System.Collections;
 using System.Diagnostics;
+using System.Diagnostics.Metrics;
+using System.Xml.Linq;
 
 namespace Silex.Collections;
 
@@ -98,103 +101,6 @@ internal sealed class SkipList<TKey, TValue> : IEnumerable<KeyValuePair<TKey, TV
         AddInternal(key, value);
 
         ExitWriteSection();
-    }
-
-    private void AddInternal(TKey key, TValue value)
-    {
-        var updates = BuildUpdateTable(key);
-
-        var current = updates[0];
-
-        // Is the key already present?
-        if (current[0] != NullNode && _comparer.Compare(current[0].Key, key) == 0)
-        {
-            return;
-        }
-
-        // Create a new node
-        var n = new Node(ChooseRandomHeight(_head.Height + 1), key, value);
-
-        // Increment the count of elements in the skip list
-        _count++;
-
-        // if the node's level is greater than the head's level, increase the head's level
-        if (n.Height > _head.Height)
-        {
-            _head.IncrementHeight();
-            _head[_head.Height - 1] = n;
-        }
-
-        // Splice the new node into the list
-        for (int i = 0; i < n.Height; i++)
-        {
-            if (i < updates.Length)
-            {
-                n[i] = updates[i][i];
-                updates[i][i] = n;
-            }
-        }
-    }
-
-    private Node[] BuildUpdateTable(TKey key)
-    {
-        var updates = new Node[_head.Height];
-        var current = _head;
-
-        // Determine the nodes that need to be updated at each level
-        for (var i = _head.Height - 1; i >= 0; i--)
-        {
-            while (current[i] != NullNode && _comparer.Compare(current[i].Key, key) < 0)
-            {
-                current = current[i];
-            }
-
-            updates[i] = current;
-        }
-
-        return updates;
-    }
-
-    private int ChooseRandomHeight(int maxLevel)
-    {
-        var level = 1;
-        while (_random.NextDouble() < _probability && level < maxLevel)
-        {
-            level++;
-        }
-
-        return level;
-    }
-
-    private Node FindNode(TKey key)
-    {
-        var current = _head;
-
-        for (int i = _head.Height - 1; i >= 0; i--)
-        {
-            while (current[i] != NullNode)
-            {
-                int results = _comparer.Compare(current[i].Key, key);
-                if (results == 0)
-                {
-                    // We found the element
-                    return current[i];
-                }
-                else if (results < 0)
-                {
-                    // The element is to the left, so move down a level
-                    current = current[i];
-                }
-                else
-                {
-                    // Exit while loop, because the element is to the right of this node, at (or lower than) the current level
-                    break;
-                }
-            }
-        }
-
-        // Element not found
-        return NullNode;
     }
 
     public bool TryRemove(TKey key, out TValue value)
@@ -299,25 +205,103 @@ internal sealed class SkipList<TKey, TValue> : IEnumerable<KeyValuePair<TKey, TV
         return GetEnumerator();
     }
 
-    public IEnumerable<KeyValuePair<ReadOnlyMemory<byte>, ReadOnlyMemory<byte>>> Scan(TKey? minValue = default, TKey? maxValue = default)
+    /// <summary>
+    /// Gets an iterator for all the entries with a key greater or equal to <paramref name="start"/>.
+    /// </summary>
+    /// <param name="start"></param>
+    /// <returns></returns>
+    public IEnumerator<KeyValuePair<TKey, TValue>> GetEnumerator(TKey start)
     {
-        yield break;
+        EnsureNotWriting();
+        
+        var node = FindNode(start, includeClosest: true);
 
-        //foreach (var entry in _map)
-        //{
-        //    if (!minValue.IsEmpty && minValue.Span.SequenceCompareTo(entry.Key.Span) > 0)
-        //    {
-        //        continue;
-        //    }
+        while (node != NullNode)
+        {
+            yield return new KeyValuePair<TKey, TValue>(node.Key, node.Value);
+            node = node[0];
+        }
+    }
 
-        //    if (!maxValue.IsEmpty && maxValue.Span.SequenceCompareTo(entry.Key.Span) < 0)
-        //    {
-        //        // No more elements since the list is ordered
-        //        yield break;
-        //    }
+    /// <summary>
+    /// Gets an iterator for all the entries with a key greater or equal to <paramref name="start"/> and lower than <paramref name="end"/>.
+    /// </summary>
+    /// <param name="start"></param>
+    /// <param name="end"></param>
+    /// <returns></returns>
+    public IEnumerator<KeyValuePair<TKey, TValue>> GetEnumerator(TKey start, TKey end)
+    {
+        EnsureNotWriting();
 
-        //    yield return new(entry.Key, entry.Value.Memory);
-        //}
+        var node = FindNode(start, includeClosest: true);
+        var endNode = FindNode(end, includeClosest: true);
+
+        while (node != NullNode && node != endNode)
+        {
+            yield return new KeyValuePair<TKey, TValue>(node.Key, node.Value);
+            node = node[0];
+        }
+
+        // Return the last node if the key matches exactly
+        if (node == endNode && _comparer.Compare(node.Key, end) == 0)
+        {
+            yield return new KeyValuePair<TKey, TValue>(node.Key, node.Value);
+        }
+    }
+
+    public bool TryGetNext(TKey key, out TKey result)
+    {
+        EnsureNotWriting();
+
+        // Seek first element, either exact match or previous one
+
+        var currentStart = _head;
+        var node = NullNode;
+        
+        for (var i = _head.Height - 1; i >= 0; i--)
+        {
+            while (currentStart[i] != NullNode)
+            {
+                var results = _comparer.Compare(currentStart[i].Key, key);
+                if (results == 0)
+                {
+                    // Exact, get next item
+                    node = currentStart[i][0];
+
+                    // Exit the outer for loop
+                    i = -1;
+
+                    // Exit the while loop
+                    break;
+                }
+                else if (results < 0)
+                {
+                    // The element is to the left, so move down a level
+                    currentStart = currentStart[i];
+                    node = currentStart[0];
+                }
+                else
+                {
+                    if (i == 0 && node == NullNode)
+                    {
+                        node = _head[0];
+                    }
+
+                    // Exit while loop, because the element is to the right of this node, at (or lower than) the current level
+                    break;
+                }
+            }
+        }
+
+        result = node.Key;
+
+        // If the element was not found, exit
+        if (node == NullNode)
+        {
+            return false;
+        }
+
+        return true;
     }
 
     [Conditional("DEBUG")]
@@ -338,6 +322,115 @@ internal sealed class SkipList<TKey, TValue> : IEnumerable<KeyValuePair<TKey, TV
     private void EnsureNotWriting()
     {
         Debug.Assert(!_writing);
+    }
+
+    private void AddInternal(TKey key, TValue value)
+    {
+        var updates = BuildUpdateTable(key);
+
+        var current = updates[0];
+
+        // Is the key already present?
+        if (current[0] != NullNode && _comparer.Compare(current[0].Key, key) == 0)
+        {
+            return;
+        }
+
+        // Create a new node
+        var n = new Node(ChooseRandomHeight(_head.Height + 1), key, value);
+
+        // Increment the count of elements in the skip list
+        _count++;
+
+        // if the node's level is greater than the head's level, increase the head's level
+        if (n.Height > _head.Height)
+        {
+            _head.IncrementHeight();
+            _head[_head.Height - 1] = n;
+        }
+
+        // Splice the new node into the list
+        for (int i = 0; i < n.Height; i++)
+        {
+            if (i < updates.Length)
+            {
+                n[i] = updates[i][i];
+                updates[i][i] = n;
+            }
+        }
+    }
+
+    private Node[] BuildUpdateTable(TKey key)
+    {
+        var updates = new Node[_head.Height];
+        var current = _head;
+
+        // Determine the nodes that need to be updated at each level
+        for (var i = _head.Height - 1; i >= 0; i--)
+        {
+            while (current[i] != NullNode && _comparer.Compare(current[i].Key, key) < 0)
+            {
+                current = current[i];
+            }
+
+            updates[i] = current;
+        }
+
+        return updates;
+    }
+
+    private int ChooseRandomHeight(int maxLevel)
+    {
+        var level = 1;
+        while (_random.NextDouble() < _probability && level < maxLevel)
+        {
+            level++;
+        }
+
+        return level;
+    }
+
+    private Node FindNode(TKey key, bool includeClosest = false)
+    {
+        var current = _head;
+        var closest = NullNode;
+
+        for (int i = _head.Height - 1; i >= 0; i--)
+        {
+            while (current[i] != NullNode)
+            {
+                int results = _comparer.Compare(current[i].Key, key);
+                if (results == 0)
+                {
+                    // We found the element
+                    return current[i];
+                }
+                else if (results < 0)
+                {
+                    // The element is to the left, so move down a level
+                    current = current[i];
+                    closest = current[0];
+                }
+                else
+                {
+                    if (i == 0 && closest == NullNode)
+                    {
+                        closest = _head[0];
+                    }
+
+                    // Exit while loop, because the element is to the right of this node, at (or lower than) the current level
+                    break;
+                }
+            }
+        }
+
+        if (includeClosest)
+        {
+            return closest;
+        }
+
+        // Element not found
+        return NullNode;
     }
 
     private class Node
@@ -386,5 +479,3 @@ internal sealed class SkipList<TKey, TValue> : IEnumerable<KeyValuePair<TKey, TV
         }
     }
 }
-
-

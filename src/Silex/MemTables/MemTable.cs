@@ -108,31 +108,38 @@ internal sealed class MemTable : IDisposable, IMemTable
         _map.Clear();
     }
 
-    public IEnumerable<KeyValuePair<ReadOnlyMemory<byte>, ReadOnlyMemory<byte>>> Scan(ReadOnlyMemory<byte> minValue = default, ReadOnlyMemory<byte> maxValue = default)
+    public IEnumerable<KeyValuePair<ReadOnlyMemory<byte>, ReadOnlyMemory<byte>>> Scan(ReadOnlyMemory<byte>? minValue = null, ReadOnlyMemory<byte>? maxValue = null)
     {
-        // We don't handle concurrency, like for instance doing a snapshot of the keys. The caller is responsible for preventing writes while there is a
-        // scan if it knows this MemTable is the mutable.
-        // Use a read lock when for the mutable MemTable such that no other key is added while we clone it.
-        // Deleted records need to be returned such that the merge iterator can decide if the entry should
-        // be skipped.
+        IEnumerator<KeyValuePair<ReadOnlyMemory<byte>, MemTableEntry>> enumerator;
 
-        // We can't use a Array.BinarySearch without needing to clone the keys in an array since SortedDictionary can't use a position based
-        // index, only be enumerated. A SkipList would be faster.
-
-        foreach (var entry in _map)
+        if (minValue?.Length > 0)
         {
-            if (!minValue.IsEmpty && minValue.Span.SequenceCompareTo(entry.Key.Span) > 0)
+            if (maxValue?.Length > 0)
             {
-                continue;
+                enumerator = _map.GetEnumerator(minValue.Value, maxValue.Value);
+
+            }
+            else
+            {
+                enumerator = _map.GetEnumerator(minValue.Value);
+            }
+        }
+        else
+        {
+            if (maxValue?.Length > 0)
+            {
+                enumerator = _map.GetEnumerator(default, maxValue.Value);
+            }
+            else
+            {
+                enumerator = _map.GetEnumerator();
             }
 
-            if (!maxValue.IsEmpty && maxValue.Span.SequenceCompareTo(entry.Key.Span) < 0)
-            {
-                // No more elements since the list is ordered
-                yield break;
-            }
+        }
 
-            yield return new(entry.Key, entry.Value.Memory);
+        while (enumerator.MoveNext())
+        {
+            yield return new(enumerator.Current.Key, enumerator.Current.Value.Memory);
         }
     }
 

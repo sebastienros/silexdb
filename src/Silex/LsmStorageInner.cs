@@ -151,7 +151,7 @@ public sealed class LsmStorageInner : IDisposable, IIterator
     /// </summary>
     /// <remarks>Uses a merge iterator.</remarks>
     /// <returns></returns>
-    public IEnumerable<StorageRecord> Scan(ReadOnlyMemory<byte> minValue = default, ReadOnlyMemory<byte> maxValue = default)
+    public IEnumerable<StorageRecord> Scan(ReadOnlyMemory<byte>? minValue = null, ReadOnlyMemory<byte>? maxValue = null)
     {
         List<IEnumerator<StorageRecord>> iterators = [];
 

@@ -2,5 +2,5 @@
 
 public interface IIterator
 {
-    IEnumerable<KeyValuePair<ReadOnlyMemory<byte>, ReadOnlyMemory<byte>>> Scan(ReadOnlyMemory<byte> minValue = default, ReadOnlyMemory<byte> maxValue = default);
+    IEnumerable<KeyValuePair<ReadOnlyMemory<byte>, ReadOnlyMemory<byte>>> Scan(ReadOnlyMemory<byte>? minValue = null, ReadOnlyMemory<byte>? maxValue = null);
 }
