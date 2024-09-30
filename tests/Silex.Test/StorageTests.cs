@@ -6,11 +6,11 @@ using Xunit.Abstractions;
 public class StorageTests
 {
     private readonly StorageOptions _defaultStorageOptions = new();
-    private readonly ITestOutputHelper _output;
+    private readonly ITestOutputHelper? _output;
 
-    public StorageTests(ITestOutputHelper output)
+    public StorageTests(ITestOutputHelper _)
     {
-        _output = output;
+        _output = null;
     }
 
     [Fact]
@@ -199,23 +199,23 @@ public class StorageTests
 
         var allEntries = storage.Scan().ToList();
 
-        _output.WriteLine($"Entries: {allEntries.Count}");
-        _output.WriteLine($"Immutable MemTables: {storage._state.ImmutableMemTables.Count()}");
+        _output?.WriteLine($"Entries: {allEntries.Count}");
+        _output?.WriteLine($"Immutable MemTables: {storage._state.ImmutableMemTables.Count()}");
 
-        _output.WriteLine($"Current MemTable: {storage._state.CurrentMemTable.Size}");
+        _output?.WriteLine($"Current MemTable: {storage._state.CurrentMemTable.Size}");
 
         foreach (var table in storage._state.ImmutableMemTables)
         {
-            _output.WriteLine($"ImmutableMemTable: {table.Size}");
+            _output?.WriteLine($"ImmutableMemTable: {table.Size}");
         }
 
-        _output.WriteLine($"Entries:");
+        _output?.WriteLine($"Entries:");
         foreach (var entry in allEntries)
         {
             var key = entry.Key.Span.Length == 0 ? "0" : BitConverter.ToInt32(entry.Key.Span).ToString(CultureInfo.InvariantCulture);
             var value = entry.Value.Span.Length == 0 ? "del" : BitConverter.ToInt64(entry.Value.Span).ToString(CultureInfo.InvariantCulture);
 
-            _output.WriteLine($"{key} -> {value}");
+            _output?.WriteLine($"{key} -> {value}");
         }
 
         Assert.True(allEntries.Count <= maxKeysValue);
