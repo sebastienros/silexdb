@@ -13,8 +13,13 @@ public class Block
 
     public IList<ushort> Offsets { get; } = [];
 
-    public BlockEntry GetEntry(int index)
+    public BlockEntry GetEntry(int offset)
     {
-        return _encoder.DecodeEntry(Data, Offsets[index]);
+        return _encoder.DecodeEntry(Data, offset);
+    }
+
+    public ReadOnlyMemory<byte> GetValue(BlockEntry entry)
+    {
+        return _encoder.DecodeValue(Data, entry.Offset, entry.Length);
     }
 }

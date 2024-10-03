@@ -9,6 +9,11 @@ public class ByteArrayComparer : EqualityComparer<ReadOnlyMemory<byte>>, ICompar
         return x.Span.SequenceCompareTo(y.Span);
     }
 
+    public int Compare(ReadOnlySpan<byte> x, ReadOnlySpan<byte> y)
+    {
+        return x.SequenceCompareTo(y);
+    }
+
     public override bool Equals(ReadOnlyMemory<byte> x, ReadOnlyMemory<byte> y)
     {
         return x.Span.SequenceEqual(y.Span);

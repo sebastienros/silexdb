@@ -70,16 +70,22 @@ public class DefaultBlockEncoder : IBlockEncoder
         var keyLength = binaryReader.Read7BitEncodedInt();
         var key = binaryReader.ReadBytesMemory(keyLength);
         var valueLength = binaryReader.Read7BitEncodedInt();
-        var value = binaryReader.ReadBytesMemory(valueLength);
 
         return new BlockEntry
         {
             Key = key,
-            Value = value
+            Offset = binaryReader.Offset,
+            Length = valueLength
         };
     }
 
-    public Block Encode(IBufferWriter<byte> buffer, IReadOnlyList<BlockEntry> entries)
+    public ReadOnlyMemory<byte> DecodeValue(ReadOnlyMemory<byte> data, int offset, int length)
+    {
+        var binaryReader = new EncoderBinaryReader(data, offset);
+        return data.Slice(offset, length);
+    }
+
+    public Block Encode(IBufferWriter<byte> buffer, IReadOnlyList<KeyValuePair<ReadOnlyMemory<byte>, ReadOnlyMemory<byte>>> entries)
     {
         var block = new Block(this);
 

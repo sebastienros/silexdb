@@ -16,7 +16,8 @@ internal ref struct EncoderBinaryReader
     private int _offset;
  
     public readonly bool IsEOF => _offset >= _length;
- 
+    public int Offset => _offset;
+
     public EncoderBinaryReader(ReadOnlyMemory<byte> content, int offset)
     {
         _original = content;

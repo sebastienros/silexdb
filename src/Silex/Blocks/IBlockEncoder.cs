@@ -8,9 +8,11 @@ namespace Silex.Blocks;
 /// </summary>
 public interface IBlockEncoder
 {
-    Block Encode(IBufferWriter<byte> buffer, IReadOnlyList<BlockEntry> entries);
+    Block Encode(IBufferWriter<byte> buffer, IReadOnlyList<KeyValuePair<ReadOnlyMemory<byte>, ReadOnlyMemory<byte>>> entries);
 
     Block Decode(ReadOnlyMemory<byte> buffer);
 
     BlockEntry DecodeEntry(ReadOnlyMemory<byte> data, int offset);
+    ReadOnlyMemory<byte> DecodeValue(ReadOnlyMemory<byte> data, int offset, int length);
+
 }

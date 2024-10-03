@@ -13,7 +13,7 @@ public class BlockTests
         var key = BitConverter.GetBytes((ushort)7);
         var value = Encoding.UTF8.GetBytes($"hello");
 
-        blockBuilder.AddEntry(new BlockEntry { Key = key, Value = value });
+        blockBuilder.AddEntry(key, value);
 
         var block = blockBuilder.BuildBlock();
 
@@ -46,6 +46,47 @@ public class BlockTests
         Assert.Single(block.Offsets);
         Assert.Equal(0, block.Offsets[0]);
         Assert.Equal(key, entry.Key);
-        Assert.Equal(value, entry.Value);
+        Assert.Equal(4, entry.Offset);
+        Assert.Equal(5, entry.Length);
+    }
+
+    [Fact]
+    public void ShouldIterateAllEntries()
+    {
+        var blockBuilder = new BlockBuilder(new DefaultBlockEncoder(), (ushort)4.KiB());
+
+        var value = "hello"u8.ToArray();
+        var allKeys = new int[] { 1, 3, 5, 6, 7 };
+        foreach (var i in allKeys)
+        {
+            blockBuilder.AddEntry(BitConverter.GetBytes(i), value);
+        }
+
+        var block = blockBuilder.BuildBlock();
+        var iterator = new BlockIterator(block);
+
+        var result = iterator.Enumerate().Select(x => BitConverter.ToInt32(x.Key.Span)).ToArray();
+
+        Assert.Equivalent(allKeys, result);
+    }
+
+    [Fact]
+    public void ShouldIterateFromKey()
+    {
+        var blockBuilder = new BlockBuilder(new DefaultBlockEncoder(), (ushort)4.KiB());
+
+        var value = "hello"u8.ToArray();
+        var allKeys = new int[] { 1, 3, 5, 6, 7 };
+        foreach (var i in allKeys)
+        {
+            blockBuilder.AddEntry(BitConverter.GetBytes(i), value);
+        }
+
+        var block = blockBuilder.BuildBlock();
+        var iterator = new BlockIterator(block);
+
+        var result = iterator.Enumerate(BitConverter.GetBytes(2)).Select(x => BitConverter.ToInt32(x.Key.Span)).ToArray();
+
+        Assert.Equivalent(allKeys.Skip(1), result);
     }
 }

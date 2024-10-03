@@ -4,7 +4,7 @@ public class BlockBuilder
 {
     private readonly IBlockEncoder _blockEncoder;
     private readonly int _blockSizeBytes;
-    private readonly List<BlockEntry> _blockEntries = [];
+    private readonly List<KeyValuePair<ReadOnlyMemory<byte>, ReadOnlyMemory<byte>>> _blockEntries = [];
     
     public BlockBuilder(IBlockEncoder blockEncoder, ushort blockSizeBytes)
     {
@@ -17,9 +17,9 @@ public class BlockBuilder
         _blockEntries.Clear();
     }
 
-    public void AddEntry(BlockEntry entry)
+    public void AddEntry(ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value)
     {
-        _blockEntries.Add(entry);
+        _blockEntries.Add(new(key, value));
     }
 
     public Block BuildBlock()
