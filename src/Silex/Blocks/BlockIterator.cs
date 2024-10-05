@@ -7,7 +7,7 @@ internal sealed class BlockIterator : IStorageIterator
 {
     private readonly Block _block;
 
-    private readonly BlockEntry[] _entries;
+    private readonly RecordLocation[] _entries;
 
     public BlockIterator(Block block)
     {
@@ -15,20 +15,20 @@ internal sealed class BlockIterator : IStorageIterator
         _entries = _block.Offsets.Select(x => _block.GetEntry(x)).ToArray();
     }
 
-    public IAsyncEnumerable<BlockEntry> EnumerateAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
+    public IAsyncEnumerable<RecordLocation> EnumerateAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         return EnumerateAsync(ReadOnlyMemory<byte>.Empty, cancellationToken);
     }
 
 #pragma warning disable 1998 // async function without await
-    public async IAsyncEnumerable<BlockEntry> EnumerateAsync(ReadOnlyMemory<byte> afterKey, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    public async IAsyncEnumerable<RecordLocation> EnumerateAsync(ReadOnlyMemory<byte> afterKey, [EnumeratorCancellation] CancellationToken cancellationToken = default)
 #pragma warning restore 1998
     {
         var startIndex = 0;
 
         if (!afterKey.IsEmpty)
         {
-            var compare = Array.BinarySearch(_entries, new BlockEntry { Key = afterKey });
+            var compare = Array.BinarySearch(_entries, new RecordLocation { Key = afterKey });
 
             startIndex = compare >= 0 ? compare : ~compare;
 

@@ -16,7 +16,7 @@ public interface IBlockEncoder
     /// <returns></returns>
     Block Decode(ReadOnlyMemory<byte> buffer);
 
-    BlockEntry DecodeEntry(ReadOnlyMemory<byte> data, int offset);
+    RecordLocation DecodeEntry(ReadOnlyMemory<byte> data, int offset);
 
     ReadOnlyMemory<byte> DecodeValue(ReadOnlyMemory<byte> data, int offset, int length);
 

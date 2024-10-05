@@ -13,12 +13,12 @@ internal sealed class SsTableIterator : IStorageIterator
         _table = table;
     }
 
-    public IAsyncEnumerable<BlockEntry> EnumerateAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
+    public IAsyncEnumerable<RecordLocation> EnumerateAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         return EnumerateAsync(ReadOnlyMemory<byte>.Empty, cancellationToken);
     }
 
-    public async IAsyncEnumerable<BlockEntry> EnumerateAsync(ReadOnlyMemory<byte> afterKey, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    public async IAsyncEnumerable<RecordLocation> EnumerateAsync(ReadOnlyMemory<byte> afterKey, [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         var startBlockIndex = 0;
 
@@ -65,7 +65,13 @@ internal sealed class SsTableIterator : IStorageIterator
                 var blockIterator = new BlockIterator(block);
                 await foreach (var entry in blockIterator.EnumerateAsync(cancellationToken))
                 {
-                    yield return entry;
+                    yield return new RecordLocation
+                    {
+                        SsTableFilename = _table.Filename,
+                        Length = entry.Length,
+                        Key = entry.Key,
+                        BlockOffset = entry.BlockOffset
+                    };
                 }
             }
         }

@@ -68,17 +68,17 @@ public class DefaultBlockEncoder : IBlockEncoder
         return new Block(this, memoryOwner, buffer.Length, offsets);
     }
 
-    public BlockEntry DecodeEntry(ReadOnlyMemory<byte> data, int offset)
+    public RecordLocation DecodeEntry(ReadOnlyMemory<byte> data, int offset)
     {
         var binaryReader = new EncoderBinaryReader(data, offset);
         var keyLength = binaryReader.Read7BitEncodedInt();
         var key = binaryReader.ReadBytesMemory(keyLength);
         var valueLength = binaryReader.Read7BitEncodedInt();
 
-        return new BlockEntry
+        return new RecordLocation
         {
             Key = key,
-            Offset = binaryReader.Offset,
+            BlockOffset = binaryReader.Offset,
             Length = valueLength
         };
     }

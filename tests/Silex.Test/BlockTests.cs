@@ -45,7 +45,7 @@ public class BlockTests
         Assert.Single(block.Offsets);
         Assert.Equal(0, block.Offsets[0]);
         Assert.Equal(key, entry.Key);
-        Assert.Equal(4, entry.Offset);
+        Assert.Equal(4, entry.BlockOffset);
         Assert.Equal(5, entry.Length);
     }
 

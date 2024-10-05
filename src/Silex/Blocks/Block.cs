@@ -1,5 +1,6 @@
 namespace Silex.Blocks;
 
+using Silex;
 using System;
 using System.Buffers;
 using System.Collections.Generic;
@@ -26,19 +27,19 @@ public class Block : IDisposable
     /// </summary>
     /// <param name="offset"></param>
     /// <returns></returns>
-    public BlockEntry GetEntry(int offset)
+    public RecordLocation GetEntry(int offset)
     {
         return _encoder.DecodeEntry(Memory, offset);
     }
 
     /// <summary>
-    /// Returns a block of memory containing the value associated with the specified <see cref="BlockEntry"/>.
+    /// Returns a block of memory containing the value associated with the specified <see cref="RecordLocation"/>.
     /// </summary>
     /// <param name="entry"></param>
     /// <returns></returns>
-    public ReadOnlySpan<byte> GetValue(BlockEntry entry)
+    public ReadOnlySpan<byte> GetValue(RecordLocation entry)
     {
-        return _encoder.DecodeValue(Memory, entry.Offset, entry.Length).Span;
+        return _encoder.DecodeValue(Memory, entry.BlockOffset, entry.Length).Span;
     }
 
     public void Dispose()
