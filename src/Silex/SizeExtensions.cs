@@ -49,4 +49,12 @@ public static class SizeExtensions
     {
         return @this * 1024L;
     }
+
+    /// <summary>
+    /// Bytes.
+    /// </summary>
+    public static long B(this int @this)
+    {
+        return @this;
+    }
 }

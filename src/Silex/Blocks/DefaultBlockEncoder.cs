@@ -1,3 +1,5 @@
+using Silex.Buffers;
+using System;
 using System.Buffers;
 
 namespace Silex.Blocks;
@@ -16,7 +18,7 @@ namespace Silex.Blocks;
 /// -----------------------------------------------------------------------
 /// |                           Entry #1                            | ... |
 /// -----------------------------------------------------------------------
-/// | key_len (2B) | key (keylen) | value_len (2B) | value (varlen) | ... |
+/// | key_len (u16) | key (keylen) | value_len (u16) | value (varlen) | ... |
 /// -----------------------------------------------------------------------
 /// 
 /// Key length and value length are 7 bits encoded since each entry position is 
@@ -42,26 +44,28 @@ public class DefaultBlockEncoder : IBlockEncoder
 {
     public Block Decode(ReadOnlyMemory<byte> buffer)
     {
-        var block = new Block(this);
-        block.Data = buffer;
-
         var span = buffer.Span;
 
         // Read the last two bytes
-        var totalEntries = BitConverter.ToUInt16(span.Slice(buffer.Span.Length - 2, 2));
+        var totalEntries = BitConverter.ToUInt16(span.Slice(span.Length - 2, 2));
 
         // Read the offsets position
-        var offsetPosition = buffer.Length - (totalEntries + 1) * 2;
+        var offsetPosition = span.Length - (totalEntries + 1) * 2;
         var current = offsetPosition;
+
+        var offsets = new List<ushort>(totalEntries);
 
         for (var i = 0; i < totalEntries; i++)
         {
             var bytes = span.Slice(current, 2);
-            block.Offsets.Add(BitConverter.ToUInt16(bytes));
+            offsets.Add(BitConverter.ToUInt16(bytes));
             current += 2;
         }
 
-        return block;
+        var memoryOwner = MemoryPool<byte>.Shared.Rent(buffer.Length);
+        buffer.CopyTo(memoryOwner.Memory);
+
+        return new Block(this, memoryOwner, buffer.Length, offsets);
     }
 
     public BlockEntry DecodeEntry(ReadOnlyMemory<byte> data, int offset)
@@ -81,37 +85,66 @@ public class DefaultBlockEncoder : IBlockEncoder
 
     public ReadOnlyMemory<byte> DecodeValue(ReadOnlyMemory<byte> data, int offset, int length)
     {
-        var binaryReader = new EncoderBinaryReader(data, offset);
         return data.Slice(offset, length);
     }
 
-    public Block Encode(IBufferWriter<byte> buffer, IReadOnlyList<KeyValuePair<ReadOnlyMemory<byte>, ReadOnlyMemory<byte>>> entries)
+    public Block Encode(IReadOnlyList<KeyValuePair<ReadOnlyMemory<byte>, ReadOnlyMemory<byte>>> entries)
     {
-        var block = new Block(this);
+        var size = entries.Sum(x => EstimateSize(x.Key, x.Value)) + sizeof(ushort);
 
+        // This buffer can extend its memory dynamically using an ArrayPool<byte> as we keep
+        // writing on it. Once the buffer is finalized we can copy its content to a locally 
+        // allocated array that we are free to dispose when necessary.
+
+        var buffer = new RecyclableArrayBufferWriter<byte>();
         var writer = new EncoderBinaryWriter(buffer);
 
-        foreach (var entry in entries)
+        try
         {
-            block.Offsets.Add((ushort)writer.Offset);
+            var offsets = new List<ushort>(entries.Count);
 
-            writer.Write7BitEncodedInt(entry.Key.Length);
-            writer.WriteRaw(entry.Key.Span);
+            foreach (var entry in entries)
+            {
+                offsets.Add((ushort)writer.BytesWritten);
 
-            writer.Write7BitEncodedInt(entry.Value.Length);
-            writer.WriteRaw(entry.Value.Span);
+                writer.Write7BitEncodedInt(entry.Key.Length);
+                writer.WriteRaw(entry.Key.Span);
+
+                writer.Write7BitEncodedInt(entry.Value.Length);
+                writer.WriteRaw(entry.Value.Span);
+            }
+
+            foreach (var offset in offsets)
+            {
+                // 2 bytes for each offset (ushort)
+                writer.WriteRaw(BitConverter.GetBytes(offset));
+            }
+
+            // 2 bytes for the number of elements
+            writer.WriteRaw(BitConverter.GetBytes((ushort)offsets.Count));
+
+            writer.Flush();
+
+            var memory = buffer.GetCommittedMemory();
+
+            var memoryOwner = MemoryPool<byte>.Shared.Rent(memory.Length);
+            memory.CopyTo(memoryOwner.Memory);
+
+            return new Block(this, memoryOwner, memory.Length, offsets);
         }
-
-        foreach (var offset in block.Offsets)
+        finally
         {
-            // 2 bytes for each offset (ushort)
-            writer.WriteRaw(BitConverter.GetBytes(offset));
+            buffer.Dispose();
         }
+    }
 
-        // 2 bytes for the number of elements
-        writer.WriteRaw(BitConverter.GetBytes((ushort)block.Offsets.Count));
-
-        writer.Flush();
-        return block;
+    public int EstimateSize(ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value)
+    {
+        return 2 // key length
+            + key.Length
+            + 2 // value length
+            + value.Length
+            + 2 // offset
+            ;
     }
 }

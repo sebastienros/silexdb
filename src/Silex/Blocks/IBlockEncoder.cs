@@ -1,4 +1,3 @@
-using System;
 using System.Buffers;
 
 namespace Silex.Blocks;
@@ -8,11 +7,19 @@ namespace Silex.Blocks;
 /// </summary>
 public interface IBlockEncoder
 {
-    Block Encode(IBufferWriter<byte> buffer, IReadOnlyList<KeyValuePair<ReadOnlyMemory<byte>, ReadOnlyMemory<byte>>> entries);
+    Block Encode(IReadOnlyList<KeyValuePair<ReadOnlyMemory<byte>, ReadOnlyMemory<byte>>> entries);
 
+    /// <summary>
+    /// Creates a <see cref="Block"/> instance that will hold the original memory block saved on this.
+    /// </summary>
+    /// <param name="buffer"></param>
+    /// <returns></returns>
     Block Decode(ReadOnlyMemory<byte> buffer);
 
     BlockEntry DecodeEntry(ReadOnlyMemory<byte> data, int offset);
+
     ReadOnlyMemory<byte> DecodeValue(ReadOnlyMemory<byte> data, int offset, int length);
 
+
+    int EstimateSize(ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value);
 }

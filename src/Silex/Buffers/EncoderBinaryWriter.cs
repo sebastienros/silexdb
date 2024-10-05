@@ -3,7 +3,7 @@ using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
-namespace Silex.Blocks;
+namespace Silex.Buffers;
 
 internal ref struct EncoderBinaryWriter
 {
@@ -14,19 +14,21 @@ internal ref struct EncoderBinaryWriter
     // note it also has APIs for writing raw BLOBs
 
     private readonly IBufferWriter<byte> _target;
-    private int _offset, _length;
+    private int _offset; // position in the current buffer
+    private int _length; // size of the current buffer
+    private int _written; // number of bytes written if previous buffers
     private ref byte _root;
 
     public EncoderBinaryWriter(IBufferWriter<byte> target)
     {
         ArgumentNullException.ThrowIfNull(target);
-        this._target = target;
+        _target = target;
         _root = ref Unsafe.NullRef<byte>(); // no buffer initially
-        _offset = _length = 0;
+        _written = _offset = _length = 0;
         DebugAssertValid();
     }
 
-    public int Offset => _offset;
+    public readonly int BytesWritten => _written + _offset;
 
     private Span<byte> AvailableBuffer
     {
@@ -74,6 +76,8 @@ internal ref struct EncoderBinaryWriter
 
     private void RequestNewBuffer()
     {
+        _written += _offset;
+
         Flush();
         var span = _target.GetSpan(1024); // fairly arbitrary non-trivial buffer; we can explore larger if useful
         if (span.IsEmpty)
@@ -147,7 +151,7 @@ internal ref struct EncoderBinaryWriter
     {
         if (value.IsEmpty)
         { } // nothing to do
-        else if ((_offset + value.Length) <= _length)
+        else if (_offset + value.Length <= _length)
         {
             value.CopyTo(AvailableBuffer);
             _offset += value.Length;

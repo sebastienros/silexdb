@@ -87,7 +87,7 @@ public class SkipListTests
             list.Add(i, i);
         }
 
-        var found = list.TryGetNext(key, out var next);
+        list.TryGetNext(key, out var next);
 
         Assert.Equal(expected, next);
     }

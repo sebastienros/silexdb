@@ -1,6 +1,9 @@
 ﻿namespace Silex.Blocks;
 
-internal sealed class BlockIterator : IBlockIterator
+using Silex;
+using System.Runtime.CompilerServices;
+
+internal sealed class BlockIterator : IStorageIterator
 {
     private readonly Block _block;
 
@@ -9,39 +12,35 @@ internal sealed class BlockIterator : IBlockIterator
     public BlockIterator(Block block)
     {
         _block = block;
-        _entries = new BlockEntry[_block.Offsets.Count];
-
-        var index = 0;
-        foreach (var offset in _block.Offsets)
-        {
-            _entries[index++] = _block.GetEntry(offset);
-        }
+        _entries = _block.Offsets.Select(x => _block.GetEntry(x)).ToArray();
     }
 
-    public IEnumerable<BlockEntry> Enumerate()
+    public IAsyncEnumerable<BlockEntry> EnumerateAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        return Enumerate(ReadOnlyMemory<byte>.Empty);
+        return EnumerateAsync(ReadOnlyMemory<byte>.Empty, cancellationToken);
     }
 
-    public IEnumerable<BlockEntry> Enumerate(ReadOnlyMemory<byte> afterKey)
+#pragma warning disable 1998 // async function without await
+    public async IAsyncEnumerable<BlockEntry> EnumerateAsync(ReadOnlyMemory<byte> afterKey, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+#pragma warning restore 1998
     {
-        var index = 0;
+        var startIndex = 0;
 
         if (!afterKey.IsEmpty)
         {
             var compare = Array.BinarySearch(_entries, new BlockEntry { Key = afterKey });
 
-            index = compare >= 0 ? compare : ~compare;
-        }
+            startIndex = compare >= 0 ? compare : ~compare;
 
-        while (true)
-        {
-            if (index >= _block.Offsets.Count)
+            if (startIndex > _entries.Length + 1)
             {
                 yield break;
             }
+        }
 
-            yield return _block.GetEntry(_block.Offsets[index++]);
+        for (var i = startIndex; i < _entries.Length; i++)
+        {
+            yield return _entries[i];
         }
     }
 }

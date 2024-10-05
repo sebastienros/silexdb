@@ -1,41 +1,33 @@
 namespace Silex.Blocks;
-
 public class BlockBuilder
 {
     private readonly IBlockEncoder _blockEncoder;
-    private readonly int _blockSizeBytes;
     private readonly List<KeyValuePair<ReadOnlyMemory<byte>, ReadOnlyMemory<byte>>> _blockEntries = [];
+    private int _estimatedSize;
     
-    public BlockBuilder(IBlockEncoder blockEncoder, ushort blockSizeBytes)
+    public BlockBuilder(IBlockEncoder blockEncoder)
     {
         _blockEncoder = blockEncoder;
-        _blockSizeBytes = blockSizeBytes;
     }
 
     public void Clear()
     {
         _blockEntries.Clear();
+        _estimatedSize = 0;
     }
 
     public void AddEntry(ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value)
     {
         _blockEntries.Add(new(key, value));
+        _estimatedSize += _blockEncoder.EstimateSize(key, value);
     }
+
+    public bool HasEntries => _blockEntries.Count > 0;
+
+    public int EstimatedSize => _estimatedSize;
 
     public Block BuildBlock()
     {
-        var buffer = new RecyclableArrayBufferWriter<byte>();
-
-        try
-        {
-            buffer.GetMemory(_blockSizeBytes);
-            var block = _blockEncoder.Encode(buffer, _blockEntries);
-            block.Data = buffer.GetCommittedMemory();
-            return block;
-        }
-        finally
-        {
-            buffer.Dispose();
-        }
+        return _blockEncoder.Encode(_blockEntries);
     }
 }
