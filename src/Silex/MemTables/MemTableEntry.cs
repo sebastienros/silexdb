@@ -1,6 +1,6 @@
 ﻿using System.Buffers;
 
-namespace Silex;
+namespace Silex.MemTables;
 
 internal struct MemTableEntry
 {

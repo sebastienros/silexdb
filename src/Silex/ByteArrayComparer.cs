@@ -9,7 +9,7 @@ public class ByteArrayComparer : EqualityComparer<ReadOnlyMemory<byte>>, ICompar
         return x.Span.SequenceCompareTo(y.Span);
     }
 
-    public int Compare(ReadOnlySpan<byte> x, ReadOnlySpan<byte> y)
+    public static int Compare(ReadOnlySpan<byte> x, ReadOnlySpan<byte> y)
     {
         return x.SequenceCompareTo(y);
     }

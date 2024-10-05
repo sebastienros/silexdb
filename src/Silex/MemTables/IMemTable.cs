@@ -1,7 +1,6 @@
-﻿using Silex.MemTables;
-using System.Buffers;
+﻿using System.Buffers;
 
-namespace Silex;
+namespace Silex.MemTables;
 
 public interface IMemTable : IIterator
 {

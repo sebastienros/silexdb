@@ -1,4 +1,4 @@
-﻿namespace Silex;
+﻿namespace Silex.MemTables;
 
 using MemTableRecord = KeyValuePair<ReadOnlyMemory<byte>, MemTableEntry>;
 

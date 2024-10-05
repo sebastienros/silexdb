@@ -1,4 +1,5 @@
-﻿using System.Collections.Immutable;
+﻿using Silex.MemTables;
+using System.Collections.Immutable;
 
 namespace Silex;
 
