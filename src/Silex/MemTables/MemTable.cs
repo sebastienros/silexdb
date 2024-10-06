@@ -1,5 +1,6 @@
 ﻿using Silex.Collections;
 using System.Buffers;
+using System.Runtime.CompilerServices;
 
 namespace Silex.MemTables;
 
@@ -85,6 +86,11 @@ internal sealed class MemTable : IDisposable, IMemTable
         return;
     }
 
+    public IStorageIterator CreateIterator()
+    {
+        return new MemTableIterator(this);
+    }
+
     public void Dispose()
     {
         if (_disposing)
@@ -108,43 +114,43 @@ internal sealed class MemTable : IDisposable, IMemTable
         _map.Clear();
     }
 
-    public IEnumerable<KeyValuePair<ReadOnlyMemory<byte>, ReadOnlyMemory<byte>>> Scan(ReadOnlyMemory<byte>? minValue = null, ReadOnlyMemory<byte>? maxValue = null)
-    {
-        IEnumerator<KeyValuePair<ReadOnlyMemory<byte>, MemTableEntry>> enumerator;
-
-        if (minValue?.Length > 0)
-        {
-            if (maxValue?.Length > 0)
-            {
-                enumerator = _map.GetEnumerator(minValue.Value, maxValue.Value);
-
-            }
-            else
-            {
-                enumerator = _map.GetEnumerator(minValue.Value);
-            }
-        }
-        else
-        {
-            if (maxValue?.Length > 0)
-            {
-                enumerator = _map.GetEnumerator(default, maxValue.Value);
-            }
-            else
-            {
-                enumerator = _map.GetEnumerator();
-            }
-
-        }
-
-        while (enumerator.MoveNext())
-        {
-            yield return new(enumerator.Current.Key, enumerator.Current.Value.Memory);
-        }
-    }
-
     ~MemTable()
     {
         DisposeInternal();
+    }
+
+    private sealed class MemTableIterator : IStorageIterator
+    {
+        private readonly MemTable _table;
+        
+        public MemTableIterator(MemTable table)
+        {
+            _table = table;
+        }
+
+        public IAsyncEnumerable<RecordLocation> EnumerateAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            return EnumerateAsync(ReadOnlyMemory<byte>.Empty, cancellationToken);
+        }
+
+#pragma warning disable CS1998 // Async method lacks 'await' operators and will run synchronously
+        public async IAsyncEnumerable<RecordLocation> EnumerateAsync(ReadOnlyMemory<byte> afterKey, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+#pragma warning restore CS1998 // Async method lacks 'await' operators and will run synchronously
+        {
+            if (afterKey.IsEmpty)
+            {
+                foreach (var kvp in _table._map.Enumerate())
+                {
+                    yield return new RecordLocation { Key = kvp.Key, Length = kvp.Value.Memory.Length };
+                }
+
+                yield break;
+            }
+
+            foreach (var kvp in _table._map.Enumerate(afterKey))
+            {
+                yield return new RecordLocation { Key = kvp.Key, Length = kvp.Value.Memory.Length };
+            }
+        }
     }
 }

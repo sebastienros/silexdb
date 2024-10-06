@@ -2,7 +2,7 @@
 
 namespace Silex.MemTables;
 
-public interface IMemTable : IIterator
+public interface IMemTable
 {
     /// <summary>
     /// Gets the size of the <see cref="MemTable"/>.
@@ -22,4 +22,6 @@ public interface IMemTable : IIterator
     /// <param name="key"></param>
     /// <param name="memoryOwner"></param>
     void Put(ReadOnlyMemory<byte> key, IMemoryOwner<byte> memoryOwner, int bufferSize);
+
+    IStorageIterator CreateIterator();
 }

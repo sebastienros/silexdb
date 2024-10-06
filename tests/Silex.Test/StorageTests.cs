@@ -158,23 +158,20 @@ public class StorageTests
         storage.Put(BitConverter.GetBytes('c'), new byte[] { 4 });
         storage.Put(BitConverter.GetBytes('d'), new byte[] { 5 });
 
-        var list = storage.Scan().ToList();
+        var iterator = storage.CreateIterator();
+        var list = iterator.EnumerateAsync().ToBlockingEnumerable().ToList();
 
         // a->1, c->4, d->5, e->4 and b->del should be discarded
 
         Assert.Equal(4, list.Count);
 
         Assert.Equal('a', BitConverter.ToChar(list[0].Key.Span));
-        Assert.Equal(1, list[0].Value.Span[0]);
 
         Assert.Equal('c', BitConverter.ToChar(list[1].Key.Span));
-        Assert.Equal(4, list[1].Value.Span[0]);
 
         Assert.Equal('d', BitConverter.ToChar(list[2].Key.Span));
-        Assert.Equal(5, list[2].Value.Span[0]);
 
         Assert.Equal('e', BitConverter.ToChar(list[3].Key.Span));
-        Assert.Equal(4, list[3].Value.Span[0]);
     }
 
     [Theory]
@@ -188,6 +185,7 @@ public class StorageTests
         var iterations = 50;
         var storageOptions = new StorageOptions { MemTableSizeLimit = 100 };
         var storage = new LsmStorageInner(storageOptions);
+        var iterator = storage.CreateIterator();
 
         var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5)).Token;
 
@@ -197,7 +195,7 @@ public class StorageTests
             return ValueTask.CompletedTask;
         });
 
-        var allEntries = storage.Scan().ToList();
+        var allEntries = iterator.EnumerateAsync().ToBlockingEnumerable().ToList();
 
         _output?.WriteLine($"Entries: {allEntries.Count}");
         _output?.WriteLine($"Immutable MemTables: {storage._state.ImmutableMemTables.Count()}");
@@ -213,7 +211,8 @@ public class StorageTests
         foreach (var entry in allEntries)
         {
             var key = entry.Key.Span.Length == 0 ? "0" : BitConverter.ToInt32(entry.Key.Span).ToString(CultureInfo.InvariantCulture);
-            var value = entry.Value.Span.Length == 0 ? "del" : BitConverter.ToInt64(entry.Value.Span).ToString(CultureInfo.InvariantCulture);
+            storage.TryGet(entry.Key, out var entryValue);
+            var value = entryValue.Length == 0 ? "del" : BitConverter.ToInt64(entryValue.Span).ToString(CultureInfo.InvariantCulture);
 
             _output?.WriteLine($"{key} -> {value}");
         }
@@ -250,7 +249,7 @@ public class StorageTests
                         break;
 
                     case 3: // Scan
-                        _ = storage.Scan().ToList();
+                        _ = storage.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToList();
                         break;
                 }
             }
@@ -258,24 +257,20 @@ public class StorageTests
     }
 
     [Theory]
-    [InlineData(null, null)]
-    [InlineData(0, 0)]
-    [InlineData(1, 1)]
-    [InlineData(1, 5)]
-    [InlineData(5, 10)]
-    [InlineData(null, 5)]
-    [InlineData(5, null)]
-    public void ScanWithBoundsShouldFilterResults(int? lowerBound, int? upperBound)
+    [InlineData(null)]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(5)]
+    public void ScanWithBoundsShouldFilterResults(int? lowerBound)
     {
         var count = 10;
 
         var storage = FillImmutableMemTables(entries: count, memTableSizeLimit: 1.KiB());
         ReadOnlyMemory<byte> lowerBytes = lowerBound == null ? ReadOnlyMemory<byte>.Empty : BitConverter.GetBytes(lowerBound.Value);
-        ReadOnlyMemory<byte> upperBytes = upperBound == null ? ReadOnlyMemory<byte>.Empty : BitConverter.GetBytes(upperBound.Value);
 
         var expectedKeys = Enumerable.Range(1, count);
 
-        var entries = storage.Scan(lowerBytes, upperBytes);
+        var entries = storage.CreateIterator().EnumerateAsync(lowerBytes).ToBlockingEnumerable().ToList();
 
         if (lowerBound.HasValue)
         {
@@ -284,14 +279,7 @@ public class StorageTests
             Assert.All(entries, e => Assert.True(ByteArrayComparer.Instance.Compare(lowerBytes, e.Key) <= 0));
         }
 
-        if (upperBound.HasValue)
-        {
-            expectedKeys = expectedKeys.Where(x => x <= upperBound);
-
-            Assert.All(entries, e => Assert.True(ByteArrayComparer.Instance.Compare(upperBytes, e.Key) >= 0));
-        }
-
-        var actualKeys = storage.Scan(lowerBytes, upperBytes).Select(x => BitConverter.ToInt32(x.Key.Span)).ToArray();
+        var actualKeys = storage.CreateIterator().EnumerateAsync(lowerBytes).ToBlockingEnumerable().Select(x => BitConverter.ToInt32(x.Key.Span)).ToArray();
 
         Assert.Equal(expectedKeys, actualKeys);
     }

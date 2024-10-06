@@ -8,7 +8,7 @@ using StorageRecord = KeyValuePair<ReadOnlyMemory<byte>, ReadOnlyMemory<byte>>;
 /// <summary>
 /// The inner storage engine. It handles thread-safety for the <see cref="StorageState"/>.
 /// </summary>
-public sealed class LsmStorageInner : IDisposable, IIterator
+public sealed class LsmStorageInner : IDisposable
 {
     private static readonly MemoryOwner _tombStone = new(Memory<byte>.Empty);
 
@@ -146,87 +146,9 @@ public sealed class LsmStorageInner : IDisposable, IIterator
         }
     }
 
-    /// <summary>
-    /// Returns all the values currently stored in memory.
-    /// </summary>
-    /// <remarks>Uses a merge iterator.</remarks>
-    /// <returns></returns>
-    public IEnumerable<StorageRecord> Scan(ReadOnlyMemory<byte>? minValue = null, ReadOnlyMemory<byte>? maxValue = null)
+    public IStorageIterator CreateIterator()
     {
-        List<IEnumerator<StorageRecord>> iterators = [];
-
-        // In theory only the current MemTable needs to be synchronized,
-        // but we need to keep the mutable MemTable iterator around to compare with immutable ones.
-        // A solution to shorten the read-lock would be to copy the mutable MemTable keys. 
-
-        _rwLock.EnterReadLock();
-
-        try
-        {
-            var currentIterator = _state.CurrentMemTable.Scan(minValue, maxValue).GetEnumerator();
-            
-            if (currentIterator.MoveNext())
-            {
-                iterators.Add(currentIterator);
-            }
-
-            foreach (var memTable in _state.ImmutableMemTables)
-            {
-                var iterator = memTable.Scan(minValue, maxValue).GetEnumerator();
-                if (iterator.MoveNext())
-                {
-                    iterators.Add(iterator);
-                }
-            }
-
-            while (iterators.Count > 0)
-            {
-                // Assume the smallest is the element from the first iterator
-                StorageRecord smallest = iterators[0].Current;
-
-                var smallestIndex = 0;
-
-                for (var i = 1; i < iterators.Count; i++)
-                {
-                    var iterator = iterators[i];
-
-                    var current = iterator.Current;
-
-                    switch (ByteArrayComparer.Instance.Compare(smallest.Key, current.Key))
-                    {
-                        // Discard the entry since there is the same key from a more recent table
-                        case 0:
-                            if (!iterator.MoveNext())
-                            {
-                                iterators.RemoveAt(i);
-                                i--;
-                            }
-                            break;
-
-                        case > 0:
-                            smallestIndex = i;
-                            smallest = current;
-                            break;
-                    }
-                }
-
-                // Consume the smallest element
-                if (!iterators[smallestIndex].MoveNext())
-                {
-                    iterators.RemoveAt(smallestIndex);
-                }
-
-                // Don't return the entry if it's been deleted
-                if (smallest.Value.Length != 0)
-                {
-                    yield return smallest;
-                }
-            }
-        }
-        finally
-        {
-            _rwLock.ExitReadLock();
-        }
+        return new Iterator(this);
     }
 
     /// <summary>
@@ -246,5 +168,109 @@ public sealed class LsmStorageInner : IDisposable, IIterator
     public void Dispose()
     {
         _rwLock.Dispose();
+    }
+
+    private class Iterator : IStorageIterator
+    {
+        private readonly ReaderWriterLockSlim _rwLock;
+        private readonly StorageState _state;
+
+        public Iterator(LsmStorageInner storage)
+        {
+            _rwLock = storage._rwLock;
+            _state = storage._state;
+        }
+
+        public IAsyncEnumerable<RecordLocation> EnumerateAsync(CancellationToken cancellationToken = default)
+        {
+            return EnumerateAsync(ReadOnlyMemory<byte>.Empty, cancellationToken);
+        }
+
+        /// <summary>
+        /// Returns all the values currently stored in memory.
+        /// </summary>
+        /// <remarks>Uses a merge iterator.</remarks>
+        /// <returns></returns>
+        public async IAsyncEnumerable<RecordLocation> EnumerateAsync(ReadOnlyMemory<byte> minValue, CancellationToken cancellationToken = default)
+        {
+            List<IAsyncEnumerator<RecordLocation>> iterators = [];
+
+            // In theory only the current MemTable needs to be synchronized,
+            // but we need to keep the mutable MemTable iterator around to compare with immutable ones.
+            // A solution to shorten the read-lock would be to copy the mutable MemTable keys. 
+
+            _rwLock.EnterReadLock();
+
+            try
+            {
+                var currentIterator = _state.CurrentMemTable.CreateIterator();
+
+                var currentEnumerator = currentIterator.EnumerateAsync(minValue, cancellationToken).GetAsyncEnumerator();
+
+                if (await currentEnumerator.MoveNextAsync())
+                {
+                    iterators.Add(currentEnumerator);
+                }
+
+                foreach (var memTable in _state.ImmutableMemTables)
+                {
+                    var iterator = memTable.CreateIterator();
+
+                    var enumerator = iterator.EnumerateAsync(minValue, cancellationToken).GetAsyncEnumerator();
+
+                    if (await enumerator.MoveNextAsync())
+                    {
+                        iterators.Add(enumerator);
+                    }
+                }
+
+                while (iterators.Count > 0)
+                {
+                    // Assume the smallest is the element from the first iterator
+                    var smallest = iterators[0].Current;
+
+                    var smallestIndex = 0;
+
+                    for (var i = 1; i < iterators.Count; i++)
+                    {
+                        var iterator = iterators[i];
+
+                        var current = iterator.Current;
+
+                        switch (ByteArrayComparer.Instance.Compare(smallest.Key, current.Key))
+                        {
+                            // Discard the entry since there is the same key from a more recent table
+                            case 0:
+                                if (!await iterator.MoveNextAsync())
+                                {
+                                    iterators.RemoveAt(i);
+                                    i--;
+                                }
+                                break;
+
+                            case > 0:
+                                smallestIndex = i;
+                                smallest = current;
+                                break;
+                        }
+                    }
+
+                    // Consume the smallest element
+                    if (!await iterators[smallestIndex].MoveNextAsync())
+                    {
+                        iterators.RemoveAt(smallestIndex);
+                    }
+
+                    if (smallest.Length != 0)
+                    {
+                        yield return smallest;
+                    }
+                }
+            }
+            finally
+            {
+                _rwLock.ExitReadLock();
+            }
+        }
     }
 }

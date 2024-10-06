@@ -202,19 +202,35 @@ internal sealed class SkipList<TKey, TValue> : IEnumerable<KeyValuePair<TKey, TV
         return GetEnumerator();
     }
 
+    public IEnumerable<KeyValuePair<TKey, TValue>> Enumerate()
+    {
+        EnsureNotWriting();
+
+        var node = _head[0];
+        while (node != NullNode)
+        {
+            EnsureNotWriting();
+
+            yield return new KeyValuePair<TKey, TValue>(node.Key, node.Value);
+            node = node[0];
+        }
+    }
+
     /// <summary>
     /// Gets an iterator for all the entries with a key greater or equal to <paramref name="start"/>.
     /// </summary>
     /// <param name="start"></param>
     /// <returns></returns>
-    public IEnumerator<KeyValuePair<TKey, TValue>> GetEnumerator(TKey start)
+    public IEnumerable<KeyValuePair<TKey, TValue>> Enumerate(TKey start)
     {
         EnsureNotWriting();
-        
+
         var node = FindNode(start, includeClosest: true);
 
         while (node != NullNode)
         {
+            EnsureNotWriting();
+
             yield return new KeyValuePair<TKey, TValue>(node.Key, node.Value);
             node = node[0];
         }
