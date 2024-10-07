@@ -9,89 +9,54 @@ public class TableTests
     [Fact]
     public async Task ShouldCreateTable()
     {
-        var tempDirectory = Directory.CreateTempSubdirectory("silex_");
+        var tempFilename = Path.GetRandomFileName();
 
-        var builder = new SsTableBuilder(tempDirectory.FullName, new DefaultSsTableEncoder(), new DefaultBlockEncoder(), 2.MiB());
-
-        var key = BitConverter.GetBytes((ushort)7);
-        var value = Encoding.UTF8.GetBytes($"hello");
-
-        builder.AddEntry(key, value);
-
-        var tables = await builder.BuildTablesAsync();
-
-        Assert.Single(tempDirectory.GetFiles());
-        Assert.Single(tables);
-        Assert.Single(tables[0].BlockMetadata);
-        using var block = await tables[0].LoadBlockAsync(0);
-        Assert.Equal(new byte[] { 2, 7, 0, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, block.Memory);
-
-        tempDirectory.Delete(true);
-    }
-
-    [Fact]
-    public async Task ShouldLoadExistingTable()
-    {
-        var tempDirectory = Directory.CreateTempSubdirectory("silex_");
-
-        var builder = new SsTableBuilder(tempDirectory.FullName, new DefaultSsTableEncoder(), new DefaultBlockEncoder(), 2.MiB());
+        var builder = new SsTableBuilder(new DefaultSsTableEncoder(), new DefaultBlockEncoder());
 
         var key = BitConverter.GetBytes((ushort)7);
         var value = Encoding.UTF8.GetBytes($"hello");
 
-        builder.AddEntry(key, value);
+        builder.Add(key, value);
 
-        var tables = await builder.BuildTablesAsync();
-        var filename = tables[0].Filename;
-
-        var table = await SsTable.LoadSsTableAsync(filename, new DefaultSsTableEncoder(), new DefaultBlockEncoder());
+        var table = await builder.BuildAsync(tempFilename);
 
         Assert.Single(table.BlockMetadata);
         using var block = await table.LoadBlockAsync(0);
         Assert.Equal(new byte[] { 2, 7, 0, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, block.Memory);
 
-        tempDirectory.Delete(true);
+        File.Delete(tempFilename);
     }
 
     [Fact]
-    public async Task ShouldCreateNewTablesWhenSstLimitReached()
+    public async Task ShouldLoadExistingTable()
     {
-        var tempDirectory = Directory.CreateTempSubdirectory("silex_");
+        var tempFilename = Path.GetRandomFileName();
+        var blockBuilder = new BlockBuilder(new DefaultBlockEncoder());
 
-        // Create 100 KiB SST files
-        var builder = new SsTableBuilder(tempDirectory.FullName, new DefaultSsTableEncoder(), new DefaultBlockEncoder(), 100.KiB());
+        var builder = new SsTableBuilder(new DefaultSsTableEncoder(), new DefaultBlockEncoder());
 
-        // Random 1 KiB value
-        var value = new byte[1.KiB()];
-        Random.Shared.NextBytes(value);
+        var key = BitConverter.GetBytes((ushort)7);
+        var value = Encoding.UTF8.GetBytes($"hello");
 
-        for (uint i = 0; i < 1000; i++)
-        {
-            builder.AddEntry(BitConverter.GetBytes(i), value);
-        }
+        builder.Add(key, value);
 
-        var tables = await builder.BuildTablesAsync();
+        await builder.BuildAsync(tempFilename);
 
-        Assert.Equal(11, tempDirectory.GetFiles().Length);
-        Assert.Equal(11, tables.Count);
+        var table = await SsTable.LoadSsTableAsync(tempFilename, new DefaultSsTableEncoder(), blockBuilder);
 
-        using var block = await tables[0].LoadBlockAsync(0);
-        var entry = block.GetEntry(0);
-        var data = block.GetValue(entry);
+        Assert.Single(table.BlockMetadata);
+        using var block = await table.LoadBlockAsync(0);
+        Assert.Equal(new byte[] { 2, 7, 0, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, block.Memory);
 
-        Assert.Equal(BitConverter.GetBytes((uint)0), entry.Key);
-        Assert.Equal(value, data);
-
-        tempDirectory.Delete(true);
+        File.Delete(tempFilename);
     }
 
     [Fact]
     public async Task ShouldIterateAllEntries()
     {
-        var tempDirectory = Directory.CreateTempSubdirectory("silex_");
+        var tempFilename = Path.GetRandomFileName();
 
-        // Create 1 MiB SST files
-        var builder = new SsTableBuilder(tempDirectory.FullName, new DefaultSsTableEncoder(), new DefaultBlockEncoder(), 1.MiB());
+        var builder = new SsTableBuilder(new DefaultSsTableEncoder(), new DefaultBlockEncoder());
 
         // Random 100 B values
         var value = new byte[100.B()];
@@ -99,31 +64,28 @@ public class TableTests
 
         for (uint i = 0; i < 100; i++)
         {
-            builder.AddEntry(BitConverter.GetBytes(i), value);
+            builder.Add(BitConverter.GetBytes(i), value);
         }
 
-        var tables = await builder.BuildTablesAsync();
+        var table = await builder.BuildAsync(tempFilename);
 
-        // Check we have one table with multiple blocks
-        Assert.Single(tables);
-        Assert.True(tables[0].BlockMetadata.Count > 0);
+        Assert.True(table.BlockMetadata.Count > 0);
 
-        var iterator = new SsTableIterator(tables[0]);
+        var iterator = new SsTableIterator(table);
 
         var result = iterator.EnumerateAsync().ToBlockingEnumerable().Select(x => BitConverter.ToInt32(x.Key.Span)).ToArray();
 
         Assert.Equivalent(Enumerable.Range(0, 100), result);
 
-        tempDirectory.Delete(true);
+        File.Delete(tempFilename);
     }
 
     [Fact]
     public async Task ShouldIterateFromKey()
     {
-        var tempDirectory = Directory.CreateTempSubdirectory("silex_");
+        var tempFilename = Path.GetRandomFileName();
 
-        // Create 1 MiB SST files
-        var builder = new SsTableBuilder(tempDirectory.FullName, new DefaultSsTableEncoder(), new DefaultBlockEncoder(), 1.MiB());
+        var builder = new SsTableBuilder(new DefaultSsTableEncoder(), new DefaultBlockEncoder());
 
         // Random 100 B values
         var value = new byte[100.B()];
@@ -131,31 +93,29 @@ public class TableTests
 
         for (uint i = 0; i < 100; i++)
         {
-            builder.AddEntry(BitConverter.GetBytes(i), value);
+            builder.Add(BitConverter.GetBytes(i), value);
         }
 
-        var tables = await builder.BuildTablesAsync();
+        var table = await builder.BuildAsync(tempFilename);
 
         // Check we have one table with multiple blocks
-        Assert.Single(tables);
-        Assert.True(tables[0].BlockMetadata.Count > 0);
+        Assert.True(table.BlockMetadata.Count > 0);
 
-        var iterator = new SsTableIterator(tables[0]);
+        var iterator = new SsTableIterator(table);
 
         var result = iterator.EnumerateAsync(BitConverter.GetBytes(13)).ToBlockingEnumerable().Select(x => BitConverter.ToInt32(x.Key.Span)).ToArray();
 
         Assert.Equivalent(Enumerable.Range(13, 100 - 13), result);
 
-        tempDirectory.Delete(true);
+        File.Delete(tempFilename);
     }
 
     [Fact]
     public async Task ShouldIterateFromUnknownKey()
     {
-        var tempDirectory = Directory.CreateTempSubdirectory("silex_");
+        var tempFilename = Path.GetRandomFileName();
 
-        // Create 1 MiB SST files
-        var builder = new SsTableBuilder(tempDirectory.FullName, new DefaultSsTableEncoder(), new DefaultBlockEncoder(), 1.MiB());
+        var builder = new SsTableBuilder(new DefaultSsTableEncoder(), new DefaultBlockEncoder());
 
         // Random 100 B values
         var value = new byte[100.B()];
@@ -163,22 +123,21 @@ public class TableTests
 
         for (uint i = 0; i < 100; i++)
         {
-            builder.AddEntry(BitConverter.GetBytes(i), value);
+            builder.Add(BitConverter.GetBytes(i), value);
         }
 
-        var tables = await builder.BuildTablesAsync();
+        var table = await builder.BuildAsync(tempFilename);
 
         // Check we have one table with multiple blocks
-        Assert.Single(tables);
-        Assert.True(tables[0].BlockMetadata.Count > 0);
+        Assert.True(table.BlockMetadata.Count > 0);
 
-        var iterator = new SsTableIterator(tables[0]);
+        var iterator = new SsTableIterator(table);
 
         var result = iterator.EnumerateAsync(BitConverter.GetBytes(101)).ToBlockingEnumerable().Select(x => BitConverter.ToInt32(x.Key.Span)).ToArray();
 
         Assert.Empty(result);
 
-        tempDirectory.Delete(true);
+        File.Delete(tempFilename);
     }
 }
 

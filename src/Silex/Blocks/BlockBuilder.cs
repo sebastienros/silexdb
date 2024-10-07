@@ -1,4 +1,6 @@
 namespace Silex.Blocks;
+using System;
+
 public class BlockBuilder
 {
     private readonly IBlockEncoder _blockEncoder;
@@ -16,10 +18,12 @@ public class BlockBuilder
         _estimatedSize = 0;
     }
 
-    public void AddEntry(ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value)
+    public bool Add(ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value)
     {
         _blockEntries.Add(new(key, value));
         _estimatedSize += _blockEncoder.EstimateSize(key, value);
+
+        return true;    
     }
 
     public bool HasEntries => _blockEntries.Count > 0;
@@ -29,5 +33,10 @@ public class BlockBuilder
     public Block BuildBlock()
     {
         return _blockEncoder.Encode(_blockEntries);
+    }
+
+    public Block Decode(ReadOnlyMemory<byte> data)
+    {
+        return _blockEncoder.Decode(data);
     }
 }

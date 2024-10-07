@@ -13,7 +13,7 @@ public class BlockTests
         var key = BitConverter.GetBytes((ushort)7);
         var value = Encoding.UTF8.GetBytes($"hello");
 
-        blockBuilder.AddEntry(key, value);
+        blockBuilder.Add(key, value);
 
         var block = blockBuilder.BuildBlock();
 
@@ -58,7 +58,7 @@ public class BlockTests
         var allKeys = new int[] { 1, 3, 5, 6, 7 };
         foreach (var i in allKeys)
         {
-            blockBuilder.AddEntry(BitConverter.GetBytes(i), value);
+            blockBuilder.Add(BitConverter.GetBytes(i), value);
         }
 
         var block = blockBuilder.BuildBlock();
@@ -78,7 +78,7 @@ public class BlockTests
         var allKeys = new int[] { 1, 3, 5, 6, 7 };
         foreach (var i in allKeys)
         {
-            blockBuilder.AddEntry(BitConverter.GetBytes(i), value);
+            blockBuilder.Add(BitConverter.GetBytes(i), value);
         }
 
         var block = blockBuilder.BuildBlock();
@@ -98,7 +98,7 @@ public class BlockTests
         var allKeys = new int[] { 1, 3, 5, 6, 7 };
         foreach (var i in allKeys)
         {
-            blockBuilder.AddEntry(BitConverter.GetBytes(i), value);
+            blockBuilder.Add(BitConverter.GetBytes(i), value);
         }
 
         var block = blockBuilder.BuildBlock();

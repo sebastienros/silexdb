@@ -128,7 +128,7 @@ internal sealed class MemTable : IDisposable, IMemTable
             _table = table;
         }
 
-        public IAsyncEnumerable<RecordLocation> EnumerateAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
+        public IAsyncEnumerable<RecordLocation> EnumerateAsync(CancellationToken cancellationToken = default)
         {
             return EnumerateAsync(ReadOnlyMemory<byte>.Empty, cancellationToken);
         }

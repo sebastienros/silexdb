@@ -1,5 +1,5 @@
 using Silex.Blocks;
-using System.Buffers;
+using Silex.Buffers;
 
 namespace Silex.Tables;
 
@@ -8,7 +8,7 @@ namespace Silex.Tables;
 /// </summary>
 public interface ISsTableEncoder
 {
-    (IMemoryOwner<byte>, int) EncodeMetadata(IReadOnlyList<BlockMetadata> blockMetadata, long metadataOffset);
+    void EncodeMetadata(EncoderBinaryWriter writer, IReadOnlyList<BlockMetadata> blockMetadata, long metadataOffset);
 
     IReadOnlyList<BlockMetadata> DecodeMetadata(ReadOnlyMemory<byte> buffer, int offset);
 

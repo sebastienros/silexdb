@@ -2,6 +2,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Runtime.CompilerServices;
 
 internal class MergeIterator : IStorageIterator
 {
@@ -17,7 +18,7 @@ internal class MergeIterator : IStorageIterator
         return EnumerateAsync(ReadOnlyMemory<byte>.Empty, cancellationToken);
     }
 
-    public async IAsyncEnumerable<RecordLocation> EnumerateAsync(ReadOnlyMemory<byte> minValue, CancellationToken cancellationToken = default)
+    public async IAsyncEnumerable<RecordLocation> EnumerateAsync(ReadOnlyMemory<byte> minValue, [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         List<IAsyncEnumerator<RecordLocation>> enumerators = [];
 

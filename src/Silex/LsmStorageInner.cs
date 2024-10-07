@@ -1,5 +1,6 @@
 ﻿using Silex.MemTables;
 using System.Buffers;
+using System.Runtime.CompilerServices;
 
 namespace Silex;
 
@@ -191,7 +192,7 @@ public sealed class LsmStorageInner : IDisposable
         /// </summary>
         /// <remarks>Uses a merge iterator.</remarks>
         /// <returns></returns>
-        public async IAsyncEnumerable<RecordLocation> EnumerateAsync(ReadOnlyMemory<byte> minValue, CancellationToken cancellationToken = default)
+        public async IAsyncEnumerable<RecordLocation> EnumerateAsync(ReadOnlyMemory<byte> minValue, [EnumeratorCancellation] CancellationToken cancellationToken = default)
         {
             List<IAsyncEnumerator<RecordLocation>> iterators = [];
 
@@ -216,7 +217,7 @@ public sealed class LsmStorageInner : IDisposable
                 {
                     var iterator = memTable.CreateIterator();
 
-                    var enumerator = iterator.EnumerateAsync(minValue, cancellationToken).GetAsyncEnumerator();
+                    var enumerator = iterator.EnumerateAsync(minValue, cancellationToken).GetAsyncEnumerator(cancellationToken);
 
                     if (await enumerator.MoveNextAsync())
                     {

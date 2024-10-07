@@ -48,43 +48,21 @@ public class DefaultSsTableEncoder : ISsTableEncoder
         return result;
     }
 
-    public (IMemoryOwner<byte>, int) EncodeMetadata(IReadOnlyList<BlockMetadata> blockMetadata, long metadataOffset)
+    public void EncodeMetadata(EncoderBinaryWriter writer, IReadOnlyList<BlockMetadata> blockMetadata, long metadataOffset)
     {
-        
-        var buffer = new RecyclableArrayBufferWriter<byte>();
-        var writer = new EncoderBinaryWriter(buffer);
+        writer.Write7BitEncodedInt(blockMetadata.Count);
 
-        var size = EstimateMetadataSize(blockMetadata);
-
-        try
+        foreach (var block in blockMetadata)
         {
-            buffer.GetMemory(size);
-
-            writer.Write7BitEncodedInt(blockMetadata.Count);
-
-            foreach (var block in blockMetadata)
-            {
-                writer.Write7BitEncodedInt64(block.Offset);
-                writer.Write7BitEncodedInt(block.FirstKey.Length);
-                writer.WriteRaw(block.FirstKey.Span);
-                writer.Write7BitEncodedInt(block.LastKey.Length);
-                writer.WriteRaw(block.LastKey.Span);
-            }
-
-            writer.WriteRaw(BitConverter.GetBytes((uint)metadataOffset));
-            writer.Flush();
-
-            var memory = buffer.GetCommittedMemory();
-
-            var memoryOwner = MemoryPool<byte>.Shared.Rent(memory.Length);
-            memory.CopyTo(memoryOwner.Memory);
-
-            return (memoryOwner, memory.Length);
+            writer.Write7BitEncodedInt64(block.Offset);
+            writer.Write7BitEncodedInt(block.FirstKey.Length);
+            writer.WriteRaw(block.FirstKey.Span);
+            writer.Write7BitEncodedInt(block.LastKey.Length);
+            writer.WriteRaw(block.LastKey.Span);
         }
-        finally
-        {
-            buffer.Dispose();
-        }
+
+        writer.WriteRaw(BitConverter.GetBytes((uint)metadataOffset));
+        writer.Flush();
     }
 
     public int EstimateMetadataSize(IReadOnlyList<BlockMetadata> blockMetadata)

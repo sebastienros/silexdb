@@ -6,14 +6,14 @@ namespace Silex.Tables;
 public class SsTable
 {
     private readonly string _filename;
-    private readonly IBlockEncoder _blockEncoder;
+    private readonly BlockBuilder _blockBuilder;
 
-    public SsTable(string filename, IReadOnlyList<BlockMetadata> blockMetadata, long metadataBlockOffset, IBlockEncoder blockEncoder)
+    public SsTable(string filename, IReadOnlyList<BlockMetadata> blockMetadata, long metadataBlockOffset, BlockBuilder blockBuilder)
     {
         _filename = filename;
-        _blockEncoder = blockEncoder;
         BlockMetadata = blockMetadata;
         MetaBlockOffset = metadataBlockOffset;
+        _blockBuilder = blockBuilder;
     }
 
     public IReadOnlyList<BlockMetadata> BlockMetadata { get; } = [];
@@ -38,10 +38,10 @@ public class SsTable
         stream.Seek(offset, SeekOrigin.Begin);
         await stream.ReadExactlyAsync(buffer, 0, buffer.Length, cancellationToken);
         
-        return _blockEncoder.Decode(buffer);
+        return _blockBuilder.Decode(buffer);
     }
 
-    public static async Task<SsTable> LoadSsTableAsync(string filename, ISsTableEncoder tableEncoder, IBlockEncoder blockEncoder, CancellationToken cancellationToken = default)
+    public static async Task<SsTable> LoadSsTableAsync(string filename, ISsTableEncoder tableEncoder, BlockBuilder blockBuilder, CancellationToken cancellationToken = default)
     {
         using var stream = File.OpenRead(filename);
 
@@ -61,7 +61,7 @@ public class SsTable
         var blockMetadata = tableEncoder.DecodeMetadata(buffer, 0);
         ArrayPool<byte>.Shared.Return(buffer);
 
-        var table = new SsTable(filename, blockMetadata, metaBlockOffset, blockEncoder);
+        var table = new SsTable(filename, blockMetadata, metaBlockOffset, blockBuilder);
         
         return table;
     }

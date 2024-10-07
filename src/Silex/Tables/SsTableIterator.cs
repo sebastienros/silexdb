@@ -13,7 +13,7 @@ internal sealed class SsTableIterator : IStorageIterator
         _table = table;
     }
 
-    public IAsyncEnumerable<RecordLocation> EnumerateAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
+    public IAsyncEnumerable<RecordLocation> EnumerateAsync(CancellationToken cancellationToken = default)
     {
         return EnumerateAsync(ReadOnlyMemory<byte>.Empty, cancellationToken);
     }

@@ -1,177 +1,124 @@
 using Silex.Blocks;
+using Silex.Buffers;
 using System.Buffers;
-using System.Diagnostics;
 
 namespace Silex.Tables;
 
 public class SsTableBuilder
 {
-    const string _tableNamePrefix = "sst";
-
-    private readonly string _path;
     private readonly ISsTableEncoder _tableEncoder;
-    private readonly IBlockEncoder _blockEncoder;
-    private readonly long _tableSizeBytes;
-    private readonly List<KeyValuePair<ReadOnlyMemory<byte>, ReadOnlyMemory<byte>>> _blockEntries = [];
+    private long _offset;
+
+    private ReadOnlyMemory<byte> _firstKey = ReadOnlyMemory<byte>.Empty;
+    private ReadOnlyMemory<byte> _lastKey = ReadOnlyMemory<byte>.Empty;
+    private readonly BlockBuilder _blockBuilder;
+    private List<BlockMetadata>? _metadata;
     
-    public SsTableBuilder(string path, ISsTableEncoder tableEncoder, IBlockEncoder blockEncoder, long tableSizeBytes)
+    private RecyclableArrayBufferWriter<byte>? _bufferWriter;
+
+    public SsTableBuilder(ISsTableEncoder tableEncoder, IBlockEncoder blockEncoder)
     {
-        _path = path;
         _tableEncoder = tableEncoder;
-        _blockEncoder = blockEncoder;
-        _tableSizeBytes = tableSizeBytes;
+        _blockBuilder = new BlockBuilder(blockEncoder);
     }
 
-    public void Clear()
+    public void Add(ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value)
     {
-        _blockEntries.Clear();
-    }
-
-    public void AddEntry(ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value)
-    {
-        _blockEntries.Add(new(key, value));
-    }
-
-    public async Task<IReadOnlyList<SsTable>> BuildTablesAsync(CancellationToken cancellationToken = default)
-    {
-        if (!Directory.Exists(_path))
+        if (_firstKey.IsEmpty)
         {
-            Directory.CreateDirectory(_path);
+            _firstKey = key;
         }
 
-        var tables = new List<SsTable>();
+        _blockBuilder.Add(key, value);
 
-        var index = 1;
+        _lastKey = key;
         
-        var blockBuilder = new BlockBuilder(_blockEncoder);
-
-        List<BlockMetadata> blockMetadata = [];
-        FileStream? stream = null;
-        long offset = 0; // The current offset in the SST file
-        var firstKey = ReadOnlyMemory<byte>.Empty;
-        var lastKey = ReadOnlyMemory<byte>.Empty;
-        string? filename = null;
-        var isTableOpen = false;
-
-        try
+        if (_blockBuilder.EstimatedSize >= _tableEncoder.BlockSize)
         {
-            foreach (var entry in _blockEntries)
-            {
-                if (!isTableOpen)
-                {
-                    do
-                    {
-                        filename = Path.Combine(_path, $"{_tableNamePrefix}.{index++:000}");
-                    } while (File.Exists(filename));
-
-                    blockMetadata.Clear();
-                    stream = File.Create(filename);
-                    offset = 0;
-                    blockBuilder.Clear();
-
-                    isTableOpen = true;
-                }
-
-                Debug.Assert(stream != null);
-                Debug.Assert(filename != null);
-
-                blockBuilder.AddEntry(entry.Key, entry.Value);
-
-                if (firstKey.IsEmpty)
-                {
-                    firstKey = entry.Key;
-                }
-
-                lastKey = entry.Key;
-
-                if (blockBuilder.EstimatedSize >= _tableEncoder.BlockSize)
-                {
-                    var blockIndex = blockMetadata.Count;
-                    using var block = await WriteBlockAsync(blockBuilder, blockMetadata, stream, blockIndex, offset, firstKey, lastKey, cancellationToken);
-                    offset += block.Memory.Length;
-                    blockBuilder.Clear();
-                    firstKey = ReadOnlyMemory<byte>.Empty;
-                }
-
-                // Flush table on disk?
-                if (offset + _tableEncoder.BlockSize >= _tableSizeBytes)
-                {
-                    await WriteTableMetadataAsync(blockMetadata, offset, stream, cancellationToken);
-                    await stream.DisposeAsync();
-
-                    // Create new table
-
-                    var table = new SsTable(filename, blockMetadata, offset, _blockEncoder);
-                    tables.Add(table);
-
-                    isTableOpen = false;
-                }
-            }
-
-            // Is there a table pending finalization?
-            if (isTableOpen)
-            {
-                Debug.Assert(stream != null);
-
-                // If there are entries to flush, create a final table
-                if (blockBuilder.HasEntries)
-                {
-                    var blockIndex = blockMetadata.Count;
-                    using var block = await WriteBlockAsync(blockBuilder, blockMetadata, stream, blockIndex++, offset, firstKey, lastKey, cancellationToken);
-                    offset += block.Memory.Length;
-                }
-
-                await WriteTableMetadataAsync(blockMetadata, offset, stream, cancellationToken);
-                await stream.DisposeAsync();
-
-                Debug.Assert(filename != null);
-
-                var table = new SsTable(filename, blockMetadata, offset, _blockEncoder);
-                tables.Add(table);
-            }
-        }
-        catch
-        {
-            if (stream != null)
-            {
-                await stream.DisposeAsync();
-                stream = null;
-            }
-        }
-
-        return tables;
-
-        static async Task<Block> WriteBlockAsync(BlockBuilder blockBuilder, List<BlockMetadata> blockMetadata, FileStream stream, int index, long offset, ReadOnlyMemory<byte> firstKey, ReadOnlyMemory<byte> lastKey, CancellationToken cancellationToken)
-        {
-            var block = blockBuilder.BuildBlock();
-
-            var m = new BlockMetadata()
-            {
-                Index = index,
-                Offset = offset,
-                FirstKey = firstKey,
-                LastKey = lastKey
-            };
-
-            await stream.WriteAsync(block.Memory, cancellationToken);
-            blockMetadata.Add(m);
-
-            return block;
+            FinishBlock();
         }
     }
 
-    private async Task WriteTableMetadataAsync(List<BlockMetadata> blockMetadata, long offset, FileStream stream, CancellationToken cancellationToken)
+    public long EstimatedSize => _offset;
+
+    private void FinishBlock()
     {
-        IMemoryOwner<byte>? memoryOwner = null;
+        if (!_blockBuilder.HasEntries)
+        {
+            return;
+        }
+
+        // Release the block's memory as soon as we have copied its content.
+        using var block = _blockBuilder.BuildBlock();
+
+        var blockLength = block.Memory.Length;
+
+        _metadata ??= [];
+
+        var m = new BlockMetadata()
+        {
+            Index = _metadata.Count,
+            Offset = _offset,
+            FirstKey = _firstKey,
+            LastKey = _lastKey
+        };
+
+        _metadata.Add(m);
+
+        // Write the SST content in memory as blocks are getting created.
+        // Use a buffer writer as it will handle the growth of the SST buffer automatically.
+
+        if (_bufferWriter == null)
+        {
+            _bufferWriter = new(); ;
+            _bufferWriter.GetMemory(blockLength);
+        }
+
+        _bufferWriter.Write(block.Memory.Span);
+        
+        _offset += block.Memory.Length;
+
+        _firstKey = ReadOnlyMemory<byte>.Empty;
+        _lastKey = ReadOnlyMemory<byte>.Empty;
+        _blockBuilder.Clear();
+    }
+
+    public async Task<SsTable> BuildAsync(string filename, CancellationToken cancellationToken = default)
+    {
+        FinishBlock();
+
+        if (_metadata == null || _bufferWriter == null)
+        {
+            throw new InvalidOperationException("Nothing to store in SsTable.");
+        }
+
+        using var stream = File.Create(filename);
+
+        var binaryWriter = new EncoderBinaryWriter(_bufferWriter);
+        _tableEncoder.EncodeMetadata(binaryWriter, _metadata, _offset);
 
         try
         {
-            (memoryOwner, int length) = _tableEncoder.EncodeMetadata(blockMetadata, offset);
-            await stream.WriteAsync(memoryOwner.Memory.Slice(0, length), cancellationToken);
+            var memory = _bufferWriter.GetCommittedMemory();
+            await stream.WriteAsync(memory, cancellationToken);
         }
         finally
         {
-            memoryOwner?.Dispose();
+            await stream.DisposeAsync();
         }
+
+        var table = new SsTable(filename, _metadata, _offset, _blockBuilder);
+
+        _bufferWriter.Dispose();
+        _bufferWriter = null;
+        _metadata = null;
+        _offset = 0;
+
+        return table;
+    }
+
+    ~SsTableBuilder()
+    {
+        _bufferWriter?.Dispose();
     }
 }

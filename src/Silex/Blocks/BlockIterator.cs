@@ -15,7 +15,7 @@ internal sealed class BlockIterator : IStorageIterator
         _entries = _block.Offsets.Select(x => _block.GetEntry(x)).ToArray();
     }
 
-    public IAsyncEnumerable<RecordLocation> EnumerateAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
+    public IAsyncEnumerable<RecordLocation> EnumerateAsync(CancellationToken cancellationToken = default)
     {
         return EnumerateAsync(ReadOnlyMemory<byte>.Empty, cancellationToken);
     }

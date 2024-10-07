@@ -5,7 +5,7 @@ using System.Runtime.InteropServices;
 
 namespace Silex.Buffers;
 
-internal ref struct EncoderBinaryWriter
+public ref struct EncoderBinaryWriter
 {
     // this is effectively a cut-down re-implementation of BinaryWriter
     // from https://github.com/dotnet/runtime/blob/3689fbec921418e496962dc0ee252bdc9eafa3de/src/libraries/System.Private.CoreLib/src/System/IO/BinaryWriter.cs
