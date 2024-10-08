@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Caching.Memory;
 using Silex.Blocks;
 using System.Buffers;
 using System.Buffers.Binary;
@@ -6,13 +7,16 @@ namespace Silex.Tables;
 
 public class SsTable
 {
+    private readonly long _id;
     private readonly string _filename;
     private readonly Bytes _firstKey;
     private readonly Bytes _lastKey;
     private readonly BlockBuilder _blockBuilder;
+    private static readonly WorkDispatcher<BlockCacheKey, Block> _dispatcher = new();
 
-    public SsTable(string filename, IReadOnlyList<BlockMetadata> blockMetadata, long metadataBlockOffset, BlockBuilder blockBuilder)
+    public SsTable(long id, string filename, IReadOnlyList<BlockMetadata> blockMetadata, long metadataBlockOffset, BlockBuilder blockBuilder)
     {
+        _id = id;
         _filename = filename;
         BlockMetadata = blockMetadata;
         MetaBlockOffset = metadataBlockOffset;
@@ -35,7 +39,7 @@ public class SsTable
 
     public Bytes LastKey => _lastKey;
 
-    public async Task<Block> ReadBlockAsync(int index, CancellationToken cancellationToken = default)
+    public async Task<Block?> ReadBlockAsync(int index, CancellationToken cancellationToken = default)
     {
         using var stream = File.OpenRead(Filename);
         var offset = BlockMetadata[index].Offset;
@@ -59,6 +63,27 @@ public class SsTable
         return block;
     }
 
+    public Task<Block?> ReadBlockCachedAsync(int index, MemoryCache blockCache, CancellationToken cancellationToken = default)
+    {
+        var key = new BlockCacheKey(_id, index);
+
+        // Use a dispatcher to prevent cache stampede
+        return _dispatcher.ScheduleAsync(key, (key) =>
+        {
+            return blockCache.GetOrCreateAsync(key, async entry =>
+            {
+                var block = await ReadBlockAsync(index, cancellationToken);
+
+                if (block != null)
+                {
+                    entry.SetSize(block.Memory.Length);
+                }
+
+                return block;
+            });
+        });
+    }
+
     public static async Task<SsTable> LoadSsTableAsync(string filename, ISsTableEncoder tableEncoder, BlockBuilder blockBuilder, CancellationToken cancellationToken = default)
     {
         using var stream = File.OpenRead(filename);
@@ -79,8 +104,10 @@ public class SsTable
         var blockMetadata = tableEncoder.DecodeMetadata(buffer, 0);
         ArrayPool<byte>.Shared.Return(buffer);
 
-        var table = new SsTable(filename, blockMetadata, metaBlockOffset, blockBuilder);
+        var table = new SsTable(IdGenerator.GetNextId(), filename, blockMetadata, metaBlockOffset, blockBuilder);
         
         return table;
     }
+
+    private record struct BlockCacheKey(long Id, int Index);
 }

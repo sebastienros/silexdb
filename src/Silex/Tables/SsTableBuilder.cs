@@ -107,7 +107,7 @@ public class SsTableBuilder
             await stream.DisposeAsync();
         }
 
-        var table = new SsTable(filename, _metadata, _offset, _blockBuilder);
+        var table = new SsTable(IdGenerator.GetNextId(), filename, _metadata, _offset, _blockBuilder);
 
         _bufferWriter.Dispose();
         _bufferWriter = null;

@@ -9,9 +9,6 @@ namespace Silex;
 /// </summary>
 public sealed class LsmStorageInner : IDisposable
 {
-    private static long _lastId = DateTime.UtcNow.Ticks;
-    private static long GetNextId() => Interlocked.Increment(ref _lastId);
-
     private static readonly MemoryOwner _tombStone = new(Memory<byte>.Empty);
 
     private readonly ReaderWriterLockSlim _rwLock = new();
@@ -23,7 +20,7 @@ public sealed class LsmStorageInner : IDisposable
 
     public LsmStorageInner(StorageOptions options)
     {
-        _state = new StorageState(options) { CurrentMemTable = new MemTable(GetNextId()) };
+        _state = new StorageState(options) { CurrentMemTable = new MemTable(IdGenerator.GetNextId()) };
         _memTableSizeLimit = options.MemTableSizeLimit;
     }
 

@@ -1,9 +1,9 @@
 ﻿namespace Silex.Test;
 
+using Microsoft.Extensions.Caching.Memory;
 using Silex.Blocks;
 using Silex.Tables;
 using System.Buffers.Binary;
-using System.Text;
 
 public class TableTests
 {
@@ -23,7 +23,7 @@ public class TableTests
 
         Assert.Single(table.BlockMetadata);
         using var block = await table.ReadBlockAsync(0);
-        Assert.Equal(new byte[] { 2, 7, 0, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, block.Memory);
+        Assert.Equal(new byte[] { 2, 7, 0, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, block!.Memory);
 
         File.Delete(tempFilename);
     }
@@ -47,7 +47,7 @@ public class TableTests
 
         Assert.Single(table.BlockMetadata);
         using var block = await table.ReadBlockAsync(0);
-        Assert.Equal(new byte[] { 2, 7, 0, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, block.Memory);
+        Assert.Equal(new byte[] { 2, 7, 0, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, block!.Memory);
 
         File.Delete(tempFilename);
     }
@@ -137,6 +137,66 @@ public class TableTests
         var result = iterator.EnumerateAsync(101).ToBlockingEnumerable().Select(x => BinaryPrimitives.ReadUInt32LittleEndian(x.Key.Span)).ToArray();
 
         Assert.Empty(result);
+
+        File.Delete(tempFilename);
+    }
+
+    [Fact]
+    public async Task ShouldCacheBlocks()
+    {
+        var tempFilename = Path.GetRandomFileName();
+
+        var builder = new SsTableBuilder(new DefaultSsTableEncoder(), new DefaultBlockEncoder());
+        var memoryCache = new MemoryCache(new MemoryCacheOptions());
+        Bytes key = (ushort)7;
+        Bytes value = "hello";
+
+        builder.Add(key, value);
+
+        var table = await builder.BuildAsync(tempFilename);
+
+        Assert.Single(table.BlockMetadata);
+        using var block1 = await table.ReadBlockCachedAsync(0, memoryCache);
+        using var block2 = await table.ReadBlockCachedAsync(0, memoryCache);
+        Assert.Equal(new byte[] { 2, 7, 0, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, block1!.Memory);
+        Assert.Equal(new byte[] { 2, 7, 0, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, block2!.Memory);
+        Assert.Same(block1, block2);
+        File.Delete(tempFilename);
+    }
+
+    [Fact]
+    public async Task ShouldCacheBlocksConcurrently()
+    {
+        var tempFilename = Path.GetRandomFileName();
+
+        var builder = new SsTableBuilder(new DefaultSsTableEncoder(), new DefaultBlockEncoder());
+        var memoryCache = new MemoryCache(new MemoryCacheOptions());
+        Bytes key = (ushort)7;
+        Bytes value = "hello";
+
+        builder.Add(key, value);
+
+        var table = await builder.BuildAsync(tempFilename);
+
+        Assert.Single(table.BlockMetadata);
+        
+        var blocks = new List<Task<Block?>>();
+
+        for (var i = 0; i < 100; i++)
+        {
+            blocks.Add(table.ReadBlockCachedAsync(0, memoryCache));
+        }
+
+        await Task.WhenAll(blocks);
+
+        var result1 = await blocks[0];
+
+        foreach (var block in blocks)
+        {
+            var result2 = await block;
+            Assert.Equal(new byte[] { 2, 7, 0, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, result2!.Memory);
+            Assert.Same(result1, result2);
+        }
 
         File.Delete(tempFilename);
     }
