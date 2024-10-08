@@ -1,5 +1,7 @@
 using Silex.Blocks;
+using Silex.Buffers;
 using System.Buffers;
+using System.Buffers.Binary;
 
 namespace Silex.Tables;
 
@@ -50,7 +52,7 @@ public class SsTable
         var buffer = ArrayPool<byte>.Shared.Rent(4);
         Memory<byte> memory = buffer.AsMemory(0, 4);
         await stream.ReadExactlyAsync(memory, cancellationToken);
-        var metaBlockOffset = BitConverter.ToUInt32(buffer);
+        var metaBlockOffset = BinaryPrimitives.ReadUInt32LittleEndian(buffer);
 
         // Read the metadata block content
         var metadataLength = stream.Length - 4 - metaBlockOffset;

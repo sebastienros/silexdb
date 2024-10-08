@@ -8,12 +8,12 @@ namespace Silex;
 public readonly struct RecordLocation : IComparable<RecordLocation>
 {
     public string SsTableFilename { get; init; }
-    public ReadOnlyMemory<byte> Key { get; init; }
+    public Bytes Key { get; init; }
     public int BlockOffset { get; init; }
     public int Length { get; init; }
 
     public int CompareTo(RecordLocation other)
     {
-        return ByteArrayComparer.Instance.Compare(Key, other.Key);
+        return Key.CompareTo(other.Key);
     }
 }

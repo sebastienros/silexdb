@@ -6,7 +6,7 @@ namespace Silex.Tables;
 internal sealed class SsTableIterator : IStorageIterator
 {
     private readonly SsTable _table;
-    private ReadOnlyMemory<byte>[]? _firstKeys;
+    private Bytes[]? _firstKeys;
 
     public SsTableIterator(SsTable table)
     {
@@ -15,10 +15,10 @@ internal sealed class SsTableIterator : IStorageIterator
 
     public IAsyncEnumerable<RecordLocation> EnumerateAsync(CancellationToken cancellationToken = default)
     {
-        return EnumerateAsync(ReadOnlyMemory<byte>.Empty, cancellationToken);
+        return EnumerateAsync(Bytes.Empty, cancellationToken);
     }
 
-    public async IAsyncEnumerable<RecordLocation> EnumerateAsync(ReadOnlyMemory<byte> afterKey, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    public async IAsyncEnumerable<RecordLocation> EnumerateAsync(Bytes afterKey, [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         var startBlockIndex = 0;
 
@@ -27,7 +27,7 @@ internal sealed class SsTableIterator : IStorageIterator
             // Create a reusable index for binary search
             _firstKeys ??= _table.BlockMetadata.Select(x => x.FirstKey).ToArray();
 
-            var compare = Array.BinarySearch(_firstKeys, afterKey, ByteArrayComparer.Instance);
+            var compare = Array.BinarySearch(_firstKeys, afterKey);
 
             startBlockIndex = (compare >= 0 ? compare : ~compare) - 1;
 

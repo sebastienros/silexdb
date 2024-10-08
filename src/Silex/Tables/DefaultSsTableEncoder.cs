@@ -38,9 +38,9 @@ public class DefaultSsTableEncoder : ISsTableEncoder
         {
             var blockOffset = binaryReader.Read7BitEncodedInt();
             var firstKeyLen = binaryReader.Read7BitEncodedInt();
-            var firstKey = binaryReader.ReadBytesMemory(firstKeyLen);
+            var firstKey = (Bytes)binaryReader.ReadBytesMemory(firstKeyLen);
             var lastKeyLen = binaryReader.Read7BitEncodedInt();
-            var lastKey = binaryReader.ReadBytesMemory(lastKeyLen);
+            var lastKey = (Bytes)binaryReader.ReadBytesMemory(lastKeyLen);
 
             result.Add(new BlockMetadata { Index = i, Offset = blockOffset, FirstKey = firstKey, LastKey = lastKey });
         }
@@ -61,7 +61,7 @@ public class DefaultSsTableEncoder : ISsTableEncoder
             writer.WriteRaw(block.LastKey.Span);
         }
 
-        writer.WriteRaw(BitConverter.GetBytes((uint)metadataOffset));
+        writer.WriteUInt32((uint)metadataOffset);
         writer.Flush();
     }
 

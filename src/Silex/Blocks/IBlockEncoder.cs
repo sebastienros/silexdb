@@ -7,7 +7,7 @@ namespace Silex.Blocks;
 /// </summary>
 public interface IBlockEncoder
 {
-    Block Encode(IReadOnlyList<KeyValuePair<ReadOnlyMemory<byte>, ReadOnlyMemory<byte>>> entries);
+    Block Encode(IReadOnlyList<KeyValuePair<Bytes, Bytes>> entries);
 
     /// <summary>
     /// Creates a <see cref="Block"/> instance that will hold the original memory block saved on this.
@@ -21,5 +21,5 @@ public interface IBlockEncoder
     ReadOnlyMemory<byte> DecodeValue(ReadOnlyMemory<byte> data, int offset, int length);
 
 
-    int EstimateSize(ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value);
+    int EstimateSize(Bytes key, Bytes value);
 }

@@ -4,8 +4,6 @@ using System.Runtime.CompilerServices;
 
 namespace Silex;
 
-using StorageRecord = KeyValuePair<ReadOnlyMemory<byte>, ReadOnlyMemory<byte>>;
-
 /// <summary>
 /// The inner storage engine. It handles thread-safety for the <see cref="StorageState"/>.
 /// </summary>
@@ -31,7 +29,7 @@ public sealed class LsmStorageInner : IDisposable
     /// </summary>
     /// <param name="key"></param>
     /// <returns><c>true</c> if the key was found, <c>false</c> otherwise.</returns>
-    public bool TryGet(ReadOnlyMemory<byte> key, out ReadOnlyMemory<byte> value)
+    public bool TryGet(Bytes key, out Bytes value)
     {
         // The immutable MemTables can be accessed without lock since they are frozen (read-only),
         // and the collection won't be changed FreezeMemTable substitute the collection when it's altered.
@@ -75,7 +73,7 @@ public sealed class LsmStorageInner : IDisposable
     /// </summary>
     /// <param name="key"></param>
     /// <param name="value"></param>
-    public void Put(ReadOnlyMemory<byte> key, Memory<byte> value)
+    public void Put(Bytes key, Memory<byte> value)
     {
         Put(key, new MemoryOwner(value), value.Length);
     }
@@ -85,7 +83,7 @@ public sealed class LsmStorageInner : IDisposable
     /// </summary>
     /// <param name="key"></param>
     /// <param name="value"></param>
-    void Put(ReadOnlyMemory<byte> key, IMemoryOwner<byte> value, int bufferSize)
+    void Put(Bytes key, IMemoryOwner<byte> value, int bufferSize)
     {
         _rwLock.EnterWriteLock();
 
@@ -108,7 +106,7 @@ public sealed class LsmStorageInner : IDisposable
     /// Adds a delete operation for the specified key.
     /// </summary>
     /// <param name="key"></param>
-    public void Delete(ReadOnlyMemory<byte> key)
+    public void Delete(Bytes key)
     {
         _rwLock.EnterWriteLock();
 
@@ -184,7 +182,7 @@ public sealed class LsmStorageInner : IDisposable
 
         public IAsyncEnumerable<RecordLocation> EnumerateAsync(CancellationToken cancellationToken = default)
         {
-            return EnumerateAsync(ReadOnlyMemory<byte>.Empty, cancellationToken);
+            return EnumerateAsync(Bytes.Empty, cancellationToken);
         }
 
         /// <summary>
@@ -192,7 +190,7 @@ public sealed class LsmStorageInner : IDisposable
         /// </summary>
         /// <remarks>Uses a merge iterator.</remarks>
         /// <returns></returns>
-        public async IAsyncEnumerable<RecordLocation> EnumerateAsync(ReadOnlyMemory<byte> minValue, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        public async IAsyncEnumerable<RecordLocation> EnumerateAsync(Bytes minValue, [EnumeratorCancellation] CancellationToken cancellationToken = default)
         {
             List<IAsyncEnumerator<RecordLocation>> iterators = [];
 
@@ -206,7 +204,7 @@ public sealed class LsmStorageInner : IDisposable
             {
                 var currentIterator = _state.CurrentMemTable.CreateIterator();
 
-                var currentEnumerator = currentIterator.EnumerateAsync(minValue, cancellationToken).GetAsyncEnumerator();
+                var currentEnumerator = currentIterator.EnumerateAsync(minValue, cancellationToken).GetAsyncEnumerator(cancellationToken);
 
                 if (await currentEnumerator.MoveNextAsync())
                 {
@@ -238,7 +236,7 @@ public sealed class LsmStorageInner : IDisposable
 
                         var current = iterator.Current;
 
-                        switch (ByteArrayComparer.Instance.Compare(smallest.Key, current.Key))
+                        switch (smallest.Key.CompareTo(current.Key))
                         {
                             // Discard the entry since there is the same key from a more recent table
                             case 0:

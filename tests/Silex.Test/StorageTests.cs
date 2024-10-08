@@ -1,5 +1,6 @@
 namespace Silex.Test;
 
+using System.Buffers.Binary;
 using System.Globalization;
 using Xunit.Abstractions;
 
@@ -77,7 +78,7 @@ public class StorageTests
 
         for (var i = 1; i <= entries; i++)
         {
-            var key = BitConverter.GetBytes(i); // 4 bytes
+            var key = i; // 4 bytes
             var value = new byte[valueSize];
             Random.Shared.NextBytes(value);
 
@@ -101,7 +102,7 @@ public class StorageTests
 
         for (var i = 1; i <= entries; i++)
         {
-            var key = BitConverter.GetBytes(i);
+            var key = i;
             var value = new byte[valueSize];
             Random.Shared.NextBytes(value);
 
@@ -112,7 +113,7 @@ public class StorageTests
         for (var i = 1; i <= entries; i++)
         {
             var expectedValue = dictionary[i];
-            var result = storage.TryGet(BitConverter.GetBytes(i), out var actualValue);
+            var result = storage.TryGet(i, out var actualValue);
 
             Assert.True(result);
             Assert.Equal(expectedValue, actualValue);
@@ -124,7 +125,7 @@ public class StorageTests
     {
         var storage = FillImmutableMemTables();
 
-        byte[] key = BitConverter.GetBytes(10);
+        Bytes key = 10;
 
         var current = storage.TryGet(key, out var result);
         Assert.True(current);
@@ -146,17 +147,17 @@ public class StorageTests
         // table2: a->1, b->2, c->3
         // table3: e->4
 
-        storage.Put(BitConverter.GetBytes('e'), new byte[] { 4 });
+        storage.Put('e', new byte[] { 4 });
         storage.ForceFreezeMemTable();
 
-        storage.Put(BitConverter.GetBytes('a'), new byte[] { 1 });
-        storage.Put(BitConverter.GetBytes('b'), new byte[] { 2 });
-        storage.Put(BitConverter.GetBytes('c'), new byte[] { 3 });
+        storage.Put('a', new byte[] { 1 });
+        storage.Put('b', new byte[] { 2 });
+        storage.Put('c', new byte[] { 3 });
         storage.ForceFreezeMemTable();
 
-        storage.Delete(BitConverter.GetBytes('b'));
-        storage.Put(BitConverter.GetBytes('c'), new byte[] { 4 });
-        storage.Put(BitConverter.GetBytes('d'), new byte[] { 5 });
+        storage.Delete('b');
+        storage.Put('c', new byte[] { 4 });
+        storage.Put('d', new byte[] { 5 });
 
         var iterator = storage.CreateIterator();
         var list = iterator.EnumerateAsync().ToBlockingEnumerable().ToList();
@@ -210,9 +211,9 @@ public class StorageTests
         _output?.WriteLine($"Entries:");
         foreach (var entry in allEntries)
         {
-            var key = entry.Key.Span.Length == 0 ? "0" : BitConverter.ToInt32(entry.Key.Span).ToString(CultureInfo.InvariantCulture);
+            var key = entry.Key.Span.Length == 0 ? "0" : BinaryPrimitives.ReadUInt32LittleEndian(entry.Key.Span).ToString(CultureInfo.InvariantCulture);
             storage.TryGet(entry.Key, out var entryValue);
-            var value = entryValue.Length == 0 ? "del" : BitConverter.ToInt64(entryValue.Span).ToString(CultureInfo.InvariantCulture);
+            var value = entryValue.Length == 0 ? "del" : BinaryPrimitives.ReadUInt64LittleEndian(entryValue.Span).ToString(CultureInfo.InvariantCulture);
 
             _output?.WriteLine($"{key} -> {value}");
         }
@@ -225,7 +226,7 @@ public class StorageTests
             {
                 var id = Random.Shared.NextInt64(maxKeysValue);
                 var value = Random.Shared.NextInt64();
-                storage.Put(BitConverter.GetBytes(id), BitConverter.GetBytes(value));
+                storage.Put(id, BitConverter.GetBytes(value));
             }
 
             for (var i = 0; i < iterations; i++)
@@ -237,15 +238,15 @@ public class StorageTests
                 {
                     case 0: // Put
                         var value = Random.Shared.NextInt64();
-                        storage.Put(BitConverter.GetBytes(id), BitConverter.GetBytes(value));
+                        storage.Put(id, BitConverter.GetBytes(value));
                         break;
 
                     case 1: // Get
-                        storage.TryGet(BitConverter.GetBytes(id), out var actualValue);
+                        storage.TryGet(id, out var actualValue);
                         break;
 
                     case 2: // Delete
-                        storage.Delete(BitConverter.GetBytes(id));
+                        storage.Delete(id);
                         break;
 
                     case 3: // Scan
@@ -266,7 +267,7 @@ public class StorageTests
         var count = 10;
 
         var storage = FillImmutableMemTables(entries: count, memTableSizeLimit: 1.KiB());
-        ReadOnlyMemory<byte> lowerBytes = lowerBound == null ? ReadOnlyMemory<byte>.Empty : BitConverter.GetBytes(lowerBound.Value);
+        Bytes lowerBytes = lowerBound == null ? Bytes.Empty : lowerBound.Value;
 
         var expectedKeys = Enumerable.Range(1, count);
 
@@ -276,10 +277,10 @@ public class StorageTests
         {
             expectedKeys = expectedKeys.Where(x => x >= lowerBound);
 
-            Assert.All(entries, e => Assert.True(ByteArrayComparer.Instance.Compare(lowerBytes, e.Key) <= 0));
+            Assert.All(entries, e => Assert.True(lowerBytes.CompareTo(e.Key) <= 0));
         }
 
-        var actualKeys = storage.CreateIterator().EnumerateAsync(lowerBytes).ToBlockingEnumerable().Select(x => BitConverter.ToInt32(x.Key.Span)).ToArray();
+        var actualKeys = storage.CreateIterator().EnumerateAsync(lowerBytes).ToBlockingEnumerable().Select(x => (int)BinaryPrimitives.ReadUInt32LittleEndian(x.Key.Span)).ToArray();
 
         Assert.Equal(expectedKeys, actualKeys);
     }
@@ -291,7 +292,7 @@ public class StorageTests
 
         for (var i = 1; i <= entries; i++)
         {
-            var key = BitConverter.GetBytes(i);
+            var key = i;
             var value = new byte[valueSize];
             Random.Shared.NextBytes(value);
 

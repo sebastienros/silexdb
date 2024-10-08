@@ -6,6 +6,13 @@ namespace Silex.Buffers;
 // this is effectively a cut-down re-implementation of ArrayBufferWriter
 // from https://github.com/dotnet/runtime/blob/6cd9bf1937c3b4d2f7304a6c534aacde58a202b6/src/libraries/Common/src/System/Buffers/ArrayBufferWriter.cs
 // except it uses the array pool for allocations
+/// <summary>
+/// Provides a way to write to an automatically growing buffer backed by the array pool to prevent allocations.
+/// The first buffer can be initialized with <see cref="GetMemory(int)"/>. A default size will be used otherwise.
+/// The buffer will double every time it's too small to fit more data. The final buffer can be retrieved using <see cref="GetCommittedMemory()"/>.
+/// The final buffer shouldn't be used once the <see cref="RecyclableArrayBufferWriter<T>"/> is disposed since it will be returned to the pool.
+/// </summary>
+/// <typeparam name="T"></typeparam>
 internal sealed class RecyclableArrayBufferWriter<T> : IBufferWriter<T>, IDisposable
 {
 

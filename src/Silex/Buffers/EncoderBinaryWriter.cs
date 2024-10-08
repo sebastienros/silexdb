@@ -1,4 +1,5 @@
 ﻿using System.Buffers;
+using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -145,6 +146,27 @@ public ref struct EncoderBinaryWriter
         }
 
         Write((byte)uValue);
+    }
+
+    public void WriteUInt16(ushort value)
+    {
+        Span<byte> buffer = stackalloc byte[sizeof(ushort)];
+        BinaryPrimitives.WriteUInt16LittleEndian(buffer, value);
+        WriteRaw(buffer);
+    }
+
+    public void WriteUInt32(uint value)
+    {
+        Span<byte> buffer = stackalloc byte[sizeof(uint)];
+        BinaryPrimitives.WriteUInt32LittleEndian(buffer, value);
+        WriteRaw(buffer);
+    }
+
+    public void WriteUInt64(ulong value)
+    {
+        Span<byte> buffer = stackalloc byte[sizeof(ulong)];
+        BinaryPrimitives.WriteUInt64LittleEndian(buffer, value);
+        WriteRaw(buffer);
     }
 
     public void WriteRaw(scoped ReadOnlySpan<byte> value)

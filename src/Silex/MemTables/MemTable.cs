@@ -21,7 +21,7 @@ namespace Silex.MemTables;
 /// </remarks>
 internal sealed class MemTable : IDisposable, IMemTable
 {
-    private readonly SkipList<ReadOnlyMemory<byte>, MemTableEntry> _map = new(ByteArrayComparer.Instance);
+    private readonly SkipList<Bytes, MemTableEntry> _map = new(Bytes.Comparer);
     private long _size;
     private bool _disposing;
     private readonly int _id;
@@ -40,27 +40,27 @@ internal sealed class MemTable : IDisposable, IMemTable
     public long Size => _size;
 
     /// <inheritdocs />
-    public bool TryGet(ReadOnlyMemory<byte> key, out ReadOnlyMemory<byte> result)
+    public bool TryGet(Bytes key, out Bytes result)
     {
         ObjectDisposedException.ThrowIf(_disposing, this);
 
         if (_map.TryGetValue(key, out var memoryOwner))
         {
-            result = memoryOwner.Memory;
+            result = (Bytes)memoryOwner.Memory;
             return true;
         }
 
-        result = ReadOnlyMemory<byte>.Empty;
+        result = Bytes.Empty;
         return false;
     }
 
-    public void Put(ReadOnlyMemory<byte> key, Memory<byte> value)
+    public void Put(Bytes key, Memory<byte> value)
     {
         Put(key, new MemoryOwner(value), value.Length);
     }
 
     /// <inheritdocs />
-    public void Put(ReadOnlyMemory<byte> key, IMemoryOwner<byte> memoryOwner, int bufferSize)
+    public void Put(Bytes key, IMemoryOwner<byte> memoryOwner, int bufferSize)
     {
         ObjectDisposedException.ThrowIf(_disposing, this);
 
@@ -130,11 +130,11 @@ internal sealed class MemTable : IDisposable, IMemTable
 
         public IAsyncEnumerable<RecordLocation> EnumerateAsync(CancellationToken cancellationToken = default)
         {
-            return EnumerateAsync(ReadOnlyMemory<byte>.Empty, cancellationToken);
+            return EnumerateAsync(Bytes.Empty, cancellationToken);
         }
 
 #pragma warning disable CS1998 // Async method lacks 'await' operators and will run synchronously
-        public async IAsyncEnumerable<RecordLocation> EnumerateAsync(ReadOnlyMemory<byte> afterKey, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        public async IAsyncEnumerable<RecordLocation> EnumerateAsync(Bytes afterKey, [EnumeratorCancellation] CancellationToken _ = default)
 #pragma warning restore CS1998 // Async method lacks 'await' operators and will run synchronously
         {
             if (afterKey.IsEmpty)

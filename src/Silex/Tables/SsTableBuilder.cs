@@ -9,8 +9,8 @@ public class SsTableBuilder
     private readonly ISsTableEncoder _tableEncoder;
     private long _offset;
 
-    private ReadOnlyMemory<byte> _firstKey = ReadOnlyMemory<byte>.Empty;
-    private ReadOnlyMemory<byte> _lastKey = ReadOnlyMemory<byte>.Empty;
+    private Bytes _firstKey = Bytes.Empty;
+    private Bytes _lastKey = Bytes.Empty;
     private readonly BlockBuilder _blockBuilder;
     private List<BlockMetadata>? _metadata;
     
@@ -22,7 +22,7 @@ public class SsTableBuilder
         _blockBuilder = new BlockBuilder(blockEncoder);
     }
 
-    public void Add(ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value)
+    public void Add(Bytes key, Bytes value)
     {
         if (_firstKey.IsEmpty)
         {
@@ -78,8 +78,8 @@ public class SsTableBuilder
         
         _offset += block.Memory.Length;
 
-        _firstKey = ReadOnlyMemory<byte>.Empty;
-        _lastKey = ReadOnlyMemory<byte>.Empty;
+        _firstKey = Bytes.Empty;
+        _lastKey = Bytes.Empty;
         _blockBuilder.Clear();
     }
 

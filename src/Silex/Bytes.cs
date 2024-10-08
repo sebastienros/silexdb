@@ -1,0 +1,213 @@
+﻿namespace Silex;
+
+using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
+using System.Text;
+using System.Text.Encodings.Web;
+using System.Text.Json;
+using System.Text.RegularExpressions;
+
+[DebuggerDisplay($"{{{nameof(GetDebuggerDisplay)}(),nq}}")]
+public readonly struct Bytes : IEquatable<Bytes>, IComparable<Bytes>
+{
+    private readonly ReadOnlyMemory<byte> _data;
+
+    public static readonly IComparer<Bytes> Comparer = BytesComparer.Instance;
+
+    public Bytes(ReadOnlyMemory<byte> value)
+    {
+        _data = value;
+    }
+    public Bytes(byte value)
+    {
+        _data = new byte[] { value };
+    }
+
+    public Bytes(byte value, params byte[] bytes)
+    {
+        byte[] bs = [value, ..bytes];
+        _data = bs;
+    }
+
+    public Bytes(byte[] value)
+    {
+        _data = value;
+    }
+
+    /// <summary>
+    /// Create a new <see cref="Bytes"/> instance using the UTF-8 bytes from a <see cref="string"/>.
+    /// </summary>
+    /// <remarks>
+    /// This allocates a new <see cref="byte[]"/> instance.
+    /// </remarks>
+    public Bytes(string value)
+    {
+        _data = Encoding.UTF8.GetBytes(value);
+    }
+
+    /// <summary>
+    /// Create a new <see cref="Bytes"/> instance using the UTF-8 bytes from a <see cref="ReadOnlySpan<byte>"/>.
+    /// </summary>
+    /// <remarks>
+    /// This allocates a new <see cref="byte[]"/> instance.
+    /// </remarks>
+    public Bytes(ReadOnlySpan<byte> value)
+    {
+        _data = value.ToArray();
+    }
+
+    /// <summary>
+    /// Create a new <see cref="Bytes"/> instance from an <see cref="short">.
+    /// </summary>
+    public Bytes(short value)
+    {
+        _data = BitConverter.GetBytes(value);
+    }
+
+    /// <summary>
+    /// Create a new <see cref="Bytes"/> instance from an <see cref="ushort">.
+    /// </summary>
+    public Bytes(ushort value)
+    {
+        _data = BitConverter.GetBytes(value);
+    }
+
+    /// <summary>
+    /// Create a new <see cref="Bytes"/> instance from an <see cref="int">.
+    /// </summary>
+    public Bytes(int value)
+    {
+        _data = BitConverter.GetBytes(value);
+    }
+
+    /// <summary>
+    /// Create a new <see cref="Bytes"/> instance from an <see cref="uint">.
+    /// </summary>
+    public Bytes(uint value)
+    {
+        _data = BitConverter.GetBytes(value);
+    }
+
+    /// <summary>
+    /// Create a new <see cref="Bytes"/> instance from an <see cref="long">.
+    /// </summary>
+    public Bytes(long value)
+    {
+        _data = BitConverter.GetBytes(value);
+    }
+
+    /// <summary>
+    /// Create a new <see cref="Bytes"/> instance from an <see cref="ulong">.
+    /// </summary>
+    public Bytes(ulong value)
+    {
+        _data = BitConverter.GetBytes(value);
+    }
+
+    public readonly ReadOnlySpan<byte> Span => _data.Span;
+
+    /// <summary>
+    /// Returns an empty <see cref="Bytes"/>.
+    /// </summary>
+    public static Bytes Empty => default;
+
+    /// <summary>
+    /// The number of bytes.
+    /// </summary>
+    public readonly int Length => _data.Length;
+
+    /// <summary>
+    /// Returns <see langword="true"> if <see cref="Length"> is 0.
+    /// </summary>
+    public readonly bool IsEmpty => _data.IsEmpty;
+
+    public Bytes Slice(int start, int length)
+    {
+        return new Bytes(_data.Slice(start, length));
+    }
+
+    public static implicit operator Bytes(byte b) => new(b);
+    public static implicit operator Bytes(byte[] bytes) => new(bytes);
+    public static implicit operator Bytes(string s) => new(s);
+    public static implicit operator Bytes(short value) => new(value);
+    public static implicit operator Bytes(ushort value) => new(value);
+    public static implicit operator Bytes(int value) => new(value);
+    public static implicit operator Bytes(uint value) => new(value);
+    public static implicit operator Bytes(long value) => new(value);
+    public static implicit operator Bytes(ulong value) => new(value);
+    public static implicit operator Bytes(ReadOnlyMemory<byte> value) => new(value);
+    public static implicit operator Bytes(Memory<byte> value) => new(value);
+
+    public static bool operator <(Bytes left, Bytes right)
+    {
+        return left.CompareTo(right) < 0;
+    }
+
+    public static bool operator <=(Bytes left, Bytes right)
+    {
+        return left.CompareTo(right) <= 0;
+    }
+
+    public static bool operator >(Bytes left, Bytes right)
+    {
+        return left.CompareTo(right) > 0;
+    }
+
+    public static bool operator >=(Bytes left, Bytes right)
+    {
+        return left.CompareTo(right) >= 0;
+    }
+
+    public override readonly bool Equals([NotNullWhen(true)] object? obj)
+    {
+        return obj is Bytes b && ((Bytes)this).Equals(b);
+    }
+
+    public readonly bool Equals(Bytes other)
+    {
+        return Span.SequenceEqual(other.Span);
+    }
+
+    public readonly int CompareTo(Bytes other)
+    {
+        return Span.SequenceCompareTo(other.Span);
+    }
+
+    public override readonly int GetHashCode()
+    {
+        var hashCode = new HashCode();
+        hashCode.AddBytes(Span);
+        return hashCode.ToHashCode();
+    }
+
+    public override readonly string ToString()
+    {
+        return $"[{Length}] {Convert.ToHexString(Span)} (\"{JsonEncodedText.Encode(Span, JavaScriptEncoder.UnsafeRelaxedJsonEscaping).Value}\")";
+    }
+
+    private string GetDebuggerDisplay()
+    {
+        return ToString();
+    }
+
+    public static bool operator ==(Bytes left, Bytes right)
+    {
+        return left.Equals(right);
+    }
+
+    public static bool operator !=(Bytes left, Bytes right)
+    {
+        return !(left == right);
+    }
+
+    private class BytesComparer : EqualityComparer<Bytes>, IComparer<Bytes>
+    {
+        public static readonly BytesComparer Instance = new();
+
+        public int Compare(Bytes x, Bytes y) => x.CompareTo(y);
+
+        public override bool Equals(Bytes x, Bytes y) => x.Equals(y);
+
+        public override int GetHashCode(Bytes obj) => obj.GetHashCode();
+    }
+}

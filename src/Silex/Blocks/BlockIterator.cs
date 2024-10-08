@@ -17,11 +17,11 @@ internal sealed class BlockIterator : IStorageIterator
 
     public IAsyncEnumerable<RecordLocation> EnumerateAsync(CancellationToken cancellationToken = default)
     {
-        return EnumerateAsync(ReadOnlyMemory<byte>.Empty, cancellationToken);
+        return EnumerateAsync(Bytes.Empty, cancellationToken);
     }
 
 #pragma warning disable 1998 // async function without await
-    public async IAsyncEnumerable<RecordLocation> EnumerateAsync(ReadOnlyMemory<byte> afterKey, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    public async IAsyncEnumerable<RecordLocation> EnumerateAsync(Bytes afterKey, [EnumeratorCancellation] CancellationToken _ = default)
 #pragma warning restore 1998
     {
         var startIndex = 0;

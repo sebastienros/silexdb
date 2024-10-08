@@ -4,7 +4,7 @@ using System;
 public class BlockBuilder
 {
     private readonly IBlockEncoder _blockEncoder;
-    private readonly List<KeyValuePair<ReadOnlyMemory<byte>, ReadOnlyMemory<byte>>> _blockEntries = [];
+    private readonly List<KeyValuePair<Bytes, Bytes>> _blockEntries = [];
     private int _estimatedSize;
     
     public BlockBuilder(IBlockEncoder blockEncoder)
@@ -18,7 +18,7 @@ public class BlockBuilder
         _estimatedSize = 0;
     }
 
-    public bool Add(ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value)
+    public bool Add(Bytes key, Bytes value)
     {
         _blockEntries.Add(new(key, value));
         _estimatedSize += _blockEncoder.EstimateSize(key, value);

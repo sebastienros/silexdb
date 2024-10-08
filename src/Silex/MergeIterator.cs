@@ -15,10 +15,10 @@ internal class MergeIterator : IStorageIterator
 
     public IAsyncEnumerable<RecordLocation> EnumerateAsync(CancellationToken cancellationToken = default)
     {
-        return EnumerateAsync(ReadOnlyMemory<byte>.Empty, cancellationToken);
+        return EnumerateAsync(Bytes.Empty, cancellationToken);
     }
 
-    public async IAsyncEnumerable<RecordLocation> EnumerateAsync(ReadOnlyMemory<byte> minValue, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    public async IAsyncEnumerable<RecordLocation> EnumerateAsync(Bytes minValue, [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         List<IAsyncEnumerator<RecordLocation>> enumerators = [];
 
@@ -40,21 +40,18 @@ internal class MergeIterator : IStorageIterator
 
                 var current = iterator.Current;
 
-                switch (ByteArrayComparer.Instance.Compare(smallest.Key, current.Key))
+                if (current.Key < smallest.Key)
                 {
-                    // Discard the entry since there is the same key from a more recent table
-                    case 0:
-                        if (!await iterator.MoveNextAsync())
-                        {
-                            enumerators.RemoveAt(i);
-                            i--;
-                        }
-                        break;
-
-                    case > 0:
-                        smallestIndex = i;
-                        smallest = current;
-                        break;
+                    smallestIndex = i;
+                    smallest = current;
+                }
+                else
+                {
+                    if (!await iterator.MoveNextAsync())
+                    {
+                        enumerators.RemoveAt(i);
+                        i--;
+                    }
                 }
             }
 

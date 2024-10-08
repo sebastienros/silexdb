@@ -2,6 +2,7 @@
 
 using Silex.Blocks;
 using Silex.Tables;
+using System.Buffers.Binary;
 using System.Text;
 
 public class TableTests
@@ -13,8 +14,8 @@ public class TableTests
 
         var builder = new SsTableBuilder(new DefaultSsTableEncoder(), new DefaultBlockEncoder());
 
-        var key = BitConverter.GetBytes((ushort)7);
-        var value = Encoding.UTF8.GetBytes($"hello");
+        Bytes key = (ushort)7;
+        Bytes value = "hello";
 
         builder.Add(key, value);
 
@@ -35,8 +36,8 @@ public class TableTests
 
         var builder = new SsTableBuilder(new DefaultSsTableEncoder(), new DefaultBlockEncoder());
 
-        var key = BitConverter.GetBytes((ushort)7);
-        var value = Encoding.UTF8.GetBytes($"hello");
+        Bytes key = (ushort)7;
+        Bytes value = "hello";
 
         builder.Add(key, value);
 
@@ -64,7 +65,7 @@ public class TableTests
 
         for (uint i = 0; i < 100; i++)
         {
-            builder.Add(BitConverter.GetBytes(i), value);
+            builder.Add(i, value);
         }
 
         var table = await builder.BuildAsync(tempFilename);
@@ -73,7 +74,7 @@ public class TableTests
 
         var iterator = new SsTableIterator(table);
 
-        var result = iterator.EnumerateAsync().ToBlockingEnumerable().Select(x => BitConverter.ToInt32(x.Key.Span)).ToArray();
+        var result = iterator.EnumerateAsync().ToBlockingEnumerable().Select(x => BinaryPrimitives.ReadUInt32LittleEndian(x.Key.Span)).ToArray();
 
         Assert.Equivalent(Enumerable.Range(0, 100), result);
 
@@ -93,7 +94,7 @@ public class TableTests
 
         for (uint i = 0; i < 100; i++)
         {
-            builder.Add(BitConverter.GetBytes(i), value);
+            builder.Add(i, value);
         }
 
         var table = await builder.BuildAsync(tempFilename);
@@ -103,7 +104,7 @@ public class TableTests
 
         var iterator = new SsTableIterator(table);
 
-        var result = iterator.EnumerateAsync(BitConverter.GetBytes(13)).ToBlockingEnumerable().Select(x => BitConverter.ToInt32(x.Key.Span)).ToArray();
+        var result = iterator.EnumerateAsync(13).ToBlockingEnumerable().Select(x => BinaryPrimitives.ReadUInt32LittleEndian(x.Key.Span)).ToArray();
 
         Assert.Equivalent(Enumerable.Range(13, 100 - 13), result);
 
@@ -123,7 +124,7 @@ public class TableTests
 
         for (uint i = 0; i < 100; i++)
         {
-            builder.Add(BitConverter.GetBytes(i), value);
+            builder.Add(i, value);
         }
 
         var table = await builder.BuildAsync(tempFilename);
@@ -133,7 +134,7 @@ public class TableTests
 
         var iterator = new SsTableIterator(table);
 
-        var result = iterator.EnumerateAsync(BitConverter.GetBytes(101)).ToBlockingEnumerable().Select(x => BitConverter.ToInt32(x.Key.Span)).ToArray();
+        var result = iterator.EnumerateAsync(101).ToBlockingEnumerable().Select(x => BinaryPrimitives.ReadUInt32LittleEndian(x.Key.Span)).ToArray();
 
         Assert.Empty(result);
 

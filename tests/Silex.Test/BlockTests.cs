@@ -1,7 +1,7 @@
 ﻿namespace Silex.Test;
 
 using Silex.Blocks;
-using System.Text;
+using System.Buffers.Binary;
 
 public class BlockTests
 {
@@ -10,8 +10,8 @@ public class BlockTests
     {
         var blockBuilder = new BlockBuilder(new DefaultBlockEncoder());
 
-        var key = BitConverter.GetBytes((ushort)7);
-        var value = Encoding.UTF8.GetBytes($"hello");
+        var key = new Bytes((ushort)7);
+        var value = new Bytes("hello");
 
         blockBuilder.Add(key, value);
 
@@ -34,7 +34,7 @@ public class BlockTests
     public void ShouldDecodeBlock()
     {
         var raw = new byte[] { 2, 7, 0, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 };
-        var key = BitConverter.GetBytes((ushort)7);
+        var key = new Bytes((ushort)7);
 
         var encoder = new DefaultBlockEncoder();
 
@@ -54,17 +54,17 @@ public class BlockTests
     {
         var blockBuilder = new BlockBuilder(new DefaultBlockEncoder());
 
-        var value = "hello"u8.ToArray();
+        var value = new Bytes("hello");
         var allKeys = new int[] { 1, 3, 5, 6, 7 };
         foreach (var i in allKeys)
         {
-            blockBuilder.Add(BitConverter.GetBytes(i), value);
+            blockBuilder.Add(i, value);
         }
 
         var block = blockBuilder.BuildBlock();
         var iterator = new BlockIterator(block);
 
-        var result = iterator.EnumerateAsync().ToBlockingEnumerable().Select(x => BitConverter.ToInt32(x.Key.Span)).ToArray();
+        var result = iterator.EnumerateAsync().ToBlockingEnumerable().Select(x => BinaryPrimitives.ReadUInt32LittleEndian(x.Key.Span)).ToArray();
 
         Assert.Equivalent(allKeys, result);
     }
@@ -78,13 +78,13 @@ public class BlockTests
         var allKeys = new int[] { 1, 3, 5, 6, 7 };
         foreach (var i in allKeys)
         {
-            blockBuilder.Add(BitConverter.GetBytes(i), value);
+            blockBuilder.Add(i, value);
         }
 
         var block = blockBuilder.BuildBlock();
         var iterator = new BlockIterator(block);
 
-        var result = iterator.EnumerateAsync(BitConverter.GetBytes(2)).ToBlockingEnumerable().Select(x => BitConverter.ToInt32(x.Key.Span)).ToArray();
+        var result = iterator.EnumerateAsync(2).ToBlockingEnumerable().Select(x => BinaryPrimitives.ReadUInt32LittleEndian(x.Key.Span)).ToArray();
 
         Assert.Equivalent(allKeys.Skip(1), result);
     }
@@ -98,13 +98,13 @@ public class BlockTests
         var allKeys = new int[] { 1, 3, 5, 6, 7 };
         foreach (var i in allKeys)
         {
-            blockBuilder.Add(BitConverter.GetBytes(i), value);
+            blockBuilder.Add(i, value);
         }
 
         var block = blockBuilder.BuildBlock();
         var iterator = new BlockIterator(block);
 
-        var result = iterator.EnumerateAsync(BitConverter.GetBytes(8)).ToBlockingEnumerable().Select(x => BitConverter.ToInt32(x.Key.Span)).ToArray();
+        var result = iterator.EnumerateAsync(8).ToBlockingEnumerable().Select(x => BinaryPrimitives.ReadUInt32LittleEndian(x.Key.Span)).ToArray();
 
         Assert.Empty(result);
     }

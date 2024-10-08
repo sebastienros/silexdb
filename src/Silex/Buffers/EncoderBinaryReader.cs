@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -16,7 +17,7 @@ internal ref struct EncoderBinaryReader
     private int _offset;
 
     public readonly bool IsEOF => _offset >= _length;
-    public int Offset => _offset;
+    public readonly int Offset => _offset;
 
     public EncoderBinaryReader(ReadOnlyMemory<byte> content, int offset)
     {
@@ -120,6 +121,10 @@ internal ref struct EncoderBinaryReader
         return (long)result;
     }
 
+    public ushort ReadUInt16() => BinaryPrimitives.ReadUInt16LittleEndian(ReadBytesSpan(sizeof(short)));
+    public uint ReadUInt32() => BinaryPrimitives.ReadUInt16LittleEndian(ReadBytesSpan(sizeof(uint)));
+    public ulong ReadUInt64() => BinaryPrimitives.ReadUInt16LittleEndian(ReadBytesSpan(sizeof(ulong)));
+
     public void Skip(int bytes)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(bytes);
@@ -128,6 +133,16 @@ internal ref struct EncoderBinaryReader
             ThrowEndOfStream();
         }
         _offset += bytes;
+    }
+
+    public void Seek(int position)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(position);
+        if (position > _length)
+        {
+            ThrowEndOfStream();
+        }
+        _offset = position;
     }
 
     public ReadOnlySpan<byte> ReadBytesSpan(int count)

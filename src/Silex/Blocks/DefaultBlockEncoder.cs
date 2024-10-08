@@ -1,5 +1,4 @@
 using Silex.Buffers;
-using System;
 using System.Buffers;
 
 namespace Silex.Blocks;
@@ -44,22 +43,21 @@ public class DefaultBlockEncoder : IBlockEncoder
 {
     public Block Decode(ReadOnlyMemory<byte> buffer)
     {
-        var span = buffer.Span;
+        var binaryReader = new EncoderBinaryReader(buffer, 0);
 
         // Read the last two bytes
-        var totalEntries = BitConverter.ToUInt16(span.Slice(span.Length - 2, 2));
+        binaryReader.Seek(buffer.Length - 2);
+        var totalEntries = binaryReader.ReadUInt16();
 
         // Read the offsets position
-        var offsetPosition = span.Length - (totalEntries + 1) * 2;
-        var current = offsetPosition;
+        var offsetPosition = buffer.Length - (totalEntries + 1) * 2;
+        binaryReader.Seek(offsetPosition);
 
         var offsets = new List<ushort>(totalEntries);
 
         for (var i = 0; i < totalEntries; i++)
         {
-            var bytes = span.Slice(current, 2);
-            offsets.Add(BitConverter.ToUInt16(bytes));
-            current += 2;
+            offsets.Add(binaryReader.ReadUInt16());
         }
 
         var memoryOwner = MemoryPool<byte>.Shared.Rent(buffer.Length);
@@ -88,7 +86,7 @@ public class DefaultBlockEncoder : IBlockEncoder
         return data.Slice(offset, length);
     }
 
-    public Block Encode(IReadOnlyList<KeyValuePair<ReadOnlyMemory<byte>, ReadOnlyMemory<byte>>> entries)
+    public Block Encode(IReadOnlyList<KeyValuePair<Bytes, Bytes>> entries)
     {
         var size = entries.Sum(x => EstimateSize(x.Key, x.Value)) + sizeof(ushort);
 
@@ -117,13 +115,17 @@ public class DefaultBlockEncoder : IBlockEncoder
             foreach (var offset in offsets)
             {
                 // 2 bytes for each offset (ushort)
-                writer.WriteRaw(BitConverter.GetBytes(offset));
+                writer.WriteUInt16(offset);
             }
 
             // 2 bytes for the number of elements
-            writer.WriteRaw(BitConverter.GetBytes((ushort)offsets.Count));
+            writer.WriteUInt16((ushort)offsets.Count);
 
             writer.Flush();
+
+            // The internal array could be kept if buffer was not disposed,
+            // but by using MemoryPool and copy the value we ensure that all 
+            // array allocations are effectively pooled.
 
             var memory = buffer.GetCommittedMemory();
 
@@ -138,7 +140,7 @@ public class DefaultBlockEncoder : IBlockEncoder
         }
     }
 
-    public int EstimateSize(ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value)
+    public int EstimateSize(Bytes key, Bytes value)
     {
         return 2 // key length
             + key.Length
