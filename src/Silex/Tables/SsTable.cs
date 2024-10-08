@@ -1,5 +1,4 @@
 using Silex.Blocks;
-using Silex.Buffers;
 using System.Buffers;
 using System.Buffers.Binary;
 
@@ -8,6 +7,8 @@ namespace Silex.Tables;
 public class SsTable
 {
     private readonly string _filename;
+    private readonly Bytes _firstKey;
+    private readonly Bytes _lastKey;
     private readonly BlockBuilder _blockBuilder;
 
     public SsTable(string filename, IReadOnlyList<BlockMetadata> blockMetadata, long metadataBlockOffset, BlockBuilder blockBuilder)
@@ -16,6 +17,12 @@ public class SsTable
         BlockMetadata = blockMetadata;
         MetaBlockOffset = metadataBlockOffset;
         _blockBuilder = blockBuilder;
+
+        if (blockMetadata.Count > 0)
+        {
+            _firstKey = BlockMetadata[0].FirstKey;
+            _lastKey = BlockMetadata[BlockMetadata.Count - 1].LastKey;
+        }
     }
 
     public IReadOnlyList<BlockMetadata> BlockMetadata { get; } = [];
@@ -24,23 +31,32 @@ public class SsTable
 
     public string Filename => _filename;
 
-    public async Task<Block> LoadBlockAsync(int index, CancellationToken cancellationToken = default)
+    public Bytes FirstKey => _firstKey;
+
+    public Bytes LastKey => _lastKey;
+
+    public async Task<Block> ReadBlockAsync(int index, CancellationToken cancellationToken = default)
     {
         using var stream = File.OpenRead(Filename);
         var offset = BlockMetadata[index].Offset;
         
         // If there is a single block it ends at the metadata block
-        var length = BlockMetadata.Count > index + 1
-            ? BlockMetadata[index + 1].Offset - offset
-            : MetaBlockOffset - offset
-            ;
+        var offsetEnd = BlockMetadata.Count > index + 1
+            ? BlockMetadata[index + 1].Offset
+            : MetaBlockOffset;
 
-        var buffer = new byte[length];
+        var length = (int)(offsetEnd - offset);
+
+        var buffer = ArrayPool<byte>.Shared.Rent(length)!;
 
         stream.Seek(offset, SeekOrigin.Begin);
-        await stream.ReadExactlyAsync(buffer, 0, buffer.Length, cancellationToken);
+        await stream.ReadExactlyAsync(buffer, 0, length, cancellationToken);
         
-        return _blockBuilder.Decode(buffer);
+        var block = _blockBuilder.Decode(new ReadOnlyMemory<byte>(buffer, 0, length));
+
+        ArrayPool<byte>.Shared.Return(buffer);
+
+        return block;
     }
 
     public static async Task<SsTable> LoadSsTableAsync(string filename, ISsTableEncoder tableEncoder, BlockBuilder blockBuilder, CancellationToken cancellationToken = default)

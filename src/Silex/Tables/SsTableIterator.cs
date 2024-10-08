@@ -40,7 +40,7 @@ internal sealed class SsTableIterator : IStorageIterator
             // Iterate this block only, after the specified key
             var blockMetadata = _table.BlockMetadata[startBlockIndex];
 
-            using var block = await _table.LoadBlockAsync(blockMetadata.Index, cancellationToken);
+            using var block = await _table.ReadBlockAsync(blockMetadata.Index, cancellationToken);
 
             if (block != null)
             {
@@ -58,7 +58,7 @@ internal sealed class SsTableIterator : IStorageIterator
         {
             var blockMetadata = _table.BlockMetadata[i];
 
-            using var block = await _table.LoadBlockAsync(blockMetadata.Index, cancellationToken);
+            using var block = await _table.ReadBlockAsync(blockMetadata.Index, cancellationToken);
 
             if (block != null)
             {

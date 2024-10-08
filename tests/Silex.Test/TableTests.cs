@@ -22,7 +22,7 @@ public class TableTests
         var table = await builder.BuildAsync(tempFilename);
 
         Assert.Single(table.BlockMetadata);
-        using var block = await table.LoadBlockAsync(0);
+        using var block = await table.ReadBlockAsync(0);
         Assert.Equal(new byte[] { 2, 7, 0, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, block.Memory);
 
         File.Delete(tempFilename);
@@ -46,7 +46,7 @@ public class TableTests
         var table = await SsTable.LoadSsTableAsync(tempFilename, new DefaultSsTableEncoder(), blockBuilder);
 
         Assert.Single(table.BlockMetadata);
-        using var block = await table.LoadBlockAsync(0);
+        using var block = await table.ReadBlockAsync(0);
         Assert.Equal(new byte[] { 2, 7, 0, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, block.Memory);
 
         File.Delete(tempFilename);
