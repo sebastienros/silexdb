@@ -24,9 +24,9 @@ internal sealed class MemTable : IDisposable, IMemTable
     private readonly SkipList<Bytes, MemTableEntry> _map = new(Bytes.Comparer);
     private long _size;
     private bool _disposing;
-    private readonly int _id;
+    private readonly long _id;
 
-    public MemTable(int id)
+    public MemTable(long id)
     {
         _id = id;
     }
@@ -34,7 +34,7 @@ internal sealed class MemTable : IDisposable, IMemTable
     /// <summary>
     /// The identifier of the <see cref="MemTable"/>. Used for debugging purpose.
     /// </summary>
-    public int Id => _id;
+    public long Id => _id;
 
     /// <inheritdocs />
     public long Size => _size;

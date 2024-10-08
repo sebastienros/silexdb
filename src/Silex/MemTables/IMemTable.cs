@@ -4,6 +4,8 @@ namespace Silex.MemTables;
 
 public interface IMemTable
 {
+    long Id { get; }
+
     /// <summary>
     /// Gets the size of the <see cref="MemTable"/>.
     /// </summary>
