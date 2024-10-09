@@ -251,6 +251,9 @@ public sealed class LsmStorageInner : IDisposable
                                 smallestIndex = i;
                                 smallest = current;
                                 break;
+                            
+                            default:
+                                break;
                         }
                     }
 

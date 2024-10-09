@@ -40,18 +40,43 @@ internal class MergeIterator : IStorageIterator
 
                 var current = iterator.Current;
 
-                if (current.Key < smallest.Key)
+                switch (smallest.Key.CompareTo(current.Key))
                 {
-                    smallestIndex = i;
-                    smallest = current;
+                    // Discard the entry since there is the same key from a more recent table
+                    case 0:
+                        if (!await iterator.MoveNextAsync())
+                        {
+                            enumerators.RemoveAt(i);
+                            i--;
+                        }
+                        break;
+
+                    case > 0:
+                        smallestIndex = i;
+                        smallest = current;
+                        break;
+
+                    default:
+                        break;
                 }
-                else
+                switch (smallest.Key.CompareTo(current.Key))
                 {
-                    if (!await iterator.MoveNextAsync())
-                    {
-                        enumerators.RemoveAt(i);
-                        i--;
-                    }
+                    // Discard the entry since there is the same key from a more recent table
+                    case 0:
+                        if (!await iterator.MoveNextAsync())
+                        {
+                            enumerators.RemoveAt(i);
+                            i--;
+                        }
+                        break;
+
+                    case > 0:
+                        smallestIndex = i;
+                        smallest = current;
+                        break;
+
+                    default:
+                        break;
                 }
             }
 

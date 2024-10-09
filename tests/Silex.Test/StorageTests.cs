@@ -277,7 +277,7 @@ public class StorageTests
         {
             expectedKeys = expectedKeys.Where(x => x >= lowerBound);
 
-            Assert.All(entries, e => Assert.True(lowerBytes.CompareTo(e.Key) <= 0));
+            Assert.All(entries, e => Assert.True(lowerBytes <= e.Key));
         }
 
         var actualKeys = storage.CreateIterator().EnumerateAsync(lowerBytes).ToBlockingEnumerable().Select(x => (int)BinaryPrimitives.ReadUInt32LittleEndian(x.Key.Span)).ToArray();
