@@ -18,12 +18,7 @@ public interface IMemTable
     /// <returns><c>true</c> if the key was found, <c>false</c> otherwise.</returns>
     bool TryGet(Bytes key, out Bytes result);
 
-    /// <summary>
-    /// Puts a value with the specified key. If one already exists it is replaced.
-    /// </summary>
-    /// <param name="key"></param>
-    /// <param name="memoryOwner"></param>
-    void Put(Bytes key, IMemoryOwner<byte> memoryOwner, int bufferSize);
+    void Put(Bytes key, Bytes value);
 
     IStorageIterator CreateIterator();
 }

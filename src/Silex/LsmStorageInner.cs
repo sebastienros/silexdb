@@ -1,4 +1,5 @@
 ﻿using Silex.MemTables;
+using System;
 using System.Buffers;
 using System.Runtime.CompilerServices;
 
@@ -9,7 +10,7 @@ namespace Silex;
 /// </summary>
 public sealed class LsmStorageInner : IDisposable
 {
-    private static readonly MemoryOwner _tombStone = new(Memory<byte>.Empty);
+    private static readonly ReadOnlyMemory<byte> _tombStone = new([]);
 
     private readonly ReaderWriterLockSlim _rwLock = new();
     internal StorageState _state;
@@ -73,23 +74,13 @@ public sealed class LsmStorageInner : IDisposable
     /// </summary>
     /// <param name="key"></param>
     /// <param name="value"></param>
-    public void Put(Bytes key, Memory<byte> value)
-    {
-        Put(key, new MemoryOwner(value), value.Length);
-    }
-
-    /// <summary>
-    /// Puts a value with the specified key in the current <see cref="IMemTable">. If one already exists it is replaced.
-    /// </summary>
-    /// <param name="key"></param>
-    /// <param name="value"></param>
-    void Put(Bytes key, IMemoryOwner<byte> value, int bufferSize)
+    public void Put(Bytes key, Bytes value)
     {
         _rwLock.EnterWriteLock();
 
         try
         {
-            _state.CurrentMemTable.Put(key, value, bufferSize);
+            _state.CurrentMemTable.Put(key, value);
 
             if (_state.CurrentMemTable.Size >= _memTableSizeLimit)
             {
@@ -112,7 +103,7 @@ public sealed class LsmStorageInner : IDisposable
 
         try
         {
-            _state.CurrentMemTable.Put(key, _tombStone, 0);
+            _state.CurrentMemTable.Put(key, _tombStone);
 
             if (_state.CurrentMemTable.Size >= _memTableSizeLimit)
             {

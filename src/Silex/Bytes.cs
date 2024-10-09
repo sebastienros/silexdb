@@ -1,22 +1,42 @@
-﻿namespace Silex;
-
+﻿using System.Buffers;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 
+namespace Silex;
+
+/// <summary>
+/// Represents a set of bytes.
+/// </summary>
+/// <remarks>
+/// If the backing field implements <see cref="IMemoryOwner{bytes}"/> it can be retrieved with <see cref="Owner"/>.
+/// </remarks>
 [DebuggerDisplay($"{{{nameof(GetDebuggerDisplay)}(),nq}}")]
 public readonly struct Bytes : IEquatable<Bytes>, IComparable<Bytes>
 {
     private readonly ReadOnlyMemory<byte> _data;
+    private readonly IMemoryOwner<byte>? _owner;
 
     public static readonly IComparer<Bytes> Comparer = BytesComparer.Instance;
+
+    public Bytes(Memory<byte> value)
+    {
+        _data = value;
+    }
+
+    public Bytes(IMemoryOwner<byte> value, int length)
+    {
+        _data = value.Memory[..length];
+        _owner = value;
+    }
 
     public Bytes(ReadOnlyMemory<byte> value)
     {
         _data = value;
     }
+
     public Bytes(byte value)
     {
         _data = new byte[] { value };
@@ -58,6 +78,9 @@ public readonly struct Bytes : IEquatable<Bytes>, IComparable<Bytes>
     /// <summary>
     /// Create a new <see cref="Bytes"/> instance from an <see cref="short">.
     /// </summary>
+    /// <remarks>
+    /// This allocates a new <see cref="byte[]"/> instance.
+    /// </remarks>
     public Bytes(short value)
     {
         _data = BitConverter.GetBytes(value);
@@ -105,6 +128,13 @@ public readonly struct Bytes : IEquatable<Bytes>, IComparable<Bytes>
 
     public readonly ReadOnlySpan<byte> Span => _data.Span;
 
+    public readonly ReadOnlyMemory<byte> Memory => _data;
+
+    /// <summary>
+    /// If the backing store is a <see cref="IMemoryOwner{byte}"/> returns its value, <see langword="null"/> otherwise.
+    /// </summary>
+    public readonly IMemoryOwner<byte>? Owner => _owner;
+
     /// <summary>
     /// Returns an empty <see cref="Bytes"/>.
     /// </summary>
@@ -144,7 +174,7 @@ public readonly struct Bytes : IEquatable<Bytes>, IComparable<Bytes>
 
     public static bool operator <=(Bytes left, Bytes right)
     {
-        return left.CompareTo(right) <= 0;
+        return left.Equals(right) || left.CompareTo(right) <= 0;
     }
 
     public static bool operator >(Bytes left, Bytes right)
@@ -154,7 +184,7 @@ public readonly struct Bytes : IEquatable<Bytes>, IComparable<Bytes>
 
     public static bool operator >=(Bytes left, Bytes right)
     {
-        return left.CompareTo(right) >= 0;
+        return left.Equals(right) || left.CompareTo(right) > 0;
     }
 
     public override readonly bool Equals([NotNullWhen(true)] object? obj)

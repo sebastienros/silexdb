@@ -21,7 +21,7 @@ namespace Silex.MemTables;
 /// </remarks>
 internal sealed class MemTable : IDisposable, IMemTable
 {
-    private readonly SkipList<Bytes, MemTableEntry> _map = new(Bytes.Comparer);
+    private readonly SkipList<Bytes, Bytes> _map = new(Bytes.Comparer);
     private long _size;
     private bool _disposing;
     private readonly long _id;
@@ -54,13 +54,8 @@ internal sealed class MemTable : IDisposable, IMemTable
         return false;
     }
 
-    public void Put(Bytes key, Memory<byte> value)
-    {
-        Put(key, new MemoryOwner(value), value.Length);
-    }
-
     /// <inheritdocs />
-    public void Put(Bytes key, IMemoryOwner<byte> memoryOwner, int bufferSize)
+    public void Put(Bytes key, Bytes value)
     {
         ObjectDisposedException.ThrowIf(_disposing, this);
 
@@ -68,21 +63,15 @@ internal sealed class MemTable : IDisposable, IMemTable
         // and the size need to be consistent.
         // This also needs to handle when the same key is updated concurrently
 
-        var memoryEntry = new MemTableEntry
-        {
-            MemoryOwner = memoryOwner,
-            Size = bufferSize
-        };
-
         // Retrieve the previous value to keep its size consistent.
         if (_map.TryRemove(key, out var previousValue))
         {
-            _size -= previousValue.Size + key.Length;
-            previousValue.MemoryOwner.Dispose();
+            _size -= previousValue.Length + key.Length;
+            previousValue.Owner?.Dispose();
         }
 
-        _map.Add(key, memoryEntry);
-        _size += bufferSize + key.Length;
+        _map.Add(key, value);
+        _size += value.Length + key.Length;
         return;
     }
 
@@ -108,7 +97,7 @@ internal sealed class MemTable : IDisposable, IMemTable
     {
         foreach (var entry in _map)
         {
-            entry.Value.MemoryOwner.Dispose();
+            entry.Value.Owner?.Dispose();
         }
 
         _map.Clear();

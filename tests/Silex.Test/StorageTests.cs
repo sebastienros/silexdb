@@ -166,13 +166,10 @@ public class StorageTests
 
         Assert.Equal(4, list.Count);
 
-        Assert.Equal('a', BitConverter.ToChar(list[0].Key.Span));
-
-        Assert.Equal('c', BitConverter.ToChar(list[1].Key.Span));
-
-        Assert.Equal('d', BitConverter.ToChar(list[2].Key.Span));
-
-        Assert.Equal('e', BitConverter.ToChar(list[3].Key.Span));
+        Assert.Equal((Bytes)'a', list[0].Key);
+        Assert.Equal((Bytes)'c', list[1].Key);
+        Assert.Equal((Bytes)'d', list[2].Key);
+        Assert.Equal((Bytes)'e', list[3].Key);
     }
 
     [Theory]

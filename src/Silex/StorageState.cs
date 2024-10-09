@@ -1,4 +1,5 @@
 ﻿using Silex.MemTables;
+using Silex.Tables;
 using System.Collections.Immutable;
 
 namespace Silex;
@@ -19,12 +20,21 @@ internal struct StorageState
 
     public required IMemTable CurrentMemTable { get; set; }
 
+    /// <summary>
+    /// The list of <see cref="SsTable"/> for each level.
+    /// </summary>
+    /// <remarks>
+    /// This table is initialized for level-0.
+    /// </remarks>
+    public List<List<SsTable>> SsTables { get; set; } = [[]];
+
     public StorageState Clone()
     {
         return new StorageState
         {
             CurrentMemTable = CurrentMemTable,
-            ImmutableMemTables = ImmutableMemTables
+            ImmutableMemTables = ImmutableMemTables,
+            SsTables = SsTables
         };
     }
 }

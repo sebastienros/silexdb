@@ -8,14 +8,22 @@ using System.Collections.Generic;
 public class Block : IDisposable
 {
     private readonly IBlockEncoder _encoder;
-    private readonly IMemoryOwner<byte> _blockData;
+    private readonly IMemoryOwner<byte>? _memoryOwner;
     private bool _disposed;
 
     public Block(IBlockEncoder encoder, IMemoryOwner<byte> blockData, int length, IReadOnlyList<ushort> offsets)
     {
         _encoder = encoder;
-        _blockData = blockData;
-        Memory = _blockData.Memory[..length];
+        _memoryOwner = blockData;
+        Memory = _memoryOwner.Memory[..length];
+        Offsets = offsets;
+    }
+
+    public Block(IBlockEncoder encoder, ReadOnlyMemory<byte> blockData, int length, IReadOnlyList<ushort> offsets)
+    {
+        _encoder = encoder;
+        _memoryOwner = null;
+        Memory = blockData[..length];
         Offsets = offsets;
     }
 
@@ -44,6 +52,11 @@ public class Block : IDisposable
 
     public void Dispose()
     {
+        if (_memoryOwner == null)
+        {
+            return;
+        }
+
         GC.SuppressFinalize(this);
         DisposeInternal();
     }
@@ -55,13 +68,17 @@ public class Block : IDisposable
             return;
         }
 
-        _blockData.Dispose();
-
+        _memoryOwner?.Dispose();
         _disposed = true;
     }
 
     ~Block()
     {
+        if (_memoryOwner == null)
+        {
+            return;
+        }
+
         DisposeInternal();
     }
 }
