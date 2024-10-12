@@ -1,5 +1,5 @@
 ﻿using Silex.Collections;
-using System.Buffers;
+using Silex.Tables;
 using System.Runtime.CompilerServices;
 
 namespace Silex.MemTables;
@@ -19,7 +19,7 @@ namespace Silex.MemTables;
 /// A MemTable usually has a size limit and it will be frozen to an immutable MemTable when it reaches the size limit.
 /// This logic is part of <see cref="LsmStorageInner"/>.
 /// </remarks>
-internal sealed class MemTable : IDisposable, IMemTable
+internal sealed class MemTable : IMemTable
 {
     private readonly SkipList<Bytes, Bytes> _map = new(Bytes.Comparer);
     private long _size;
@@ -80,6 +80,13 @@ internal sealed class MemTable : IDisposable, IMemTable
         return new MemTableIterator(this);
     }
 
+    public void Flush(SsTableBuilder builder)
+    {
+        foreach (var entry in _map)
+        {
+            builder.Add(entry.Key, entry.Value);
+        }
+    }
     public void Dispose()
     {
         if (_disposing)

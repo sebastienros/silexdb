@@ -24,7 +24,7 @@ internal class MergeIterator : IStorageIterator
 
         foreach (var iterator in _iterators)
         {
-            enumerators.Add(iterator.EnumerateAsync(minValue, cancellationToken).GetAsyncEnumerator());
+            enumerators.Add(iterator.EnumerateAsync(minValue, cancellationToken).GetAsyncEnumerator(cancellationToken));
         }
 
         while (enumerators.Count > 0)
@@ -40,25 +40,6 @@ internal class MergeIterator : IStorageIterator
 
                 var current = iterator.Current;
 
-                switch (smallest.Key.CompareTo(current.Key))
-                {
-                    // Discard the entry since there is the same key from a more recent table
-                    case 0:
-                        if (!await iterator.MoveNextAsync())
-                        {
-                            enumerators.RemoveAt(i);
-                            i--;
-                        }
-                        break;
-
-                    case > 0:
-                        smallestIndex = i;
-                        smallest = current;
-                        break;
-
-                    default:
-                        break;
-                }
                 switch (smallest.Key.CompareTo(current.Key))
                 {
                     // Discard the entry since there is the same key from a more recent table

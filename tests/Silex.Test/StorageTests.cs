@@ -17,7 +17,7 @@ public class StorageTests
     [Fact]
     public void CanPutArray()
     {
-        var storage = new LsmStorageInner(_defaultStorageOptions);
+        var storage = new LsmStorageInner(Path.GetTempPath(), _defaultStorageOptions);
 
         byte[] key = [1, 2, 3];
         byte[] value = [4, 5, 6];
@@ -32,7 +32,7 @@ public class StorageTests
     [Fact]
     public void PutValueIsCopied()
     {
-        var storage = new LsmStorageInner(_defaultStorageOptions);
+        var storage = new LsmStorageInner(Path.GetTempPath(), _defaultStorageOptions);
 
         byte[] key1 = [1];
         byte[] key2 = [2];
@@ -52,7 +52,7 @@ public class StorageTests
     [Fact]
     public void DeleteShouldStoreTombStone()
     {
-        var storage = new LsmStorageInner(_defaultStorageOptions);
+        var storage = new LsmStorageInner(Path.GetTempPath(), _defaultStorageOptions);
 
         byte[] key = [1, 2, 3];
 
@@ -74,7 +74,7 @@ public class StorageTests
         var memTableSizeLimit = 100;
 
         var storageOptions = new StorageOptions { MemTableSizeLimit = memTableSizeLimit };
-        var storage = new LsmStorageInner(storageOptions);
+        var storage = new LsmStorageInner(Path.GetTempPath(), storageOptions);
 
         for (var i = 1; i <= entries; i++)
         {
@@ -98,7 +98,7 @@ public class StorageTests
         var dictionary = new Dictionary<int, byte[]>();
 
         var storageOptions = new StorageOptions { MemTableSizeLimit = memTableSizeLimit };
-        var storage = new LsmStorageInner(storageOptions);
+        var storage = new LsmStorageInner(Path.GetTempPath(), storageOptions);
 
         for (var i = 1; i <= entries; i++)
         {
@@ -141,7 +141,7 @@ public class StorageTests
     [Fact]
     public void ScanListsAllMemTables()
     {
-        var storage = new LsmStorageInner(_defaultStorageOptions);
+        var storage = new LsmStorageInner(Path.GetTempPath(), _defaultStorageOptions);
 
         // table1: b->del, c->4, d->5
         // table2: a->1, b->2, c->3
@@ -182,7 +182,7 @@ public class StorageTests
         var maxKeysValue = 50; // Limit the number of unique ids to generate collisions
         var iterations = 50;
         var storageOptions = new StorageOptions { MemTableSizeLimit = 100 };
-        var storage = new LsmStorageInner(storageOptions);
+        var storage = new LsmStorageInner(Path.GetTempPath(), storageOptions);
         var iterator = storage.CreateIterator();
 
         var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5)).Token;
@@ -282,10 +282,59 @@ public class StorageTests
         Assert.Equal(expectedKeys, actualKeys);
     }
 
+    [Fact]
+    public async Task OpenAsyncShouldCreateFolder()
+    {
+        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+
+        var storage = await LsmStorageInner.OpenAsync(tempFolder, _defaultStorageOptions);
+
+        Assert.True(Directory.Exists(tempFolder));
+
+        Directory.Delete(tempFolder, true);
+    }
+
+    [Fact]
+    public async Task ForceFlushShouldNotFailWithNoImmutableMemTable()
+    {
+        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+
+        var storage = await LsmStorageInner.OpenAsync(tempFolder, _defaultStorageOptions);
+
+        storage.Put('e', new byte[] { 4 });
+
+        // Don't freeze current MemTable
+
+        // Nothing to flush
+        await storage.ForceFlushNextImmutableMemTableAsync();
+
+        Assert.True(Directory.Exists(tempFolder));
+        Assert.Empty(Directory.EnumerateFiles(tempFolder, "*.sst"));
+
+        Directory.Delete(tempFolder, true);
+    }
+
+    [Fact]
+    public async Task ForceFlushShouldFlushMemTable()
+    {
+        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+
+        var storage = await LsmStorageInner.OpenAsync(tempFolder, _defaultStorageOptions);
+
+        storage.Put('e', new byte[] { 4 });
+        storage.ForceFreezeMemTable();
+        await storage.ForceFlushNextImmutableMemTableAsync();
+
+        Assert.True(Directory.Exists(tempFolder));
+        Assert.Single(Directory.EnumerateFiles(tempFolder, "*.sst"));
+
+        Directory.Delete(tempFolder, true);
+    }
+
     private static LsmStorageInner FillImmutableMemTables(int entries = 100, int valueSize = 10, long memTableSizeLimit = 100)
     {
         var storageOptions = new StorageOptions { MemTableSizeLimit = memTableSizeLimit };
-        var storage = new LsmStorageInner(storageOptions);
+        var storage = new LsmStorageInner(Path.GetTempPath(), storageOptions);
 
         for (var i = 1; i <= entries; i++)
         {

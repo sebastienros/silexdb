@@ -1,6 +1,8 @@
-﻿using Silex.MemTables;
-using System;
-using System.Buffers;
+﻿using Silex.Blocks;
+using Silex.MemTables;
+using Silex.Tables;
+using System.Diagnostics;
+using System.Globalization;
 using System.Runtime.CompilerServices;
 
 namespace Silex;
@@ -12,17 +14,53 @@ public sealed class LsmStorageInner : IDisposable
 {
     private static readonly ReadOnlyMemory<byte> _tombStone = new([]);
 
-    private readonly ReaderWriterLockSlim _rwLock = new();
+    private readonly ReaderWriterLockSlim _currentMemTableLock = new();
+    private readonly ReaderWriterLockSlim _immutableMemTablesLock = new();
+    private readonly ReaderWriterLockSlim _level0Lock = new();
+    private readonly ReaderWriterLockSlim _sstLock = new();
+
     internal StorageState _state;
+    private bool _disposed;
+    private readonly IBlockEncoder _blockEncoder;
+    private readonly ISsTableEncoder _ssTableEncoder;
     private readonly long _memTableSizeLimit;
-    private int _memTableId = 0;
 
-    private int NextMemTableId() => Interlocked.Increment(ref _memTableId);
+    public string StoragePath { get; }
 
-    public LsmStorageInner(StorageOptions options)
+    internal LsmStorageInner(string path, StorageOptions options)
     {
+        StoragePath = path;
         _state = new StorageState(options) { CurrentMemTable = new MemTable(IdGenerator.GetNextId()) };
+        _blockEncoder = options.BlockEncoder;
+        _ssTableEncoder = options.SsTableEncoder;
         _memTableSizeLimit = options.MemTableSizeLimit;
+    }
+
+    public static async Task<LsmStorageInner> OpenAsync(string path, StorageOptions options, CancellationToken cancellationToken = default)
+    {
+        if (!Directory.Exists(path))
+        {
+            Directory.CreateDirectory(path);
+        }
+
+        var instance = new LsmStorageInner(path, options);
+
+        var sstFilenames = Directory.EnumerateFiles(path, "*.sst");
+
+        var ssTables = new List<SsTable>();
+
+        // TODO: [PERF] Can be parallelized
+        foreach (var sstFilename in sstFilenames)
+        {
+            var blockBuilder = new BlockBuilder(options.BlockEncoder);
+            var ssTable = await SsTable.LoadSsTableAsync(sstFilename, options.SsTableEncoder, blockBuilder, cancellationToken);
+            ssTables.Add(ssTable);
+        }
+
+        // TODO: For now we only load l0 SSTs
+        instance._state.SsTables= [ssTables];
+
+        return instance;
     }
 
     /// <summary>
@@ -39,12 +77,14 @@ public sealed class LsmStorageInner : IDisposable
         // other transaction is creating a new MemTable while we are reading variables. This is only
         // to ensure the mutable MemTable and immutable ones are consistent together.
 
-        _rwLock.EnterReadLock();
+        _currentMemTableLock.EnterReadLock();
 
         var snapshot = _state.Clone();
 
         try
         {
+            // CurrentMemTable is the only thing that needs to be locked
+            // since all other collections are immutable
             if (snapshot.CurrentMemTable.TryGet(key, out value))
             {
                 return true;
@@ -52,7 +92,7 @@ public sealed class LsmStorageInner : IDisposable
         }
         finally 
         { 
-            _rwLock.ExitReadLock(); 
+            _currentMemTableLock.ExitReadLock(); 
         }
 
         // If any new immutable MemTable(s) was created after this call then we just ignore it, as 
@@ -76,7 +116,7 @@ public sealed class LsmStorageInner : IDisposable
     /// <param name="value"></param>
     public void Put(Bytes key, Bytes value)
     {
-        _rwLock.EnterWriteLock();
+        _currentMemTableLock.EnterWriteLock();
 
         try
         {
@@ -89,7 +129,7 @@ public sealed class LsmStorageInner : IDisposable
         }
         finally
         {
-            _rwLock.ExitWriteLock();
+            _currentMemTableLock.ExitWriteLock();
         }
     }
 
@@ -99,7 +139,7 @@ public sealed class LsmStorageInner : IDisposable
     /// <param name="key"></param>
     public void Delete(Bytes key)
     {
-        _rwLock.EnterWriteLock();
+        _currentMemTableLock.EnterWriteLock();
 
         try
         {
@@ -112,7 +152,7 @@ public sealed class LsmStorageInner : IDisposable
         }
         finally
         {
-            _rwLock.ExitWriteLock();
+            _currentMemTableLock.ExitWriteLock();
         }
     }
 
@@ -124,7 +164,7 @@ public sealed class LsmStorageInner : IDisposable
     /// </remarks>
     public void ForceFreezeMemTable()
     {
-        _rwLock.EnterWriteLock();
+        _currentMemTableLock.EnterWriteLock();
 
         try
         {
@@ -132,42 +172,129 @@ public sealed class LsmStorageInner : IDisposable
         }
         finally
         {
-            _rwLock.ExitWriteLock();
+            _currentMemTableLock.ExitWriteLock();
         }
+    }
+
+    /// <summary>
+    /// Force flush the earliest created MemTable to disk.
+    /// </summary>
+    public Task ForceFlushNextImmutableMemTableAsync(CancellationToken cancellationToken = default)
+    {
+        if (_state.ImmutableMemTables.IsEmpty)
+        {
+            return Task.CompletedTask;
+        }
+
+        _immutableMemTablesLock.EnterWriteLock();
+        _level0Lock.EnterWriteLock();
+
+        try
+        {
+            return FlushNextImmutableMemTableAsync(cancellationToken);
+        }
+        finally
+        {
+            _level0Lock.ExitWriteLock();
+            _immutableMemTablesLock.ExitWriteLock();
+        }
+    }
+
+    /// <remarks>
+    /// This method is not synchronized and should only be called when the state is write-locked.
+    /// </remarks>
+    private async Task FlushNextImmutableMemTableAsync(CancellationToken token = default)
+    {
+        Debug.Assert(_immutableMemTablesLock.IsWriteLockHeld);
+        Debug.Assert(_level0Lock.IsWriteLockHeld);
+
+        _state.ImmutableMemTables = _state.ImmutableMemTables.Dequeue(out var memTableToFlush);
+
+        var builder = new SsTableBuilder(_ssTableEncoder, _blockEncoder);
+        memTableToFlush.Flush(builder);
+        memTableToFlush.Dispose();
+
+        var sstFilename = GetSstPath(memTableToFlush.Id);
+        var ssTable = await builder.BuildAsync(sstFilename, token);
+
+        _state.SsTables[0].Add(ssTable);
+    }
+
+    public string GetSstPath(long id)
+    {
+        return Path.Combine(StoragePath, $"{id.ToString(CultureInfo.InvariantCulture)}.sst");
     }
 
     public IStorageIterator CreateIterator()
     {
-        return new Iterator(this);
+        return new LsmStorageIterator(this);
     }
 
     /// <summary>
-    /// Freeze the current MemTable to an immutable MemTable. This method is not synchronized and should be called
-    /// by other synchronized methods.
+    /// Freezes the current MemTable to an immutable MemTable. This method is not synchronized and should
+    /// only be called by other synchronized methods.
     /// </summary>
     private void FreezeMemTable()
     {
-        var _previousMemTable = _state.CurrentMemTable;
-        _state = new StorageState
+        Debug.Assert(_currentMemTableLock.IsWriteLockHeld);
+
+        _immutableMemTablesLock.EnterWriteLock();
+
+        try
         {
-            CurrentMemTable = new MemTable(NextMemTableId()),
-            ImmutableMemTables = _state.ImmutableMemTables.Push(_previousMemTable)
-        };
+            var _previousMemTable = _state.CurrentMemTable;
+
+            _state = new StorageState
+            {
+                CurrentMemTable = new MemTable(IdGenerator.GetNextId()),
+                ImmutableMemTables = _state.ImmutableMemTables.Enqueue(_previousMemTable),
+                SsTables = _state.SsTables
+            };
+        }
+        finally
+        {
+            _immutableMemTablesLock.ExitWriteLock();
+        }
     }
 
     public void Dispose()
     {
-        _rwLock.Dispose();
+        if (_disposed)
+        {
+            return;
+        }
+
+        GC.SuppressFinalize(this);
+        DisposeInternal();
+
+        _disposed = true;
     }
 
-    private class Iterator : IStorageIterator
+    public void DisposeInternal()
+    {
+        _state.CurrentMemTable.Dispose();
+
+        foreach (var memTable in _state.ImmutableMemTables)
+        {
+            memTable.Dispose();
+        }
+
+        _currentMemTableLock.Dispose();
+    }
+
+    ~LsmStorageInner()
+    {
+        DisposeInternal();
+    }
+
+    private class LsmStorageIterator : IStorageIterator
     {
         private readonly ReaderWriterLockSlim _rwLock;
         private readonly StorageState _state;
 
-        public Iterator(LsmStorageInner storage)
+        public LsmStorageIterator(LsmStorageInner storage)
         {
-            _rwLock = storage._rwLock;
+            _rwLock = storage._currentMemTableLock;
             _state = storage._state;
         }
 

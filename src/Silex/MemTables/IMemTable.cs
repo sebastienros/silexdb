@@ -1,8 +1,8 @@
-﻿using System.Buffers;
+﻿namespace Silex.MemTables;
 
-namespace Silex.MemTables;
+using Silex.Tables;
 
-public interface IMemTable
+public interface IMemTable : IDisposable
 {
     long Id { get; }
 
@@ -21,4 +21,6 @@ public interface IMemTable
     void Put(Bytes key, Bytes value);
 
     IStorageIterator CreateIterator();
+
+    void Flush(SsTableBuilder builder);
 }

@@ -2,6 +2,7 @@
 
 using Silex.Blocks;
 using Silex.MemTables;
+using Silex.Tables;
 
 public class StorageOptions
 {
@@ -14,9 +15,12 @@ public class StorageOptions
     /// <summary><see cref="DefaultBlockEncoder"></summary>
     private static readonly IBlockEncoder _defaultBlockEncoder = new DefaultBlockEncoder();
 
+    /// <summary><see cref="DefaultSsTableEncoder"></summary>
+    private static readonly ISsTableEncoder _defaultSsTableEncoder = new DefaultSsTableEncoder();
+
     /// <summary>
     /// Gets or sets the maximum size of a <see cref="MemTable">. When the size is reached it is made immutable and 
-    /// can be stored as an SST.
+    /// can be stored as a level-0 SST.
     /// </summary>
     /// <value>
     /// The default value is <inheritdoc cref="_defaultTableSizeLimit"/>.
@@ -38,4 +42,12 @@ public class StorageOptions
     /// The default value is <inheritdoc cref="_defaultBlockEncoder"/>.
     /// </value>
     public IBlockEncoder BlockEncoder { get; set; } = _defaultBlockEncoder;
+
+    /// <summary>
+    /// Gets or set the <see cref="ISsTableEncoder"> to use.
+    /// </summary>
+    /// <value>
+    /// The default value is <inheritdoc cref="_defaultSsTableEncoder"/>.
+    /// </value>
+    public ISsTableEncoder SsTableEncoder { get; set; } = _defaultSsTableEncoder;
 }
