@@ -15,7 +15,6 @@ internal sealed class LockFreeQueue<T>
     public void Enqueue(T item)
     {
         Node? oldTail = null;
-        Node? oldNext = null;
 
         // Create the new node
         var node = new Node(item, null);
@@ -25,12 +24,11 @@ internal sealed class LockFreeQueue<T>
         var updatedNewLink = false;
         while (!updatedNewLink)
         {
-
             // Make local copies of the tail and its Next link, but in 
             // getting the latter use the local copy of the tail since
             // another thread may have changed the value of tail
             oldTail = Volatile.Read(ref _tail);
-            oldNext = oldTail.Next;
+            Node? oldNext = oldTail.Next;
 
             // Providing that the tail field has not changed...
             if (_tail == oldTail)

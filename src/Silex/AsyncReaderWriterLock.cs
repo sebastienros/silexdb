@@ -1,161 +1,246 @@
 ﻿namespace Silex;
 
-using Silex.Collections;
+using System.Collections.Immutable;
 
 internal class AsyncReaderWriterLock
 {
-    LockFreeQueue<Ticket> _queue = new LockFreeQueue<Ticket>();
-
-    private static readonly Task<Ticket> _noTcsReaderTicket = Task.FromResult(new Ticket(EnterLockType.Read, new TaskCompletionSource()));
-    private static readonly Task<Ticket> _noTcsWriterTicket = Task.FromResult(new Ticket(EnterLockType.Write, new TaskCompletionSource()));
-
-    // Number of active readers
-    private uint _readers;
-    
-    // Number of active writers
-    private uint _writers;
-
-    // When only readers are acquiring the lock we can skip the _locks table
-    private uint _readersOnly = 1;
+    internal volatile State _state = new(0, 0, []);
 
     public AsyncReaderWriterLock()
     {
-        
     }
+
+    public bool IsWriteLockHeld => _state.Writers != 0;
 
     public Task EnterReadLock()
     {
-        // TODO: Adding only readers (from an empty list) should not add Ticket instances to _locks
-        
-        var readers = Interlocked.Increment(ref _readers);
+        Ticket? ticket = null;
 
-        var canSkipLock = Interlocked.CompareExchange(ref _readersOnly, 0, 1);
-        
-        // There are no writers, we can add a reader without locking
-        if (canSkipLock == 1)
+        // Loop until we have managed to update the state
+        while (true)
         {
-            return _noTcsReaderTicket;
-        }
+            // Make local copy of the state. Use the local copy since
+            // another thread may have changed the value;
+            var oldState = _state;
+            var state = oldState.Clone();
+            state.Readers++;
 
-        // There is a writer, prevent the writers from being
-        // updated while we are registering a reader
-        // Double lock in case the writer was released while
-        // we were starting this method
-        if (_writers == 0)
-        {
-            return _noTcsReaderTicket;
-        }
+            // There are no writers, we can add a reader without locking
+            if (state.Writers == 0)
+            {
+                // If the swap was successful, return the result
+                if (Interlocked.CompareExchange(ref _state, state, oldState) == oldState)
+                {
+                    return Task.CompletedTask;
+                }
+                else
+                {
+                    // There was a concurrent update, retry
+                    continue;
+                }
+            }
+            else
+            {
+                // Enqueue a ticket so we can trigger the readers
+                // when the writers are done
 
-        // Record the ticket so we can trigger the readers
-        // when the writers are done
-        var tcs = new TaskCompletionSource();
-        var ticket = new Ticket(EnterLockType.Read, tcs);
-        _queue.Enqueue(ticket);
-        return tcs.Task;
+                ticket ??= new Ticket(EnterLockType.Read);
+                state.Queue = state.Queue.Enqueue(ticket);
+
+                // If the swap was successful, return the result
+                if (Interlocked.CompareExchange(ref _state, state, oldState) == oldState)
+                {
+                    return ticket.TaskCompletionSource.Task;
+                }
+            }
+        }
     }
 
     public Task ExitReadLock()
     {
-        var readers = Interlocked.Decrement(ref _readers);
-        
-        if (readers == 0)
+        // Loop until we have managed to update the state
+        while (true)
         {
-            Interlocked.Exchange(ref _readersOnly, 1);
-        }
+            // Make local copy of the state. Use the local copy since
+            // another thread may have changed the value;
+            var oldState = _state;
+            var state = oldState.Clone();
 
-        Ticket? next;
-
-        if (_queue.IsEmpty)
-        {
-            if (_readers == uint.MaxValue)
+            if (state.Readers == 0)
             {
                 throw new SynchronizationLockException($"Invalid usage of {nameof(ExitReadLock)}(), expected {nameof(EnterReadLock)}() first.");
             }
 
-            return Task.CompletedTask;
+            state.Readers--;
+            
+            // If there is nothing to unblock, return asap
+            if (state.Queue.IsEmpty)
+            {
+                if (Interlocked.CompareExchange(ref _state, state, oldState) == oldState)
+                {
+                    return Task.CompletedTask;
+                }
+                else
+                {
+                    // There was a concurrent update, retry
+                    continue;
+                }
+            }
+
+            // Fetch the next consumer in line
+            state.Queue = state.Queue.Dequeue(out var next);
+
+            // If the swap was successful, return the result
+            if (Interlocked.CompareExchange(ref _state, state, oldState) == oldState)
+            {            
+                // The tcs might already be set if the previous locks was a writer
+                if (next != null && !next.TaskCompletionSource.Task.IsCompleted)
+                {
+                    next.TaskCompletionSource.SetResult();
+                }
+
+                return Task.CompletedTask;
+            }
+
+            // Retry
         }
-
-        // Fetch the next consumer in line
-        next = _queue.Dequeue();
-
-        // The tcs might already be set if the previous locks was a writer
-        if (next != null && !next.TaskCompletionSource.Task.IsCompleted)
-        {
-            next.TaskCompletionSource.SetResult();
-        }
-
-        return Task.CompletedTask;
     }
 
     public Task EnterWriteLock()
     {
-        Interlocked.Increment(ref _writers);
+        Ticket? ticket = null;
 
-        var canWrite = Interlocked.CompareExchange(ref _readersOnly, 0, 1);
-
-        // There are no writers, we can add one
-        if (canWrite == 1)
+        // Loop until we have managed to update the state
+        while (true)
         {
-            return _noTcsWriterTicket;
-        }
+            // Make local copy of the state. Use the local copy since
+            // another thread may have changed the value;
+            var oldState = _state;
+            var state = oldState.Clone();
+            state.Writers++;
 
-        var tcs = new TaskCompletionSource();
-        var ticket = new Ticket(EnterLockType.Write, tcs);
-        _queue.Enqueue(ticket);
-        return tcs.Task;
+            // If there are no consumers return without updating the queue
+            if (state.Readers == 0 && state.Writers == 1)
+            {
+                // If the swap was successful, return the result
+                if (Interlocked.CompareExchange(ref _state, state, oldState) == oldState)
+                {
+                    return Task.CompletedTask;
+                }
+            }
+            else
+            {
+                ticket ??= new Ticket(EnterLockType.Write);
+                state.Queue = state.Queue.Enqueue(ticket);
+                
+                // If the swap was successful, return the result
+                if (Interlocked.CompareExchange(ref _state, state, oldState) == oldState)
+                {
+                    return ticket.TaskCompletionSource.Task;
+                }
+            }
+        }
     }
 
     public Task ExitWriteLock()
     {
-        var writers = Interlocked.Decrement(ref _writers);
-
-        Ticket? next = _queue.Dequeue();
-
-        if (next == null)
+        // Loop until we have managed to update the state
+        while (true)
         {
-            if (writers == uint.MaxValue)
+            // Make local copy of the state. Use the local copy since
+            // another thread may have changed the value;
+            var oldState = _state;
+            var state = oldState.Clone();
+
+            if (state.Writers == 0)
             {
                 throw new SynchronizationLockException($"Invalid usage of {nameof(ExitWriteLock)}(), expected {nameof(EnterWriteLock)}() first.");
             }
 
-            return Task.CompletedTask;
-        }
+            state.Writers--;
 
-        next.TaskCompletionSource.SetResult();
-
-        // If we unblocked a reader, unblock other ones too
-        if (next.EnterLockType == EnterLockType.Read)
-        {
-            var node = Volatile.Read(ref _queue._head).Next;
-                
-            while (node != null)
+            // If there is nothing to unblock, return asap
+            if (state.Queue.IsEmpty)
             {
-                if (node.Item?.EnterLockType != EnterLockType.Read)
+                if (Interlocked.CompareExchange(ref _state, state, oldState) == oldState)
                 {
-                    break;
+                    return Task.CompletedTask;
+                }
+                else
+                {
+                    // There was a concurrent update, retry
+                    continue;
+                }
+            }
+            
+            state.Queue = state.Queue.Dequeue(out var ticket);
+
+            // If we unblocked a reader, unblock the following ones too
+            if (!state.Queue.IsEmpty && ticket.EnterLockType == EnterLockType.Read)
+            {
+                List<Ticket>? readers = [ticket];
+
+                ticket = state.Queue.Peek();
+
+                var iterator = state.Queue.GetEnumerator();
+
+                while (iterator.MoveNext() && iterator.Current.EnterLockType == EnterLockType.Read)
+                {
+                    readers.Add(iterator.Current);
+                }                    
+
+                if (Interlocked.CompareExchange(ref _state, state, oldState) == oldState)
+                {
+                    foreach (var r in readers)
+                    {
+                        if (!r.TaskCompletionSource.Task.IsCompleted)
+                        {
+                            r.TaskCompletionSource.SetResult();
+                        }
+                    }
+
+                    return Task.CompletedTask;
                 }
 
-                node.Item.TaskCompletionSource.SetResult();
-                node = Volatile.Read(ref node.Next);
+                // If we couldn't update the state, try again
+            }
+            else
+            {
+                // Next is a write or the last to unblock
+                if (Interlocked.CompareExchange(ref _state, state, oldState) == oldState)
+                {
+                    if (!ticket.TaskCompletionSource.Task.IsCompleted)
+                    {
+                        ticket.TaskCompletionSource.SetResult();
+                    }
+                    return Task.CompletedTask;
+                }
+
+                // If failure, retry
             }
         }
-
-        return Task.CompletedTask;
     }
 
-
-    internal class Ticket(EnterLockType enterLockType, TaskCompletionSource taskCompletionSource)
+    internal class Ticket(EnterLockType enterLockType)
     {
-        public static readonly Ticket Empty = new Ticket(EnterLockType.None, new TaskCompletionSource());
-        public EnterLockType EnterLockType { get; } = enterLockType;
-        public TaskCompletionSource TaskCompletionSource { get; } = taskCompletionSource;
+        public static readonly Ticket Empty = new(EnterLockType.None);
+        public EnterLockType EnterLockType = enterLockType;
+        public TaskCompletionSource TaskCompletionSource = new();
     }
 
-internal enum EnterLockType
+    internal enum EnterLockType
     {
         None,
         Read,
         Write,
     }
 
+    internal class State(uint readers, uint writers, ImmutableQueue<Ticket> queue)
+    {
+        public uint Readers = readers;
+        public uint Writers = writers;
+        public ImmutableQueue<Ticket> Queue = queue;
+
+        public State Clone() => new(Readers, Writers, Queue);
+    }
 }

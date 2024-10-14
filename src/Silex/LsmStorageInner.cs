@@ -14,10 +14,13 @@ public sealed class LsmStorageInner : IDisposable
 {
     private static readonly ReadOnlyMemory<byte> _tombStone = new([]);
 
+    // Use different locks for each type of manipulated data such that we can lock them individually.
+    // For instance updating the MemTable should be synchronized, but not blocked by compaction.
+    // Moreover, some locks are asynchronous (level0) while other are synchronous (mem tables).
+
     private readonly ReaderWriterLockSlim _currentMemTableLock = new();
     private readonly ReaderWriterLockSlim _immutableMemTablesLock = new();
-    private readonly ReaderWriterLockSlim _level0Lock = new();
-    private readonly ReaderWriterLockSlim _sstLock = new();
+    private readonly AsyncReaderWriterLock _level0Lock = new();
 
     internal StorageState _state;
     private bool _disposed;
@@ -179,24 +182,22 @@ public sealed class LsmStorageInner : IDisposable
     /// <summary>
     /// Force flush the earliest created MemTable to disk.
     /// </summary>
-    public Task ForceFlushNextImmutableMemTableAsync(CancellationToken cancellationToken = default)
+    public async Task ForceFlushNextImmutableMemTableAsync(CancellationToken cancellationToken = default)
     {
         if (_state.ImmutableMemTables.IsEmpty)
         {
-            return Task.CompletedTask;
+            return;
         }
 
-        _immutableMemTablesLock.EnterWriteLock();
-        _level0Lock.EnterWriteLock();
+        await _level0Lock.EnterWriteLock();
 
         try
         {
-            return FlushNextImmutableMemTableAsync(cancellationToken);
+            await FlushNextImmutableMemTableAsync(cancellationToken);
         }
         finally
         {
-            _level0Lock.ExitWriteLock();
-            _immutableMemTablesLock.ExitWriteLock();
+            await _level0Lock.ExitWriteLock();
         }
     }
 
@@ -205,9 +206,8 @@ public sealed class LsmStorageInner : IDisposable
     /// </remarks>
     private async Task FlushNextImmutableMemTableAsync(CancellationToken token = default)
     {
-        Debug.Assert(_immutableMemTablesLock.IsWriteLockHeld);
         Debug.Assert(_level0Lock.IsWriteLockHeld);
-
+        
         _state.ImmutableMemTables = _state.ImmutableMemTables.Dequeue(out var memTableToFlush);
 
         var builder = new SsTableBuilder(_ssTableEncoder, _blockEncoder);
@@ -278,8 +278,6 @@ public sealed class LsmStorageInner : IDisposable
         {
             memTable.Dispose();
         }
-
-        _currentMemTableLock.Dispose();
     }
 
     ~LsmStorageInner()
@@ -289,12 +287,12 @@ public sealed class LsmStorageInner : IDisposable
 
     private class LsmStorageIterator : IStorageIterator
     {
-        private readonly ReaderWriterLockSlim _rwLock;
+        private readonly ReaderWriterLockSlim _memTableLock;
         private readonly StorageState _state;
 
         public LsmStorageIterator(LsmStorageInner storage)
         {
-            _rwLock = storage._currentMemTableLock;
+            _memTableLock = storage._currentMemTableLock;
             _state = storage._state;
         }
 
@@ -316,7 +314,7 @@ public sealed class LsmStorageInner : IDisposable
             // but we need to keep the mutable MemTable iterator around to compare with immutable ones.
             // A solution to shorten the read-lock would be to copy the mutable MemTable keys. 
 
-            _rwLock.EnterReadLock();
+            _memTableLock.EnterReadLock();
 
             try
             {
@@ -389,7 +387,7 @@ public sealed class LsmStorageInner : IDisposable
             }
             finally
             {
-                _rwLock.ExitReadLock();
+                _memTableLock.ExitReadLock();
             }
         }
     }
