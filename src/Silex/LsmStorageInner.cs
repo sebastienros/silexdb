@@ -198,7 +198,7 @@ public sealed class LsmStorageInner : IDisposable
             return;
         }
 
-        await _level0Lock.EnterWriteLock();
+        await _level0Lock.EnterWriteLockAsync();
 
         try
         {
@@ -206,7 +206,7 @@ public sealed class LsmStorageInner : IDisposable
         }
         finally
         {
-            await _level0Lock.ExitWriteLock();
+            _level0Lock.ExitWriteLock();
         }
     }
 

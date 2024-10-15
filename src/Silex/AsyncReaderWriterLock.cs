@@ -22,7 +22,7 @@ internal class AsyncReaderWriterLock
 
     public bool IsWriteLockHeld => _state.Writers != 0;
 
-    public Task EnterReadLock()
+    public Task EnterReadLockAsync()
     {
         LockCompletionSource? ticket = null;
 
@@ -66,7 +66,7 @@ internal class AsyncReaderWriterLock
         }
     }
 
-    public Task ExitReadLock()
+    public void ExitReadLock()
     {
         // Loop until we have managed to update the state
         while (true)
@@ -77,7 +77,7 @@ internal class AsyncReaderWriterLock
 
             if (oldState.Readers == 0)
             {
-                throw new SynchronizationLockException($"Invalid usage of {nameof(ExitReadLock)}(), expected {nameof(EnterReadLock)}() first.");
+                throw new SynchronizationLockException($"Invalid usage of {nameof(ExitReadLock)}(), expected {nameof(EnterReadLockAsync)}() first.");
             }
 
             var state = oldState.Clone();
@@ -88,7 +88,7 @@ internal class AsyncReaderWriterLock
             {
                 if (Interlocked.CompareExchange(ref _state, state, oldState) == oldState)
                 {
-                    return Task.CompletedTask;
+                    return;
                 }
                 else
                 {
@@ -109,14 +109,14 @@ internal class AsyncReaderWriterLock
                     next.TaskCompletionSource.SetResult();
                 }
 
-                return Task.CompletedTask;
+                return;
             }
 
             // Retry
         }
     }
 
-    public Task EnterWriteLock()
+    public Task EnterWriteLockAsync()
     {
         LockCompletionSource? ticket = null;
 
@@ -161,7 +161,7 @@ internal class AsyncReaderWriterLock
     /// code when no other clients are active.
     /// </summary>
     /// <returns><see langword="true"/> if the lock was acquired, <see langword="false"/> otherwise.</returns>
-    public ValueTask<bool> TryEnterWriteLock()
+    public ValueTask<bool> TryEnterWriteLockAsync()
     {
         // Make local copy of the state. Use the local copy since
         // another thread may have changed the value;
@@ -183,7 +183,7 @@ internal class AsyncReaderWriterLock
         return ValueTask.FromResult(false);
     }
 
-    public Task ExitWriteLock()
+    public void ExitWriteLock()
     {
         // Loop until we have managed to update the state
         while (true)
@@ -195,7 +195,7 @@ internal class AsyncReaderWriterLock
 
             if (state.Writers == 0)
             {
-                throw new SynchronizationLockException($"Invalid usage of {nameof(ExitWriteLock)}(), expected {nameof(EnterWriteLock)}() first.");
+                throw new SynchronizationLockException($"Invalid usage of {nameof(ExitWriteLock)}(), expected {nameof(EnterWriteLockAsync)}() first.");
             }
 
             state.Writers--;
@@ -205,7 +205,7 @@ internal class AsyncReaderWriterLock
             {
                 if (Interlocked.CompareExchange(ref _state, state, oldState) == oldState)
                 {
-                    return Task.CompletedTask;
+                    return;
                 }
                 else
                 {
@@ -240,7 +240,7 @@ internal class AsyncReaderWriterLock
                         }
                     }
 
-                    return Task.CompletedTask;
+                    return;
                 }
 
                 // If we couldn't update the state, try again
@@ -254,7 +254,8 @@ internal class AsyncReaderWriterLock
                     {
                         ticket.TaskCompletionSource.SetResult();
                     }
-                    return Task.CompletedTask;
+
+                    return;
                 }
 
                 // If failure, retry
