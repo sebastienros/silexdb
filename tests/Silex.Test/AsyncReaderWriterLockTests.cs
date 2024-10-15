@@ -82,6 +82,28 @@ public class AsyncReaderWriterLockTests
     }
 
     [Fact]
+    public async Task TryEnterWriteLockShouldWork()
+    {
+        var loq = new AsyncReaderWriterLock();
+
+        Assert.True(await loq.TryEnterWriteLock().AsTask().WaitAsync(_timeout));
+        await loq.ExitWriteLock().WaitAsync(_timeout);
+
+        await loq.EnterReadLock().WaitAsync(_timeout);
+        Assert.False(await loq.TryEnterWriteLock().AsTask().WaitAsync(_timeout));
+        
+        await loq.ExitReadLock().WaitAsync(_timeout);
+        Assert.True(await loq.TryEnterWriteLock().AsTask().WaitAsync(_timeout));
+        await loq.ExitWriteLock().WaitAsync(_timeout);
+
+        await loq.EnterWriteLock().WaitAsync(_timeout);
+        Assert.False(await loq.TryEnterWriteLock().AsTask().WaitAsync(_timeout));
+
+        await loq.ExitWriteLock().WaitAsync(_timeout);
+        Assert.True(await loq.TryEnterWriteLock().AsTask().WaitAsync(_timeout));
+    }
+
+    [Fact]
     public async Task WriteFollowingRead()
     {
         var loq = new AsyncReaderWriterLock();

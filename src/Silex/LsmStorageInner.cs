@@ -30,6 +30,13 @@ public sealed class LsmStorageInner : IDisposable
 
     public string StoragePath { get; }
 
+    /// <summary>
+    /// Creates an empty new <see cref="LsmStorageInner"/> that will store its tables to the specified existing path.
+    /// Any existing tables in the path are ignored, use <see cref="OpenAsync(string, StorageOptions, CancellationToken)"/> to load
+    /// an existing folder instead.
+    /// </summary>
+    /// <param name="path"></param>
+    /// <param name="options"></param>
     internal LsmStorageInner(string path, StorageOptions options)
     {
         StoragePath = path;
@@ -184,6 +191,8 @@ public sealed class LsmStorageInner : IDisposable
     /// </summary>
     public async Task ForceFlushNextImmutableMemTableAsync(CancellationToken cancellationToken = default)
     {
+        // No need to acquire a lock here, we do a double-check locking within the actual flush too.
+
         if (_state.ImmutableMemTables.IsEmpty)
         {
             return;
@@ -207,7 +216,13 @@ public sealed class LsmStorageInner : IDisposable
     private async Task FlushNextImmutableMemTableAsync(CancellationToken token = default)
     {
         Debug.Assert(_level0Lock.IsWriteLockHeld);
-        
+
+        // Second check of the double-check lock. First check is done in ForceFlushNextImmutableMemTableAsync
+        if (_state.ImmutableMemTables.IsEmpty)
+        {
+            return;
+        }
+
         _state.ImmutableMemTables = _state.ImmutableMemTables.Dequeue(out var memTableToFlush);
 
         var builder = new SsTableBuilder(_ssTableEncoder, _blockEncoder);
