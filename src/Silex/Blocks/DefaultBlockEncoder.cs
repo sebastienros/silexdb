@@ -41,6 +41,8 @@ namespace Silex.Blocks;
 /// </summary>
 public class DefaultBlockEncoder : IBlockEncoder
 {
+    public ushort BlockSize => (ushort)4.KiB();
+
     public Block Decode(ReadOnlyMemory<byte> buffer)
     {
         var binaryReader = new EncoderBinaryReader(buffer, 0);

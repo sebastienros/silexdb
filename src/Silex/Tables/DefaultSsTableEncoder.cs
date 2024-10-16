@@ -21,8 +21,6 @@ namespace Silex.Tables;
 /// </summary>
 public class DefaultSsTableEncoder : ISsTableEncoder
 {
-    public ushort BlockSize => (ushort)4.KiB();
-
     public IReadOnlyList<BlockMetadata> DecodeMetadata(ReadOnlyMemory<byte> buffer, int offset)
     {
         var binaryReader = new EncoderBinaryReader(buffer, offset);

@@ -6,7 +6,7 @@ public class AsyncReaderWriterLockTests
 {
     private readonly TimeSpan _timeout = TimeSpan.FromSeconds(1);
 
-    private readonly ITestOutputHelper? _output;
+    private readonly ITestOutputHelper? _output = null;
 
     public AsyncReaderWriterLockTests(ITestOutputHelper _)
     {

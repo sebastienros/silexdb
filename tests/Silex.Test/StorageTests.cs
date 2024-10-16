@@ -287,7 +287,7 @@ public class StorageTests
     {
         var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
 
-        var storage = await LsmStorageInner.OpenAsync(tempFolder, _defaultStorageOptions);
+        await LsmStorage.OpenAsync(tempFolder, _defaultStorageOptions);
 
         Assert.True(Directory.Exists(tempFolder));
 
@@ -299,14 +299,14 @@ public class StorageTests
     {
         var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
 
-        var storage = await LsmStorageInner.OpenAsync(tempFolder, _defaultStorageOptions);
+        var storage = await LsmStorage.OpenAsync(tempFolder, _defaultStorageOptions);
 
         storage.Put('e', new byte[] { 4 });
 
         // Don't freeze current MemTable
 
         // Nothing to flush
-        await storage.ForceFlushNextImmutableMemTableAsync();
+        await storage._inner.ForceFlushNextImmutableMemTableAsync();
 
         Assert.True(Directory.Exists(tempFolder));
         Assert.Empty(Directory.EnumerateFiles(tempFolder, "*.sst"));
@@ -319,13 +319,58 @@ public class StorageTests
     {
         var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
 
-        var storage = await LsmStorageInner.OpenAsync(tempFolder, _defaultStorageOptions);
+        var storage = await LsmStorage.OpenAsync(tempFolder, _defaultStorageOptions);
 
         storage.Put('e', new byte[] { 4 });
-        storage.ForceFreezeMemTable();
-        await storage.ForceFlushNextImmutableMemTableAsync();
+        storage._inner.ForceFreezeMemTable();
+        await storage._inner.ForceFlushNextImmutableMemTableAsync();
 
         Assert.True(Directory.Exists(tempFolder));
+        Assert.Single(Directory.EnumerateFiles(tempFolder, "*.sst"));
+
+        Directory.Delete(tempFolder, true);
+    }
+
+    [Fact]
+    public async Task CompacterShouldCreateSst()
+    {
+        // When the number of mem tables is higher than MemTableMaxCount it should
+        // flush the oldest mem table to disk
+
+        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        var options = new StorageOptions { MemTableMaxCount = 2 };
+        var storage = await LsmStorage.OpenAsync(tempFolder, options);
+
+        storage.Put('a', 1);
+        storage._inner.ForceFreezeMemTable();
+
+        await Task.Delay(100);
+        Assert.Empty(Directory.EnumerateFiles(tempFolder, "*.sst"));
+        Assert.Single(storage._inner._state.ImmutableMemTables);
+        Assert.True(storage._inner._state.ImmutableMemTables.Peek().TryGet('a', out _));
+        Assert.False(storage._inner._state.ImmutableMemTables.Peek().TryGet('b', out _));
+
+        storage.Put('b', 2);
+        storage._inner.ForceFreezeMemTable();
+
+        await Task.Delay(100);
+        Assert.Single(Directory.EnumerateFiles(tempFolder, "*.sst"));
+        Assert.Single(storage._inner._state.ImmutableMemTables);
+        Assert.False(storage._inner._state.ImmutableMemTables.Peek().TryGet('a', out _));
+        Assert.True(storage._inner._state.ImmutableMemTables.Peek().TryGet('b', out _));
+
+        Directory.Delete(tempFolder, true);
+    }
+
+
+    [Fact]
+    public async Task CloseAsyncShouldFlushToDisk()
+    {
+        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        var storage = await LsmStorage.OpenAsync(tempFolder, _defaultStorageOptions);
+
+        storage.Put('a', 1);
+        await storage.CloseAsync();
         Assert.Single(Directory.EnumerateFiles(tempFolder, "*.sst"));
 
         Directory.Delete(tempFolder, true);

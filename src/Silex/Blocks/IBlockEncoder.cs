@@ -1,5 +1,3 @@
-using System.Buffers;
-
 namespace Silex.Blocks;
 
 /// <summary>
@@ -20,6 +18,10 @@ public interface IBlockEncoder
 
     ReadOnlyMemory<byte> DecodeValue(ReadOnlyMemory<byte> data, int offset, int length);
 
+    /// <summary>
+    /// The size that a <see cref="Block"/> takes on the disk for this <see cref="ISsTableEncoder" />.
+    /// </summary>
+    ushort BlockSize { get; }
 
     int EstimateSize(Bytes key, Bytes value);
 }

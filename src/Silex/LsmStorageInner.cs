@@ -4,13 +4,14 @@ using Silex.Tables;
 using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.CompilerServices;
+using static Silex.AsyncReaderWriterLock;
 
 namespace Silex;
 
 /// <summary>
 /// The inner storage engine. It handles thread-safety for the <see cref="StorageState"/>.
 /// </summary>
-public sealed class LsmStorageInner : IDisposable
+internal sealed class LsmStorageInner : IDisposable
 {
     private static readonly ReadOnlyMemory<byte> _tombStone = new([]);
 
@@ -44,33 +45,6 @@ public sealed class LsmStorageInner : IDisposable
         _blockEncoder = options.BlockEncoder;
         _ssTableEncoder = options.SsTableEncoder;
         _memTableSizeLimit = options.MemTableSizeLimit;
-    }
-
-    public static async Task<LsmStorageInner> OpenAsync(string path, StorageOptions options, CancellationToken cancellationToken = default)
-    {
-        if (!Directory.Exists(path))
-        {
-            Directory.CreateDirectory(path);
-        }
-
-        var instance = new LsmStorageInner(path, options);
-
-        var sstFilenames = Directory.EnumerateFiles(path, "*.sst");
-
-        var ssTables = new List<SsTable>();
-
-        // TODO: [PERF] Can be parallelized
-        foreach (var sstFilename in sstFilenames)
-        {
-            var blockBuilder = new BlockBuilder(options.BlockEncoder);
-            var ssTable = await SsTable.LoadSsTableAsync(sstFilename, options.SsTableEncoder, blockBuilder, cancellationToken);
-            ssTables.Add(ssTable);
-        }
-
-        // TODO: For now we only load l0 SSTs
-        instance._state.SsTables= [ssTables];
-
-        return instance;
     }
 
     /// <summary>
@@ -174,6 +148,20 @@ public sealed class LsmStorageInner : IDisposable
     /// </remarks>
     public void ForceFreezeMemTable()
     {
+        _currentMemTableLock.EnterReadLock();
+
+        try
+        {
+            if (_state.CurrentMemTable.Size == 0)
+            {
+                return;
+            }
+        }
+        finally
+        {
+            _currentMemTableLock.ExitReadLock();
+        }
+
         _currentMemTableLock.EnterWriteLock();
 
         try

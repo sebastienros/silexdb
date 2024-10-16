@@ -20,8 +20,15 @@ public class BlockBuilder
 
     public bool Add(Bytes key, Bytes value)
     {
+        var size = _blockEncoder.EstimateSize(key, value);
+
+        if (_estimatedSize + size > _blockEncoder.BlockSize)
+        {
+            return false;
+        }
+
         _blockEntries.Add(new(key, value));
-        _estimatedSize += _blockEncoder.EstimateSize(key, value);
+        _estimatedSize += size;
 
         return true;    
     }

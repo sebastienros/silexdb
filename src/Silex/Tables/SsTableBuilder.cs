@@ -29,14 +29,22 @@ public class SsTableBuilder
             _firstKey = key;
         }
 
-        _blockBuilder.Add(key, value);
-
-        _lastKey = key;
-        
-        if (_blockBuilder.EstimatedSize >= _tableEncoder.BlockSize)
+        if (_blockBuilder.Add(key, value))
         {
-            FinishBlock();
+            _lastKey = key;
+            return;
         }
+
+        // There was not enough space in the current block for the data, start a new one
+        FinishBlock();
+
+        if (!_blockBuilder.Add(key, value))
+        {
+            throw new InvalidOperationException("Data is too big for the storage.");
+        }
+
+        _firstKey = key;
+        _lastKey = key;
     }
 
     public long EstimatedSize => _offset;
