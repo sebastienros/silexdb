@@ -1,4 +1,5 @@
-﻿using Silex.Blocks;
+﻿using Microsoft.Extensions.Caching.Memory;
+using Silex.Blocks;
 using Silex.MemTables;
 using Silex.Tables;
 using System.Diagnostics;
@@ -27,6 +28,8 @@ internal sealed class LsmStorageInner : IDisposable
     private readonly IBlockEncoder _blockEncoder;
     private readonly ISsTableEncoder _ssTableEncoder;
     private readonly long _memTableSizeLimit;
+    private readonly IMemoryCache _blockCache;
+    private readonly MemoryCacheEntryOptions _cacheEntryOptions;
 
     public string StoragePath { get; }
 
@@ -44,21 +47,27 @@ internal sealed class LsmStorageInner : IDisposable
         _blockEncoder = options.BlockEncoder;
         _ssTableEncoder = options.SsTableEncoder;
         _memTableSizeLimit = options.MemTableSizeLimit;
+        _blockCache = new MemoryCache(new MemoryCacheOptions { SizeLimit = options.BlockCacheSizeLimit });
+        _cacheEntryOptions = new MemoryCacheEntryOptions
+        {
+            AbsoluteExpirationRelativeToNow = options.BlockCacheAbsoluteExpiration == TimeSpan.Zero ? null : options.BlockCacheAbsoluteExpiration,
+            SlidingExpiration = options.BlockCacheSlidingExpiration == TimeSpan.Zero ? null : options.BlockCacheSlidingExpiration
+        };
     }
 
     /// <summary>
     /// Gets the value associated with the specified key.
     /// </summary>
     /// <param name="key"></param>
-    /// <returns><c>true</c> if the key was found, <c>false</c> otherwise.</returns>
-    public bool TryGet(Bytes key, out Bytes value)
+    /// <returns><see cref="Bytes.Empty"/> if the key was not found.</returns>
+    public async ValueTask<Bytes> GetAsync(Bytes key, CancellationToken cancellationToken = default)
     {
         // The immutable MemTables can be accessed without lock since they are frozen (read-only),
         // and the collection won't be changed FreezeMemTable substitute the collection when it's altered.
 
         // Access the current and immutable MemTables in a read-lock to ensure no
         // other transaction is creating a new MemTable while we are reading variables. This is only
-        // to ensure the mutable MemTable and immutable ones are consistent together.
+        // to ensure the mutable MemTable and immutable ones are coherent.
 
         _currentMemTableLock.EnterReadLock();
 
@@ -68,9 +77,9 @@ internal sealed class LsmStorageInner : IDisposable
         {
             // CurrentMemTable is the only thing that needs to be locked
             // since all other collections are immutable
-            if (snapshot.CurrentMemTable.TryGet(key, out value))
+            if (snapshot.CurrentMemTable.TryGet(key, out var result))
             {
-                return true;
+                return result;
             }
         }
         finally 
@@ -81,15 +90,68 @@ internal sealed class LsmStorageInner : IDisposable
         // If any new immutable MemTable(s) was created after this call then we just ignore it, as 
         // the newly created MemTable(s).
 
-        foreach (var memTable in snapshot.ImmutableMemTables)
+        try
         {
-            if (memTable.TryGet(key, out value))
+            _immutableMemTablesLock.EnterReadLock();
+
+            foreach (var memTable in snapshot.ImmutableMemTables)
             {
-                return true;
+                if (memTable.TryGet(key, out var result))
+                {
+                    return result;
+                }
             }
         }
+        finally
+        {
+            _immutableMemTablesLock.ExitReadLock();
+        }
 
-        return false;
+        // Process L0 tables in reverse order since the last one to be flush is at the end
+
+        try
+        {
+            await _level0Lock.EnterReadLockAsync();
+
+            var l0 = snapshot.SsTables[0];
+
+            // TODO: this can be parallelized, multiple table could return the value, the one 
+            // from the most recent table would be used.
+
+            for (var i = l0.Count - 1; i >= 0; i--)
+            {
+                var table = l0[i];
+
+                // The key could be in this table, if not will go to the next one
+                if (key >= table.FirstKey && key <= table.LastKey)
+                {
+                    foreach (var metadata in table.BlockMetadata)
+                    {
+                        if (key >= metadata.FirstKey && key <= metadata.LastKey)
+                        {
+                            var block = await table.ReadBlockCachedAsync(metadata.Index, _blockCache, _cacheEntryOptions, cancellationToken);
+
+                            if (block != null)
+                            {
+                                var value = block.GetValue(key);
+                                if (!value.IsEmpty)
+                                {
+                                    return new Bytes(value);
+                                }
+                            }
+                        }
+                    }
+
+                    return default;
+                }
+            }
+        }
+        finally
+        {
+            _level0Lock.ExitReadLock();
+        }
+
+        return default;
     }
 
     /// <summary>

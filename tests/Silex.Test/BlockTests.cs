@@ -110,6 +110,29 @@ public class BlockTests
     }
 
     [Fact]
+    public void TryGetValueShouldReturnCorrectValues()
+    {
+        var blockBuilder = new BlockBuilder(new DefaultBlockEncoder());
+
+        var allKeys = new int[] { 1, 3, 5, 6, 7 };
+        foreach (var i in allKeys)
+        {
+            blockBuilder.Add(i, i*i);
+        }
+
+        var block = blockBuilder.BuildBlock();
+
+        // Assert
+
+        foreach (var i in allKeys)
+        {
+            var result = block.GetValue(i);
+            Assert.False(result.IsEmpty);
+            Assert.Equal(new Bytes(i * i), new Bytes(result));
+        }
+    }
+
+    [Fact]
     public void ShouldNotAcceptEntriesWhenFull()
     {
         var blockBuilder = new BlockBuilder(new DefaultBlockEncoder());

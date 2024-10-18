@@ -15,7 +15,7 @@ public class StorageTests
     }
 
     [Fact]
-    public void CanPutArray()
+    public async Task CanPutArray()
     {
         var storage = new LsmStorageInner(Path.GetTempPath(), _defaultStorageOptions);
 
@@ -23,14 +23,14 @@ public class StorageTests
         byte[] value = [4, 5, 6];
 
         storage.Put(key, value);
-        _ = storage.TryGet(key, out var result);
+        var result = await storage.GetAsync(key);
 
         Assert.Equal(value, result);
         Assert.Equal(6, storage._state.CurrentMemTable.Size);
     }
 
     [Fact]
-    public void PutValueIsCopied()
+    public async Task PutValueIsCopied()
     {
         var storage = new LsmStorageInner(Path.GetTempPath(), _defaultStorageOptions);
 
@@ -41,8 +41,8 @@ public class StorageTests
         storage.Put(key1, value);
         storage.Put(key2, value);
 
-        _ = storage.TryGet(key1, out var result1);
-        _ = storage.TryGet(key2, out var result2);
+        var result1 = await storage.GetAsync(key1);
+        var result2 = await storage.GetAsync(key2);
 
         Assert.Equal(value, result1);
         Assert.Equal(value, result2);
@@ -50,17 +50,16 @@ public class StorageTests
     }
 
     [Fact]
-    public void DeleteShouldStoreTombStone()
+    public async Task DeleteShouldStoreTombStone()
     {
         var storage = new LsmStorageInner(Path.GetTempPath(), _defaultStorageOptions);
 
         byte[] key = [1, 2, 3];
 
         storage.Delete(key);
-        var deleted = storage.TryGet(key, out var result);
+        var result = await storage.GetAsync(key);
 
-        Assert.True(deleted);
-        Assert.Equal(0, result.Length);
+        Assert.True(result.IsEmpty);
         Assert.Equal(3, storage._state.CurrentMemTable.Size);
     }
 
@@ -89,7 +88,7 @@ public class StorageTests
     }
 
     [Fact]
-    public void GetFromImmutableMemTables()
+    public async Task GetFromImmutableMemTables()
     {
         var memTableSizeLimit = 100;
         int valueSize = 10;
@@ -113,28 +112,25 @@ public class StorageTests
         for (var i = 1; i <= entries; i++)
         {
             var expectedValue = dictionary[i];
-            var result = storage.TryGet(i, out var actualValue);
+            var actualValue = await storage.GetAsync(i);
 
-            Assert.True(result);
             Assert.Equal(expectedValue, actualValue);
         }            
     }
 
     [Fact]
-    public void DeletedEntriesShouldAppearAfterPuts ()
+    public async Task DeletedEntriesShouldAppearAfterPuts ()
     {
         var storage = FillImmutableMemTables();
 
         Bytes key = 10;
 
-        var current = storage.TryGet(key, out var result);
-        Assert.True(current);
+        var result = await storage.GetAsync(key);
         Assert.Equal(10, result.Length);
 
         storage.Delete(key);
-        var deleted = storage.TryGet(key, out result);
+        result = await storage.GetAsync(key);
 
-        Assert.True(deleted);
         Assert.Equal(0, result.Length);
     }
 
@@ -189,8 +185,7 @@ public class StorageTests
 
         await Parallel.ForAsync(0, levelOfConcurrency, timeout, (i, cancellationToken) =>
         {
-            Work(storage);
-            return ValueTask.CompletedTask;
+            return Work(storage);
         });
 
         var allEntries = iterator.EnumerateAsync().ToBlockingEnumerable().ToList();
@@ -209,7 +204,7 @@ public class StorageTests
         foreach (var entry in allEntries)
         {
             var key = entry.Key.Span.Length == 0 ? "0" : BinaryPrimitives.ReadUInt32LittleEndian(entry.Key.Span).ToString(CultureInfo.InvariantCulture);
-            storage.TryGet(entry.Key, out var entryValue);
+            var entryValue = await storage.GetAsync(entry.Key);
             var value = entryValue.Length == 0 ? "del" : BinaryPrimitives.ReadUInt64LittleEndian(entryValue.Span).ToString(CultureInfo.InvariantCulture);
 
             _output?.WriteLine($"{key} -> {value}");
@@ -217,7 +212,7 @@ public class StorageTests
 
         Assert.True(allEntries.Count <= maxKeysValue);
 
-        void Work(LsmStorageInner storage)
+        async ValueTask Work(LsmStorageInner storage)
         {
             for (var i = 0; i < iterations; i++)
             {
@@ -239,7 +234,7 @@ public class StorageTests
                         break;
 
                     case 1: // Get
-                        storage.TryGet(id, out var actualValue);
+                        var actualValue = await storage.GetAsync(id);
                         break;
 
                     case 2: // Delete

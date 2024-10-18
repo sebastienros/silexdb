@@ -32,7 +32,7 @@ internal struct StorageState
     /// directly created as a result of MemTable flush. Other levels are the result of compaction,
     /// (either tiered or leveled).
     /// </remarks>
-    public List<List<SsTable>> SsTables { get; set; } = [];
+    public List<List<SsTable>> SsTables { get; set; } = [[]];
 
     public StorageState Clone()
     {

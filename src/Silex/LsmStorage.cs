@@ -45,9 +45,9 @@ public class LsmStorage
     }
 
     /// <inheritdoc cref="LsmStorageInner.TryGet(Bytes, out Bytes)"/>
-    public bool TryGet(Bytes key, out Bytes value)
+    public ValueTask<Bytes> GetAsync(Bytes key)
     {
-        return _inner.TryGet(key, out value);
+        return _inner.GetAsync(key);
     }
 
     /// <inheritdoc cref="LsmStorageInner.Put(Bytes, Bytes)"/>

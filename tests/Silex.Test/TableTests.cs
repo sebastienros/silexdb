@@ -156,8 +156,8 @@ public class TableTests
         var table = await builder.BuildAsync(tempFilename);
 
         Assert.Single(table.BlockMetadata);
-        using var block1 = await table.ReadBlockCachedAsync(0, memoryCache);
-        using var block2 = await table.ReadBlockCachedAsync(0, memoryCache);
+        using var block1 = await table.ReadBlockCachedAsync(0, memoryCache, new());
+        using var block2 = await table.ReadBlockCachedAsync(0, memoryCache, new());
         Assert.Equal(new byte[] { 2, 7, 0, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, block1!.Memory);
         Assert.Equal(new byte[] { 2, 7, 0, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, block2!.Memory);
         Assert.Same(block1, block2);
@@ -184,7 +184,7 @@ public class TableTests
 
         for (var i = 0; i < 100; i++)
         {
-            blocks.Add(table.ReadBlockCachedAsync(0, memoryCache));
+            blocks.Add(table.ReadBlockCachedAsync(0, memoryCache, new()));
         }
 
         await Task.WhenAll(blocks);

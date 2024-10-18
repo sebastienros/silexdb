@@ -4,6 +4,7 @@ using Silex;
 using System;
 using System.Buffers;
 using System.Collections.Generic;
+using static System.Runtime.InteropServices.JavaScript.JSType;
 
 public class Block : IDisposable
 {
@@ -38,6 +39,33 @@ public class Block : IDisposable
     public RecordLocation GetEntry(int offset)
     {
         return _encoder.DecodeEntry(Memory, offset);
+    }
+
+    public ReadOnlySpan<byte> GetValue(Bytes key)
+    {
+        double start = 0;
+        var end = Offsets.Count - 1;
+
+        while (start <= end)
+        {
+            var m = (int)Math.Round((start + end) / 2);
+
+            var entry = GetEntry(Offsets[m]);
+
+            switch (Bytes.Comparer.Compare(key, entry.Key))
+            {
+                case 0:
+                    return GetValue(entry);
+                case > 0:
+                    start = m + 1;
+                    break;
+                case < 0:
+                    end = m - 1;
+                    break;
+            }
+        }
+
+        return default;
     }
 
     /// <summary>

@@ -63,9 +63,15 @@ public class SsTable
         return block;
     }
 
-    public Task<Block?> ReadBlockCachedAsync(int index, MemoryCache blockCache, CancellationToken cancellationToken = default)
+    public Task<Block?> ReadBlockCachedAsync(int index, IMemoryCache blockCache, MemoryCacheEntryOptions cacheEntryOptions, CancellationToken cancellationToken = default)
     {
         var key = new BlockCacheKey(_id, index);
+
+        // Try without the dispatcher first since this is a cheap lookup
+        if (blockCache.TryGetValue(key, out var block))
+        {
+            return Task.FromResult(block as Block);
+        }
 
         // Use a dispatcher to prevent cache stampede
         return _dispatcher.ScheduleAsync(key, (key) =>
@@ -77,6 +83,7 @@ public class SsTable
                 if (block != null)
                 {
                     entry.SetSize(block.Memory.Length);
+                    entry.SetOptions(cacheEntryOptions);
                 }
 
                 return block;

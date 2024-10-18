@@ -21,6 +21,15 @@ public class StorageOptions
     /// <value><see cref="DefaultSsTableEncoder"></value>
     private static readonly ISsTableEncoder _defaultSsTableEncoder = new DefaultSsTableEncoder();
 
+    /// <value>1MiB</value>
+    private static readonly long _defaultBlockCacheSizeLimit = 1.MiB();
+
+    /// <value>5 minutes</value>
+    private static readonly TimeSpan _defaultBlockCacheSlidingExpiration = 5.Minute();
+
+    /// <value>1 day</value>
+    private static readonly TimeSpan _defaultBlockCacheAbsoluteExpiration = 1.Day();
+
     /// <value>50ms</value>
     private static readonly TimeSpan _defaultFlushPeriod = TimeSpan.FromMilliseconds(50);
 
@@ -74,4 +83,29 @@ public class StorageOptions
     /// The default value is <inheritdoc cref="_defaultFlushPeriod"/>.
     /// </value>
     public TimeSpan FlushPeriod { get; set; } = _defaultFlushPeriod;
+
+    /// <summary>
+    /// Gets or sets the size of the block cache.
+    /// </summary>
+    /// <remarks>A block is the unit of data that is stored on the disk at once.</remarks>
+    /// <value>
+    /// The default value is <inheritdoc cref="_defaultBlockCacheSizeLimit"/>.
+    /// </value>
+    public long BlockCacheSizeLimit { get; set; } =_defaultBlockCacheSizeLimit;
+
+    /// <summary>
+    /// Gets or sets how long a cache entry can be inactive (e.g. not accessed) before it will be removed. This will not extend the entry lifetime beyond the absolute expiration (if set).
+    /// </summary>
+    /// <value>
+    /// The default value is <inheritdoc cref="_defaultBlockCacheSlidingExpiration"/>. Use <c>TimeSpan.Zero</c> (<c>"00:00:00"</c>) to disable sliding expiration.
+    /// </value>
+    public TimeSpan BlockCacheSlidingExpiration { get; set; } = _defaultBlockCacheSlidingExpiration;
+
+    /// <summary>
+    /// Gets or sets an absolute expiration time, relative to when the cache is added, even if it is effectively accessed.
+    /// </summary>
+    /// <value>
+    /// The default value is <inheritdoc cref="_defaultBlockCacheAbsoluteExpiration"/>. Use <c>TimeSpan.Zero</c> (<c>"00:00:00"</c>) to disable absolute expiration.
+    /// </value>
+    public TimeSpan BlockCacheAbsoluteExpiration { get; set; } = _defaultBlockCacheAbsoluteExpiration;
 }
