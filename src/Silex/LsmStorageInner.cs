@@ -4,7 +4,6 @@ using Silex.Tables;
 using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.CompilerServices;
-using static Silex.AsyncReaderWriterLock;
 
 namespace Silex;
 
@@ -179,47 +178,47 @@ internal sealed class LsmStorageInner : IDisposable
     /// </summary>
     public async Task ForceFlushNextImmutableMemTableAsync(CancellationToken cancellationToken = default)
     {
-        // No need to acquire a lock here, we do a double-check locking within the actual flush too.
-
         if (_state.ImmutableMemTables.IsEmpty)
         {
             return;
         }
 
-        await _level0Lock.EnterWriteLockAsync();
+        _immutableMemTablesLock.EnterWriteLock();
+
+        IMemTable memTableToFlush;
 
         try
         {
-            await FlushNextImmutableMemTableAsync(cancellationToken);
+            // double-check lock
+            if (_state.ImmutableMemTables.IsEmpty)
+            {
+                return;
+            }
+
+            _state.ImmutableMemTables = _state.ImmutableMemTables.Dequeue(out memTableToFlush);
         }
         finally
         {
-            _level0Lock.ExitWriteLock();
+            _immutableMemTablesLock.ExitWriteLock();
         }
-    }
-
-    /// <remarks>
-    /// This method is not synchronized and should only be called when the state is write-locked.
-    /// </remarks>
-    private async Task FlushNextImmutableMemTableAsync(CancellationToken token = default)
-    {
-        Debug.Assert(_level0Lock.IsWriteLockHeld);
-
-        // Second check of the double-check lock. First check is done in ForceFlushNextImmutableMemTableAsync
-        if (_state.ImmutableMemTables.IsEmpty)
-        {
-            return;
-        }
-
-        _state.ImmutableMemTables = _state.ImmutableMemTables.Dequeue(out var memTableToFlush);
 
         var builder = new SsTableBuilder(_ssTableEncoder, _blockEncoder);
         memTableToFlush.Flush(builder);
 
         var sstFilename = GetSstPath(memTableToFlush.Id);
-        var ssTable = await builder.BuildAsync(sstFilename, token);
+        var ssTable = await builder.BuildAsync(sstFilename, cancellationToken);
 
-        _state.SsTables[0].Add(ssTable);
+        await _level0Lock.EnterWriteLockAsync();
+
+        try
+        {
+            _state.SsTables[0].Add(ssTable);
+        }
+        finally
+        {
+            _level0Lock.ExitWriteLock();
+        }
+
         memTableToFlush.Dispose();
     }
 
