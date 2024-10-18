@@ -1,4 +1,5 @@
-﻿using System.Buffers;
+﻿using Silex.Buffers;
+using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Text;
@@ -10,47 +11,37 @@ namespace Silex;
 /// <summary>
 /// Represents a set of bytes.
 /// </summary>
-/// <remarks>
-/// If the backing field implements <see cref="IMemoryOwner{bytes}"/> it can be retrieved with <see cref="Owner"/>.
-/// </remarks>
 [DebuggerDisplay($"{{{nameof(GetDebuggerDisplay)}(),nq}}")]
 public readonly struct Bytes : IEquatable<Bytes>, IComparable<Bytes>
 {
-    private readonly ReadOnlyMemory<byte> _data;
-    private readonly IMemoryOwner<byte>? _owner;
+    private readonly MemoryOwner<byte> _data;
 
     public static readonly IComparer<Bytes> Comparer = BytesComparer.Instance;
 
     public Bytes(Memory<byte> value)
     {
-        _data = value;
-    }
-
-    public Bytes(IMemoryOwner<byte> value, int length)
-    {
-        _data = value.Memory[..length];
-        _owner = value;
+        _data = MemoryOwner<byte>.RentCopy(value.Span);
     }
 
     public Bytes(ReadOnlyMemory<byte> value)
     {
-        _data = value;
+        _data = MemoryOwner<byte>.RentCopy(value.Span);
     }
 
     public Bytes(byte value)
     {
-        _data = new byte[] { value };
+        _data = MemoryOwner<byte>.Rent(1);
+        _data.Span[0] = value;
     }
 
-    public Bytes(byte value, params byte[] bytes)
+    public Bytes(params byte[] bytes)
     {
-        byte[] bs = [value, ..bytes];
-        _data = bs;
+        _data = MemoryOwner<byte>.RentCopy(bytes);
     }
 
-    public Bytes(byte[] value)
+    public Bytes(byte[] value, int start, int length)
     {
-        _data = value;
+        _data = MemoryOwner<byte>.RentCopy(value.AsSpan(start, length));
     }
 
     /// <summary>
@@ -61,29 +52,25 @@ public readonly struct Bytes : IEquatable<Bytes>, IComparable<Bytes>
     /// </remarks>
     public Bytes(string value)
     {
-        _data = Encoding.UTF8.GetBytes(value);
+        _data = MemoryOwner<byte>.Rent(Encoding.UTF8.GetByteCount(value));
+        Encoding.UTF8.GetBytes(value, _data.Span);
     }
 
     /// <summary>
     /// Create a new <see cref="Bytes"/> instance using the UTF-8 bytes from a <see cref="ReadOnlySpan<byte>"/>.
     /// </summary>
-    /// <remarks>
-    /// This allocates a new <see cref="byte[]"/> instance.
-    /// </remarks>
     public Bytes(ReadOnlySpan<byte> value)
     {
-        _data = value.ToArray();
+        _data = MemoryOwner<byte>.RentCopy(value);
     }
 
     /// <summary>
     /// Create a new <see cref="Bytes"/> instance from an <see cref="short">.
     /// </summary>
-    /// <remarks>
-    /// This allocates a new <see cref="byte[]"/> instance.
-    /// </remarks>
     public Bytes(short value)
     {
-        _data = BitConverter.GetBytes(value);
+        _data = MemoryOwner<byte>.Rent(sizeof(short));
+        BinaryPrimitives.WriteInt16LittleEndian(_data.Span, value);
     }
 
     /// <summary>
@@ -91,7 +78,8 @@ public readonly struct Bytes : IEquatable<Bytes>, IComparable<Bytes>
     /// </summary>
     public Bytes(ushort value)
     {
-        _data = BitConverter.GetBytes(value);
+        _data = MemoryOwner<byte>.Rent(sizeof(ushort));
+        BinaryPrimitives.WriteUInt16LittleEndian(_data.Span, value);
     }
 
     /// <summary>
@@ -99,7 +87,8 @@ public readonly struct Bytes : IEquatable<Bytes>, IComparable<Bytes>
     /// </summary>
     public Bytes(int value)
     {
-        _data = BitConverter.GetBytes(value);
+        _data = MemoryOwner<byte>.Rent(sizeof(int));
+        BinaryPrimitives.WriteInt32LittleEndian(_data.Span, value);
     }
 
     /// <summary>
@@ -107,7 +96,8 @@ public readonly struct Bytes : IEquatable<Bytes>, IComparable<Bytes>
     /// </summary>
     public Bytes(uint value)
     {
-        _data = BitConverter.GetBytes(value);
+        _data = MemoryOwner<byte>.Rent(sizeof(uint));
+        BinaryPrimitives.WriteUInt32LittleEndian(_data.Span, value);
     }
 
     /// <summary>
@@ -115,7 +105,8 @@ public readonly struct Bytes : IEquatable<Bytes>, IComparable<Bytes>
     /// </summary>
     public Bytes(long value)
     {
-        _data = BitConverter.GetBytes(value);
+        _data = MemoryOwner<byte>.Rent(sizeof(long));
+        BinaryPrimitives.WriteInt64LittleEndian(_data.Span, value);
     }
 
     /// <summary>
@@ -123,17 +114,13 @@ public readonly struct Bytes : IEquatable<Bytes>, IComparable<Bytes>
     /// </summary>
     public Bytes(ulong value)
     {
-        _data = BitConverter.GetBytes(value);
+        _data = MemoryOwner<byte>.Rent(sizeof(ulong));
+        BinaryPrimitives.WriteUInt64LittleEndian(_data.Span, value);
     }
 
     public readonly ReadOnlySpan<byte> Span => _data.Span;
 
-    public readonly ReadOnlyMemory<byte> Memory => _data;
-
-    /// <summary>
-    /// If the backing store is a <see cref="IMemoryOwner{byte}"/> returns its value, <see langword="null"/> otherwise.
-    /// </summary>
-    public readonly IMemoryOwner<byte>? Owner => _owner;
+    public readonly ReadOnlyMemory<byte> Memory => _data.Memory;
 
     /// <summary>
     /// Returns an empty <see cref="Bytes"/>.
@@ -143,16 +130,16 @@ public readonly struct Bytes : IEquatable<Bytes>, IComparable<Bytes>
     /// <summary>
     /// The number of bytes.
     /// </summary>
-    public readonly int Length => _data.Length;
+    public readonly int Length => _data == null ? 0 : _data.Length;
 
     /// <summary>
     /// Returns <see langword="true"> if <see cref="Length"> is 0.
     /// </summary>
-    public readonly bool IsEmpty => _data.IsEmpty;
+    public readonly bool IsEmpty => Length == 0;
 
-    public Bytes Slice(int start, int length)
+    public void Dispose()
     {
-        return new Bytes(_data.Slice(start, length));
+        _data.Dispose();
     }
 
     public static implicit operator Bytes(byte b) => new(b);

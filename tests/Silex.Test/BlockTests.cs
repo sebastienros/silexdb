@@ -138,4 +138,29 @@ public class BlockTests
         Assert.True(r1);
         Assert.False(r2);
     }
+
+    [Fact]
+    public void EntryBuffersShouldBeCopied()
+    {
+        var blockBuilder = new BlockBuilder(new DefaultBlockEncoder());
+
+        byte[] bytes = [111];
+        var value = bytes;
+        blockBuilder.Add(1, value);
+
+        // The value should be copied, so 222 should not update the value stored with key '1'
+        bytes[0] = 222;
+
+        blockBuilder.Add(2, value);
+
+        var block = blockBuilder.BuildBlock();
+        var iterator = new BlockIterator(block);
+
+        var locations = iterator.EnumerateAsync().ToBlockingEnumerable().ToArray();
+        var v1 = block.GetValue(locations[0]);
+        var v2 = block.GetValue(locations[1]);
+
+        Assert.Equal(111, v1[0]);
+        Assert.Equal(222, v2[0]);
+    }
 }

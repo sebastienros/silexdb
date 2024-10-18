@@ -40,7 +40,9 @@ public class SsTableBuilder
 
         if (!_blockBuilder.Add(key, value))
         {
-            throw new InvalidOperationException("Data is too big for the storage.");
+            // The block builder has to accept this entry since it's empty, even if
+            // the size is over the block size
+            throw new InvalidOperationException("The data was not be successfully added to a block.");
         }
 
         _firstKey = key;

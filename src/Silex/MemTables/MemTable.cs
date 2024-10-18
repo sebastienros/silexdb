@@ -67,7 +67,7 @@ internal sealed class MemTable : IMemTable
         if (_map.TryRemove(key, out var previousValue))
         {
             _size -= previousValue.Length + key.Length;
-            previousValue.Owner?.Dispose();
+            previousValue.Dispose();
         }
 
         _map.Add(key, value);
@@ -87,6 +87,7 @@ internal sealed class MemTable : IMemTable
             builder.Add(entry.Key, entry.Value);
         }
     }
+
     public void Dispose()
     {
         if (_disposing)
@@ -104,7 +105,7 @@ internal sealed class MemTable : IMemTable
     {
         foreach (var entry in _map)
         {
-            entry.Value.Owner?.Dispose();
+            entry.Value.Dispose();
         }
 
         _map.Clear();

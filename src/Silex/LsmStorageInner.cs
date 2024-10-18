@@ -215,12 +215,12 @@ internal sealed class LsmStorageInner : IDisposable
 
         var builder = new SsTableBuilder(_ssTableEncoder, _blockEncoder);
         memTableToFlush.Flush(builder);
-        memTableToFlush.Dispose();
 
         var sstFilename = GetSstPath(memTableToFlush.Id);
         var ssTable = await builder.BuildAsync(sstFilename, token);
 
         _state.SsTables[0].Add(ssTable);
+        memTableToFlush.Dispose();
     }
 
     public string GetSstPath(long id)
