@@ -108,4 +108,34 @@ public class BlockTests
 
         Assert.Empty(result);
     }
+
+    [Fact]
+    public void ShouldNotAcceptEntriesWhenFull()
+    {
+        var blockBuilder = new BlockBuilder(new DefaultBlockEncoder());
+
+        var value = new byte[1024];
+        var r1 = blockBuilder.Add(1, value);
+        var r2 = blockBuilder.Add(2, value);
+        var r3 = blockBuilder.Add(3, value);
+        var r4 = blockBuilder.Add(4, value);
+
+        Assert.True(r1);
+        Assert.True(r2);
+        Assert.True(r3);
+        Assert.False(r4);
+    }
+
+    [Fact]
+    public void NewBlocksShouldAcceptFirstEntryBiggerThanBlockSize()
+    {
+        var blockBuilder = new BlockBuilder(new DefaultBlockEncoder());
+
+        var value = new byte[8.KiB()];
+        var r1 = blockBuilder.Add(1, value);
+        var r2 = blockBuilder.Add(1, 1);
+
+        Assert.True(r1);
+        Assert.False(r2);
+    }
 }

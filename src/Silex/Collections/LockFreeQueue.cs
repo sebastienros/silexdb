@@ -1,4 +1,7 @@
 ﻿namespace Silex.Collections;
+
+using System.Diagnostics;
+
 internal sealed class LockFreeQueue<T>
 {
     private Node _tail;
@@ -93,6 +96,8 @@ internal sealed class LockFreeQueue<T>
                 // Otherwise the head and tail fields are different
                 else
                 {
+                    Debug.Assert(oldHeadNext != null);
+
                     // Grab the item to dequeue, and then try to advance the head reference
                     result = oldHeadNext.Item;
                     haveAdvancedHead = Interlocked.CompareExchange(ref _head, oldHeadNext, oldHead) == oldHead;

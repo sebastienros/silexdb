@@ -22,7 +22,8 @@ public class BlockBuilder
     {
         var size = _blockEncoder.EstimateSize(key, value);
 
-        if (_estimatedSize + size > _blockEncoder.BlockSize)
+        // A fresh new block has to accept an entry even if it's over its max size
+        if (_estimatedSize > 0 && _estimatedSize + size > _blockEncoder.BlockSize)
         {
             return false;
         }
