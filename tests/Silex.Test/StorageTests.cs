@@ -371,6 +371,26 @@ public class StorageTests
         Directory.Delete(tempFolder, true);
     }
 
+    [Fact]
+    public async Task CloseAsyncCanBeInvokedMultipleTimes()
+    {
+        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        var storage = await LsmStorage.OpenAsync(tempFolder, _defaultStorageOptions);
+
+        storage.Put('a', 1);
+        await storage.CloseAsync();
+        Assert.Single(Directory.EnumerateFiles(tempFolder, "*.sst"));
+
+        await storage.CloseAsync();
+        Assert.Single(Directory.EnumerateFiles(tempFolder, "*.sst"));
+
+        storage.Put('a', 2);
+        await storage.CloseAsync();
+        Assert.Equal(2, Directory.EnumerateFiles(tempFolder, "*.sst").Count());
+
+        Directory.Delete(tempFolder, true);
+    }
+
     private static LsmStorageInner FillImmutableMemTables(int entries = 100, int valueSize = 10, long memTableSizeLimit = 100)
     {
         var storageOptions = new StorageOptions { MemTableSizeLimit = memTableSizeLimit };

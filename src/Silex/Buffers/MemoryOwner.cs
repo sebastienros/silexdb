@@ -10,7 +10,7 @@ namespace Silex.Buffers;
 /// accessor, with memory allocated from <seealso cref="ArrayPool{T}.Shared"/>.
 /// </summary>
 /// <typeparam name="T">The type of item to store.</typeparam>
-public sealed class MemoryOwner<T> : IMemoryOwner<T>
+internal sealed class MemoryOwner<T> : IMemoryOwner<T>
 {
     private readonly int _length;
     private T[]? _array;

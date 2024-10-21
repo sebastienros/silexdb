@@ -279,9 +279,9 @@ internal sealed class LsmStorageInner : IDisposable
         finally
         {
             _level0Lock.ExitWriteLock();
-        }
 
-        memTableToFlush.Dispose();
+            memTableToFlush.Dispose();
+        }
     }
 
     public string GetSstPath(long id)

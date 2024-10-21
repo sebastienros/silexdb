@@ -17,6 +17,7 @@ public readonly struct Bytes : IEquatable<Bytes>, IComparable<Bytes>
     private readonly MemoryOwner<byte> _data;
 
     public static readonly IComparer<Bytes> Comparer = BytesComparer.Instance;
+    public static readonly IEqualityComparer<Bytes> EqualityComparer = BytesComparer.Instance;
 
     public Bytes(Memory<byte> value)
     {
