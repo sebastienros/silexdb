@@ -66,12 +66,12 @@ internal sealed class MemTable : IMemTable
         // Retrieve the previous value to keep its size consistent.
         if (_map.TryRemove(key, out var previousValue))
         {
-            _size -= previousValue.Length + key.Length;
+            _size -= previousValue.Length + key.Length + sizeof(int);
             previousValue.Dispose();
         }
 
         _map.Add(key, value);
-        _size += value.Length + key.Length;
+        _size += value.Length + key.Length + sizeof(int);
         return;
     }
 

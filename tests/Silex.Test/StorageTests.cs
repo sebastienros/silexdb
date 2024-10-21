@@ -26,7 +26,7 @@ public class StorageTests
         var result = await storage.GetAsync(key);
 
         Assert.Equal(value, result);
-        Assert.Equal(6, storage._state.CurrentMemTable.Size);
+        Assert.Equal(10, storage._state.CurrentMemTable.Size);
     }
 
     [Fact]
@@ -46,7 +46,7 @@ public class StorageTests
 
         Assert.Equal(value, result1);
         Assert.Equal(value, result2);
-        Assert.Equal(8, storage._state.CurrentMemTable.Size);
+        Assert.Equal(16, storage._state.CurrentMemTable.Size);
     }
 
     [Fact]
@@ -60,14 +60,14 @@ public class StorageTests
         var result = await storage.GetAsync(key);
 
         Assert.True(result.IsEmpty);
-        Assert.Equal(3, storage._state.CurrentMemTable.Size);
+        Assert.Equal(7, storage._state.CurrentMemTable.Size);
     }
 
     [Theory]
     [InlineData(1, 1, 0)]
     [InlineData(7, 10, 1)]
     [InlineData(100, 100, 100)]
-    [InlineData(10, 500, 62)]
+    [InlineData(10, 500, 83)]
     public void ShouldFreezeMemTablesWhenSizeIsOverLimit(int valueSize, int entries, int expectedImmutableTables)
     {
         var memTableSizeLimit = 100;
