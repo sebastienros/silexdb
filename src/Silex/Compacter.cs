@@ -1,16 +1,19 @@
 ﻿namespace Silex;
-internal class Compacter : IAsyncDisposable
+
+using System.Diagnostics;
+
+internal class Compacter<TKey, TValue> : IAsyncDisposable where TKey : notnull
 {
-    private readonly LsmStorageInner _storage;
-    private readonly PeriodicTimer _flushTimer;
+    private readonly LsmStorageInner<TKey, TValue> _storage;
+    private readonly PeriodicTimer? _flushTimer;
     private Task? _flushTask;
     private CancellationTokenSource? _flushTaskCts;
     private readonly ushort _memTableTableMaxCount;
 
-    public Compacter(LsmStorageInner storage, TimeProvider timeProvider, StorageOptions options)
+    public Compacter(LsmStorageInner<TKey, TValue> storage, TimeProvider timeProvider, StorageOptions options)
     {
         _storage = storage;
-        _flushTimer = new PeriodicTimer(options.FlushPeriod, timeProvider);
+        _flushTimer = options.FlushPeriod == TimeSpan.Zero ? null : new PeriodicTimer(options.FlushPeriod, timeProvider);
         _memTableTableMaxCount = options.MemTableMaxCount;
     }
 
@@ -40,6 +43,8 @@ internal class Compacter : IAsyncDisposable
 
     private async Task BackgroundFlushAsync()
     {
+        Debug.Assert(_flushTimer != null);
+
         _flushTaskCts = new();
 
         try

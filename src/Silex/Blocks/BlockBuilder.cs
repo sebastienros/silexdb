@@ -1,13 +1,14 @@
 namespace Silex.Blocks;
+
 using System;
 
-public class BlockBuilder
+public class BlockBuilder<TKey, TValue>
 {
-    private readonly IBlockEncoder _blockEncoder;
-    private readonly List<KeyValuePair<Bytes, Bytes>> _blockEntries = [];
+    private readonly IBlockEncoder<TKey, TValue> _blockEncoder;
+    private readonly List<KeyValuePair<TKey, TValue>> _blockEntries = [];
     private int _estimatedSize;
-    
-    public BlockBuilder(IBlockEncoder blockEncoder)
+
+    public BlockBuilder(IBlockEncoder<TKey, TValue> blockEncoder)
     {
         _blockEncoder = blockEncoder;
     }
@@ -18,7 +19,7 @@ public class BlockBuilder
         _estimatedSize = 0;
     }
 
-    public bool Add(Bytes key, Bytes value)
+    public bool Add(TKey key, TValue value)
     {
         var size = _blockEncoder.EstimateSize(key, value);
 
@@ -38,12 +39,12 @@ public class BlockBuilder
 
     public int EstimatedSize => _estimatedSize;
 
-    public Block BuildBlock()
+    public Block<TKey, TValue> BuildBlock()
     {
         return _blockEncoder.Encode(_blockEntries);
     }
 
-    public Block Decode(ReadOnlyMemory<byte> data)
+    public Block<TKey, TValue> Decode(ReadOnlyMemory<byte> data)
     {
         return _blockEncoder.Decode(data);
     }

@@ -3,18 +3,18 @@ namespace Silex.Blocks;
 /// <summary>
 /// Encodes or decodes a <see cref="Block"/>. 
 /// </summary>
-public interface IBlockEncoder
+public interface IBlockEncoder<TKey, TValue>
 {
-    Block Encode(IReadOnlyList<KeyValuePair<Bytes, Bytes>> entries);
+    Block<TKey, TValue> Encode(IReadOnlyList<KeyValuePair<TKey, TValue>> entries);
 
     /// <summary>
     /// Creates a <see cref="Block"/> instance that will hold the original memory block saved on this.
     /// </summary>
     /// <param name="buffer"></param>
     /// <returns></returns>
-    Block Decode(ReadOnlyMemory<byte> buffer);
+    Block<TKey, TValue> Decode(ReadOnlyMemory<byte> buffer);
 
-    RecordLocation DecodeEntry(ReadOnlyMemory<byte> data, int offset);
+    RecordLocation<TKey> DecodeEntry(ReadOnlyMemory<byte> data, int offset);
 
     ReadOnlyMemory<byte> DecodeValue(ReadOnlyMemory<byte> data, int offset, int length);
 
@@ -23,5 +23,5 @@ public interface IBlockEncoder
     /// </summary>
     ushort BlockSize { get; }
 
-    int EstimateSize(Bytes key, Bytes value);
+    int EstimateSize(TKey key, TValue value);
 }

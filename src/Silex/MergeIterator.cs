@@ -1,31 +1,54 @@
 ﻿namespace Silex;
 
+using Silex.Serialization;
 using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 
-internal class MergeIterator : IStorageIterator
+internal class MergeIterator<TKey, TValue> : IStorageIterator<TKey, TValue>
 {
-    private readonly IEnumerable<IStorageIterator> _iterators;
+    private static readonly IComparer<TKey> _keyComparer = BinaryEncoderFactory<TKey>.BinarySerializer.Comparer;
 
-    public MergeIterator(IEnumerable<IStorageIterator> iterators)
+    private readonly IEnumerable<IStorageIterator<TKey, TValue>> _iterators;
+
+    public MergeIterator(IEnumerable<IStorageIterator<TKey, TValue>> iterators)
     {
         _iterators = iterators;
     }
 
-    public IAsyncEnumerable<RecordLocation> EnumerateAsync(CancellationToken cancellationToken = default)
+    public async IAsyncEnumerable<RecordLocation<TKey>> EnumerateAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        return EnumerateAsync(Bytes.Empty, cancellationToken);
+        List<IAsyncEnumerator<RecordLocation<TKey>>> enumerators = [];
+
+        foreach (var iterator in _iterators)
+        {
+            enumerators.Add(iterator.EnumerateAsync(cancellationToken).GetAsyncEnumerator(cancellationToken));
+        }
+
+        await foreach (var r in MergeIterator<TKey, TValue>.EnumerateAsync(enumerators, cancellationToken))
+        {
+            yield return r;
+        }
     }
 
-    public async IAsyncEnumerable<RecordLocation> EnumerateAsync(Bytes minValue, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    public async IAsyncEnumerable<RecordLocation<TKey>> EnumerateAsync(TKey minValue, [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        List<IAsyncEnumerator<RecordLocation>> enumerators = [];
+        List<IAsyncEnumerator<RecordLocation<TKey>>> enumerators = [];
 
         foreach (var iterator in _iterators)
         {
             enumerators.Add(iterator.EnumerateAsync(minValue, cancellationToken).GetAsyncEnumerator(cancellationToken));
         }
+
+        await foreach (var r in MergeIterator<TKey, TValue>.EnumerateAsync(enumerators, cancellationToken))
+        {
+            yield return r;
+        }
+    }
+
+    private static async IAsyncEnumerable<RecordLocation<TKey>> EnumerateAsync(List<IAsyncEnumerator<RecordLocation<TKey>>> enumerators, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
 
         while (enumerators.Count > 0)
         {
@@ -40,7 +63,7 @@ internal class MergeIterator : IStorageIterator
 
                 var current = iterator.Current;
 
-                switch (smallest.Key.CompareTo(current.Key))
+                switch (_keyComparer.Compare(smallest.Key, current.Key))
                 {
                     // Discard the entry since there is the same key from a more recent table
                     case 0:
@@ -73,4 +96,5 @@ internal class MergeIterator : IStorageIterator
             }
         }
     }
+
 }

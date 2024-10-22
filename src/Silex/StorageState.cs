@@ -11,7 +11,7 @@ namespace Silex;
 /// This structure is mostly immutable (minus CurrentMemTable) such that we can duplicate it
 /// to get a snapshot for read-only operation.
 /// </remarks>
-internal struct StorageState
+internal struct StorageState<TKey, TValue> where TKey : notnull
 {
     public StorageState(StorageOptions _)
     {
@@ -20,9 +20,9 @@ internal struct StorageState
     /// <summary>
     /// The list of immutable MemTables.
     /// </summary>
-    public ImmutableQueue<IMemTable> ImmutableMemTables { get; set; } = [];
+    public ImmutableQueue<IMemTable<TKey, TValue>> ImmutableMemTables { get; set; } = [];
 
-    public required IMemTable CurrentMemTable { get; set; }
+    public required IMemTable<TKey, TValue> CurrentMemTable { get; set; }
 
     /// <summary>
     /// The list of <see cref="SsTable"/> for each level.
@@ -32,11 +32,11 @@ internal struct StorageState
     /// directly created as a result of MemTable flush. Other levels are the result of compaction,
     /// (either tiered or leveled).
     /// </remarks>
-    public List<List<SsTable>> SsTables { get; set; } = [[]];
+    public List<List<SsTable<TKey, TValue>>> SsTables { get; set; } = [[]];
 
-    public StorageState Clone()
+    public StorageState<TKey, TValue> Clone()
     {
-        return new StorageState
+        return new StorageState<TKey, TValue>
         {
             CurrentMemTable = CurrentMemTable,
             ImmutableMemTables = ImmutableMemTables,

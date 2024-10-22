@@ -5,16 +5,16 @@ using System.Buffers.Binary;
 
 namespace Silex.Tables;
 
-public class SsTable
+public class SsTable<TKey, TValue>
 {
     private readonly long _id;
     private readonly string _filename;
-    private readonly Bytes _firstKey;
-    private readonly Bytes _lastKey;
-    private readonly BlockBuilder _blockBuilder;
-    private static readonly WorkDispatcher<BlockCacheKey, Block> _dispatcher = new();
+    private readonly TKey? _firstKey;
+    private readonly TKey? _lastKey;
+    private readonly BlockBuilder<TKey, TValue> _blockBuilder;
+    private static readonly WorkDispatcher<BlockCacheKey, Block<TKey, TValue>> _dispatcher = new();
 
-    public SsTable(long id, string filename, IReadOnlyList<BlockMetadata> blockMetadata, long metadataBlockOffset, BlockBuilder blockBuilder)
+    public SsTable(long id, string filename, IReadOnlyList<BlockMetadata<TKey>> blockMetadata, long metadataBlockOffset, BlockBuilder<TKey, TValue> blockBuilder)
     {
         _id = id;
         _filename = filename;
@@ -29,17 +29,17 @@ public class SsTable
         }
     }
 
-    public IReadOnlyList<BlockMetadata> BlockMetadata { get; } = [];
+    public IReadOnlyList<BlockMetadata<TKey>> BlockMetadata { get; } = [];
 
     public long MetaBlockOffset { get; }
 
     public string Filename => _filename;
 
-    public Bytes FirstKey => _firstKey;
+    public TKey FirstKey => _firstKey!;
 
-    public Bytes LastKey => _lastKey;
+    public TKey LastKey => _lastKey!;
 
-    public async Task<Block?> ReadBlockAsync(int index, CancellationToken cancellationToken = default)
+    public async Task<Block<TKey, TValue>?> ReadBlockAsync(int index, CancellationToken cancellationToken = default)
     {
         using var stream = File.OpenRead(Filename);
         var offset = BlockMetadata[index].Offset;
@@ -63,14 +63,14 @@ public class SsTable
         return block;
     }
 
-    public Task<Block?> ReadBlockCachedAsync(int index, IMemoryCache blockCache, MemoryCacheEntryOptions cacheEntryOptions, CancellationToken cancellationToken = default)
+    public Task<Block<TKey, TValue>?> ReadBlockCachedAsync(int index, IMemoryCache blockCache, MemoryCacheEntryOptions cacheEntryOptions, CancellationToken cancellationToken = default)
     {
         var key = new BlockCacheKey(_id, index);
 
         // Try without the dispatcher first since this is a cheap lookup
         if (blockCache.TryGetValue(key, out var block))
         {
-            return Task.FromResult(block as Block);
+            return Task.FromResult(block as Block<TKey, TValue>);
         }
 
         // Use a dispatcher to prevent cache stampede
@@ -91,7 +91,7 @@ public class SsTable
         });
     }
 
-    public static async Task<SsTable> LoadSsTableAsync(string filename, ISsTableEncoder tableEncoder, BlockBuilder blockBuilder, CancellationToken cancellationToken = default)
+    public static async Task<SsTable<TKey, TValue>> LoadSsTableAsync(string filename, ISsTableEncoder<TKey, TValue> tableEncoder, BlockBuilder<TKey, TValue> blockBuilder, CancellationToken cancellationToken = default)
     {
         using var stream = File.OpenRead(filename);
 
@@ -111,7 +111,7 @@ public class SsTable
         var blockMetadata = tableEncoder.DecodeMetadata(buffer, 0);
         ArrayPool<byte>.Shared.Return(buffer);
 
-        var table = new SsTable(IdGenerator.GetNextId(), filename, blockMetadata, metaBlockOffset, blockBuilder);
+        var table = new SsTable<TKey, TValue>(IdGenerator.GetNextId(), filename, blockMetadata, metaBlockOffset, blockBuilder);
         
         return table;
     }

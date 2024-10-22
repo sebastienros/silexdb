@@ -1,8 +1,8 @@
 ﻿namespace Silex;
 
-public interface IStorageIterator
+public interface IStorageIterator<TKey, TValue>
 {
-    IAsyncEnumerable<RecordLocation> EnumerateAsync(CancellationToken cancellationToken = default);
+    IAsyncEnumerable<RecordLocation<TKey>> EnumerateAsync(CancellationToken cancellationToken = default);
 
-    IAsyncEnumerable<RecordLocation> EnumerateAsync(Bytes afterKey, CancellationToken cancellationToken = default);
+    IAsyncEnumerable<RecordLocation<TKey>> EnumerateAsync(TKey afterKey, CancellationToken cancellationToken = default);
 }

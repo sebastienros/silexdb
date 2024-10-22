@@ -4,29 +4,31 @@ using System.Buffers;
 
 namespace Silex.Tables;
 
-public class SsTableBuilder
+public class SsTableBuilder<TKey, TValue>
 {
-    private readonly ISsTableEncoder _tableEncoder;
+    private readonly ISsTableEncoder<TKey, TValue> _tableEncoder;
     private long _offset;
 
-    private Bytes _firstKey = Bytes.Empty;
-    private Bytes _lastKey = Bytes.Empty;
-    private readonly BlockBuilder _blockBuilder;
-    private List<BlockMetadata>? _metadata;
+    private bool _isFirstKey = true;
+    private TKey? _firstKey = default;
+    private TKey? _lastKey = default;
+    private readonly BlockBuilder<TKey, TValue> _blockBuilder;
+    private List<BlockMetadata<TKey>>? _metadata;
     
     private RecyclableArrayBufferWriter<byte>? _bufferWriter;
 
-    public SsTableBuilder(ISsTableEncoder tableEncoder, IBlockEncoder blockEncoder)
+    public SsTableBuilder(ISsTableEncoder<TKey, TValue> tableEncoder, IBlockEncoder<TKey, TValue> blockEncoder)
     {
         _tableEncoder = tableEncoder;
-        _blockBuilder = new BlockBuilder(blockEncoder);
+        _blockBuilder = new BlockBuilder<TKey, TValue>(blockEncoder);
     }
 
-    public void Add(Bytes key, Bytes value)
+    public void Add(TKey key, TValue value)
     {
-        if (_firstKey.IsEmpty)
+        if (_isFirstKey)
         {
             _firstKey = key;
+            _isFirstKey = false;
         }
 
         if (_blockBuilder.Add(key, value))
@@ -65,12 +67,12 @@ public class SsTableBuilder
 
         _metadata ??= [];
 
-        var m = new BlockMetadata()
+        var m = new BlockMetadata<TKey>()
         {
             Index = _metadata.Count,
             Offset = _offset,
-            FirstKey = _firstKey,
-            LastKey = _lastKey
+            FirstKey = _firstKey!,
+            LastKey = _lastKey!
         };
 
         _metadata.Add(m);
@@ -88,12 +90,12 @@ public class SsTableBuilder
         
         _offset += block.Memory.Length;
 
-        _firstKey = Bytes.Empty;
-        _lastKey = Bytes.Empty;
+        _firstKey = default;
+        _lastKey = default;
         _blockBuilder.Clear();
     }
 
-    public async Task<SsTable> BuildAsync(string filename, CancellationToken cancellationToken = default)
+    public async Task<SsTable<TKey, TValue>> BuildAsync(string filename, CancellationToken cancellationToken = default)
     {
         FinishBlock();
 
@@ -117,7 +119,7 @@ public class SsTableBuilder
             await stream.DisposeAsync();
         }
 
-        var table = new SsTable(IdGenerator.GetNextId(), filename, _metadata, _offset, _blockBuilder);
+        var table = new SsTable<TKey, TValue>(IdGenerator.GetNextId(), filename, _metadata, _offset, _blockBuilder);
 
         _bufferWriter.Dispose();
         _bufferWriter = null;

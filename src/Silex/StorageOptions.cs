@@ -1,7 +1,6 @@
 ﻿namespace Silex;
 
 using Silex.Blocks;
-using Silex.MemTables;
 using Silex.Tables;
 
 public class StorageOptions
@@ -15,11 +14,11 @@ public class StorageOptions
     /// <value>50</value>
     private static readonly ushort _defaultMemTableMaxCount = 50;
 
-    /// <value><see cref="DefaultBlockEncoder"></value>
-    private static readonly IBlockEncoder _defaultBlockEncoder = new DefaultBlockEncoder();
+    /// <value><see cref="DefaultBlockEncoderFactory"></value>
+    private static readonly IBlockEncoderFactory _defaultBlockEncoderFactory = new DefaultBlockEncoderFactory();
 
-    /// <value><see cref="DefaultSsTableEncoder"></value>
-    private static readonly ISsTableEncoder _defaultSsTableEncoder = new DefaultSsTableEncoder();
+    /// <value><see cref="DefaultSsTableEncoderFactory"></value>
+    private static readonly ISsTableEncoderFactory _defaultSsTableEncoderFactory = new DefaultSsTableEncoderFactory();
 
     /// <value>1MiB</value>
     private static readonly long _defaultBlockCacheSizeLimit = 1.MiB();
@@ -61,20 +60,20 @@ public class StorageOptions
     public ushort BlockSize { get; set; } = _defaultBlockSize;
 
     /// <summary>
-    /// Gets or set the <see cref="IBlockEncoder"> to use.
+    /// Gets or set the <see cref="IBlockEncoderFactory"> to use.
     /// </summary>
     /// <value>
-    /// The default value is <inheritdoc cref="_defaultBlockEncoder"/>.
+    /// The default value is <inheritdoc cref="_defaultBlockEncoderFactory"/>.
     /// </value>
-    public IBlockEncoder BlockEncoder { get; set; } = _defaultBlockEncoder;
+    public IBlockEncoderFactory BlockEncoderFactory { get; set; } = _defaultBlockEncoderFactory;
 
     /// <summary>
-    /// Gets or set the <see cref="ISsTableEncoder"> to use.
+    /// Gets or set the <see cref="ISsTableEncoderFactory"> to use.
     /// </summary>
     /// <value>
-    /// The default value is <inheritdoc cref="_defaultSsTableEncoder"/>.
+    /// The default value is <inheritdoc cref="_defaultSsTableEncoderFactory"/>.
     /// </value>
-    public ISsTableEncoder SsTableEncoder { get; set; } = _defaultSsTableEncoder;
+    public ISsTableEncoderFactory SsTableEncoderFactory { get; set; } = _defaultSsTableEncoderFactory;
 
     /// <summary>
     /// Gets or set the delays between mem table flushes. Setting a value of <c>TimeSpan.Zero</c> disables the flush thread.

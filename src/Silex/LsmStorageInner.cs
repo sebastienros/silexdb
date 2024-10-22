@@ -1,6 +1,7 @@
 ﻿using Microsoft.Extensions.Caching.Memory;
 using Silex.Blocks;
 using Silex.MemTables;
+using Silex.Serialization;
 using Silex.Tables;
 using System.Diagnostics;
 using System.Globalization;
@@ -11,9 +12,10 @@ namespace Silex;
 /// <summary>
 /// The inner storage engine. It handles thread-safety for the <see cref="StorageState"/>.
 /// </summary>
-internal sealed class LsmStorageInner : IDisposable
+internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : notnull
 {
-    private static readonly ReadOnlyMemory<byte> _tombStone = new([]);
+    private static readonly IBinaryEncoder<TValue> _valueSerializer = BinaryEncoderFactory<TValue>.BinarySerializer;
+    private static readonly IComparer<TKey> _keyComparer = BinaryEncoderFactory<TKey>.BinarySerializer.Comparer;
 
     // Use different locks for each type of manipulated data such that we can lock them individually.
     // For instance updating the MemTable should be synchronized, but not blocked by compaction.
@@ -23,10 +25,10 @@ internal sealed class LsmStorageInner : IDisposable
     private readonly ReaderWriterLockSlim _immutableMemTablesLock = new();
     private readonly AsyncReaderWriterLock _level0Lock = new();
 
-    internal StorageState _state;
+    internal StorageState<TKey, TValue> _state;
     private bool _disposed;
-    private readonly IBlockEncoder _blockEncoder;
-    private readonly ISsTableEncoder _ssTableEncoder;
+    private readonly IBlockEncoder<TKey, TValue> _blockEncoder;
+    private readonly ISsTableEncoder<TKey, TValue> _ssTableEncoder;
     private readonly long _memTableSizeLimit;
     private readonly IMemoryCache _blockCache;
     private readonly MemoryCacheEntryOptions _cacheEntryOptions;
@@ -43,9 +45,9 @@ internal sealed class LsmStorageInner : IDisposable
     internal LsmStorageInner(string path, StorageOptions options)
     {
         StoragePath = path;
-        _state = new StorageState(options) { CurrentMemTable = new MemTable(IdGenerator.GetNextId()) };
-        _blockEncoder = options.BlockEncoder;
-        _ssTableEncoder = options.SsTableEncoder;
+        _state = new StorageState<TKey, TValue>(options) { CurrentMemTable = new MemTable<TKey, TValue>(IdGenerator.GetNextId()) };
+        _blockEncoder = options.BlockEncoderFactory.Create<TKey, TValue>();
+        _ssTableEncoder = options.SsTableEncoderFactory.Create<TKey, TValue>();
         _memTableSizeLimit = options.MemTableSizeLimit;
         _blockCache = new MemoryCache(new MemoryCacheOptions { SizeLimit = options.BlockCacheSizeLimit });
         _cacheEntryOptions = new MemoryCacheEntryOptions
@@ -59,8 +61,8 @@ internal sealed class LsmStorageInner : IDisposable
     /// Gets the value associated with the specified key.
     /// </summary>
     /// <param name="key"></param>
-    /// <returns><see cref="Bytes.Empty"/> if the key was not found.</returns>
-    public async ValueTask<Bytes> GetAsync(Bytes key, CancellationToken cancellationToken = default)
+    /// <returns><see cref="TValue"/> if the key was not found.</returns>
+    public async ValueTask<TValue> GetAsync(TKey key, CancellationToken cancellationToken = default)
     {
         // The immutable MemTables can be accessed without lock since they are frozen (read-only),
         // and the collection won't be changed FreezeMemTable substitute the collection when it's altered.
@@ -123,26 +125,27 @@ internal sealed class LsmStorageInner : IDisposable
                 var table = l0[i];
 
                 // The key could be in this table, if not will go to the next one
-                if (key >= table.FirstKey && key <= table.LastKey)
+                if (_keyComparer.Compare(key, table.FirstKey) >= 0 && _keyComparer.Compare(key, table.LastKey) <= 0)
                 {
                     foreach (var metadata in table.BlockMetadata)
                     {
-                        if (key >= metadata.FirstKey && key <= metadata.LastKey)
+                        if (_keyComparer.Compare(key, metadata.FirstKey) >= 0 && _keyComparer.Compare(key, metadata.LastKey) <= 0)
                         {
                             var block = await table.ReadBlockCachedAsync(metadata.Index, _blockCache, _cacheEntryOptions, cancellationToken);
 
                             if (block != null)
                             {
                                 var value = block.GetValue(key);
+                                
                                 if (!value.IsEmpty)
                                 {
-                                    return new Bytes(value);
+                                    return _valueSerializer.Decode(value);
                                 }
                             }
                         }
                     }
 
-                    return default;
+                    return default!;
                 }
             }
         }
@@ -151,7 +154,7 @@ internal sealed class LsmStorageInner : IDisposable
             _level0Lock.ExitReadLock();
         }
 
-        return default;
+        return default!;
     }
 
     /// <summary>
@@ -159,7 +162,7 @@ internal sealed class LsmStorageInner : IDisposable
     /// </summary>
     /// <param name="key"></param>
     /// <param name="value"></param>
-    public void Put(Bytes key, Bytes value)
+    public void Put(TKey key, TValue value)
     {
         _currentMemTableLock.EnterWriteLock();
 
@@ -182,13 +185,13 @@ internal sealed class LsmStorageInner : IDisposable
     /// Adds a delete operation for the specified key.
     /// </summary>
     /// <param name="key"></param>
-    public void Delete(Bytes key)
+    public void Delete(TKey key)
     {
         _currentMemTableLock.EnterWriteLock();
 
         try
         {
-            _state.CurrentMemTable.Put(key, _tombStone);
+            _state.CurrentMemTable.Put(key, _valueSerializer.GetTombstoneValue());
 
             if (_state.CurrentMemTable.Size >= _memTableSizeLimit)
             {
@@ -247,7 +250,7 @@ internal sealed class LsmStorageInner : IDisposable
 
         _immutableMemTablesLock.EnterWriteLock();
 
-        IMemTable memTableToFlush;
+        IMemTable<TKey, TValue> memTableToFlush;
 
         try
         {
@@ -264,7 +267,7 @@ internal sealed class LsmStorageInner : IDisposable
             _immutableMemTablesLock.ExitWriteLock();
         }
 
-        var builder = new SsTableBuilder(_ssTableEncoder, _blockEncoder);
+        var builder = new SsTableBuilder<TKey, TValue>(_ssTableEncoder, _blockEncoder);
         memTableToFlush.Flush(builder);
 
         var sstFilename = GetSstPath(memTableToFlush.Id);
@@ -289,7 +292,7 @@ internal sealed class LsmStorageInner : IDisposable
         return Path.Combine(StoragePath, $"{id.ToString(CultureInfo.InvariantCulture)}.sst");
     }
 
-    public IStorageIterator CreateIterator()
+    public IStorageIterator<TKey, TValue> CreateIterator()
     {
         return new LsmStorageIterator(this);
     }
@@ -308,9 +311,9 @@ internal sealed class LsmStorageInner : IDisposable
         {
             var _previousMemTable = _state.CurrentMemTable;
 
-            _state = new StorageState
+            _state = new StorageState<TKey, TValue>
             {
-                CurrentMemTable = new MemTable(IdGenerator.GetNextId()),
+                CurrentMemTable = new MemTable<TKey, TValue>(IdGenerator.GetNextId()),
                 ImmutableMemTables = _state.ImmutableMemTables.Enqueue(_previousMemTable),
                 SsTables = _state.SsTables
             };
@@ -349,20 +352,100 @@ internal sealed class LsmStorageInner : IDisposable
         DisposeInternal();
     }
 
-    private class LsmStorageIterator : IStorageIterator
+    private class LsmStorageIterator : IStorageIterator<TKey, TValue>
     {
         private readonly ReaderWriterLockSlim _memTableLock;
-        private readonly StorageState _state;
+        private readonly StorageState<TKey, TValue> _state;
 
-        public LsmStorageIterator(LsmStorageInner storage)
+        public LsmStorageIterator(LsmStorageInner<TKey, TValue> storage)
         {
             _memTableLock = storage._currentMemTableLock;
             _state = storage._state;
         }
 
-        public IAsyncEnumerable<RecordLocation> EnumerateAsync(CancellationToken cancellationToken = default)
+        public async IAsyncEnumerable<RecordLocation<TKey>> EnumerateAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
         {
-            return EnumerateAsync(Bytes.Empty, cancellationToken);
+            List<IAsyncEnumerator<RecordLocation<TKey>>> iterators = [];
+
+            // In theory only the current MemTable needs to be synchronized,
+            // but we need to keep the mutable MemTable iterator around to compare with immutable ones.
+            // A solution to shorten the read-lock would be to copy the mutable MemTable keys. 
+
+            _memTableLock.EnterReadLock();
+
+            try
+            {
+                var currentIterator = _state.CurrentMemTable.CreateIterator();
+
+                var currentEnumerator = currentIterator.EnumerateAsync(cancellationToken).GetAsyncEnumerator(cancellationToken);
+
+                if (await currentEnumerator.MoveNextAsync())
+                {
+                    iterators.Add(currentEnumerator);
+                }
+
+                foreach (var memTable in _state.ImmutableMemTables)
+                {
+                    var iterator = memTable.CreateIterator();
+
+                    var enumerator = iterator.EnumerateAsync(cancellationToken).GetAsyncEnumerator(cancellationToken);
+
+                    if (await enumerator.MoveNextAsync())
+                    {
+                        iterators.Add(enumerator);
+                    }
+                }
+
+                while (iterators.Count > 0)
+                {
+                    // Assume the smallest is the element from the first iterator
+                    var smallest = iterators[0].Current;
+
+                    var smallestIndex = 0;
+
+                    for (var i = 1; i < iterators.Count; i++)
+                    {
+                        var iterator = iterators[i];
+
+                        var current = iterator.Current;
+
+                        switch (_keyComparer.Compare(smallest.Key, current.Key))
+                        {
+                            // Discard the entry since there is the same key from a more recent table
+                            case 0:
+                                if (!await iterator.MoveNextAsync())
+                                {
+                                    iterators.RemoveAt(i);
+                                    i--;
+                                }
+                                break;
+
+                            case > 0:
+                                smallestIndex = i;
+                                smallest = current;
+                                break;
+
+                            default:
+                                break;
+                        }
+                    }
+
+                    // Consume the smallest element
+                    if (!await iterators[smallestIndex].MoveNextAsync())
+                    {
+                        iterators.RemoveAt(smallestIndex);
+                    }
+
+                    if (!smallest.IsTombstone)
+                    {
+                        yield return smallest;
+                    }
+                }
+            }
+            finally
+            {
+                _memTableLock.ExitReadLock();
+            }
         }
 
         /// <summary>
@@ -370,9 +453,9 @@ internal sealed class LsmStorageInner : IDisposable
         /// </summary>
         /// <remarks>Uses a merge iterator.</remarks>
         /// <returns></returns>
-        public async IAsyncEnumerable<RecordLocation> EnumerateAsync(Bytes minValue, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        public async IAsyncEnumerable<RecordLocation<TKey>> EnumerateAsync(TKey minValue, [EnumeratorCancellation] CancellationToken cancellationToken = default)
         {
-            List<IAsyncEnumerator<RecordLocation>> iterators = [];
+            List<IAsyncEnumerator<RecordLocation<TKey>>> iterators = [];
 
             // In theory only the current MemTable needs to be synchronized,
             // but we need to keep the mutable MemTable iterator around to compare with immutable ones.
@@ -416,7 +499,7 @@ internal sealed class LsmStorageInner : IDisposable
 
                         var current = iterator.Current;
 
-                        switch (smallest.Key.CompareTo(current.Key))
+                        switch (_keyComparer.Compare(smallest.Key, current.Key))
                         {
                             // Discard the entry since there is the same key from a more recent table
                             case 0:
@@ -443,7 +526,8 @@ internal sealed class LsmStorageInner : IDisposable
                         iterators.RemoveAt(smallestIndex);
                     }
 
-                    if (smallest.Length != 0)
+                    // Don't return tombstones
+                    if (!smallest.IsTombstone)
                     {
                         yield return smallest;
                     }

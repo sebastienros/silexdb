@@ -1,8 +1,9 @@
 ﻿namespace Silex.MemTables;
 
 using Silex.Tables;
+using System.Diagnostics.CodeAnalysis;
 
-public interface IMemTable : IDisposable
+public interface IMemTable<TKey, TValue> : IDisposable where TKey : notnull
 {
     long Id { get; }
 
@@ -16,11 +17,11 @@ public interface IMemTable : IDisposable
     /// </summary>
     /// <param name="key"></param>
     /// <returns><c>true</c> if the key was found, <c>false</c> otherwise.</returns>
-    bool TryGet(Bytes key, out Bytes result);
+    bool TryGet(TKey key, [MaybeNullWhen(false)] out TValue result);
 
-    void Put(Bytes key, Bytes value);
+    void Put(TKey key, TValue value);
 
-    IStorageIterator CreateIterator();
+    IStorageIterator<TKey, TValue> CreateIterator();
 
-    void Flush(SsTableBuilder builder);
+    void Flush(SsTableBuilder<TKey, TValue> builder);
 }

@@ -12,10 +12,10 @@ public class TableTests
     {
         var tempFilename = Path.GetRandomFileName();
 
-        var builder = new SsTableBuilder(new DefaultSsTableEncoder(), new DefaultBlockEncoder());
+        var builder = new SsTableBuilder<ushort, string>(new DefaultSsTableEncoder<ushort, string>(), new DefaultBlockEncoder<ushort, string>());
 
-        Bytes key = (ushort)7;
-        Bytes value = "hello";
+        ushort key = 7;
+        string value = "hello";
 
         builder.Add(key, value);
 
@@ -32,18 +32,18 @@ public class TableTests
     public async Task ShouldLoadExistingTable()
     {
         var tempFilename = Path.GetRandomFileName();
-        var blockBuilder = new BlockBuilder(new DefaultBlockEncoder());
+        var blockBuilder = new BlockBuilder<ushort, string>(new DefaultBlockEncoder<ushort, string>());
 
-        var builder = new SsTableBuilder(new DefaultSsTableEncoder(), new DefaultBlockEncoder());
+        var builder = new SsTableBuilder<ushort, string>(new DefaultSsTableEncoder<ushort, string>(), new DefaultBlockEncoder<ushort, string>());
 
-        Bytes key = (ushort)7;
-        Bytes value = "hello";
+        ushort key = 7;
+        string value = "hello";
 
         builder.Add(key, value);
 
         await builder.BuildAsync(tempFilename);
 
-        var table = await SsTable.LoadSsTableAsync(tempFilename, new DefaultSsTableEncoder(), blockBuilder);
+        var table = await SsTable<ushort, string>.LoadSsTableAsync(tempFilename, new DefaultSsTableEncoder<ushort, string>(), blockBuilder);
 
         Assert.Single(table.BlockMetadata);
         using var block = await table.ReadBlockAsync(0);
@@ -57,7 +57,7 @@ public class TableTests
     {
         var tempFilename = Path.GetRandomFileName();
 
-        var builder = new SsTableBuilder(new DefaultSsTableEncoder(), new DefaultBlockEncoder());
+        var builder = new SsTableBuilder<uint, byte[]>(new DefaultSsTableEncoder<uint, byte[]>(), new DefaultBlockEncoder<uint, byte[]>());
 
         // Random 100 B values
         var value = new byte[100.B()];
@@ -72,9 +72,9 @@ public class TableTests
 
         Assert.True(table.BlockMetadata.Count > 0);
 
-        var iterator = new SsTableIterator(table);
+        var iterator = new SsTableIterator<uint, byte[]>(table);
 
-        var result = iterator.EnumerateAsync().ToBlockingEnumerable().Select(x => BinaryPrimitives.ReadUInt32LittleEndian(x.Key.Span)).ToArray();
+        var result = iterator.EnumerateAsync().ToBlockingEnumerable().Select(x => x.Key).ToArray();
 
         Assert.Equivalent(Enumerable.Range(0, 100), result);
 
@@ -86,7 +86,7 @@ public class TableTests
     {
         var tempFilename = Path.GetRandomFileName();
 
-        var builder = new SsTableBuilder(new DefaultSsTableEncoder(), new DefaultBlockEncoder());
+        var builder = new SsTableBuilder<uint, byte[]>(new DefaultSsTableEncoder<uint, byte[]>(), new DefaultBlockEncoder<uint, byte[]>());
 
         // Random 100 B values
         var value = new byte[100.B()];
@@ -102,9 +102,9 @@ public class TableTests
         // Check we have one table with multiple blocks
         Assert.True(table.BlockMetadata.Count > 0);
 
-        var iterator = new SsTableIterator(table);
+        var iterator = new SsTableIterator<uint, byte[]>(table);
 
-        var result = iterator.EnumerateAsync(13).ToBlockingEnumerable().Select(x => BinaryPrimitives.ReadUInt32LittleEndian(x.Key.Span)).ToArray();
+        var result = iterator.EnumerateAsync(13).ToBlockingEnumerable().Select(x => x.Key).ToArray();
 
         Assert.Equivalent(Enumerable.Range(13, 100 - 13), result);
 
@@ -116,7 +116,7 @@ public class TableTests
     {
         var tempFilename = Path.GetRandomFileName();
 
-        var builder = new SsTableBuilder(new DefaultSsTableEncoder(), new DefaultBlockEncoder());
+        var builder = new SsTableBuilder<uint, byte[]>(new DefaultSsTableEncoder<uint, byte[]>(), new DefaultBlockEncoder<uint, byte[]>());
 
         // Random 100 B values
         var value = new byte[100.B()];
@@ -132,9 +132,9 @@ public class TableTests
         // Check we have one table with multiple blocks
         Assert.True(table.BlockMetadata.Count > 0);
 
-        var iterator = new SsTableIterator(table);
+        var iterator = new SsTableIterator<uint, byte[]>(table);
 
-        var result = iterator.EnumerateAsync(101).ToBlockingEnumerable().Select(x => BinaryPrimitives.ReadUInt32LittleEndian(x.Key.Span)).ToArray();
+        var result = iterator.EnumerateAsync(101).ToBlockingEnumerable().Select(x => x.Key).ToArray();
 
         Assert.Empty(result);
 
@@ -146,10 +146,10 @@ public class TableTests
     {
         var tempFilename = Path.GetRandomFileName();
 
-        var builder = new SsTableBuilder(new DefaultSsTableEncoder(), new DefaultBlockEncoder());
+        var builder = new SsTableBuilder<ushort, string>(new DefaultSsTableEncoder<ushort, string>(), new DefaultBlockEncoder<ushort, string>());
         var memoryCache = new MemoryCache(new MemoryCacheOptions());
-        Bytes key = (ushort)7;
-        Bytes value = "hello";
+        ushort key = 7;
+        string value = "hello";
 
         builder.Add(key, value);
 
@@ -169,10 +169,10 @@ public class TableTests
     {
         var tempFilename = Path.GetRandomFileName();
 
-        var builder = new SsTableBuilder(new DefaultSsTableEncoder(), new DefaultBlockEncoder());
+        var builder = new SsTableBuilder<ushort, string>(new DefaultSsTableEncoder<ushort, string>(), new DefaultBlockEncoder<ushort, string>());
         var memoryCache = new MemoryCache(new MemoryCacheOptions());
-        Bytes key = (ushort)7;
-        Bytes value = "hello";
+        ushort key = 7;
+        string value = "hello";
 
         builder.Add(key, value);
 
@@ -180,7 +180,7 @@ public class TableTests
 
         Assert.Single(table.BlockMetadata);
         
-        var blocks = new List<Task<Block?>>();
+        var blocks = new List<Task<Block<ushort, string>?>>();
 
         for (var i = 0; i < 100; i++)
         {

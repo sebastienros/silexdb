@@ -1,18 +1,20 @@
 namespace Silex.Blocks;
 
 using Silex;
+using Silex.Serialization;
 using System;
 using System.Buffers;
 using System.Collections.Generic;
-using static System.Runtime.InteropServices.JavaScript.JSType;
 
-public class Block : IDisposable
+public class Block<TKey, TValue> : IDisposable
 {
-    private readonly IBlockEncoder _encoder;
+    private static readonly IComparer<TKey> _keyComparer = BinaryEncoderFactory<TKey>.BinarySerializer.Comparer;
+
+    private readonly IBlockEncoder<TKey, TValue> _encoder;
     private readonly IMemoryOwner<byte>? _memoryOwner;
     private bool _disposed;
 
-    public Block(IBlockEncoder encoder, IMemoryOwner<byte> blockData, int length, IReadOnlyList<ushort> offsets)
+    public Block(IBlockEncoder<TKey, TValue> encoder, IMemoryOwner<byte> blockData, int length, IReadOnlyList<ushort> offsets)
     {
         _encoder = encoder;
         _memoryOwner = blockData;
@@ -20,7 +22,7 @@ public class Block : IDisposable
         Offsets = offsets;
     }
 
-    public Block(IBlockEncoder encoder, ReadOnlyMemory<byte> blockData, int length, IReadOnlyList<ushort> offsets)
+    public Block(IBlockEncoder<TKey, TValue> encoder, ReadOnlyMemory<byte> blockData, int length, IReadOnlyList<ushort> offsets)
     {
         _encoder = encoder;
         _memoryOwner = null;
@@ -36,12 +38,12 @@ public class Block : IDisposable
     /// </summary>
     /// <param name="offset"></param>
     /// <returns></returns>
-    public RecordLocation GetEntry(int offset)
+    public RecordLocation<TKey> GetEntry(int offset)
     {
         return _encoder.DecodeEntry(Memory, offset);
     }
 
-    public ReadOnlySpan<byte> GetValue(Bytes key)
+    public ReadOnlySpan<byte> GetValue(TKey key)
     {
         double start = 0;
         var end = Offsets.Count - 1;
@@ -52,7 +54,7 @@ public class Block : IDisposable
 
             var entry = GetEntry(Offsets[m]);
 
-            switch (Bytes.Comparer.Compare(key, entry.Key))
+            switch (_keyComparer.Compare(key, entry.Key))
             {
                 case 0:
                     return GetValue(entry);
@@ -73,7 +75,7 @@ public class Block : IDisposable
     /// </summary>
     /// <param name="entry"></param>
     /// <returns></returns>
-    public ReadOnlySpan<byte> GetValue(RecordLocation entry)
+    public ReadOnlySpan<byte> GetValue(RecordLocation<TKey> entry)
     {
         return _encoder.DecodeValue(Memory, entry.BlockOffset, entry.Length).Span;
     }

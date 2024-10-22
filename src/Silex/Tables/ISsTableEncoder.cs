@@ -1,4 +1,3 @@
-using Silex.Blocks;
 using Silex.Buffers;
 
 namespace Silex.Tables;
@@ -6,11 +5,11 @@ namespace Silex.Tables;
 /// <summary>
 /// Encodes or decodes a <see cref="SsTable"/>. 
 /// </summary>
-public interface ISsTableEncoder
+public interface ISsTableEncoder<TKey, TValue>
 {
-    void EncodeMetadata(EncoderBinaryWriter writer, IReadOnlyList<BlockMetadata> blockMetadata, long metadataOffset);
+    void EncodeMetadata(EncoderBinaryWriter writer, IReadOnlyList<BlockMetadata<TKey>> blockMetadata, long metadataOffset);
 
-    IReadOnlyList<BlockMetadata> DecodeMetadata(ReadOnlyMemory<byte> buffer, int offset);
+    IReadOnlyList<BlockMetadata<TKey>> DecodeMetadata(ReadOnlyMemory<byte> buffer, int offset);
 
-    int EstimateMetadataSize(IReadOnlyList<BlockMetadata> blockMetadata);
+    int EstimateMetadataSize(IReadOnlyList<BlockMetadata<TKey>> blockMetadata);
 }

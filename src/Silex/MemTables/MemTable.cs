@@ -1,5 +1,6 @@
-﻿using Silex.Collections;
+﻿using Silex.Serialization;
 using Silex.Tables;
+using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 
 namespace Silex.MemTables;
@@ -19,11 +20,16 @@ namespace Silex.MemTables;
 /// A MemTable usually has a size limit and it will be frozen to an immutable MemTable when it reaches the size limit.
 /// This logic is part of <see cref="LsmStorageInner"/>.
 /// </remarks>
-internal sealed class MemTable : IMemTable
+internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKey : notnull
 {
-    private readonly SkipList<Bytes, Bytes> _map = new(Bytes.Comparer);
+    private static readonly IBinaryEncoder<TKey> _keySerializer = BinaryEncoderFactory<TKey>.BinarySerializer;
+    private static readonly IBinaryEncoder<TValue> _valueSerializer = BinaryEncoderFactory<TValue>.BinarySerializer;
+
+    private IDictionary<TKey, TValue> _map = new Dictionary<TKey, TValue>(_keySerializer.EqualityComparer);
+
     private long _size;
     private bool _disposing;
+    private bool _keysAreOrdered;
     private readonly long _id;
 
     public MemTable(long id)
@@ -40,22 +46,21 @@ internal sealed class MemTable : IMemTable
     public long Size => _size;
 
     /// <inheritdocs />
-    public bool TryGet(Bytes key, out Bytes result)
+    public bool TryGet(TKey key, [MaybeNullWhen(false)] out TValue result)
     {
         ObjectDisposedException.ThrowIf(_disposing, this);
 
-        if (_map.TryGetValue(key, out var memoryOwner))
+        if (_map.TryGetValue(key, out result))
         {
-            result = (Bytes)memoryOwner.Memory;
             return true;
         }
 
-        result = Bytes.Empty;
+        result = default!;
         return false;
     }
 
     /// <inheritdocs />
-    public void Put(Bytes key, Bytes value)
+    public void Put(TKey key, TValue value)
     {
         ObjectDisposedException.ThrowIf(_disposing, this);
 
@@ -63,29 +68,45 @@ internal sealed class MemTable : IMemTable
         // and the size need to be consistent.
         // This also needs to handle when the same key is updated concurrently
 
+        var keyLength = _keySerializer.GetLength(key);
+
         // Retrieve the previous value to keep its size consistent.
-        if (_map.TryRemove(key, out var previousValue))
+        if (_map.Remove(key, out var previousValue))
         {
-            _size -= previousValue.Length + key.Length + sizeof(int);
-            previousValue.Dispose();
+            _size -= _valueSerializer.GetLength(previousValue) + keyLength + sizeof(int);
         }
 
         _map.Add(key, value);
-        _size += value.Length + key.Length + sizeof(int);
+
+        _size += _valueSerializer.GetLength(value) + keyLength + sizeof(int);
         return;
     }
 
-    public IStorageIterator CreateIterator()
+    public IStorageIterator<TKey, TValue> CreateIterator()
     {
         return new MemTableIterator(this);
     }
 
-    public void Flush(SsTableBuilder builder)
+    public void Flush(SsTableBuilder<TKey, TValue> builder)
     {
+        EnsureSortedMap();
+
         foreach (var entry in _map)
         {
             builder.Add(entry.Key, entry.Value);
         }
+    }
+
+    private void EnsureSortedMap()
+    {
+        if (_keysAreOrdered)
+        {
+            return;
+        }
+
+        _map = new SortedDictionary<TKey, TValue>(_map, _keySerializer.Comparer);
+
+        _keysAreOrdered = true;
     }
 
     public void Dispose()
@@ -105,7 +126,10 @@ internal sealed class MemTable : IMemTable
     {
         foreach (var entry in _map)
         {
-            entry.Value.Dispose();
+            if (entry is IDisposable d)
+            {
+                d.Dispose();
+            }
         }
 
         _map.Clear();
@@ -116,37 +140,56 @@ internal sealed class MemTable : IMemTable
         DisposeInternal();
     }
 
-    private sealed class MemTableIterator : IStorageIterator
+    private sealed class MemTableIterator : IStorageIterator<TKey, TValue>
     {
-        private readonly MemTable _table;
+        private readonly MemTable<TKey, TValue> _table;
         
-        public MemTableIterator(MemTable table)
+        public MemTableIterator(MemTable<TKey, TValue> table)
         {
             _table = table;
         }
 
-        public IAsyncEnumerable<RecordLocation> EnumerateAsync(CancellationToken cancellationToken = default)
+#pragma warning disable CS1998 // Async method lacks 'await' operators and will run synchronously
+        public async IAsyncEnumerable<RecordLocation<TKey>> EnumerateAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
+#pragma warning restore CS1998 // Async method lacks 'await' operators and will run synchronously
         {
-            return EnumerateAsync(Bytes.Empty, cancellationToken);
+            _table.EnsureSortedMap();
+
+            foreach (var entry in _table._map)
+            {
+                yield return new RecordLocation<TKey> { Key = entry.Key, Length = 0, IsTombstone = _valueSerializer.IsTombstoneValue(entry.Value) };
+            }
         }
 
 #pragma warning disable CS1998 // Async method lacks 'await' operators and will run synchronously
-        public async IAsyncEnumerable<RecordLocation> EnumerateAsync(Bytes afterKey, [EnumeratorCancellation] CancellationToken _ = default)
+        public async IAsyncEnumerable<RecordLocation<TKey>> EnumerateAsync(TKey afterKey, [EnumeratorCancellation] CancellationToken _ = default)
 #pragma warning restore CS1998 // Async method lacks 'await' operators and will run synchronously
         {
-            if (afterKey.IsEmpty)
-            {
-                foreach (var kvp in _table._map.Enumerate())
-                {
-                    yield return new RecordLocation { Key = kvp.Key, Length = kvp.Value.Memory.Length };
-                }
+            _table.EnsureSortedMap();
 
-                yield break;
+            // TODO: [PERF] Optimize the iteration by seeking the index
+            // of the key without cloning the collection
+
+            var orderedKeys = new List<TKey>(_table._map.Keys);
+            
+            var index = orderedKeys.BinarySearch(0, _table._map.Count, afterKey, _keySerializer.Comparer);
+
+            if (index < 0)
+            {
+                index = ~index;
             }
 
-            foreach (var kvp in _table._map.Enumerate(afterKey))
+            for (var i = index; i < orderedKeys.Count; i++)
             {
-                yield return new RecordLocation { Key = kvp.Key, Length = kvp.Value.Memory.Length };
+                var key = orderedKeys[i];
+
+                // TODO: [PERF] Optimize the iteration by preventing
+                // a lookup for each key
+
+                if (_table._map.TryGetValue(key, out var value))
+                {
+                    yield return new RecordLocation<TKey> { Key = key, Length = 0, IsTombstone = _valueSerializer.IsTombstoneValue(value) };
+                }
             }
         }
     }

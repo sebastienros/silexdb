@@ -8,9 +8,3 @@
 - Should encoding be responsible for creating files? We should be able to decide which files are created for an SST (like one for content and one for metadata)
   or where it should be stored (blobs)
 - Use IStorageIterator for MemTables and implement a MergeIterator implementing it too. Use it in LsmStorageInner.
-
-
-- SkipList is much slower than Dictionary, allocating a log of Node.List<>
-- Parallelization in Put() is not helping, probably because there is a lock on MemTable. Maybe
-  a concurrent collection (in place of SkipList) could help remove some locking on Puts.
-- 

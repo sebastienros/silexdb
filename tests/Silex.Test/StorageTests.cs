@@ -17,7 +17,7 @@ public class StorageTests
     [Fact]
     public async Task CanPutArray()
     {
-        var storage = new LsmStorageInner(Path.GetTempPath(), _defaultStorageOptions);
+        var storage = new LsmStorageInner<byte[], byte[]>(Path.GetTempPath(), _defaultStorageOptions);
 
         byte[] key = [1, 2, 3];
         byte[] value = [4, 5, 6];
@@ -32,7 +32,7 @@ public class StorageTests
     [Fact]
     public async Task PutValueIsCopied()
     {
-        var storage = new LsmStorageInner(Path.GetTempPath(), _defaultStorageOptions);
+        var storage = new LsmStorageInner<byte[], byte[]>(Path.GetTempPath(), _defaultStorageOptions);
 
         byte[] key1 = [1];
         byte[] key2 = [2];
@@ -52,14 +52,14 @@ public class StorageTests
     [Fact]
     public async Task DeleteShouldStoreTombStone()
     {
-        var storage = new LsmStorageInner(Path.GetTempPath(), _defaultStorageOptions);
+        var storage = new LsmStorageInner<byte[], byte[]>(Path.GetTempPath(), _defaultStorageOptions);
 
         byte[] key = [1, 2, 3];
 
         storage.Delete(key);
         var result = await storage.GetAsync(key);
 
-        Assert.True(result.IsEmpty);
+        Assert.True(result?.Length == 0);
         Assert.Equal(7, storage._state.CurrentMemTable.Size);
     }
 
@@ -73,7 +73,7 @@ public class StorageTests
         var memTableSizeLimit = 100;
 
         var storageOptions = new StorageOptions { MemTableSizeLimit = memTableSizeLimit };
-        var storage = new LsmStorageInner(Path.GetTempPath(), storageOptions);
+        var storage = new LsmStorageInner<int, byte[]>(Path.GetTempPath(), storageOptions);
 
         for (var i = 1; i <= entries; i++)
         {
@@ -97,7 +97,7 @@ public class StorageTests
         var dictionary = new Dictionary<int, byte[]>();
 
         var storageOptions = new StorageOptions { MemTableSizeLimit = memTableSizeLimit };
-        var storage = new LsmStorageInner(Path.GetTempPath(), storageOptions);
+        var storage = new LsmStorageInner<int, byte[]>(Path.GetTempPath(), storageOptions);
 
         for (var i = 1; i <= entries; i++)
         {
@@ -123,37 +123,37 @@ public class StorageTests
     {
         var storage = FillImmutableMemTables();
 
-        Bytes key = 10;
+        int key = 10;
 
         var result = await storage.GetAsync(key);
-        Assert.Equal(10, result.Length);
+        Assert.Equal(10, result?.Length);
 
-        storage.Delete(key);
+         storage.Delete(key);
         result = await storage.GetAsync(key);
 
-        Assert.Equal(0, result.Length);
+        Assert.Equal(0, result?.Length);
     }
 
     [Fact]
     public void ScanListsAllMemTables()
     {
-        var storage = new LsmStorageInner(Path.GetTempPath(), _defaultStorageOptions);
+        var storage = new LsmStorageInner<char, byte[]>(Path.GetTempPath(), new StorageOptions());
 
         // table1: b->del, c->4, d->5
         // table2: a->1, b->2, c->3
         // table3: e->4
 
-        storage.Put('e', new byte[] { 4 });
+        storage.Put('e', [4]);
         storage.ForceFreezeMemTable();
 
-        storage.Put('a', new byte[] { 1 });
-        storage.Put('b', new byte[] { 2 });
-        storage.Put('c', new byte[] { 3 });
+        storage.Put('a', [1]);
+        storage.Put('b', [2]);
+        storage.Put('c', [3]);
         storage.ForceFreezeMemTable();
 
         storage.Delete('b');
-        storage.Put('c', new byte[] { 4 });
-        storage.Put('d', new byte[] { 5 });
+        storage.Put('c', [4]);
+        storage.Put('d', [5]);
 
         var iterator = storage.CreateIterator();
         var list = iterator.EnumerateAsync().ToBlockingEnumerable().ToList();
@@ -178,7 +178,7 @@ public class StorageTests
         var maxKeysValue = 50; // Limit the number of unique ids to generate collisions
         var iterations = 50;
         var storageOptions = new StorageOptions { MemTableSizeLimit = 100 };
-        var storage = new LsmStorageInner(Path.GetTempPath(), storageOptions);
+        var storage = new LsmStorageInner<long, byte[]>(Path.GetTempPath(), storageOptions);
         var iterator = storage.CreateIterator();
 
         var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5)).Token;
@@ -203,16 +203,16 @@ public class StorageTests
         _output?.WriteLine($"Entries:");
         foreach (var entry in allEntries)
         {
-            var key = entry.Key.Span.Length == 0 ? "0" : BinaryPrimitives.ReadUInt32LittleEndian(entry.Key.Span).ToString(CultureInfo.InvariantCulture);
+            var key = entry.Key.ToString(CultureInfo.InvariantCulture);
             var entryValue = await storage.GetAsync(entry.Key);
-            var value = entryValue.Length == 0 ? "del" : BinaryPrimitives.ReadUInt64LittleEndian(entryValue.Span).ToString(CultureInfo.InvariantCulture);
+            var value = entryValue.Length == 0 ? "del" : BinaryPrimitives.ReadUInt64LittleEndian(entryValue.AsSpan()).ToString(CultureInfo.InvariantCulture);
 
             _output?.WriteLine($"{key} -> {value}");
         }
 
         Assert.True(allEntries.Count <= maxKeysValue);
 
-        async ValueTask Work(LsmStorageInner storage)
+        async ValueTask Work(LsmStorageInner<long, byte[]> storage)
         {
             for (var i = 0; i < iterations; i++)
             {
@@ -259,7 +259,7 @@ public class StorageTests
         var count = 10;
 
         var storage = FillImmutableMemTables(entries: count, memTableSizeLimit: 1.KiB());
-        Bytes lowerBytes = lowerBound == null ? Bytes.Empty : lowerBound.Value;
+        int lowerBytes = lowerBound == null ? -1 : lowerBound.Value;
 
         var expectedKeys = Enumerable.Range(1, count);
 
@@ -272,7 +272,7 @@ public class StorageTests
             Assert.All(entries, e => Assert.True(lowerBytes <= e.Key));
         }
 
-        var actualKeys = storage.CreateIterator().EnumerateAsync(lowerBytes).ToBlockingEnumerable().Select(x => (int)BinaryPrimitives.ReadUInt32LittleEndian(x.Key.Span)).ToArray();
+        var actualKeys = storage.CreateIterator().EnumerateAsync(lowerBytes).ToBlockingEnumerable().Select(x => x.Key).ToArray();
 
         Assert.Equal(expectedKeys, actualKeys);
     }
@@ -282,7 +282,7 @@ public class StorageTests
     {
         var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
 
-        await LsmStorage.OpenAsync(tempFolder, _defaultStorageOptions);
+        await LsmStorage.OpenAsync<int, int>(tempFolder, _defaultStorageOptions);
 
         Assert.True(Directory.Exists(tempFolder));
 
@@ -294,9 +294,9 @@ public class StorageTests
     {
         var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
 
-        var storage = await LsmStorage.OpenAsync(tempFolder, _defaultStorageOptions);
+        var storage = await LsmStorage.OpenAsync<char, byte[]>(tempFolder, new StorageOptions());
 
-        storage.Put('e', new byte[] { 4 });
+        storage.Put('e', [4]);
 
         // Don't freeze current MemTable
 
@@ -314,9 +314,9 @@ public class StorageTests
     {
         var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
 
-        var storage = await LsmStorage.OpenAsync(tempFolder, _defaultStorageOptions);
+        var storage = await LsmStorage.OpenAsync<char, byte[]>(tempFolder, new());
 
-        storage.Put('e', new byte[] { 4 });
+        storage.Put('e', [4]);
         storage._inner.ForceFreezeMemTable();
         await storage._inner.ForceFlushNextImmutableMemTableAsync();
 
@@ -334,7 +334,7 @@ public class StorageTests
 
         var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
         var options = new StorageOptions { MemTableMaxCount = 2 };
-        var storage = await LsmStorage.OpenAsync(tempFolder, options);
+        var storage = await LsmStorage.OpenAsync<char, int>(tempFolder, options);
 
         storage.Put('a', 1);
         storage._inner.ForceFreezeMemTable();
@@ -362,7 +362,7 @@ public class StorageTests
     public async Task CloseAsyncShouldFlushToDisk()
     {
         var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-        var storage = await LsmStorage.OpenAsync(tempFolder, _defaultStorageOptions);
+        var storage = await LsmStorage.OpenAsync<char, int>(tempFolder, new StorageOptions());
 
         storage.Put('a', 1);
         await storage.CloseAsync();
@@ -375,7 +375,7 @@ public class StorageTests
     public async Task CloseAsyncCanBeInvokedMultipleTimes()
     {
         var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-        var storage = await LsmStorage.OpenAsync(tempFolder, _defaultStorageOptions);
+        var storage = await LsmStorage.OpenAsync<char, int>(tempFolder, new StorageOptions());
 
         storage.Put('a', 1);
         await storage.CloseAsync();
@@ -391,10 +391,10 @@ public class StorageTests
         Directory.Delete(tempFolder, true);
     }
 
-    private static LsmStorageInner FillImmutableMemTables(int entries = 100, int valueSize = 10, long memTableSizeLimit = 100)
+    private static LsmStorageInner<int, byte[]> FillImmutableMemTables(int entries = 100, int valueSize = 10, long memTableSizeLimit = 100)
     {
         var storageOptions = new StorageOptions { MemTableSizeLimit = memTableSizeLimit };
-        var storage = new LsmStorageInner(Path.GetTempPath(), storageOptions);
+        var storage = new LsmStorageInner<int, byte[]>(Path.GetTempPath(), storageOptions);
 
         for (var i = 1; i <= entries; i++)
         {
