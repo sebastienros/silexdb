@@ -363,9 +363,9 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
             _state = storage._state;
         }
 
-        public async IAsyncEnumerable<RecordLocation<TKey>> EnumerateAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
+        public async IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
         {
-            List<IAsyncEnumerator<RecordLocation<TKey>>> iterators = [];
+            List<IAsyncEnumerator<KeyValuePair<TKey, TValue>>> iterators = [];
 
             // In theory only the current MemTable needs to be synchronized,
             // but we need to keep the mutable MemTable iterator around to compare with immutable ones.
@@ -436,7 +436,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
                         iterators.RemoveAt(smallestIndex);
                     }
 
-                    if (!smallest.IsTombstone)
+                    if (!_valueSerializer.IsTombstoneValue(smallest.Value))
                     {
                         yield return smallest;
                     }
@@ -453,9 +453,9 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         /// </summary>
         /// <remarks>Uses a merge iterator.</remarks>
         /// <returns></returns>
-        public async IAsyncEnumerable<RecordLocation<TKey>> EnumerateAsync(TKey minValue, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        public async IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateAsync(TKey from, [EnumeratorCancellation] CancellationToken cancellationToken = default)
         {
-            List<IAsyncEnumerator<RecordLocation<TKey>>> iterators = [];
+            List<IAsyncEnumerator<KeyValuePair<TKey, TValue>>> iterators = [];
 
             // In theory only the current MemTable needs to be synchronized,
             // but we need to keep the mutable MemTable iterator around to compare with immutable ones.
@@ -467,7 +467,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
             {
                 var currentIterator = _state.CurrentMemTable.CreateIterator();
 
-                var currentEnumerator = currentIterator.EnumerateAsync(minValue, cancellationToken).GetAsyncEnumerator(cancellationToken);
+                var currentEnumerator = currentIterator.EnumerateAsync(from, cancellationToken).GetAsyncEnumerator(cancellationToken);
 
                 if (await currentEnumerator.MoveNextAsync())
                 {
@@ -478,7 +478,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
                 {
                     var iterator = memTable.CreateIterator();
 
-                    var enumerator = iterator.EnumerateAsync(minValue, cancellationToken).GetAsyncEnumerator(cancellationToken);
+                    var enumerator = iterator.EnumerateAsync(from, cancellationToken).GetAsyncEnumerator(cancellationToken);
 
                     if (await enumerator.MoveNextAsync())
                     {
@@ -527,7 +527,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
                     }
 
                     // Don't return tombstones
-                    if (!smallest.IsTombstone)
+                    if (!_valueSerializer.IsTombstoneValue(smallest.Value))
                     {
                         yield return smallest;
                     }

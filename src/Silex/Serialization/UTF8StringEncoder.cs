@@ -5,7 +5,7 @@ using System.Text;
 
 public sealed class UTF8StringEncoder : IBinaryEncoder<string>
 {
-    internal const int BufferLength = 128;
+    internal const int StackAllocThreshold = 100;
 
     public string Decode(ReadOnlySpan<byte> data)
     {
@@ -37,9 +37,9 @@ public sealed class UTF8StringEncoder : IBinaryEncoder<string>
         var length = Encoding.UTF8.GetByteCount(value);
 
         var span = value.AsSpan();
-        Span<byte> bytes = stackalloc byte[BufferLength];
+        Span<byte> bytes = stackalloc byte[StackAllocThreshold];
 
-        if (length <= BufferLength)
+        if (length <= StackAllocThreshold)
         {
             var written = Encoding.UTF8.GetBytes(span, bytes);
             writer.WriteRaw(bytes.Slice(0, written));

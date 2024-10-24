@@ -1,9 +1,7 @@
-﻿namespace Silex;
-
-using Silex.Serialization;
-using System;
-using System.Collections.Generic;
+﻿using Silex.Serialization;
 using System.Runtime.CompilerServices;
+
+namespace Silex;
 
 internal class MergeIterator<TKey, TValue> : IStorageIterator<TKey, TValue>
 {
@@ -16,9 +14,9 @@ internal class MergeIterator<TKey, TValue> : IStorageIterator<TKey, TValue>
         _iterators = iterators;
     }
 
-    public async IAsyncEnumerable<RecordLocation<TKey>> EnumerateAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
+    public async IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        List<IAsyncEnumerator<RecordLocation<TKey>>> enumerators = [];
+        List<IAsyncEnumerator<KeyValuePair<TKey, TValue>>> enumerators = [];
 
         foreach (var iterator in _iterators)
         {
@@ -31,13 +29,13 @@ internal class MergeIterator<TKey, TValue> : IStorageIterator<TKey, TValue>
         }
     }
 
-    public async IAsyncEnumerable<RecordLocation<TKey>> EnumerateAsync(TKey minValue, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    public async IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateAsync(TKey from, [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        List<IAsyncEnumerator<RecordLocation<TKey>>> enumerators = [];
+        List<IAsyncEnumerator<KeyValuePair<TKey, TValue>>> enumerators = [];
 
         foreach (var iterator in _iterators)
         {
-            enumerators.Add(iterator.EnumerateAsync(minValue, cancellationToken).GetAsyncEnumerator(cancellationToken));
+            enumerators.Add(iterator.EnumerateAsync(from, cancellationToken).GetAsyncEnumerator(cancellationToken));
         }
 
         await foreach (var r in MergeIterator<TKey, TValue>.EnumerateAsync(enumerators, cancellationToken))
@@ -46,7 +44,7 @@ internal class MergeIterator<TKey, TValue> : IStorageIterator<TKey, TValue>
         }
     }
 
-    private static async IAsyncEnumerable<RecordLocation<TKey>> EnumerateAsync(List<IAsyncEnumerator<RecordLocation<TKey>>> enumerators, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    private static async IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateAsync(List<IAsyncEnumerator<KeyValuePair<TKey, TValue>>> enumerators, [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
 
@@ -90,11 +88,7 @@ internal class MergeIterator<TKey, TValue> : IStorageIterator<TKey, TValue>
                 enumerators.RemoveAt(smallestIndex);
             }
 
-            if (smallest.Length != 0)
-            {
-                yield return smallest;
-            }
+            yield return smallest;
         }
     }
-
 }

@@ -13,7 +13,7 @@ var data = Enumerable.Range(0, 1_000_000).Select(x => Random.Shared.Next()).ToLi
 
 var sw = Stopwatch.StartNew();
 data.ForEach(x => db.Put(x, x));
-//await db.CloseAsync();
+await db.CloseAsync();
 sw.Stop();
 
 Console.WriteLine(sw.Elapsed);

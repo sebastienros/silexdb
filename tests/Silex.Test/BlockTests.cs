@@ -180,8 +180,8 @@ public class BlockTests
         var iterator = new BlockIterator<int, byte[]>(block);
 
         var locations = iterator.EnumerateAsync().ToBlockingEnumerable().ToArray();
-        var v1 = block.GetValue(locations[0]);
-        var v2 = block.GetValue(locations[1]);
+        var v1 = locations[0].Value;
+        var v2 = locations[1].Value;
 
         Assert.Equal(111, v1[0]);
         Assert.Equal(222, v2[0]);

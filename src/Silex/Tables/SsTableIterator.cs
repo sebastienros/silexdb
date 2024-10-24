@@ -13,7 +13,7 @@ internal sealed class SsTableIterator<TKey, TValue> : IStorageIterator<TKey, TVa
         _table = table;
     }
 
-    public async IAsyncEnumerable<RecordLocation<TKey>> EnumerateAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
+    public async IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         for (var i = 0; i < _table.BlockMetadata.Count; i++)
         {
@@ -26,26 +26,20 @@ internal sealed class SsTableIterator<TKey, TValue> : IStorageIterator<TKey, TVa
                 var blockIterator = new BlockIterator<TKey, TValue>(block);
                 await foreach (var entry in blockIterator.EnumerateAsync(cancellationToken))
                 {
-                    yield return new RecordLocation<TKey>
-                    {
-                        SsTableFilename = _table.Filename,
-                        Length = entry.Length,
-                        Key = entry.Key,
-                        BlockOffset = entry.BlockOffset
-                    };
+                    yield return entry;
                 }
             }
         }
     }
 
-    public async IAsyncEnumerable<RecordLocation<TKey>> EnumerateAsync(TKey afterKey, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    public async IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateAsync(TKey from, [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         var startBlockIndex = 0;
 
         // Create a reusable index for binary search
         _firstKeys ??= _table.BlockMetadata.Select(x => x.FirstKey).ToArray();
 
-        var compare = Array.BinarySearch(_firstKeys, afterKey);
+        var compare = Array.BinarySearch(_firstKeys, from);
 
         startBlockIndex = (compare >= 0 ? compare : ~compare) - 1;
 
@@ -63,7 +57,7 @@ internal sealed class SsTableIterator<TKey, TValue> : IStorageIterator<TKey, TVa
         if (block != null)
         {
             var blockIterator = new BlockIterator<TKey, TValue>(block);
-            await foreach (var entry in blockIterator.EnumerateAsync(afterKey, cancellationToken))
+            await foreach (var entry in blockIterator.EnumerateAsync(from, cancellationToken))
             {
                 yield return entry;
             }
@@ -82,13 +76,7 @@ internal sealed class SsTableIterator<TKey, TValue> : IStorageIterator<TKey, TVa
                 var blockIterator = new BlockIterator<TKey, TValue>(block2);
                 await foreach (var entry in blockIterator.EnumerateAsync(cancellationToken))
                 {
-                    yield return new RecordLocation<TKey>
-                    {
-                        SsTableFilename = _table.Filename,
-                        Length = entry.Length,
-                        Key = entry.Key,
-                        BlockOffset = entry.BlockOffset
-                    };
+                    yield return entry;
                 }
             }
         }

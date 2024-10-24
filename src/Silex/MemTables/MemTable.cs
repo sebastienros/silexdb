@@ -1,4 +1,5 @@
-﻿using Silex.Serialization;
+﻿using Silex.Collections;
+using Silex.Serialization;
 using Silex.Tables;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
@@ -7,12 +8,14 @@ namespace Silex.MemTables;
 
 /// <summary>
 /// An instance of <see cref="MemTable"/> contains a sorted list of key value pairs of bytes to be stored.
-/// The memory that is passed is not duplicated, but deallocated when not used anymore. The ownership is delegated.
+/// The default collection is a dictionary, and mutates to a custom implementation of <see cref="SortedDictionary{TKey, TValue}"/> once
+/// the table is enumerated. We use a custom implementation in order to add Enumerate(from, to) without needing to 
+/// clone the keys collection.
 /// </summary>
 /// <remarks>
 /// The current implementation is not thread-safe when writes are involved. Thread-safety is handled in <see cref="LsmStorageInner"/>
 /// as it knows when a MemTable is frozen or used concurrently in read/write.
-/// The dictionary supports multiple readers concurrently, as long as the collection is not modified, meaning the 
+/// The dictionary supports multiple concurrent readers, as long as the collection is not modified, meaning the 
 /// higher-level component needs to lock reads during writes.
 /// 
 /// A MemTable doesn't hold an entry that was read from the store. It is not a reads cache.
@@ -29,7 +32,6 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
 
     private long _size;
     private bool _disposing;
-    private bool _keysAreOrdered;
     private readonly long _id;
 
     public MemTable(long id)
@@ -99,14 +101,14 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
 
     private void EnsureSortedMap()
     {
-        if (_keysAreOrdered)
+        var map = _map;
+
+        if (map is SortedDictionary<TKey, TValue>)
         {
             return;
         }
 
-        _map = new SortedDictionary<TKey, TValue>(_map, _keySerializer.Comparer);
-
-        _keysAreOrdered = true;
+        _map = new SortedDictionary<TKey, TValue>(map, _keySerializer.Comparer);
     }
 
     public void Dispose()
@@ -126,7 +128,7 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
     {
         foreach (var entry in _map)
         {
-            if (entry is IDisposable d)
+            if (entry.Value is IDisposable d)
             {
                 d.Dispose();
             }
@@ -150,46 +152,32 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
         }
 
 #pragma warning disable CS1998 // Async method lacks 'await' operators and will run synchronously
-        public async IAsyncEnumerable<RecordLocation<TKey>> EnumerateAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
+        public async IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
 #pragma warning restore CS1998 // Async method lacks 'await' operators and will run synchronously
         {
             _table.EnsureSortedMap();
 
+            // _map is a SortedDictionary at this point
+
             foreach (var entry in _table._map)
             {
-                yield return new RecordLocation<TKey> { Key = entry.Key, Length = 0, IsTombstone = _valueSerializer.IsTombstoneValue(entry.Value) };
+                yield return entry;
             }
         }
 
 #pragma warning disable CS1998 // Async method lacks 'await' operators and will run synchronously
-        public async IAsyncEnumerable<RecordLocation<TKey>> EnumerateAsync(TKey afterKey, [EnumeratorCancellation] CancellationToken _ = default)
+        public async IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateAsync(TKey afterKey, [EnumeratorCancellation] CancellationToken _ = default)
 #pragma warning restore CS1998 // Async method lacks 'await' operators and will run synchronously
         {
             _table.EnsureSortedMap();
 
-            // TODO: [PERF] Optimize the iteration by seeking the index
-            // of the key without cloning the collection
+            var sorted = (SortedDictionary<TKey, TValue> )_table._map;
 
-            var orderedKeys = new List<TKey>(_table._map.Keys);
-            
-            var index = orderedKeys.BinarySearch(0, _table._map.Count, afterKey, _keySerializer.Comparer);
+            var items = sorted.Enumerate(afterKey, default!, true, false);
 
-            if (index < 0)
+            foreach (var item in items)
             {
-                index = ~index;
-            }
-
-            for (var i = index; i < orderedKeys.Count; i++)
-            {
-                var key = orderedKeys[i];
-
-                // TODO: [PERF] Optimize the iteration by preventing
-                // a lookup for each key
-
-                if (_table._map.TryGetValue(key, out var value))
-                {
-                    yield return new RecordLocation<TKey> { Key = key, Length = 0, IsTombstone = _valueSerializer.IsTombstoneValue(value) };
-                }
+                yield return item;
             }
         }
     }

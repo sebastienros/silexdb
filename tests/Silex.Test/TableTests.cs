@@ -3,7 +3,6 @@
 using Microsoft.Extensions.Caching.Memory;
 using Silex.Blocks;
 using Silex.Tables;
-using System.Buffers.Binary;
 
 public class TableTests
 {
