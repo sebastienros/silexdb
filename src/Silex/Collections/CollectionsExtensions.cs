@@ -1,5 +1,6 @@
 ﻿using System.Reflection;
 using System.Reflection.Emit;
+using System.Runtime.CompilerServices;
 
 namespace Silex.Collections;
 
@@ -44,32 +45,33 @@ internal static class CollectionsExtensions
     private static class InternalSortedSetTypeCache<TKey, TValue> where TKey : notnull
     {
         private static readonly Func<SortedDictionary<TKey, TValue>, SortedSet<KeyValuePair<TKey, TValue>>> _getSetValue;
-        private static readonly Type _treeSubSetType;
 
         static InternalSortedSetTypeCache()
         {
             var sortedDictionaryType = typeof(SortedDictionary<TKey, TValue>);
             var sortedSetType = typeof(SortedSet<KeyValuePair<TKey, TValue>>);
 
-            _treeSubSetType = sortedSetType.GetNestedType("TreeSubSet", BindingFlags.NonPublic)!.MakeGenericType(typeof(KeyValuePair<TKey, TValue>));
-
             // Create a delegate to access the private field _set
             // private readonly TreeSet<KeyValuePair<TKey, TValue>> _set
             var setField = sortedDictionaryType.GetField("_set", BindingFlags.NonPublic | BindingFlags.Instance)!;
-            string methodName = setField.ReflectedType!.FullName + ".get_set" + setField.Name;
-            DynamicMethod setterMethod = new DynamicMethod(methodName, typeof(SortedSet<KeyValuePair<TKey, TValue>>), [sortedDictionaryType], true);
-            ILGenerator gen = setterMethod.GetILGenerator();
+            
+            // This is the name of a fake method, it can be anything
+            string methodName = setField.ReflectedType!.FullName + ".get" + setField.Name;
+            DynamicMethod getterMethod = new(methodName, typeof(SortedSet<KeyValuePair<TKey, TValue>>), [sortedDictionaryType], true);
+            ILGenerator gen = getterMethod.GetILGenerator();
             gen.Emit(OpCodes.Ldarg_0);
             gen.Emit(OpCodes.Ldfld, setField);
             gen.Emit(OpCodes.Ret);
-            _getSetValue = (Func<SortedDictionary<TKey, TValue>, SortedSet<KeyValuePair<TKey, TValue>>>)setterMethod.CreateDelegate(typeof(Func<SortedDictionary<TKey, TValue>, SortedSet<KeyValuePair<TKey, TValue>>>));
+
+            _getSetValue = (Func<SortedDictionary<TKey, TValue>, SortedSet<KeyValuePair<TKey, TValue>>>)getterMethod.CreateDelegate(typeof(Func<SortedDictionary<TKey, TValue>, SortedSet<KeyValuePair<TKey, TValue>>>));
         }
 
         public static IEnumerable<KeyValuePair<TKey, TValue>> Enumerate(SortedDictionary<TKey, TValue> dic, TKey from, TKey to, bool lowerBoundActive, bool upperBoundActive)
         {
             var sortedSet = _getSetValue(dic);
-            var treeSubSet = Activator.CreateInstance(_treeSubSetType, [sortedSet, new KeyValuePair<TKey, TValue>(from, default!), new KeyValuePair<TKey, TValue>(to, default!), lowerBoundActive, upperBoundActive])!;
-            return (IEnumerable<KeyValuePair<TKey, TValue>>)treeSubSet;
+            var kvpTo = lowerBoundActive ? new(from, default!) : sortedSet.Min;
+            var kvpFrom = upperBoundActive ? new(to, default!) : sortedSet.Max;
+            return sortedSet.GetViewBetween(kvpTo, kvpFrom);
         }
     }
 }
