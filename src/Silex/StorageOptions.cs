@@ -36,7 +36,9 @@ public class StorageOptions
     /// Gets or sets the maximum size of a <see cref="MemTable">. When the size is reached it is made immutable and 
     /// can be stored as a level-0 SST.
     /// </summary>
-    /// <value>
+    /// <remarks>
+    /// This value and <see cref="MemTableMaxCount"/> will define the maximum size of allocated memory for keys and values.
+    /// </remarks>/// <value>
     /// The default value is <inheritdoc cref="_defaultTableSizeLimit"/>.
     /// </value>
     public long MemTableSizeLimit { get; set; } = _defaultTableSizeLimit;
@@ -45,8 +47,11 @@ public class StorageOptions
     /// Gets or sets the maximum number of <see cref="MemTable"> which can be kept in memory before being flushed
     /// and stored as a level-0 SST.
     /// </summary>
+    /// <remarks>
+    /// This value and <see cref="MemTableSizeLimit"/> will define the maximum size of allocated memory for keys and values.
+    /// </remarks>
     /// <value>
-    /// The default value is <inheritdoc cref="_defaultTableSizeLimit"/>.
+    /// The default value is <inheritdoc cref="_defaultMemTableMaxCount"/>.
     /// </value>
     public ushort MemTableMaxCount { get; set; } = _defaultMemTableMaxCount;
 
@@ -93,7 +98,7 @@ public class StorageOptions
     public long BlockCacheSizeLimit { get; set; } =_defaultBlockCacheSizeLimit;
 
     /// <summary>
-    /// Gets or sets how long a cache entry can be inactive (e.g. not accessed) before it will be removed. This will not extend the entry lifetime beyond the absolute expiration (if set).
+    /// Gets or sets how long a block cache entry can be inactive (e.g. not accessed) before it will be removed. This will not extend the entry lifetime beyond the absolute expiration (if set).
     /// </summary>
     /// <value>
     /// The default value is <inheritdoc cref="_defaultBlockCacheSlidingExpiration"/>. Use <c>TimeSpan.Zero</c> (<c>"00:00:00"</c>) to disable sliding expiration.
@@ -101,7 +106,7 @@ public class StorageOptions
     public TimeSpan BlockCacheSlidingExpiration { get; set; } = _defaultBlockCacheSlidingExpiration;
 
     /// <summary>
-    /// Gets or sets an absolute expiration time, relative to when the cache is added, even if it is effectively accessed.
+    /// Gets or sets an absolute expiration time, relative to when a block cache is added, even if it is effectively accessed.
     /// </summary>
     /// <value>
     /// The default value is <inheritdoc cref="_defaultBlockCacheAbsoluteExpiration"/>. Use <c>TimeSpan.Zero</c> (<c>"00:00:00"</c>) to disable absolute expiration.

@@ -1,8 +1,7 @@
-﻿namespace Silex.Serialization;
-
-using Silex.Buffers;
-using System.Collections.Generic;
+﻿using Silex.Buffers;
 using System.Diagnostics;
+
+namespace Silex.Serialization;
 
 public sealed class BytesEncoder : IBinaryEncoder<Bytes>
 {

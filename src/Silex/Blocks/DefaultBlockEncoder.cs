@@ -104,53 +104,43 @@ public class DefaultBlockEncoder<TKey, TValue> : IBlockEncoder<TKey, TValue>
         var size = entries.Sum(x => EstimateSize(x.Key, x.Value)) + sizeof(ushort);
 
         // This buffer can extend its memory dynamically using an ArrayPool<byte> as we keep
-        // writing on it. Once the buffer is finalized we can copy its content to a locally 
-        // allocated array that we are free to dispose when necessary.
+        // writing on it. We pass it along as an IMemoryOwner so it can be disposed once used.
 
-        var buffer = new RecyclableArrayBufferWriter<byte>();
+        var buffer = RecyclableMemoryStreamFactory.Shared.GetStream(tag: null, size);
+
         var writer = new EncoderBinaryWriter(buffer);
 
-        try
+        var offsets = new List<ushort>(entries.Count);
+
+        foreach (var entry in entries)
         {
-            var offsets = new List<ushort>(entries.Count);
+            offsets.Add((ushort)writer.BytesWritten);
 
-            foreach (var entry in entries)
-            {
-                offsets.Add((ushort)writer.BytesWritten);
+            writer.Write7BitEncodedInt(_keySerializer.GetLength(entry.Key));
+            _keySerializer.Encode(entry.Key, ref writer);
 
-                writer.Write7BitEncodedInt(_keySerializer.GetLength(entry.Key));
-                _keySerializer.Encode(entry.Key, ref writer);
-
-                writer.Write7BitEncodedInt(_valueSerializer.GetLength(entry.Value));
-                _valueSerializer.Encode(entry.Value, ref writer);
-            }
-
-            foreach (var offset in offsets)
-            {
-                // 2 bytes for each offset (ushort)
-                writer.WriteUInt16(offset);
-            }
-
-            // 2 bytes for the number of elements
-            writer.WriteUInt16((ushort)offsets.Count);
-
-            writer.Flush();
-
-            // The internal array could be kept if buffer was not disposed,
-            // but by using MemoryPool and copy the value we ensure that all 
-            // array allocations are effectively pooled.
-
-            var memory = buffer.GetCommittedMemory();
-
-            var memoryOwner = MemoryPool<byte>.Shared.Rent(memory.Length);
-            memory.CopyTo(memoryOwner.Memory);
-
-            return new Block<TKey, TValue>(this, memoryOwner, memory.Length, offsets);
+            writer.Write7BitEncodedInt(_valueSerializer.GetLength(entry.Value));
+            _valueSerializer.Encode(entry.Value, ref writer);
         }
-        finally
+
+        foreach (var offset in offsets)
         {
-            buffer.Dispose();
+            // 2 bytes for each offset (ushort)
+            writer.WriteUInt16(offset);
         }
+
+        // 2 bytes for the number of elements
+        writer.WriteUInt16((ushort)offsets.Count);
+
+        // The internal array could be kept if buffer was not disposed,
+        // but by using MemoryPool and copy the value we ensure that all 
+        // array allocations are effectively pooled.
+
+        var memory = new MemoryStreamOwner(buffer);
+
+        writer.Flush();
+           
+        return new Block<TKey, TValue>(this, memory, (int)buffer.Length, offsets);
     }
 
     public int EstimateSize(TKey key, TValue value)

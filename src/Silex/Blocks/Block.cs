@@ -1,10 +1,7 @@
-namespace Silex.Blocks;
-
-using Silex;
 using Silex.Serialization;
-using System;
 using System.Buffers;
-using System.Collections.Generic;
+
+namespace Silex.Blocks;
 
 public class Block<TKey, TValue> : IDisposable
 {

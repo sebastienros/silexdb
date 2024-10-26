@@ -1,6 +1,6 @@
+using Microsoft.IO;
 using Silex.Blocks;
 using Silex.Buffers;
-using System.Buffers;
 
 namespace Silex.Tables;
 
@@ -14,8 +14,8 @@ public class SsTableBuilder<TKey, TValue>
     private TKey? _lastKey = default;
     private readonly BlockBuilder<TKey, TValue> _blockBuilder;
     private List<BlockMetadata<TKey>>? _metadata;
-    
-    private RecyclableArrayBufferWriter<byte>? _bufferWriter;
+
+    private readonly RecyclableMemoryStream _bufferWriter = RecyclableMemoryStreamFactory.Shared.GetStream();
 
     public SsTableBuilder(ISsTableEncoder<TKey, TValue> tableEncoder, IBlockEncoder<TKey, TValue> blockEncoder)
     {
@@ -44,7 +44,7 @@ public class SsTableBuilder<TKey, TValue>
         {
             // The block builder has to accept this entry since it's empty, even if
             // the size is over the block size
-            throw new InvalidOperationException("The data was not be successfully added to a block.");
+            throw new InvalidOperationException("The data was not successfully added to a block.");
         }
 
         _firstKey = key;
@@ -63,8 +63,6 @@ public class SsTableBuilder<TKey, TValue>
         // Release the block's memory as soon as we have copied its content.
         using var block = _blockBuilder.BuildBlock();
 
-        var blockLength = block.Memory.Length;
-
         _metadata ??= [];
 
         var m = new BlockMetadata<TKey>()
@@ -79,12 +77,6 @@ public class SsTableBuilder<TKey, TValue>
 
         // Write the SST content in memory as blocks are getting created.
         // Use a buffer writer as it will handle the growth of the SST buffer automatically.
-
-        if (_bufferWriter == null)
-        {
-            _bufferWriter = new(); ;
-            _bufferWriter.GetMemory(blockLength);
-        }
 
         _bufferWriter.Write(block.Memory.Span);
         
@@ -111,8 +103,12 @@ public class SsTableBuilder<TKey, TValue>
 
         try
         {
-            var memory = _bufferWriter.GetCommittedMemory();
-            await stream.WriteAsync(memory, cancellationToken);
+            var sequence = _bufferWriter.GetReadOnlySequence();
+
+            foreach (var s in sequence)
+            {
+                await stream.WriteAsync(s, cancellationToken);
+            }
         }
         finally
         {
@@ -122,7 +118,6 @@ public class SsTableBuilder<TKey, TValue>
         var table = new SsTable<TKey, TValue>(IdGenerator.GetNextId(), filename, _metadata, _offset, _blockBuilder);
 
         _bufferWriter.Dispose();
-        _bufferWriter = null;
         _metadata = null;
         _offset = 0;
 

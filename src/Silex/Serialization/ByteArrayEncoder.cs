@@ -1,6 +1,6 @@
-﻿namespace Silex.Serialization;
+﻿using Silex.Buffers;
 
-using Silex.Buffers;
+namespace Silex.Serialization;
 
 public sealed class ByteArrayEncoder : IBinaryEncoder<byte[]>
 {

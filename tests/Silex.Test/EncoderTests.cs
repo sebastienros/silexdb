@@ -24,11 +24,11 @@ public class EncoderTests
         Assert.Equal(length, value.Length);
         Assert.Equal(length, encoder.GetLength(value));
 
-        var _bufferWriter = new RecyclableArrayBufferWriter<byte>();
+        var _bufferWriter = new PooledArrayBufferWriter<byte>();
         var writer = new EncoderBinaryWriter(_bufferWriter);
         encoder.Encode(value, ref writer);
         writer.Flush();
-        var memory = _bufferWriter.GetCommittedMemory();
+        var memory = _bufferWriter.WrittenMemory;
         var decoded = encoder.Decode(memory.Span);
 
         Assert.Equal(length, memory.Length);
@@ -58,11 +58,11 @@ public class EncoderTests
             Assert.True(length < encoder.GetLength(value));
         }
 
-        var _bufferWriter = new RecyclableArrayBufferWriter<byte>();
+        var _bufferWriter = new PooledArrayBufferWriter<byte>();
         var writer = new EncoderBinaryWriter(_bufferWriter);
         encoder.Encode(value, ref writer);
         writer.Flush();
-        var memory = _bufferWriter.GetCommittedMemory();
+        var memory = _bufferWriter.WrittenMemory;
         var decoded = encoder.Decode(memory.Span);
 
         Assert.Equal(value, decoded);

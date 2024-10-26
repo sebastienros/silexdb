@@ -1,7 +1,7 @@
-﻿namespace Silex.MemTables;
-
-using Silex.Tables;
+﻿using Silex.Tables;
 using System.Diagnostics.CodeAnalysis;
+
+namespace Silex.MemTables;
 
 public interface IMemTable<TKey, TValue> : IDisposable where TKey : notnull
 {
