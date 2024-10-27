@@ -28,11 +28,16 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
     private static readonly IBinaryEncoder<TKey> _keySerializer = BinaryEncoderFactory<TKey>.BinarySerializer;
     private static readonly IBinaryEncoder<TValue> _valueSerializer = BinaryEncoderFactory<TValue>.BinarySerializer;
 
-    private IDictionary<TKey, TValue> _map = new Dictionary<TKey, TValue>(_keySerializer.EqualityComparer);
+    private Dictionary<TKey, TValue>? _dic = new(_keySerializer.EqualityComparer);
+    private SortedDictionary<TKey, TValue>? _sorted;
 
     private long _size;
     private bool _disposing;
     private readonly long _id;
+
+    [MemberNotNullWhen(true, nameof(_sorted))]
+    [MemberNotNullWhen(false, nameof(_dic))]
+    private bool IsSortedDictionary => _sorted != null;
 
     public MemTable(long id)
     {
@@ -52,9 +57,19 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
     {
         ObjectDisposedException.ThrowIf(_disposing, this);
 
-        if (_map.TryGetValue(key, out result))
+        if (_dic != null)
         {
-            return true;
+            if (_dic.TryGetValue(key, out result))
+            {
+                return true;
+            }
+        }
+        else
+        {
+            if (_sorted!.TryGetValue(key, out result))
+            {
+                return true;
+            }
         }
 
         result = default!;
@@ -72,13 +87,26 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
 
         var keyLength = _keySerializer.GetLength(key);
 
-        // Retrieve the previous value to keep its size consistent.
-        if (_map.Remove(key, out var previousValue))
+        if (!IsSortedDictionary)
         {
-            _size -= _valueSerializer.GetLength(previousValue) + keyLength + sizeof(int);
-        }
+            // Retrieve the previous value to keep its size consistent.
+            if (_dic.Remove(key, out var previousValue))
+            {
+                _size -= _valueSerializer.GetLength(previousValue) + keyLength + sizeof(int);
+            }
 
-        _map.Add(key, value);
+            _dic.Add(key, value);
+        }
+        else
+        {
+            // Retrieve the previous value to keep its size consistent.
+            if (_sorted.Remove(key, out var previousValue))
+            {
+                _size -= _valueSerializer.GetLength(previousValue) + keyLength + sizeof(int);
+            }
+
+            _sorted.Add(key, value);
+        }
 
         _size += _valueSerializer.GetLength(value) + keyLength + sizeof(int);
         return;
@@ -93,22 +121,25 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
     {
         EnsureSortedMap();
 
-        foreach (var entry in _map)
+        IDictionary<TKey, TValue> store = _dic != null ? _dic : _sorted!;
+
+        foreach (var entry in store)
         {
             builder.Add(entry.Key, entry.Value);
         }
     }
 
+    [MemberNotNull(nameof(_sorted))]
     private void EnsureSortedMap()
     {
-        var map = _map;
-
-        if (map is SortedDictionary<TKey, TValue>)
+        if (IsSortedDictionary)
         {
             return;
         }
 
-        _map = new SortedDictionary<TKey, TValue>(map, _keySerializer.Comparer);
+        var dic = _dic;
+        _sorted = new SortedDictionary<TKey, TValue>(dic, _keySerializer.Comparer);
+        _dic = null;
     }
 
     public void Dispose()
@@ -126,7 +157,9 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
 
     private void DisposeInternal()
     {
-        foreach (var entry in _map)
+        IDictionary<TKey, TValue> store = IsSortedDictionary ? _sorted : _dic;
+
+        foreach (var entry in store)
         {
             if (entry.Value is IDisposable d)
             {
@@ -134,7 +167,7 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
             }
         }
 
-        _map.Clear();
+        store.Clear();
     }
 
     ~MemTable()
@@ -159,7 +192,7 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
 
             // _map is a SortedDictionary at this point
 
-            foreach (var entry in _table._map)
+            foreach (var entry in _table._sorted)
             {
                 yield return entry;
             }
@@ -171,9 +204,7 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
         {
             _table.EnsureSortedMap();
 
-            var sorted = (SortedDictionary<TKey, TValue> )_table._map;
-
-            var items = sorted.Enumerate(afterKey, default!, true, false);
+            var items = _table._sorted.Enumerate(afterKey, default!, true, false);
 
             foreach (var item in items)
             {

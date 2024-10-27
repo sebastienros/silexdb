@@ -7,6 +7,10 @@ public class MemTableTests
     [Fact]
     public void SortedDictionaryShouldReturnRange()
     {
+        // SortedDictionary doesn't provide a way to enumerate a range of values (as of .NET 9) so
+        // we use a custom extension method to access the private SortedSet which allows it
+        // c.f. https://github.com/dotnet/runtime/issues/77645
+
         var dic = new SortedDictionary<int, int>();
 
         for (int i = 0; i < 10; i++)
