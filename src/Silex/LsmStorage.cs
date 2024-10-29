@@ -1,6 +1,7 @@
 ﻿namespace Silex;
 using Silex.Blocks;
 using Silex.Tables;
+using static Silex.AsyncReaderWriterLock;
 
 public static class LsmStorage
 {
@@ -30,7 +31,7 @@ public static class LsmStorage
         foreach (var sstFilename in sstFilenames)
         {
             var blockBuilder = new BlockBuilder<TKey, TValue>(options.BlockEncoderFactory.Create<TKey, TValue>());
-            var ssTable = await SsTable<TKey, TValue>.LoadSsTableAsync(sstFilename, options.SsTableEncoderFactory.Create<TKey, TValue>(), blockBuilder, cancellationToken);
+            var ssTable = await SsTable<TKey, TValue>.LoadSsTableAsync(sstFilename, options.SsTableEncoderFactory.Create<TKey, TValue>(), blockBuilder, options.BloomFilterFactory, cancellationToken);
             ssTables.Add(ssTable);
         }
 
@@ -45,10 +46,12 @@ public static class LsmStorage
     }
 }
 
-public class LsmStorage<TKey, TValue> where TKey : notnull
+public class LsmStorage<TKey, TValue> : IAsyncDisposable where TKey : notnull
 {
     internal readonly LsmStorageInner<TKey, TValue> _inner;
     internal readonly Compacter<TKey, TValue> _compacter;
+
+    private bool _disposed;
 
     internal LsmStorage(LsmStorageInner<TKey, TValue> inner, Compacter<TKey, TValue> compacter)
     {
@@ -81,13 +84,51 @@ public class LsmStorage<TKey, TValue> where TKey : notnull
     /// </summary>
     public async Task CloseAsync()
     {
+        await DisposeAsync();
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        GC.SuppressFinalize(this);
+        await DisposeInternalAsync();
+
+        _disposed = true;
+    }
+
+    private void Dispose()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        GC.SuppressFinalize(this);
+        DisposeInternalAsync().GetAwaiter().GetResult();
+
+        _disposed = true;
+    }
+
+    public async Task DisposeInternalAsync()
+    {
         await _compacter.CloseAsync();
-        
+
         _inner.ForceFreezeMemTable();
 
         while (!_inner._state.ImmutableMemTables.IsEmpty)
         {
             await _inner.ForceFlushNextImmutableMemTableAsync();
         }
+
+        _inner.Dispose();
+    }
+
+    ~LsmStorage()
+    {
+        Dispose();
     }
 }

@@ -8,7 +8,12 @@ public interface IMemTable<TKey, TValue> : IDisposable where TKey : notnull
     long Id { get; }
 
     /// <summary>
-    /// Gets the size of the <see cref="MemTable"/>.
+    /// Gets the number of entries in the <see cref="IMemTable{TKey, TValue}">.
+    /// </summary>
+    int Count { get; }
+
+    /// <summary>
+    /// Gets the size of the <see cref="IMemTable{TKey, TValue}"> in bytes.
     /// </summary>
     long Size { get; }
 

@@ -1,8 +1,11 @@
 ﻿using Microsoft.Extensions.Caching.Memory;
 using Silex.Blocks;
+using Silex.BloomFilters;
+using Silex.Buffers;
 using Silex.MemTables;
 using Silex.Serialization;
 using Silex.Tables;
+using System.Buffers;
 using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.CompilerServices;
@@ -15,6 +18,7 @@ namespace Silex;
 internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : notnull
 {
     private static readonly IBinaryEncoder<TValue> _valueSerializer = BinaryEncoderFactory<TValue>.BinarySerializer;
+    private static readonly IBinaryEncoder<TKey> _keySerializer= BinaryEncoderFactory<TKey>.BinarySerializer;
     private static readonly IComparer<TKey> _keyComparer = BinaryEncoderFactory<TKey>.BinarySerializer.Comparer;
 
     // Use different locks for each type of manipulated data such that we can lock them individually.
@@ -29,6 +33,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     private bool _disposed;
     private readonly IBlockEncoder<TKey, TValue> _blockEncoder;
     private readonly ISsTableEncoder<TKey, TValue> _ssTableEncoder;
+    private readonly IBloomFilterFactory _bloomFilterFactory;
     private readonly long _memTableSizeLimit;
     private readonly IMemoryCache _blockCache;
     private readonly MemoryCacheEntryOptions _cacheEntryOptions;
@@ -45,9 +50,10 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     internal LsmStorageInner(string path, StorageOptions options)
     {
         StoragePath = path;
-        _state = new StorageState<TKey, TValue>(options) { CurrentMemTable = new MemTable<TKey, TValue>(IdGenerator.GetNextId()) };
+        _state = new StorageState<TKey, TValue>() { CurrentMemTable = new MemTable<TKey, TValue>(IdGenerator.GetNextId()) };
         _blockEncoder = options.BlockEncoderFactory.Create<TKey, TValue>();
         _ssTableEncoder = options.SsTableEncoderFactory.Create<TKey, TValue>();
+        _bloomFilterFactory = options.BloomFilterFactory;
         _memTableSizeLimit = options.MemTableSizeLimit;
         _blockCache = new MemoryCache(new MemoryCacheOptions { SizeLimit = options.BlockCacheSizeLimit });
         _cacheEntryOptions = new MemoryCacheEntryOptions
@@ -111,13 +117,19 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
 
         // Process L0 tables in reverse order since the last one to be flush is at the end
 
+        var keyLength = _keySerializer.GetLength(key);
+        var bufferWriter = new PooledArrayBufferWriter<byte>(keyLength);
+        var writer = new EncoderBinaryWriter(bufferWriter);
+        _keySerializer.Encode(key, ref writer);
+        var keyMemory = bufferWriter.WrittenMemory;
+        
         try
         {
             await _level0Lock.EnterReadLockAsync();
 
             var l0 = snapshot.SsTables[0];
-
-            // TODO: this can be parallelized, multiple table could return the value, the one 
+            
+            // TODO: this can be parallelized, multiple table could return the value, but the one 
             // from the most recent table would be used.
 
             for (var i = l0.Count - 1; i >= 0; i--)
@@ -125,32 +137,45 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
                 var table = l0[i];
 
                 // The key could be in this table, if not will go to the next one
-                if (_keyComparer.Compare(key, table.FirstKey) >= 0 && _keyComparer.Compare(key, table.LastKey) <= 0)
+                if (_keyComparer.Compare(key, table.FirstKey) < 0 || _keyComparer.Compare(key, table.LastKey) > 0)
                 {
-                    foreach (var metadata in table.BlockMetadata)
-                    {
-                        if (_keyComparer.Compare(key, metadata.FirstKey) >= 0 && _keyComparer.Compare(key, metadata.LastKey) <= 0)
-                        {
-                            var block = await table.ReadBlockCachedAsync(metadata.Index, _blockCache, _cacheEntryOptions, cancellationToken);
+                    continue;
+                }
 
-                            if (block != null)
-                            {
-                                var value = block.GetValue(key);
-                                
-                                if (!value.IsEmpty)
-                                {
-                                    return _valueSerializer.Decode(value);
-                                }
-                            }
-                        }
+                // Check if the bloom filter tells us to skip this table
+                if (!table.BloomFilter.Probe(keyMemory.Span))
+                {
+                    continue; 
+                }
+
+                foreach (var metadata in table.BlockMetadata)
+                {
+                    if (_keyComparer.Compare(key, metadata.FirstKey) < 0 || _keyComparer.Compare(key, metadata.LastKey) > 0)
+                    {
+                        continue;
                     }
 
-                    return default!;
+                    var block = await table.ReadBlockCachedAsync(metadata.Index, _blockCache, _cacheEntryOptions, cancellationToken);
+
+                    if (block != null)
+                    {
+                        var value = block.GetValue(key);
+                                
+                        if (!value.IsEmpty)
+                        {
+                            return _valueSerializer.Decode(value);
+                        }
+                    }
                 }
+
+                return default!;
             }
         }
         finally
         {
+            // Return the key buffer
+            bufferWriter.Dispose();
+
             _level0Lock.ExitReadLock();
         }
 
@@ -267,7 +292,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
             _immutableMemTablesLock.ExitWriteLock();
         }
 
-        var builder = new SsTableBuilder<TKey, TValue>(_ssTableEncoder, _blockEncoder);
+        using var builder = new SsTableBuilder<TKey, TValue>(_ssTableEncoder, _blockEncoder, _bloomFilterFactory, memTableToFlush.Count);
         memTableToFlush.Flush(builder);
 
         var sstFilename = GetSstPath(memTableToFlush.Id);
@@ -344,6 +369,11 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         foreach (var memTable in _state.ImmutableMemTables)
         {
             memTable.Dispose();
+        }
+
+        foreach (var table in _state.SsTables.SelectMany(x => x))
+        {
+            table.Dispose();
         }
     }
 

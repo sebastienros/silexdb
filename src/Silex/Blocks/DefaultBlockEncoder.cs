@@ -1,6 +1,7 @@
 using Silex.Buffers;
 using Silex.Serialization;
 using System.Buffers;
+using System.Diagnostics;
 
 namespace Silex.Blocks;
 
@@ -80,8 +81,8 @@ public class DefaultBlockEncoder<TKey, TValue> : IBlockEncoder<TKey, TValue>
         if (keyLength == 0)
         {
             throw new InvalidOperationException("Unexpected zero-length key was stored");
-
         }
+
         var keyData = binaryReader.ReadBytesSpan(keyLength);
         var key = _keySerializer.Decode(keyData);
         var valueLength = binaryReader.Read7BitEncodedInt();
@@ -116,7 +117,14 @@ public class DefaultBlockEncoder<TKey, TValue> : IBlockEncoder<TKey, TValue>
         {
             offsets.Add((ushort)writer.BytesWritten);
 
-            writer.Write7BitEncodedInt(_keySerializer.GetLength(entry.Key));
+            var keyLength = _keySerializer.GetLength(entry.Key);
+
+            if (keyLength <= 0)
+            {
+                throw new InvalidOperationException($"Invalid key length: {keyLength}");
+            }
+
+            writer.Write7BitEncodedInt(keyLength);
             _keySerializer.Encode(entry.Key, ref writer);
 
             writer.Write7BitEncodedInt(_valueSerializer.GetLength(entry.Value));

@@ -1,10 +1,13 @@
 ﻿using Silex.Blocks;
+using Silex.Serialization;
 using System.Runtime.CompilerServices;
 
 namespace Silex.Tables;
 
 internal sealed class SsTableIterator<TKey, TValue> : IStorageIterator<TKey, TValue>
 {
+    private static readonly IComparer<TKey> _keyComparer = BinaryEncoderFactory<TKey>.BinarySerializer.Comparer;
+
     private readonly SsTable<TKey, TValue> _table;
     private TKey[]? _firstKeys;
 
@@ -39,12 +42,18 @@ internal sealed class SsTableIterator<TKey, TValue> : IStorageIterator<TKey, TVa
         // Create a reusable index for binary search
         _firstKeys ??= _table.BlockMetadata.Select(x => x.FirstKey).ToArray();
 
-        var compare = Array.BinarySearch(_firstKeys, from);
+        var compare = Array.BinarySearch(_firstKeys, from, _keyComparer);
 
         startBlockIndex = (compare >= 0 ? compare : ~compare) - 1;
 
         // If the key doesn't exist, exit
         if (startBlockIndex > _table.BlockMetadata.Count - 1)
+        {
+            yield break;
+        }
+
+        // if the key is out of bound, exit
+        if (_keyComparer.Compare(_table.BlockMetadata[startBlockIndex].LastKey, from) < 0)
         {
             yield break;
         }

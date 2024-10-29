@@ -1,7 +1,5 @@
 namespace Silex.Blocks;
 
-using System;
-
 public class BlockBuilder<TKey, TValue>
 {
     private readonly IBlockEncoder<TKey, TValue> _blockEncoder;

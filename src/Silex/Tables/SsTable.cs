@@ -1,27 +1,32 @@
 using Microsoft.Extensions.Caching.Memory;
 using Silex.Blocks;
+using Silex.BloomFilters;
 using System.Buffers;
 using System.Buffers.Binary;
 
 namespace Silex.Tables;
 
-public class SsTable<TKey, TValue>
+public class SsTable<TKey, TValue> : IDisposable
 {
+    private static readonly WorkDispatcher<BlockCacheKey, Block<TKey, TValue>> _dispatcher = new();
+
     private readonly long _id;
     private readonly string _filename;
     private readonly TKey? _firstKey;
     private readonly TKey? _lastKey;
     private readonly BlockBuilder<TKey, TValue> _blockBuilder;
-    private static readonly WorkDispatcher<BlockCacheKey, Block<TKey, TValue>> _dispatcher = new();
+    private readonly FileStream _stream;
+    private bool _disposed;
 
-    public SsTable(long id, string filename, IReadOnlyList<BlockMetadata<TKey>> blockMetadata, long metadataBlockOffset, BlockBuilder<TKey, TValue> blockBuilder)
+    public SsTable(long id, FileStream stream, string filename, IReadOnlyList<BlockMetadata<TKey>> blockMetadata, long metadataBlockOffset, BlockBuilder<TKey, TValue> blockBuilder, IBloomFilter bloomFilter)
     {
         _id = id;
         _filename = filename;
+        _stream = stream;
         BlockMetadata = blockMetadata;
         MetaBlockOffset = metadataBlockOffset;
         _blockBuilder = blockBuilder;
-
+        BloomFilter = bloomFilter;
         if (blockMetadata.Count > 0)
         {
             _firstKey = BlockMetadata[0].FirstKey;
@@ -33,6 +38,8 @@ public class SsTable<TKey, TValue>
 
     public long MetaBlockOffset { get; }
 
+    public IBloomFilter BloomFilter { get; }
+
     public string Filename => _filename;
 
     public TKey FirstKey => _firstKey!;
@@ -41,7 +48,6 @@ public class SsTable<TKey, TValue>
 
     public async Task<Block<TKey, TValue>?> ReadBlockAsync(int index, CancellationToken cancellationToken = default)
     {
-        using var stream = File.OpenRead(Filename);
         var offset = BlockMetadata[index].Offset;
         
         // If there is a single block it ends at the metadata block
@@ -53,8 +59,8 @@ public class SsTable<TKey, TValue>
 
         var buffer = ArrayPool<byte>.Shared.Rent(length)!;
 
-        stream.Seek(offset, SeekOrigin.Begin);
-        await stream.ReadExactlyAsync(buffer, 0, length, cancellationToken);
+        _stream.Seek(offset, SeekOrigin.Begin);
+        await _stream.ReadExactlyAsync(buffer, 0, length, cancellationToken);
         
         var block = _blockBuilder.Decode(new ReadOnlyMemory<byte>(buffer, 0, length));
 
@@ -91,19 +97,41 @@ public class SsTable<TKey, TValue>
         });
     }
 
-    public static async Task<SsTable<TKey, TValue>> LoadSsTableAsync(string filename, ISsTableEncoder<TKey, TValue> tableEncoder, BlockBuilder<TKey, TValue> blockBuilder, CancellationToken cancellationToken = default)
+    public static async Task<SsTable<TKey, TValue>> LoadSsTableAsync(string filename, ISsTableEncoder<TKey, TValue> tableEncoder, BlockBuilder<TKey, TValue> blockBuilder, IBloomFilterFactory bloomFilterFactory, CancellationToken cancellationToken = default)
     {
-        using var stream = File.OpenRead(filename);
+        byte[] uintBuffer = ArrayPool<byte>.Shared.Rent(sizeof(uint));
 
-        // Read the metadata block offset in the last four bytes
-        stream.Seek(stream.Length - 4, SeekOrigin.Begin);
-        var buffer = ArrayPool<byte>.Shared.Rent(4);
-        Memory<byte> memory = buffer.AsMemory(0, 4);
-        await stream.ReadExactlyAsync(memory, cancellationToken);
-        var metaBlockOffset = BinaryPrimitives.ReadUInt32LittleEndian(buffer);
+        var stream = File.OpenRead(filename);
+
+        // Read the bloom filter k in the previous 8 - 4 digits
+        stream.Seek(stream.Length - 8, SeekOrigin.Begin);
+        await stream.ReadExactlyAsync(uintBuffer, 0, 4, cancellationToken);
+        var bloomFilterK = (int)BinaryPrimitives.ReadUInt32LittleEndian(uintBuffer);
+
+        // Read the bloom filter offset in the last four bytes
+        await stream.ReadExactlyAsync(uintBuffer, 0, 4, cancellationToken);
+        var bloomFilterOffset = BinaryPrimitives.ReadUInt32LittleEndian(uintBuffer);
+
+        // Read the bloom filter content
+        var bloomContentLength = 4;
+        var bloomKLength = 4;
+        var bloomFilterLength = stream.Length - bloomContentLength - bloomKLength - bloomFilterOffset;
+
+        var buffer = ArrayPool<byte>.Shared.Rent((int)bloomFilterLength);
+        stream.Seek(bloomFilterOffset, SeekOrigin.Begin);
+        await stream.ReadExactlyAsync(buffer, 0, (int)bloomFilterLength, cancellationToken);
+        var bloomFilter = bloomFilterFactory.CreateBloomFilter(buffer.AsSpan().Slice(0, (int)bloomFilterLength), bloomFilterK);
+        ArrayPool<byte>.Shared.Return(buffer);
+
+        // Read the metadata block offset in the last four bytes before the bloom filter
+        stream.Seek(bloomFilterOffset - 4, SeekOrigin.Begin);
+        await stream.ReadExactlyAsync(uintBuffer, 0, 4, cancellationToken);
+        var metaBlockOffset = BinaryPrimitives.ReadUInt32LittleEndian(uintBuffer);
+
+        ArrayPool<byte>.Shared.Return(uintBuffer);
 
         // Read the metadata block content
-        var metadataLength = stream.Length - 4 - metaBlockOffset;
+        var metadataLength = bloomFilterOffset - 4 - metaBlockOffset;
 
         buffer = ArrayPool<byte>.Shared.Rent((int)metadataLength);
         stream.Seek(metaBlockOffset, SeekOrigin.Begin);
@@ -111,9 +139,34 @@ public class SsTable<TKey, TValue>
         var blockMetadata = tableEncoder.DecodeMetadata(buffer, 0);
         ArrayPool<byte>.Shared.Return(buffer);
 
-        var table = new SsTable<TKey, TValue>(IdGenerator.GetNextId(), filename, blockMetadata, metaBlockOffset, blockBuilder);
+        ArrayPool<byte>.Shared.Return(uintBuffer);
+
+        var table = new SsTable<TKey, TValue>(IdGenerator.GetNextId(), stream, filename, blockMetadata, metaBlockOffset, blockBuilder, bloomFilter);
         
         return table;
+    }
+
+    public void Dispose()
+    {
+        GC.SuppressFinalize(this);
+        DisposeInternal();
+    }
+
+    private void DisposeInternal()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _stream.Close();
+        _stream.Dispose();
+        _disposed = true;
+    }
+
+    ~SsTable()
+    {
+        DisposeInternal();
     }
 
     private record struct BlockCacheKey(long Id, int Index);

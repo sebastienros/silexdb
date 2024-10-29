@@ -1,6 +1,7 @@
 ﻿using Silex.Collections;
 using Silex.Serialization;
 using Silex.Tables;
+using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 
@@ -28,16 +29,12 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
     private static readonly IBinaryEncoder<TKey> _keySerializer = BinaryEncoderFactory<TKey>.BinarySerializer;
     private static readonly IBinaryEncoder<TValue> _valueSerializer = BinaryEncoderFactory<TValue>.BinarySerializer;
 
-    private Dictionary<TKey, TValue>? _dic = new(_keySerializer.EqualityComparer);
-    private SortedDictionary<TKey, TValue>? _sorted;
+    private volatile Dictionary<TKey, TValue>? _dic = new(_keySerializer.EqualityComparer);
+    private volatile SortedDictionary<TKey, TValue>? _sorted;
 
     private long _size;
     private bool _disposing;
     private readonly long _id;
-
-    [MemberNotNullWhen(true, nameof(_sorted))]
-    [MemberNotNullWhen(false, nameof(_dic))]
-    private bool IsSortedDictionary => _sorted != null;
 
     public MemTable(long id)
     {
@@ -53,20 +50,33 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
     public long Size => _size;
 
     /// <inheritdocs />
+    public int Count
+    {
+        get
+        {
+            var dic = _dic;
+            return dic == null ? _sorted!.Count : dic.Count;
+        }
+    }
+
+    /// <inheritdocs />
     public bool TryGet(TKey key, [MaybeNullWhen(false)] out TValue result)
     {
         ObjectDisposedException.ThrowIf(_disposing, this);
 
-        if (_dic != null)
+        var dic = _dic;
+        if (dic == null)
         {
-            if (_dic.TryGetValue(key, out result))
+            Debug.Assert(_sorted != null);
+
+            if (_sorted.TryGetValue(key, out result))
             {
                 return true;
             }
         }
         else
         {
-            if (_sorted!.TryGetValue(key, out result))
+            if (dic.TryGetValue(key, out result))
             {
                 return true;
             }
@@ -87,18 +97,20 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
 
         var keyLength = _keySerializer.GetLength(key);
 
-        if (!IsSortedDictionary)
+        var dic = _dic;
+        if (dic != null)
         {
             // Retrieve the previous value to keep its size consistent.
-            if (_dic.Remove(key, out var previousValue))
+            if (dic.Remove(key, out var previousValue))
             {
                 _size -= _valueSerializer.GetLength(previousValue) + keyLength + sizeof(int);
             }
 
-            _dic.Add(key, value);
+            dic.Add(key, value);
         }
         else
         {
+            Debug.Assert(_sorted != null);
             // Retrieve the previous value to keep its size consistent.
             if (_sorted.Remove(key, out var previousValue))
             {
@@ -121,7 +133,7 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
     {
         EnsureSortedMap();
 
-        IDictionary<TKey, TValue> store = _dic != null ? _dic : _sorted!;
+        IDictionary<TKey, TValue> store = _dic != null ? _dic : _sorted;
 
         foreach (var entry in store)
         {
@@ -132,14 +144,20 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
     [MemberNotNull(nameof(_sorted))]
     private void EnsureSortedMap()
     {
-        if (IsSortedDictionary)
+        var dic = _dic;
+
+        if (dic == null)
         {
+            Debug.Assert(_sorted != null);
+
             return;
         }
 
-        var dic = _dic;
-        _sorted = new SortedDictionary<TKey, TValue>(dic, _keySerializer.Comparer);
-        _dic = null;
+        lock (dic)
+        {
+            _sorted = new SortedDictionary<TKey, TValue>(dic, _keySerializer.Comparer);
+            _dic = null;
+        }
     }
 
     public void Dispose()
@@ -157,7 +175,8 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
 
     private void DisposeInternal()
     {
-        IDictionary<TKey, TValue> store = IsSortedDictionary ? _sorted : _dic;
+        var dic = _dic;
+        IDictionary<TKey, TValue> store = dic == null ? _sorted! : dic;
 
         foreach (var entry in store)
         {

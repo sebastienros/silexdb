@@ -10,7 +10,7 @@ internal class MemoryStreamOwner : IMemoryOwner<byte>
 
     public MemoryStreamOwner(RecyclableMemoryStream stream)
     {
-        _memory = stream.GetMemory();
+        _memory = stream.GetBuffer();
         _stream = stream;
     }
 

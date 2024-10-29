@@ -7,7 +7,7 @@ namespace Silex.Tables;
 /// </summary>
 public interface ISsTableEncoder<TKey, TValue>
 {
-    void EncodeMetadata(EncoderBinaryWriter writer, IReadOnlyList<BlockMetadata<TKey>> blockMetadata, long metadataOffset);
+    void EncodeMetadata(ref EncoderBinaryWriter writer, IReadOnlyList<BlockMetadata<TKey>> blockMetadata, long metadataOffset);
 
     IReadOnlyList<BlockMetadata<TKey>> DecodeMetadata(ReadOnlyMemory<byte> buffer, int offset);
 

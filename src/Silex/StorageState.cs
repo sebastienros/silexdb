@@ -13,7 +13,7 @@ namespace Silex;
 /// </remarks>
 internal struct StorageState<TKey, TValue> where TKey : notnull
 {
-    public StorageState(StorageOptions _)
+    public StorageState()
     {
     }
 

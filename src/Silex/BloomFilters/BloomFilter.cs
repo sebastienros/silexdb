@@ -8,7 +8,7 @@ using System.IO.Hashing;
 /// A Bloom filter is a probabilistic data structure which provides an efficient way to query whether an element is a member of a set.
 /// When <see cref="Probe"/> returns false, the value is deemed not to be in the filter. If it returns true it may or may not be in the collection.
 /// </summary>
-public class BloomFilter
+public class BloomFilter : IBloomFilter
 {
     private readonly int _k = 5; // Number of hashing iterations
     private readonly int _m = 2048; // Size of the bloom filter in bits
@@ -20,6 +20,10 @@ public class BloomFilter
     {
         var n = length;
         _m = (int)CalculateM(n, p);
+
+        // Round to a multiple of 8 (bytes) because BitArray will load these
+        _m = (int)Math.Ceiling((double)_m / 8) * 8;
+
         _k = CalculateK(n, _m);
         _bits = new BitArray(_m);
         _hashBuffer = new int[_k];
@@ -28,17 +32,19 @@ public class BloomFilter
     public BloomFilter(byte[] span, int k)
     {
         _bits = new BitArray(span);
-        _m = span.Length;
+        _m = _bits.Length;
         _k = k;
-        _hashBuffer = new int[k];
+        _hashBuffer = new int[_k];
     }
 
     public Span<byte> GetBytes()
     {
-        var bytes = new byte[_bits.Count / 8];
+        var bytes = new byte[(int)Math.Ceiling((double)_bits.Count / 8)];
         _bits.CopyTo(bytes, 0);
         return bytes;
     }
+
+    public int K => _k;
 
     public void Add(ReadOnlySpan<byte> item)
     {
@@ -62,6 +68,9 @@ public class BloomFilter
 
     private void ComputeHashPositions(ReadOnlySpan<byte> item, int[] positions)
     {
+        // Read-only bloom filter?
+        if (_k == 0) return;
+
         var hash1 = XxHash3.HashToUInt64(item);
         var hash2 = XxHash64.HashToUInt64(item);
 

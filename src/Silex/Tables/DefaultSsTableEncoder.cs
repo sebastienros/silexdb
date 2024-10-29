@@ -1,24 +1,22 @@
 using Silex.Buffers;
 using Silex.Serialization;
-using System.Buffers;
-using static System.Runtime.InteropServices.JavaScript.JSType;
 
 namespace Silex.Tables;
 
 /// <summary>
 /// The table encoding format is as follows:
 /// 
-/// -------------------------------------------------------------------------------------------
-/// |         Block Section         |          Meta Section         |          Extra          |
-/// -------------------------------------------------------------------------------------------
-/// | data block | ... | data block |            metadata           | meta block offset(u32)  |
-/// -------------------------------------------------------------------------------------------
+/// ------------------------------------------------------------------------------------------------------------------------------------
+/// |         Block Section         |                   Meta Section                                                                   |
+/// ------------------------------------------------------------------------------------------------------------------------------------
+/// | data block | ... | data block | metadata (varlen) | meta block offset (u32) | bloom filter (varlen) | bloom filter offset (u32)  |
+/// ------------------------------------------------------------------------------------------------------------------------------------
 /// 
-/// -------------------------------------------------------------------------------------------------------------------------------
-/// |                           Meta Section                                                                                | ... |
-/// -------------------------------------------------------------------------------------------------------------------------------
+/// ----------------------------------------------------------------------------------------------------------------------------
+/// |                           Metadata Section                                                                         | ... |
+/// ----------------------------------------------------------------------------------------------------------------------------
 /// | num_blocks (7b) | offset (7b) | first_key_len (7b) | key (first_key_len) | last_key_len (u16) | key (last_key_len) | ... |
-/// -------------------------------------------------------------------------------------------------------------------------------
+/// ----------------------------------------------------------------------------------------------------------------------------
 /// 
 /// </summary>
 public class DefaultSsTableEncoder<TKey, TValue> : ISsTableEncoder<TKey, TValue>
@@ -54,7 +52,7 @@ public class DefaultSsTableEncoder<TKey, TValue> : ISsTableEncoder<TKey, TValue>
         return result;
     }
 
-    public void EncodeMetadata(EncoderBinaryWriter writer, IReadOnlyList<BlockMetadata<TKey>> blockMetadata, long metadataOffset)
+    public void EncodeMetadata(ref EncoderBinaryWriter writer, IReadOnlyList<BlockMetadata<TKey>> blockMetadata, long metadataOffset)
     {
         writer.Write7BitEncodedInt(blockMetadata.Count);
 
@@ -70,7 +68,6 @@ public class DefaultSsTableEncoder<TKey, TValue> : ISsTableEncoder<TKey, TValue>
         }
 
         writer.WriteUInt32((uint)metadataOffset);
-        writer.Flush();
     }
 
     public int EstimateMetadataSize(IReadOnlyList<BlockMetadata<TKey>> blockMetadata)

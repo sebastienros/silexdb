@@ -36,6 +36,9 @@ internal sealed class PooledArrayBufferWriter<T> : IBufferWriter<T>, IDisposable
         _index = 0;
     }
 
+    /// <summary>
+    /// Gets a <see cref="ReadOnlyMemory{T}"/> representing the written content.
+    /// </summary>
     public ReadOnlyMemory<T> WrittenMemory
     {
         get
@@ -46,6 +49,9 @@ internal sealed class PooledArrayBufferWriter<T> : IBufferWriter<T>, IDisposable
         }
     }
 
+    /// <summary>
+    /// Gets the number of elements written to the buffer.
+    /// </summary>
     public int WrittenCount
     {
         get
@@ -56,6 +62,9 @@ internal sealed class PooledArrayBufferWriter<T> : IBufferWriter<T>, IDisposable
         }
     }
 
+    /// <summary>
+    /// Gets the capacity of the internal buffer.
+    /// </summary>
     public int Capacity
     {
         get
@@ -66,6 +75,9 @@ internal sealed class PooledArrayBufferWriter<T> : IBufferWriter<T>, IDisposable
         }
     }
 
+    /// <summary>
+    /// Gets the remaining capacity of the internal buffer.
+    /// </summary>
     public int FreeCapacity
     {
         get
@@ -76,6 +88,9 @@ internal sealed class PooledArrayBufferWriter<T> : IBufferWriter<T>, IDisposable
         }
     }
 
+    /// <summary>
+    /// Clears the current buffer such that it can be used again without returning it to the pool
+    /// </summary>
     public void Clear()
     {
         CheckIfDisposed();
@@ -91,7 +106,9 @@ internal sealed class PooledArrayBufferWriter<T> : IBufferWriter<T>, IDisposable
         _index = 0;
     }
 
-    // Returns the rented buffer back to the pool
+    /// <summary>
+    /// Returns the rented buffer back to the pool.
+    /// </summary>
     public void Dispose()
     {
         if (_rentedBuffer == null)
@@ -101,7 +118,7 @@ internal sealed class PooledArrayBufferWriter<T> : IBufferWriter<T>, IDisposable
 
         ClearHelper();
         ArrayPool<T>.Shared.Return(_rentedBuffer);
-        _rentedBuffer = null;
+        _rentedBuffer = null!;
     }
 
     private void CheckIfDisposed()
@@ -131,6 +148,9 @@ internal sealed class PooledArrayBufferWriter<T> : IBufferWriter<T>, IDisposable
         _index += count;
     }
 
+    /// <summary>
+    /// Gets a <see cref="Memory{T}"/> that can be written to.
+    /// </summary>
     public Memory<T> GetMemory(int sizeHint = 0)
     {
         CheckIfDisposed();
@@ -139,6 +159,9 @@ internal sealed class PooledArrayBufferWriter<T> : IBufferWriter<T>, IDisposable
         return _rentedBuffer.AsMemory(_index);
     }
 
+    /// <summary>
+    /// Gets a <see cref="Span{T}"/> that can be written to.
+    /// </summary>
     public Span<T> GetSpan(int sizeHint = 0)
     {
         CheckIfDisposed();

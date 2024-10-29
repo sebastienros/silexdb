@@ -1,6 +1,7 @@
 ﻿namespace Silex;
 
 using Silex.Blocks;
+using Silex.BloomFilters;
 using Silex.Tables;
 
 public class StorageOptions
@@ -31,6 +32,9 @@ public class StorageOptions
 
     /// <value>50ms</value>
     private static readonly TimeSpan _defaultFlushPeriod = TimeSpan.FromMilliseconds(50);
+
+    /// <value><see cref="BloomFilterFactory"></value>
+    private static readonly IBloomFilterFactory _defaultBloomFilterFactory = new DefaultBloomFilterFactory();
 
     /// <summary>
     /// Gets or sets the maximum size of a <see cref="MemTable">. When the size is reached it is made immutable and 
@@ -95,7 +99,7 @@ public class StorageOptions
     /// <value>
     /// The default value is <inheritdoc cref="_defaultBlockCacheSizeLimit"/>.
     /// </value>
-    public long BlockCacheSizeLimit { get; set; } =_defaultBlockCacheSizeLimit;
+    public long BlockCacheSizeLimit { get; set; } = _defaultBlockCacheSizeLimit;
 
     /// <summary>
     /// Gets or sets how long a block cache entry can be inactive (e.g. not accessed) before it will be removed. This will not extend the entry lifetime beyond the absolute expiration (if set).
@@ -112,4 +116,12 @@ public class StorageOptions
     /// The default value is <inheritdoc cref="_defaultBlockCacheAbsoluteExpiration"/>. Use <c>TimeSpan.Zero</c> (<c>"00:00:00"</c>) to disable absolute expiration.
     /// </value>
     public TimeSpan BlockCacheAbsoluteExpiration { get; set; } = _defaultBlockCacheAbsoluteExpiration;
+
+    /// <summary>
+    /// Gets or sets the <see cref="IBloomFilterFactory"/> used to create bloom filters.
+    /// </summary>
+    /// <value>
+    /// The default value is <inheritdoc cref="_defaultBloomFilterFactory"/>.
+    /// </value>
+    public IBloomFilterFactory BloomFilterFactory { get; set; } = _defaultBloomFilterFactory;
 }

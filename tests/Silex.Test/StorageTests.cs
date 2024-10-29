@@ -323,6 +323,7 @@ public class StorageTests
         Assert.True(Directory.Exists(tempFolder));
         Assert.Single(Directory.EnumerateFiles(tempFolder, "*.sst"));
 
+        await storage.CloseAsync();
         Directory.Delete(tempFolder, true);
     }
 
@@ -354,9 +355,9 @@ public class StorageTests
         Assert.False(storage._inner._state.ImmutableMemTables.Peek().TryGet('a', out _));
         Assert.True(storage._inner._state.ImmutableMemTables.Peek().TryGet('b', out _));
 
+        await storage.CloseAsync();
         Directory.Delete(tempFolder, true);
     }
-
 
     [Fact]
     public async Task CloseAsyncShouldFlushToDisk()
@@ -368,6 +369,7 @@ public class StorageTests
         await storage.CloseAsync();
         Assert.Single(Directory.EnumerateFiles(tempFolder, "*.sst"));
 
+        await storage.CloseAsync();
         Directory.Delete(tempFolder, true);
     }
 
@@ -384,10 +386,12 @@ public class StorageTests
         await storage.CloseAsync();
         Assert.Single(Directory.EnumerateFiles(tempFolder, "*.sst"));
 
+        storage = await LsmStorage.OpenAsync<char, int>(tempFolder, new StorageOptions());
         storage.Put('a', 2);
         await storage.CloseAsync();
         Assert.Equal(2, Directory.EnumerateFiles(tempFolder, "*.sst").Count());
 
+        await storage.CloseAsync();
         Directory.Delete(tempFolder, true);
     }
 
