@@ -1,8 +1,7 @@
-﻿namespace Silex.BloomFilters;
-
-using System;
-using System.Collections;
+﻿using System.Collections;
 using System.IO.Hashing;
+
+namespace Silex.BloomFilters;
 
 /// <summary>
 /// A Bloom filter is a probabilistic data structure which provides an efficient way to query whether an element is a member of a set.

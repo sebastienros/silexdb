@@ -1,8 +1,6 @@
-﻿namespace Silex.Test;
+﻿using Silex.Blocks;
 
-using Silex.Blocks;
-using Silex.BloomFilters;
-using System.Buffers.Binary;
+namespace Silex.Test;
 
 public class BlockTests
 {

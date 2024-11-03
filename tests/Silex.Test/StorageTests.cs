@@ -1,8 +1,8 @@
-namespace Silex.Test;
-
 using System.Buffers.Binary;
 using System.Globalization;
 using Xunit.Abstractions;
+
+namespace Silex.Test;
 
 public class StorageTests
 {

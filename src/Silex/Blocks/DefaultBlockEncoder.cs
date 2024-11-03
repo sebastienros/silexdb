@@ -1,7 +1,6 @@
 using Silex.Buffers;
 using Silex.Serialization;
 using System.Buffers;
-using System.Diagnostics;
 
 namespace Silex.Blocks;
 

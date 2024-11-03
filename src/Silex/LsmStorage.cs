@@ -1,7 +1,7 @@
-﻿namespace Silex;
-using Silex.Blocks;
+﻿using Silex.Blocks;
 using Silex.Tables;
-using static Silex.AsyncReaderWriterLock;
+
+namespace Silex;
 
 public static class LsmStorage
 {

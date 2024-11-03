@@ -1,7 +1,7 @@
-﻿namespace Silex.Test;
-
-using Silex.BloomFilters;
+﻿using Silex.BloomFilters;
 using System.Buffers.Binary;
+
+namespace Silex.Test;
 
 public class BloomFilterTests
 {

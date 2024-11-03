@@ -1,8 +1,8 @@
-﻿namespace Silex;
-
-using Silex.Blocks;
+﻿using Silex.Blocks;
 using Silex.BloomFilters;
 using Silex.Tables;
+
+namespace Silex;
 
 public class StorageOptions
 {

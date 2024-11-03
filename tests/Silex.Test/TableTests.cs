@@ -1,14 +1,11 @@
-﻿namespace Silex.Test;
-
-using Microsoft.Extensions.Caching.Memory;
+﻿using Microsoft.Extensions.Caching.Memory;
 using Silex.Blocks;
 using Silex.BloomFilters;
 using Silex.Serialization;
 using Silex.Tables;
-using Silex.Tests;
 using System.Buffers.Binary;
-using System.Diagnostics;
-using System.Numerics;
+
+namespace Silex.Test;
 
 public class TableTests
 {
