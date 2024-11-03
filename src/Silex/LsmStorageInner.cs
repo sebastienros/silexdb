@@ -5,7 +5,6 @@ using Silex.Buffers;
 using Silex.MemTables;
 using Silex.Serialization;
 using Silex.Tables;
-using System.Buffers;
 using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.CompilerServices;

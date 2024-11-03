@@ -128,8 +128,6 @@ public class SsTable<TKey, TValue> : IDisposable
         await stream.ReadExactlyAsync(uintBuffer, 0, 4, cancellationToken);
         var metaBlockOffset = BinaryPrimitives.ReadUInt32LittleEndian(uintBuffer);
 
-        ArrayPool<byte>.Shared.Return(uintBuffer);
-
         // Read the metadata block content
         var metadataLength = bloomFilterOffset - 4 - metaBlockOffset;
 
@@ -142,7 +140,7 @@ public class SsTable<TKey, TValue> : IDisposable
         ArrayPool<byte>.Shared.Return(uintBuffer);
 
         var table = new SsTable<TKey, TValue>(IdGenerator.GetNextId(), stream, filename, blockMetadata, metaBlockOffset, blockBuilder, bloomFilter);
-        
+
         return table;
     }
 
@@ -159,7 +157,6 @@ public class SsTable<TKey, TValue> : IDisposable
             return;
         }
 
-        _stream.Close();
         _stream.Dispose();
         _disposed = true;
     }

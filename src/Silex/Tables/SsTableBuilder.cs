@@ -107,6 +107,9 @@ public class SsTableBuilder<TKey, TValue> : IDisposable
         _blockBuilder.Clear();
     }
 
+    /// <remarks>
+    /// The returned SST has an open file handle. The result must be disposed to close the handle.
+    /// </summary>
     public async Task<SsTable<TKey, TValue>> BuildAsync(string filename, CancellationToken cancellationToken = default)
     {
         FinishBlock();

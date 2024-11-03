@@ -5,7 +5,9 @@ using Silex.Blocks;
 using Silex.BloomFilters;
 using Silex.Serialization;
 using Silex.Tables;
+using Silex.Tests;
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Numerics;
 
 public class TableTests
@@ -45,9 +47,10 @@ public class TableTests
 
         builder.Add(key, value);
 
-        await builder.BuildAsync(tempFilename);
+        var table =  await builder.BuildAsync(tempFilename);
+        table.Dispose();
 
-        var table = await SsTable<ushort, string>.LoadSsTableAsync(tempFilename, new DefaultSsTableEncoder<ushort, string>(), blockBuilder, new DefaultBloomFilterFactory());
+        table = await SsTable<ushort, string>.LoadSsTableAsync(tempFilename, new DefaultSsTableEncoder<ushort, string>(), blockBuilder, new DefaultBloomFilterFactory());
 
         Assert.Single(table.BlockMetadata);
         using var block = await table.ReadBlockAsync(0);
@@ -221,7 +224,7 @@ public class TableTests
     public async Task ShouldLoadBloomFilter()
     {
         var entries = Enumerable.Range(0, 100).Select(x => new KeyValuePair<int, int>(x, x)).ToList();
-        var (table, tempFilename) = await CreateAndLoadSsTableAsync(entries);
+        var table = await CreateAndLoadSsTableAsync(entries);
 
         var serializer = BinaryEncoderFactory<int>.BinarySerializer;
 
@@ -254,10 +257,10 @@ public class TableTests
         }
 
         table.Dispose();
-        File.Delete(tempFilename);
+        File.Delete(table.Filename);
     }
 
-    private async Task<(SsTable<TKey, TValue>, string)> CreateAndLoadSsTableAsync<TKey, TValue>(IReadOnlyList<KeyValuePair<TKey, TValue>> entries)
+    private async Task<SsTable<TKey, TValue>> CreateAndLoadSsTableAsync<TKey, TValue>(IReadOnlyList<KeyValuePair<TKey, TValue>> entries)
     {
         var tempFilename = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
         var blockEncoder = new DefaultBlockEncoder<TKey, TValue>();
@@ -270,11 +273,10 @@ public class TableTests
             builder.Add(entry.Key, entry.Value);
         }
 
-        await builder.BuildAsync(tempFilename);
+        var table = await builder.BuildAsync(tempFilename);
+        table.Dispose();
 
-        var table = await SsTable<TKey, TValue>.LoadSsTableAsync(tempFilename, ssTableEncoder, blockBuilder, new DefaultBloomFilterFactory());
-
-        return (table, tempFilename);
+        return await SsTable<TKey, TValue>.LoadSsTableAsync(tempFilename, ssTableEncoder, blockBuilder, new DefaultBloomFilterFactory());
     }
 }
 
