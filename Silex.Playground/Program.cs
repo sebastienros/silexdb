@@ -17,10 +17,13 @@ static async Task Store1MillionValues()
 
     var sw = Stopwatch.StartNew();
     data.ForEach(x => db.Put(x, x));
+    Console.WriteLine($"Add entries: {sw.Elapsed}");
+
+    sw.Restart();
     await db.CloseAsync();
     sw.Stop();
 
-    Console.WriteLine(sw.Elapsed);
+    Console.WriteLine($"Save to disk: {sw.Elapsed}");
 
     foreach (var file in Directory.GetFiles("db"))
     {
