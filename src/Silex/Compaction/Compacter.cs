@@ -1,7 +1,10 @@
-﻿namespace Silex;
+﻿using System.Diagnostics;
 
-using System.Diagnostics;
+namespace Silex.Compaction;
 
+/// <summary>
+/// Coordinates MemTable flushes and SST compaction on regular intervals.
+/// </summary>
 internal class Compacter<TKey, TValue> : IAsyncDisposable where TKey : notnull
 {
     private readonly LsmStorageInner<TKey, TValue> _storage;
@@ -56,7 +59,7 @@ internal class Compacter<TKey, TValue> : IAsyncDisposable where TKey : notnull
         }
         catch (OperationCanceledException)
         {
-
+            // Ignore as this is thrown when the LsmStorage is closed.
         }
     }
 
@@ -70,9 +73,9 @@ internal class Compacter<TKey, TValue> : IAsyncDisposable where TKey : notnull
         return Task.CompletedTask;
     }
 
-    public async Task CloseAsync()
+    public Task CloseAsync()
     {
-        await StopBackgroundFlushAsync();
+        return StopBackgroundFlushAsync();
     }
 
     public async ValueTask DisposeAsync()

@@ -25,14 +25,23 @@ internal struct StorageState<TKey, TValue> where TKey : notnull
     public required IMemTable<TKey, TValue> CurrentMemTable { get; set; }
 
     /// <summary>
-    /// The list of <see cref="SsTable"/> for each level.
+    /// The list of level-0 <see cref="SsTable"/>.
     /// </summary>
     /// <remarks>
-    /// Level-0 SSTs are the set of SSTs files 
-    /// directly created as a result of MemTable flush. Other levels are the result of compaction,
-    /// (either tiered or leveled).
+    /// Level-0 SSTs are the set of SSTs files directly created as a result of MemTable flush.
+    /// They are also treated differently when iterated as tables are not ordered is relation
+    /// to others in this level, so a Merge Iterator is required.
     /// </remarks>
-    public List<List<SsTable<TKey, TValue>>> SsTables { get; set; } = [[]];
+    public List<SsTable<TKey, TValue>> LevelZeroTables = [];
+
+    /// <summary>
+    /// The list of <see cref="SsTable"/> for each level but 0.
+    /// </summary>
+    /// <remarks>
+    /// These levels are the result of compaction (either tiered or leveled).
+    /// Each level has ordered tables related to each other so a Concat Iterator can be used.
+    /// </remarks>
+    public List<List<SsTable<TKey, TValue>>> LeveledSsTables { get; set; } = [];
 
     public StorageState<TKey, TValue> Clone()
     {
@@ -40,7 +49,8 @@ internal struct StorageState<TKey, TValue> where TKey : notnull
         {
             CurrentMemTable = CurrentMemTable,
             ImmutableMemTables = ImmutableMemTables,
-            SsTables = SsTables
+            LevelZeroTables = LevelZeroTables.ToList(),
+            LeveledSsTables = LeveledSsTables.ToList()
         };
     }
 }

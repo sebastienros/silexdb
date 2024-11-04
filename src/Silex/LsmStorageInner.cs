@@ -27,6 +27,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     private readonly ReaderWriterLockSlim _currentMemTableLock = new();
     private readonly ReaderWriterLockSlim _immutableMemTablesLock = new();
     private readonly AsyncReaderWriterLock _level0Lock = new();
+    private readonly AsyncReaderWriterLock _leveledTablesLock = new();
 
     internal StorageState<TKey, TValue> _state;
     private bool _disposed;
@@ -128,7 +129,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         {
             await _level0Lock.EnterReadLockAsync();
 
-            var l0 = snapshot.SsTables[0];
+            var l0 = snapshot.LevelZeroTables;
             
             // TODO: this can be parallelized, multiple table could return the value, but the one 
             // from the most recent table would be used.
@@ -303,7 +304,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
 
         try
         {
-            _state.SsTables[0].Add(ssTable);
+            _state.LevelZeroTables.Add(ssTable);
         }
         finally
         {
@@ -341,7 +342,8 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
             {
                 CurrentMemTable = new MemTable<TKey, TValue>(IdGenerator.GetNextId()),
                 ImmutableMemTables = _state.ImmutableMemTables.Enqueue(_previousMemTable),
-                SsTables = _state.SsTables
+                LevelZeroTables = _state.LevelZeroTables,
+                LeveledSsTables = _state.LeveledSsTables
             };
         }
         finally
@@ -372,7 +374,12 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
             memTable.Dispose();
         }
 
-        foreach (var table in _state.SsTables.SelectMany(x => x))
+        foreach (var table in _state.LevelZeroTables)
+        {
+            table.Dispose();
+        }
+
+        foreach (var table in _state.LeveledSsTables.SelectMany(x => x))
         {
             table.Dispose();
         }

@@ -1,5 +1,7 @@
 ﻿using Silex.Blocks;
+using Silex.Compaction;
 using Silex.Tables;
+using System.Runtime.CompilerServices;
 
 namespace Silex;
 
@@ -21,7 +23,7 @@ public static class LsmStorage
             Directory.CreateDirectory(path);
         }
 
-        var instance = new LsmStorageInner<TKey, TValue>(path, options);
+        var storageInner = new LsmStorageInner<TKey, TValue>(path, options);
 
         var sstFilenames = Directory.EnumerateFiles(path, "*.sst");
 
@@ -36,17 +38,17 @@ public static class LsmStorage
         }
 
         // TODO: For now we only load l0 SSTs
-        instance._state.SsTables = [ssTables];
+        storageInner._state.LevelZeroTables = ssTables;
 
-        var compacter = new Compacter<TKey, TValue>(instance, TimeProvider.System, options);
+        var compacter = new Compacter<TKey, TValue>(storageInner, TimeProvider.System, options);
 
         compacter.StartBackgroundFlush();
 
-        return new LsmStorage<TKey, TValue>(instance, compacter);
+        return new LsmStorage<TKey, TValue>(storageInner, compacter);
     }
 }
 
-public class LsmStorage<TKey, TValue> : IAsyncDisposable where TKey : notnull
+public class LsmStorage<TKey, TValue> : IDisposable, IAsyncDisposable where TKey : notnull
 {
     internal readonly LsmStorageInner<TKey, TValue> _inner;
     internal readonly Compacter<TKey, TValue> _compacter;
@@ -62,24 +64,33 @@ public class LsmStorage<TKey, TValue> : IAsyncDisposable where TKey : notnull
     /// <inheritdoc cref="LsmStorageInner.TryGet(TKey, out TValue)"/>
     public ValueTask<TValue> GetAsync(TKey key)
     {
+        CheckDisposed();
+
         return _inner.GetAsync(key);
     }
 
     /// <inheritdoc cref="LsmStorageInner.Put(TKey, TValue)"/>
     public void Put(TKey key, TValue value)
     {
+        CheckDisposed();
+
         _inner.Put(key, value);
     }
 
     /// <inheritdoc cref="LsmStorageInner.Delete(TKey)"/>
     public void Delete(TKey key)
     {
+        CheckDisposed();
+
         _inner.Delete(key);
     }
 
     /// <summary>
     /// Flushes any pending data to disk and stops the compacter background threads.
     /// </summary>
+    /// <remarks>
+    /// Equivalent to <see cref="DisposeAsync()"/>. Call one or the other.
+    /// </remarks>
     public async Task CloseAsync()
     {
         await DisposeAsync();
@@ -98,7 +109,7 @@ public class LsmStorage<TKey, TValue> : IAsyncDisposable where TKey : notnull
         _disposed = true;
     }
 
-    private void Dispose()
+    public void Dispose()
     {
         if (_disposed)
         {
@@ -123,6 +134,12 @@ public class LsmStorage<TKey, TValue> : IAsyncDisposable where TKey : notnull
         }
 
         _inner.Dispose();
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void CheckDisposed()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
     }
 
     ~LsmStorage()
