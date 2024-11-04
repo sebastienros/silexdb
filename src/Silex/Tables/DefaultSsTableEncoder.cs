@@ -19,7 +19,7 @@ namespace Silex.Tables;
 /// ----------------------------------------------------------------------------------------------------------------------------
 /// 
 /// </summary>
-public class DefaultSsTableEncoder<TKey, TValue> : ISsTableEncoder<TKey, TValue>
+public sealed class DefaultSsTableEncoder<TKey, TValue> : ISsTableEncoder<TKey, TValue>
 {
     private static readonly IBinaryEncoder<TKey> _keySerializer = BinaryEncoderFactory<TKey>.BinarySerializer;
 

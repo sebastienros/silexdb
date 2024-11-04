@@ -3,7 +3,7 @@ using System.Runtime.CompilerServices;
 
 namespace Silex;
 
-internal class MergeIterator<TKey, TValue> : IStorageIterator<TKey, TValue>
+internal sealed class MergeIterator<TKey, TValue> : IStorageIterator<TKey, TValue>
 {
     private static readonly IComparer<TKey> _keyComparer = BinaryEncoderFactory<TKey>.BinarySerializer.Comparer;
 

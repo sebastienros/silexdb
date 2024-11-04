@@ -21,6 +21,9 @@ public class StorageOptions
     /// <value><see cref="DefaultSsTableEncoderFactory"></value>
     private static readonly ISsTableEncoderFactory _defaultSsTableEncoderFactory = new DefaultSsTableEncoderFactory();
 
+    /// <value><see cref="BufferedSsTableBuilderFactory"></value>
+    private static readonly ISsTableBuilderFactory _defaultSsTableBuilderFactory = new BufferedSsTableBuilderFactory();
+
     /// <value>1MiB</value>
     private static readonly long _defaultBlockCacheSizeLimit = 1.MiB();
 
@@ -83,6 +86,14 @@ public class StorageOptions
     /// The default value is <inheritdoc cref="_defaultSsTableEncoderFactory"/>.
     /// </value>
     public ISsTableEncoderFactory SsTableEncoderFactory { get; set; } = _defaultSsTableEncoderFactory;
+
+    /// <summary>
+    /// Gets or set the <see cref="ISsTableBuilderFactory"> to use.
+    /// </summary>
+    /// <value>
+    /// The default value is <inheritdoc cref="_defaultSsTableBuilderFactory"/>.
+    /// </value>
+    public ISsTableBuilderFactory SsTableBuilderFactory { get; set; } = _defaultSsTableBuilderFactory;
 
     /// <summary>
     /// Gets or set the delays between mem table flushes. Setting a value of <c>TimeSpan.Zero</c> disables the flush thread.

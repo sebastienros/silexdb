@@ -28,5 +28,9 @@ public interface IMemTable<TKey, TValue> : IDisposable where TKey : notnull
 
     IStorageIterator<TKey, TValue> CreateIterator();
 
-    void Flush(SsTableBuilder<TKey, TValue> builder);
+    /// <summary>
+    /// Adds all entries to an SST Builder.
+    /// </summary>
+    /// <param name="builder">The builder.</param>
+    Task FlushAsync(ISsTableBuilder<TKey, TValue> builder);
 }

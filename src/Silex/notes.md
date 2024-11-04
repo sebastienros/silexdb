@@ -11,9 +11,6 @@
 
 - When a value is added to a block (through SstBuilder), the key is encoded in the bloom filter, and encoded again 
 in the block memory. It would be better to encode it once in the block memory as they are added.
-Then the block could be flushed to disk when it's finished (FinishBlock) such that files are actually written in block size
-and the SST is also not in memory as a whole. Then test the performance of with and without `WriteThrough` on the file stream.
-
 
 ## Different memory management buffers:
 

@@ -1,7 +1,7 @@
-﻿namespace Silex.Serialization;
-
-using Silex.Buffers;
+﻿using Silex.Buffers;
 using System.Text;
+
+namespace Silex.Serialization;
 
 public sealed class UTF8StringEncoder : IBinaryEncoder<string>
 {

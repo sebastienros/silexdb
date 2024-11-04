@@ -32,6 +32,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     private bool _disposed;
     private readonly IBlockEncoder<TKey, TValue> _blockEncoder;
     private readonly ISsTableEncoder<TKey, TValue> _ssTableEncoder;
+    private readonly ISsTableBuilderFactory _ssTableBuilderFactory;
     private readonly IBloomFilterFactory _bloomFilterFactory;
     private readonly long _memTableSizeLimit;
     private readonly IMemoryCache _blockCache;
@@ -52,6 +53,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         _state = new StorageState<TKey, TValue>() { CurrentMemTable = new MemTable<TKey, TValue>(IdGenerator.GetNextId()) };
         _blockEncoder = options.BlockEncoderFactory.Create<TKey, TValue>();
         _ssTableEncoder = options.SsTableEncoderFactory.Create<TKey, TValue>();
+        _ssTableBuilderFactory = options.SsTableBuilderFactory;
         _bloomFilterFactory = options.BloomFilterFactory;
         _memTableSizeLimit = options.MemTableSizeLimit;
         _blockCache = new MemoryCache(new MemoryCacheOptions { SizeLimit = options.BlockCacheSizeLimit });
@@ -291,11 +293,11 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
             _immutableMemTablesLock.ExitWriteLock();
         }
 
-        using var builder = new SsTableBuilder<TKey, TValue>(_ssTableEncoder, _blockEncoder, _bloomFilterFactory, memTableToFlush.Count);
-        memTableToFlush.Flush(builder);
-
         var sstFilename = GetSstPath(memTableToFlush.Id);
-        var ssTable = await builder.BuildAsync(sstFilename, cancellationToken);
+        using var builder = _ssTableBuilderFactory.CreateSsTableBuilder(sstFilename, _ssTableEncoder, _blockEncoder, _bloomFilterFactory, memTableToFlush.Count);
+        await memTableToFlush.FlushAsync(builder);
+
+        var ssTable = await builder.BuildAsync(cancellationToken);
 
         await _level0Lock.EnterWriteLockAsync();
 
@@ -381,7 +383,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         DisposeInternal();
     }
 
-    private class LsmStorageIterator : IStorageIterator<TKey, TValue>
+    private sealed class LsmStorageIterator : IStorageIterator<TKey, TValue>
     {
         private readonly ReaderWriterLockSlim _memTableLock;
         private readonly StorageState<TKey, TValue> _state;

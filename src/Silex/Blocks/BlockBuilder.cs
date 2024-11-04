@@ -17,15 +17,24 @@ public class BlockBuilder<TKey, TValue>
         _estimatedSize = 0;
     }
 
+    /// <summary>
+    /// Tries to add an entry to the block. If the new entry doesn't fit in the free space of 
+    /// the block, and if the block already has entries then it will fail and return <see langword="false"/>.
+    /// </summary>
+    /// <param name="key">The key of the entry.</param>
+    /// <param name="value">The value of the entry.</param>
+    /// <returns><see langword="true"/> if the value was added, <see langword="false"/> otherwise.</returns>
     public bool Add(TKey key, TValue value)
     {
         var size = _blockEncoder.EstimateSize(key, value);
 
-        // A fresh new block has to accept an entry even if it's over its max size
+        // If the block already has other entries and the next value doesn't fit, refuse it.
         if (_estimatedSize > 0 && _estimatedSize + size > _blockEncoder.BlockSize)
         {
             return false;
         }
+
+        // If the block is new, accept any value size.
 
         _blockEntries.Add(new(key, value));
         _estimatedSize += size;

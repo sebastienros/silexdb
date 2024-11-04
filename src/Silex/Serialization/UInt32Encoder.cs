@@ -1,8 +1,8 @@
-﻿namespace Silex.Serialization;
-
-using Silex.Buffers;
+﻿using Silex.Buffers;
 using System.Buffers.Binary;
 using System.Diagnostics;
+
+namespace Silex.Serialization;
 
 public sealed class UInt32Encoder : IBinaryEncoder<uint>
 {    

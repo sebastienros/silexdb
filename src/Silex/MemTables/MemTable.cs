@@ -129,7 +129,7 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
         return new MemTableIterator(this);
     }
 
-    public void Flush(SsTableBuilder<TKey, TValue> builder)
+    public async Task FlushAsync(ISsTableBuilder<TKey, TValue> builder)
     {
         EnsureSortedMap();
 
@@ -137,7 +137,7 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
 
         foreach (var entry in store)
         {
-            builder.Add(entry.Key, entry.Value);
+            await builder.AddAsync(entry.Key, entry.Value);
         }
     }
 

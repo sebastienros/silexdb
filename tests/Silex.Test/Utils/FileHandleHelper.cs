@@ -1,6 +1,8 @@
 ﻿using System.Diagnostics;
 using System.Runtime.InteropServices;
 
+#nullable disable
+
 namespace Silex.Tests;
 
 public static class FileHandleHelper
