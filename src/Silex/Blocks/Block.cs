@@ -79,24 +79,20 @@ public class Block<TKey, TValue> : IDisposable
 
     public void Dispose()
     {
-        if (_memoryOwner == null)
+        if (_disposed)
         {
             return;
         }
 
         GC.SuppressFinalize(this);
         DisposeInternal();
+
+        _disposed = true;
     }
 
     private void DisposeInternal()
     {
-        if (_disposed)
-        {
-            return;
-        }
-
         _memoryOwner?.Dispose();
-        _disposed = true;
     }
 
     ~Block()

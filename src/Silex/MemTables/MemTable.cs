@@ -33,7 +33,7 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
     private volatile SortedDictionary<TKey, TValue>? _sorted;
 
     private long _size;
-    private bool _disposing;
+    private bool _disposed;
     private readonly long _id;
 
     public MemTable(long id)
@@ -62,7 +62,7 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
     /// <inheritdocs />
     public bool TryGet(TKey key, [MaybeNullWhen(false)] out TValue result)
     {
-        ObjectDisposedException.ThrowIf(_disposing, this);
+        ObjectDisposedException.ThrowIf(_disposed, this);
 
         var dic = _dic;
         if (dic == null)
@@ -89,7 +89,7 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
     /// <inheritdocs />
     public void Put(TKey key, TValue value)
     {
-        ObjectDisposedException.ThrowIf(_disposing, this);
+        ObjectDisposedException.ThrowIf(_disposed, this);
 
         // This method could be called concurrently, while the items in the store
         // and the size need to be consistent.
@@ -162,15 +162,15 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
 
     public void Dispose()
     {
-        if (_disposing)
+        if (_disposed)
         {
             return;
         }
 
-        _disposing = true;
-
         GC.SuppressFinalize(this);
         DisposeInternal();
+
+        _disposed = true;
     }
 
     private void DisposeInternal()

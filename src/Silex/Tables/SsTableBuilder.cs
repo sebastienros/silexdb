@@ -170,14 +170,16 @@ public class SsTableBuilder<TKey, TValue> : IDisposable
 
         DisposeInternal();
         GC.SuppressFinalize(this);
-        _metadata?.Clear();
-        _metadata = null;
+
+        _disposed = true;
     }
 
     private void DisposeInternal()
     {
         _bufferWriter.Dispose();
         _valueWriter.Dispose();
+        _metadata?.Clear();
+        _metadata = null;
     }
 
     ~SsTableBuilder()

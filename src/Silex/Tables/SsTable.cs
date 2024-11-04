@@ -146,19 +146,20 @@ public class SsTable<TKey, TValue> : IDisposable
 
     public void Dispose()
     {
-        GC.SuppressFinalize(this);
-        DisposeInternal();
-    }
-
-    private void DisposeInternal()
-    {
         if (_disposed)
         {
             return;
         }
 
-        _stream.Dispose();
+        GC.SuppressFinalize(this);
+        DisposeInternal();
+
         _disposed = true;
+    }
+
+    private void DisposeInternal()
+    {
+        _stream.Dispose();
     }
 
     ~SsTable()

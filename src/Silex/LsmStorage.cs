@@ -59,8 +59,6 @@ public class LsmStorage<TKey, TValue> : IAsyncDisposable where TKey : notnull
         _compacter= compacter;
     }
 
-    
-
     /// <inheritdoc cref="LsmStorageInner.TryGet(TKey, out TValue)"/>
     public ValueTask<TValue> GetAsync(TKey key)
     {
