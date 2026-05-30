@@ -60,6 +60,7 @@ internal sealed class Runner
     private readonly string _dbPath;
     private LsmStorage<byte[], byte[]>? _db;
     private bool _currentWalSync;
+    private bool _needsReadBarrier;
 
     public Runner(BenchmarkOptions options, string dbPath)
     {
@@ -128,38 +129,48 @@ internal sealed class Runner
         {
             case FillSeq:
                 await OpenFreshAsync(walSync: false);
-                Report(await RunWritesAsync(name, _options.Num, sequential: true));
+                var fillSeq = await RunWritesAsync(name, _options.Num, sequential: true);
+                _needsReadBarrier = true;
+                Report(fillSeq);
                 break;
             case FillRandom:
                 await OpenFreshAsync(walSync: false);
-                Report(await RunWritesAsync(name, _options.Num, sequential: false));
+                var fillRandom = await RunWritesAsync(name, _options.Num, sequential: false);
+                _needsReadBarrier = true;
+                Report(fillRandom);
                 break;
             case FillSync:
                 await OpenFreshAsync(walSync: true);
-                Report(await RunWritesAsync(name, Math.Max(1, _options.Num / 1000), sequential: false, extra: "(num/1000 ops, WAL fsync per write)"));
+                var fillSync = await RunWritesAsync(name, Math.Max(1, _options.Num / 1000), sequential: false, extra: "(num/1000 ops, WAL fsync per write)");
+                _needsReadBarrier = true;
+                Report(fillSync);
                 break;
             case Overwrite:
                 await EnsureWriteableAsync();
-                Report(await RunWritesAsync(name, _options.Num, sequential: false));
+                var overwrite = await RunWritesAsync(name, _options.Num, sequential: false);
+                _needsReadBarrier = true;
+                Report(overwrite);
                 break;
             case DeleteRandom:
                 await EnsureWriteableAsync();
-                Report(await RunDeletesAsync(name));
+                var deletes = await RunDeletesAsync(name);
+                _needsReadBarrier = true;
+                Report(deletes);
                 break;
             case ReadRandom:
-                await EnsureOpenAsync();
+                await EnsureReadableAsync();
                 Report(await RunReadsAsync(name, missing: false));
                 break;
             case ReadMissing:
-                await EnsureOpenAsync();
+                await EnsureReadableAsync();
                 Report(await RunReadsAsync(name, missing: true));
                 break;
             case ReadSeq:
-                await EnsureOpenAsync();
+                await EnsureReadableAsync();
                 Report(await RunReadSeqAsync(name));
                 break;
             case SeekRandom:
-                await EnsureOpenAsync();
+                await EnsureReadableAsync();
                 Report(await RunSeekRandomAsync(name));
                 break;
             case ReadReverse:
@@ -229,6 +240,17 @@ internal sealed class Runner
         }
     }
 
+    private async Task EnsureReadableAsync()
+    {
+        await EnsureOpenAsync();
+
+        if (_needsReadBarrier)
+        {
+            await _db!.FlushAndCompactAsync();
+            _needsReadBarrier = false;
+        }
+    }
+
     /// <summary>
     /// Ensures the database is open for writing without WAL sync. A preceding <c>fillsync</c> leaves the
     /// database open with sync enabled (it is an open-time option in Silex); reopen it without sync so a
@@ -260,6 +282,7 @@ internal sealed class Runner
         }
 
         await OpenAsync(walSync);
+        _needsReadBarrier = false;
     }
 
     private async Task OpenAsync(bool walSync)
@@ -267,6 +290,7 @@ internal sealed class Runner
         Directory.CreateDirectory(_dbPath);
         _db = await LsmStorage.OpenAsync<byte[], byte[]>(_dbPath, _options.ToStorageOptions(walSync));
         _currentWalSync = walSync;
+        _needsReadBarrier = false;
     }
 
     // ----- benchmark bodies -----
@@ -356,30 +380,73 @@ internal sealed class Runner
         });
     }
 
-    private Task<BenchmarkResult> RunReadSeqAsync(string name)
+    private async Task<BenchmarkResult> RunReadSeqAsync(string name)
     {
         var db = _db!;
+        var threads = _options.Threads;
+        var perThread = new ThreadStats[threads];
+        var tasks = new Task[threads];
+        var extra = _options.Histogram ? "(raw scan; histogram unavailable)" : string.Empty;
+
+        var gcStats = Environment.GetEnvironmentVariable("SILEX_BENCH_GC") is { Length: > 0 };
+        var allocBefore = gcStats ? GC.GetTotalAllocatedBytes(precise: false) : 0;
+        var gen0Before = gcStats ? GC.CollectionCount(0) : 0;
+        var gen1Before = gcStats ? GC.CollectionCount(1) : 0;
+        var gen2Before = gcStats ? GC.CollectionCount(2) : 0;
+
+        var wall = Stopwatch.StartNew();
 
         // Each thread independently scans forward from the start, up to the Reads budget. The op loop stops
-        // when the iterator is exhausted (per-op delegate returns false).
-        return RunParallelAsync(name, _options.EffectiveReads, partitioned: false, extra: string.Empty, (threadId, start, count, stats) =>
+        // when the store is exhausted.
+        for (var t = 0; t < threads; t++)
         {
-            var enumerator = db.CreateIterator().EnumerateAsync().GetAsyncEnumerator();
+            var stats = new ThreadStats();
+            perThread[t] = stats;
 
-            return new ThreadWorker(async op =>
+            tasks[t] = Task.Run(async () =>
             {
-                if (!await enumerator.MoveNextAsync())
-                {
-                    return false;
-                }
+                var scanState = new ReadSeqScanState(stats);
+                var sw = Stopwatch.StartNew();
 
-                var entry = enumerator.Current;
-                stats.Ops++;
-                stats.Found++;
-                stats.Bytes += entry.Key.Length + entry.Value.Length;
-                return true;
-            }, enumerator);
-        });
+                await db.ScanRawAsync(scanState, static (s, key, value) =>
+                {
+                    s.Stats.Ops++;
+                    s.Stats.Found++;
+                    s.Stats.Bytes += key.Length + value.Length;
+                    return true;
+                }, _options.EffectiveReads);
+
+                stats.ElapsedMicros = sw.Elapsed.TotalMicroseconds;
+            });
+        }
+
+        await Task.WhenAll(tasks);
+        wall.Stop();
+
+        var result = new BenchmarkResult { Name = name, WallSeconds = wall.Elapsed.TotalSeconds, Extra = extra };
+
+        if (gcStats)
+        {
+            result.AllocatedBytes = GC.GetTotalAllocatedBytes(precise: false) - allocBefore;
+            result.Gen0Collections = GC.CollectionCount(0) - gen0Before;
+            result.Gen1Collections = GC.CollectionCount(1) - gen1Before;
+            result.Gen2Collections = GC.CollectionCount(2) - gen2Before;
+        }
+
+        foreach (var stats in perThread)
+        {
+            result.TotalOps += stats.Ops;
+            result.TotalBytes += stats.Bytes;
+            result.Found += stats.Found;
+            result.SumThreadMicros += stats.ElapsedMicros;
+        }
+
+        return result;
+    }
+
+    private sealed class ReadSeqScanState(ThreadStats stats)
+    {
+        public ThreadStats Stats { get; } = stats;
     }
 
     private Task<BenchmarkResult> RunSeekRandomAsync(string name)

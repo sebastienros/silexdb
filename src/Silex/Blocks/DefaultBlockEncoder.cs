@@ -44,8 +44,24 @@ public class DefaultBlockEncoder<TKey, TValue> : IBlockEncoder<TKey, TValue>
 {
     private static readonly IBinaryEncoder<TKey> _keySerializer = BinaryEncoderFactory<TKey>.BinarySerializer;
     private static readonly IBinaryEncoder<TValue> _valueSerializer = BinaryEncoderFactory<TValue>.BinarySerializer;
+    private readonly ushort _blockSize;
 
-    public ushort BlockSize => (ushort)4.KiB();
+    public DefaultBlockEncoder()
+        : this((ushort)4.KiB())
+    {
+    }
+
+    public DefaultBlockEncoder(ushort blockSize)
+    {
+        if (blockSize == 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(blockSize), blockSize, "Block size must be positive.");
+        }
+
+        _blockSize = blockSize;
+    }
+
+    public ushort BlockSize => _blockSize;
 
     public Block<TKey, TValue> Decode(ReadOnlyMemory<byte> buffer)
     {

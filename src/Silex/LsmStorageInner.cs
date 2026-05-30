@@ -31,9 +31,8 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     private readonly ReaderWriterLockSlim _immutableMemTablesLock = new();
     private readonly AsyncReaderWriterLock _level0Lock = new();
 
-    // Serializes flush and compaction so they never interleave. The manifest-free recovery scheme
-    // relies on a flush never appending a tier in the middle of a compaction (which would make older
-    // compacted data look newer than a fresh flush), and on two compactions never sharing inputs.
+    // Serializes flush and compaction so they never interleave. This keeps each structural change's
+    // in-memory install and manifest commit ordered with respect to every other structural change.
     private readonly SemaphoreSlim _maintenanceLock = new(1, 1);
 
     internal StorageState<TKey, TValue> _state;
@@ -442,6 +441,188 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     }
 
     /// <summary>
+    /// Scans live entries in key order, invoking <paramref name="reader"/> with encoded key bytes and raw
+    /// value bytes. The spans are borrowed and valid only during the synchronous callback.
+    /// </summary>
+    /// <remarks>
+    /// The allocation-free SST fast path is used only when the on-disk tables form a single globally
+    /// non-overlapping sorted run and the value encoder uses empty-value tombstones. Other layouts fall
+    /// back to the regular iterator to preserve duplicate-key and tombstone semantics.
+    /// </remarks>
+    public async ValueTask<long> ScanRawAsync<TArg>(TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries = long.MaxValue, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(reader);
+        ArgumentOutOfRangeException.ThrowIfNegative(maxEntries);
+
+        if (maxEntries == 0)
+        {
+            return 0;
+        }
+
+        if (!_valueSerializer.UsesEmptyTombstone)
+        {
+            return await ScanRawFallbackAsync(arg, reader, maxEntries, cancellationToken);
+        }
+
+        await _level0Lock.EnterReadLockAsync();
+
+        try
+        {
+            if (TryGetGloballySortedSsTableRun(out var tables))
+            {
+                var state = new RawScanState<TArg>(arg, reader, maxEntries);
+
+                foreach (var table in tables)
+                {
+                    for (var i = 0; i < table.BlockMetadata.Count; i++)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+
+                        using var block = await table.ReadBlockAsync(i, cancellationToken);
+
+                        if (block == null)
+                        {
+                            continue;
+                        }
+
+                        if (!block.ForEachRaw(state, static (s, key, value) => s.Accept(key, value), skipEmptyValues: true))
+                        {
+                            return state.Count;
+                        }
+                    }
+                }
+
+                return state.Count;
+            }
+        }
+        finally
+        {
+            _level0Lock.ExitReadLock();
+        }
+
+        return await ScanRawFallbackAsync(arg, reader, maxEntries, cancellationToken);
+    }
+
+    private async ValueTask<long> ScanRawFallbackAsync<TArg>(TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries, CancellationToken cancellationToken)
+    {
+        long count = 0;
+
+        await foreach (var entry in CreateIterator().EnumerateAsync(cancellationToken))
+        {
+            if (count >= maxEntries)
+            {
+                break;
+            }
+
+            count++;
+
+            if (!InvokeRawEntryReader(arg, reader, entry.Key, entry.Value))
+            {
+                break;
+            }
+        }
+
+        return count;
+    }
+
+    private static bool InvokeRawEntryReader<TArg>(TArg arg, ReadRawEntryAction<TArg> reader, TKey key, TValue value)
+    {
+        if (_keySerializer.TryGetRawBytes(key, out var keyBytes) && _valueSerializer.TryGetRawBytes(value, out var valueBytes))
+        {
+            return reader(arg, keyBytes, valueBytes);
+        }
+
+        using var keyBuffer = new PooledArrayBufferWriter<byte>(Math.Max(1, _keySerializer.GetLength(key)));
+        using var valueBuffer = new PooledArrayBufferWriter<byte>(Math.Max(1, _valueSerializer.GetLength(value)));
+
+        if (!_keySerializer.TryGetRawBytes(key, out keyBytes))
+        {
+            var keyWriter = new EncoderBinaryWriter(keyBuffer);
+            _keySerializer.Encode(key, ref keyWriter);
+            keyWriter.Flush();
+            keyBytes = keyBuffer.WrittenMemory.Span;
+        }
+
+        if (!_valueSerializer.TryGetRawBytes(value, out valueBytes))
+        {
+            var valueWriter = new EncoderBinaryWriter(valueBuffer);
+            _valueSerializer.Encode(value, ref valueWriter);
+            valueWriter.Flush();
+            valueBytes = valueBuffer.WrittenMemory.Span;
+        }
+
+        return reader(arg, keyBytes, valueBytes);
+    }
+
+    private bool TryGetGloballySortedSsTableRun(out List<SsTable<TKey, TValue>> tables)
+    {
+        _currentMemTableLock.EnterReadLock();
+
+        try
+        {
+            var state = _state;
+
+            if (state.CurrentMemTable.Count != 0 || !state.ImmutableMemTables.IsEmpty)
+            {
+                tables = [];
+                return false;
+            }
+
+            var count = state.LevelZeroTables.Count;
+
+            foreach (var level in state.LeveledSsTables)
+            {
+                count += level.Count;
+            }
+
+            tables = new List<SsTable<TKey, TValue>>(count);
+            tables.AddRange(state.LevelZeroTables);
+
+            foreach (var level in state.LeveledSsTables)
+            {
+                tables.AddRange(level);
+            }
+        }
+        finally
+        {
+            _currentMemTableLock.ExitReadLock();
+        }
+
+        if (tables.Count <= 1)
+        {
+            return true;
+        }
+
+        tables.Sort(static (left, right) => _keyComparer.Compare(left.FirstKey, right.FirstKey));
+
+        for (var i = 1; i < tables.Count; i++)
+        {
+            if (_keyComparer.Compare(tables[i - 1].LastKey, tables[i].FirstKey) >= 0)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private sealed class RawScanState<TArg>(TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries)
+    {
+        public long Count { get; private set; }
+
+        public bool Accept(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
+        {
+            if (Count >= maxEntries)
+            {
+                return false;
+            }
+
+            Count++;
+            return reader(arg, key, value) && Count < maxEntries;
+        }
+    }
+
+    /// <summary>
     /// Shared sequential traversal for the raw read overloads. Hands the live value bytes to
     /// <paramref name="sink"/> and returns the value length, or <c>-1</c> when the key is missing or deleted.
     /// </summary>
@@ -817,7 +998,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
 
             var ssTable = await builder.BuildAsync(cancellationToken);
 
-            Manifest? manifest = null;
+            Manifest manifest;
 
             await _level0Lock.EnterWriteLockAsync();
 
@@ -842,10 +1023,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
 
                 // Snapshot the new structure while the lock is held so the persisted manifest exactly matches
                 // the installed state. The (small) JSON is written to disk after releasing the lock.
-                if (_compactionStrategy == CompactionStrategy.Leveled)
-                {
-                    manifest = BuildManifestSnapshot();
-                }
+                manifest = BuildManifestSnapshot();
             }
             finally
             {
@@ -854,16 +1032,15 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
                 memTableToFlush.Dispose();
             }
 
-            // For leveled compaction the manifest rewrite is the durable commit point and must happen before
-            // the WAL is deleted: a crash before it leaves the WAL to be replayed on open (the not-yet-committed
-            // SST is cleaned up as an orphan), and a crash after it leaves a committed SST whose WAL recovery
-            // correctly drops. Tiered/None keep the manifest-free, reopen-by-id recovery and skip this.
-            manifest?.Write(StoragePath);
+            // The manifest rewrite is the durable commit point and must happen before the WAL is deleted: a
+            // crash before it leaves the WAL to be replayed on open (the not-yet-committed SST is cleaned up
+            // as an orphan), and a crash after it leaves a committed SST whose WAL recovery correctly drops.
+            manifest.Write(StoragePath);
 
             // The data is now durable in an SST and visible in L0, and the memtable (and its WAL handle)
             // is disposed: the write-ahead log is obsolete and can be removed. If a crash happens before
             // this point the WAL survives and is replayed on the next open; if it happens after the SST is
-            // durable (and, for leveled, committed to the manifest) but before the delete, recovery sees the
+            // durable and committed to the manifest but before the delete, recovery sees the
             // matching SST and drops the stale WAL.
             DeleteWal(memTableToFlush.Id);
         }
@@ -897,7 +1074,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     /// Captures the current L0 + leveled structure as a <see cref="Manifest"/> of filename ids. Must be
     /// called while holding the <c>_level0Lock</c> (read or write) so the snapshot is consistent.
     /// </summary>
-    private Manifest BuildManifestSnapshot()
+    internal Manifest BuildManifestSnapshot()
     {
         var manifest = new Manifest();
 
@@ -927,10 +1104,8 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     /// </summary>
     /// <remarks>
     /// This is driven sequentially by the single background compacter loop, the only component that
-    /// flushes to and compacts L0 at runtime, so it never runs concurrently with a flush. That
-    /// invariant is what keeps the manifest-free, reopen-by-id recovery correct: compaction always
-    /// merges a <em>newest suffix</em> of the tier list into a single output SST whose id is freshly
-    /// allocated (and therefore greater than every input), appended as the new newest tier.
+    /// flushes to and compacts L0 at runtime, so it never runs concurrently with a flush. Each successful
+    /// compaction commits the updated live-file layout to the manifest before removing input SSTs.
     /// </remarks>
     public async Task<bool> TryTieredCompactionAsync(CancellationToken cancellationToken = default)
     {
@@ -948,12 +1123,14 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
             // Snapshot the tier list while briefly holding the read lock. The maintenance lock already
             // excludes flush/compaction, so the snapshot stays valid through the merge below.
             List<SsTable<TKey, TValue>> tiers;
+            bool hasLeveledData;
 
             await _level0Lock.EnterReadLockAsync();
 
             try
             {
                 tiers = _state.LevelZeroTables.ToList();
+                hasLeveledData = _state.LeveledSsTables.Any(level => level.Count > 0);
             }
             finally
             {
@@ -978,9 +1155,9 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
                 inputs.Add(tiers[i]);
             }
 
-            // Tombstones may only be dropped when the bottom-most tier participates: otherwise an older
-            // tier could still hold the deleted key and dropping the tombstone would resurrect it.
-            var dropTombstones = startIndex == 0;
+            // Tombstones may only be dropped when no older source remains below the compacted L0 tiers.
+            // After a leveled store is reopened as tiered, existing leveled levels are still older sources.
+            var dropTombstones = startIndex == 0 && !hasLeveledData;
 
             var outputId = IdGenerator.GetNextId();
             var outputPath = GetSstPath(outputId);
@@ -1032,6 +1209,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
             // Mutate the live list in place (like a flush) rather than reassigning the field so a concurrent
             // FreezeMemTable that copies the list reference observes a consistent collection.
             var installed = false;
+            Manifest? manifest = null;
 
             await _level0Lock.EnterWriteLockAsync();
 
@@ -1051,6 +1229,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
                     }
 
                     installed = true;
+                    manifest = BuildManifestSnapshot();
                 }
             }
             finally
@@ -1065,6 +1244,11 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
                 TryDeleteSstFile(outputPath);
                 return false;
             }
+
+            // The manifest is the durable commit point for the new tier list. Replaced inputs are only
+            // disposed/deleted after it succeeds, so a crash before this write keeps the old manifest intact
+            // and treats the uncommitted output as an orphan on recovery.
+            manifest!.Write(StoragePath);
 
             // The inputs are no longer reachable by new readers and any in-flight reader finished before the
             // write lock was granted, so their handles can be closed.
@@ -1814,6 +1998,27 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     public IStorageIterator<TKey, TValue> CreateIterator()
     {
         return new LsmStorageIterator(this);
+    }
+
+    public async Task FlushAndCompactAsync(CancellationToken cancellationToken = default)
+    {
+        ForceFreezeMemTable();
+
+        while (!_state.ImmutableMemTables.IsEmpty)
+        {
+            await ForceFlushNextImmutableMemTableAsync(cancellationToken);
+        }
+
+        while (true)
+        {
+            var compacted = await TryTieredCompactionAsync(cancellationToken);
+            compacted |= await TryLeveledCompactionAsync(cancellationToken);
+
+            if (!compacted)
+            {
+                break;
+            }
+        }
     }
 
     /// <summary>

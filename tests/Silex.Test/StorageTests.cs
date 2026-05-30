@@ -900,6 +900,144 @@ public class StorageTests
     }
 
     [Test]
+    public async Task TieredStoreWritesManifestAndCanReopenAsLeveled()
+    {
+        using var tempFolder = TempFolder.Create();
+        var tieredOptions = new StorageOptions { UseWriteAheadLog = false, FlushPeriod = TimeSpan.Zero };
+
+        {
+            var storage = await LsmStorage.OpenAsync<int, int>(tempFolder, tieredOptions);
+            storage.Put(1, 10);
+            storage._inner.ForceFreezeMemTable();
+            await storage._inner.ForceFlushNextImmutableMemTableAsync();
+            storage.Put(2, 20);
+            storage._inner.ForceFreezeMemTable();
+            await storage._inner.ForceFlushNextImmutableMemTableAsync();
+
+            await Assert.That(File.Exists(Path.Combine(tempFolder, "manifest"))).IsTrue();
+            await storage.CloseAsync();
+        }
+
+        var leveledOptions = new StorageOptions
+        {
+            UseWriteAheadLog = false,
+            FlushPeriod = TimeSpan.Zero,
+            CompactionStrategy = CompactionStrategy.Leveled,
+            Level0CompactionThreshold = 2,
+        };
+        var reopened = await LsmStorage.OpenAsync<int, int>(tempFolder, leveledOptions);
+
+        try
+        {
+            await Assert.That(reopened._inner._state.LevelZeroTables.Count).IsEqualTo(2);
+            await Assert.That(await reopened._inner.TryLeveledCompactionAsync()).IsTrue();
+            await Assert.That(reopened._inner._state.LevelZeroTables.Count).IsEqualTo(0);
+            await Assert.That(reopened._inner._state.LeveledSsTables[0].Count).IsEqualTo(1);
+            await Assert.That(await reopened.GetAsync(1)).IsEqualTo(10);
+            await Assert.That(await reopened.GetAsync(2)).IsEqualTo(20);
+        }
+        finally
+        {
+            await reopened.DisposeAsync();
+        }
+    }
+
+    [Test]
+    public async Task LeveledStoreCanReopenAsTieredWithoutResurrectingDeletedKeys()
+    {
+        using var tempFolder = TempFolder.Create();
+        var leveledOptions = new StorageOptions
+        {
+            UseWriteAheadLog = false,
+            FlushPeriod = TimeSpan.Zero,
+            CompactionStrategy = CompactionStrategy.Leveled,
+            Level0CompactionThreshold = 1,
+        };
+
+        {
+            var storage = await LsmStorage.OpenAsync<int, int>(tempFolder, leveledOptions);
+            storage.Put(1, 100);
+            storage._inner.ForceFreezeMemTable();
+            await storage._inner.ForceFlushNextImmutableMemTableAsync();
+            await Assert.That(await storage._inner.TryLeveledCompactionAsync()).IsTrue();
+            await Assert.That(storage._inner._state.LeveledSsTables[0].Count).IsEqualTo(1);
+            await storage.CloseAsync();
+        }
+
+        var tieredOptions = new StorageOptions
+        {
+            UseWriteAheadLog = false,
+            FlushPeriod = TimeSpan.Zero,
+            CompactionStrategy = CompactionStrategy.Tiered,
+            MaxCompactionTiers = 2,
+        };
+        var reopened = await LsmStorage.OpenAsync<int, int>(tempFolder, tieredOptions);
+
+        try
+        {
+            await Assert.That(reopened._inner._state.LeveledSsTables[0].Count).IsEqualTo(1);
+
+            reopened.Delete(1);
+            reopened._inner.ForceFreezeMemTable();
+            await reopened._inner.ForceFlushNextImmutableMemTableAsync();
+            reopened.Put(2, 200);
+            reopened._inner.ForceFreezeMemTable();
+            await reopened._inner.ForceFlushNextImmutableMemTableAsync();
+
+            await Assert.That(await reopened._inner.TryTieredCompactionAsync()).IsTrue();
+            await Assert.That(reopened._inner._state.LevelZeroTables.Count).IsEqualTo(1);
+            await Assert.That(await reopened.GetAsync(1)).IsEqualTo(0);
+            await Assert.That(await reopened.GetAsync(2)).IsEqualTo(200);
+        }
+        finally
+        {
+            await reopened.DisposeAsync();
+        }
+
+        var reopenedAgain = await LsmStorage.OpenAsync<int, int>(tempFolder, tieredOptions);
+
+        try
+        {
+            await Assert.That(await reopenedAgain.GetAsync(1)).IsEqualTo(0);
+            await Assert.That(await reopenedAgain.GetAsync(2)).IsEqualTo(200);
+        }
+        finally
+        {
+            await reopenedAgain.DisposeAsync();
+        }
+    }
+
+    [Test]
+    public async Task OpenAsyncMigratesManifestlessStoreToManifest()
+    {
+        using var tempFolder = TempFolder.Create();
+        var options = new StorageOptions { UseWriteAheadLog = false, FlushPeriod = TimeSpan.Zero };
+
+        {
+            var storage = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
+            storage.Put(1, 10);
+            storage._inner.ForceFreezeMemTable();
+            await storage._inner.ForceFlushNextImmutableMemTableAsync();
+            await storage.CloseAsync();
+        }
+
+        var manifestPath = Path.Combine(tempFolder, "manifest");
+        File.Delete(manifestPath);
+
+        var reopened = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
+
+        try
+        {
+            await Assert.That(File.Exists(manifestPath)).IsTrue();
+            await Assert.That(await reopened.GetAsync(1)).IsEqualTo(10);
+        }
+        finally
+        {
+            await reopened.DisposeAsync();
+        }
+    }
+
+    [Test]
     public async Task GetContinuesToOlderSsTableOnBloomFalsePositive()
     {
         // A newer SST whose key range straddles the target key but does not contain it must not mask an
@@ -1016,6 +1154,13 @@ public class StorageTests
         await storage.ForceFlushNextImmutableMemTableAsync();
     }
 
+    private static async Task FlushByteTierAsync(LsmStorageInner<byte[], byte[]> storage, Action write)
+    {
+        write();
+        storage.ForceFreezeMemTable();
+        await storage.ForceFlushNextImmutableMemTableAsync();
+    }
+
     [Test]
     public async Task FullScanIncludesFlushedSsTableData()
     {
@@ -1038,6 +1183,100 @@ public class StorageTests
         finally
         {
             storage.Dispose();
+        }
+    }
+
+    [Test]
+    public async Task RawScanReturnsFlushedByteEntriesWithoutTombstones()
+    {
+        using var tempFolder = TempFolder.Create();
+        var options = new StorageOptions { UseWriteAheadLog = false };
+        var storage = new LsmStorageInner<byte[], byte[]>(tempFolder, options);
+
+        try
+        {
+            await FlushByteTierAsync(storage, () => storage.Put([1], [10]));
+            await FlushByteTierAsync(storage, () => storage.Put([2], [20]));
+            await FlushByteTierAsync(storage, () => storage.Put([3], [30]));
+            await FlushByteTierAsync(storage, () => storage.Delete([4]));
+
+            var entries = new List<(byte Key, byte Value)>();
+
+            await storage.ScanRawAsync(entries, static (results, key, value) =>
+            {
+                results.Add((key[0], value[0]));
+                return true;
+            });
+
+            await Assert.That(entries.Select(e => e.Key)).IsEquivalentTo(new byte[] { 1, 2, 3 }, CollectionOrdering.Matching);
+            await Assert.That(entries.Select(e => e.Value)).IsEquivalentTo(new byte[] { 10, 20, 30 }, CollectionOrdering.Matching);
+        }
+        finally
+        {
+            storage.Dispose();
+        }
+    }
+
+    [Test]
+    public async Task RawScanFallsBackForOverlappingTablesAndKeepsNewestValue()
+    {
+        using var tempFolder = TempFolder.Create();
+        var options = new StorageOptions { UseWriteAheadLog = false };
+        var storage = new LsmStorageInner<byte[], byte[]>(tempFolder, options);
+
+        try
+        {
+            await FlushByteTierAsync(storage, () => storage.Put([1], [10]));
+            await FlushByteTierAsync(storage, () => storage.Put([1], [20]));
+
+            var entries = new List<(byte Key, byte Value)>();
+
+            await storage.ScanRawAsync(entries, static (results, key, value) =>
+            {
+                results.Add((key[0], value[0]));
+                return true;
+            });
+
+            await Assert.That(entries).HasSingleItem();
+            await Assert.That(entries[0].Key).IsEqualTo((byte)1);
+            await Assert.That(entries[0].Value).IsEqualTo((byte)20);
+        }
+        finally
+        {
+            storage.Dispose();
+        }
+    }
+
+    [Test]
+    public async Task FlushAndCompactAsyncFlushesPendingWritesForRawScan()
+    {
+        using var tempFolder = TempFolder.Create();
+        var options = new StorageOptions { UseWriteAheadLog = false, FlushPeriod = TimeSpan.Zero };
+        var storage = await LsmStorage.OpenAsync<byte[], byte[]>(tempFolder, options);
+
+        try
+        {
+            storage.Put([1], [10]);
+            storage.Put([2], [20]);
+
+            await storage.FlushAndCompactAsync();
+
+            await Assert.That(storage._inner._state.CurrentMemTable.Count).IsEqualTo(0);
+            await Assert.That(storage._inner._state.ImmutableMemTables.IsEmpty).IsTrue();
+
+            var entries = new List<byte>();
+
+            await storage.ScanRawAsync(entries, static (results, key, value) =>
+            {
+                results.Add(value[0]);
+                return true;
+            });
+
+            await Assert.That(entries).IsEquivalentTo(new byte[] { 10, 20 }, CollectionOrdering.Matching);
+        }
+        finally
+        {
+            await storage.DisposeAsync();
         }
     }
 

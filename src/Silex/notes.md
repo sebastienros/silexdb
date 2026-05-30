@@ -118,9 +118,10 @@ not in the individual collections.
   newer tiers) → merge the newer suffix; (3) **reduce sorted runs** — merge the newest tiers to bring
   the count back under the limit. Tier size is the SST file length in bytes. Merge uses
   `SsTableIterator → MergeIterator` (newest wins); the output gets a fresh highest id appended at the
-  end, keeping reopen-by-id recency correct without a manifest.
-- **Tombstones** are dropped only when the oldest tier participates (a full compaction, `startIndex==0`);
-  otherwise they are kept because an older tier could still hold the deleted key.
+  end, then the updated live-file layout is committed to the manifest.
+- **Tombstones** are dropped only when the oldest tier participates (a full compaction, `startIndex==0`)
+  and no older leveled levels remain; otherwise they are kept because an older source could still hold the
+  deleted key.
 - **Leveled compaction** (`LsmStorageInner.TryLeveledCompactionAsync`, `CompactionStrategy.Leveled`).
   Each level L1..Ln is a single sorted run (`StorageState.LeveledSsTables`, index 0 = L1). One action per
   invocation, in priority order: (1) **flush L0 → L1** once `LevelZeroTables.Count >=
@@ -137,21 +138,20 @@ not in the individual collections.
   (`List<List<SsTable>>`). Lazy builder creation guarantees no empty SSTs (all-tombstone merges produce
   zero files). Tombstones are dropped only when the destination is the **last non-empty level**
   (`HasDataBelow` is false), otherwise a deeper level could still hold the key.
-- **Manifest (`Manifest.cs`, leveled only).** Leveled breaks reopen-by-id recency (a deeper level's SST
-  is rewritten with a fresh higher id) and a crash mid-compaction could leave overlapping SSTs in a level,
-  so leveled persists a manifest: `{ "l0": [filename ids oldest-first], "levels": [[L1 ids key-asc], ...] }`.
+- **Manifest (`Manifest.cs`).** The manifest is the authoritative live-file layout for every compaction
+  strategy: `{ "Version": 1, "L0": [filename ids oldest-first], "Levels": [[L1 ids key-asc], ...] }`.
   It stores **filename** ids (`GetSstFileId`, parsed from `{id}.sst`), never the transient runtime
   `SsTable.Id`. It is rewritten atomically (temp file + rename) and is the single durable **commit point**:
   flush/compaction stage the new SST(s) via temp+rename, swap the in-memory level state under the
   `_level0Lock` write lock, **write the manifest (commit)**, then (compaction) dispose+delete the replaced
   inputs. A crash before the commit leaves the previous structure intact and the new SST as an orphan; a
   crash after it leaves a committed SST whose stale inputs/WAL recovery drops.
-- **Leveled recovery (`LsmStorage.OpenAsync`).** When opening with `CompactionStrategy.Leveled`, the
-  manifest (if present) is authoritative: referenced SSTs are loaded into the exact L0/levels they record
+- **Recovery (`LsmStorage.OpenAsync`).** The manifest (if present) is authoritative regardless of the
+  open-time `CompactionStrategy`: referenced SSTs are loaded into the exact L0/levels they record
   (**fail open** — a missing referenced file is skipped, not fatal); any `*.sst` not referenced is an
   orphan and is deleted; a surviving WAL is stale **iff** its id was actually loaded from the manifest
-  (so a fail-open-missing SST still replays its WAL). The manifest is ignored under tiered/none (those
-  strategies never maintain it), falling back to the id-ordered L0 load.
+  (so a fail-open-missing SST still replays its WAL). Manifest-less stores fall back to the id-ordered L0
+  load and are migrated by writing a manifest during open.
 - **Concurrency / crash safety:** flush and compaction are serialized by a maintenance lock; the state
   swap happens in place under the `_level0Lock` write lock (with a runtime guard that bails safely if
   the tail unexpectedly changed); inputs are written via temp-file + atomic rename and replaced inputs
@@ -212,11 +212,12 @@ not in the individual collections.
 ### Durability / crash recovery
 - **DONE — Write-ahead log (WAL).** Unflushed MemTable data now survives a process crash and is
   replayed on the next `OpenAsync` (see *Durability / crash recovery (`Wal/WriteAheadLog.cs`)* above).
-- **DONE — Manifest (leveled compaction).** `Manifest.cs` persists the L0/level structure for the leveled
+- **DONE — Manifest (universal).** `Manifest.cs` persists the L0/level structure for every compaction
   strategy and is the durable commit point for flush and compaction (atomic temp+rename). See *Background
-  flush & compaction* above. Tiered/none still use the manifest-free, reopen-by-id protocol.
-- Recovery on `OpenAsync` is manifest-driven for leveled (loads the exact L0/levels, deletes orphans, fails
-  open on a missing referenced SST); tiered/none still load every `*.sst` as L0 (id-ordered).
+  flush & compaction* above.
+- Recovery on `OpenAsync` is manifest-driven when a manifest exists (loads the exact L0/levels, deletes
+  orphans, fails open on a missing referenced SST); older manifest-less stores load every `*.sst` as L0
+  (id-ordered) and are migrated by writing a manifest during open.
 - SST loading on open is sequential (`// TODO: [PERF] Can be parallelized`).
 - Follow-up: `fsync` the parent directory after creating an SST / writing the manifest / deleting a WAL so
   the invariants also hold across power loss (not just process crash); and add a per-record CRC to the WAL
@@ -230,7 +231,7 @@ not in the individual collections.
   `Level0CompactionThreshold` L0 SSTs accumulate; over-target levels cascade down by size ratio
   (`BaseLevelTargetBytes` × `LevelSizeMultiplier^(level-1)`, capped at `MaxLevels`). Each level is a sorted,
   non-overlapping set of size-bounded SSTs (`TargetSstSizeBytes`, default 2 MiB); reads/scans consult
-  L1..Ln after L0; a persisted manifest makes it crash-safe across reopen. Compaction uses partial-overlap
+  L1..Ln after L0; the persisted manifest makes it crash-safe across reopen. Compaction uses partial-overlap
   selection (rewrites only the overlapping target run, carrying the rest over by reference) and
   output-splitting (rolls a new output SST once the builder passes the soft size target).
   Deferred follow-ups: multi-threaded parallel compaction; smarter source-file pick
@@ -405,7 +406,7 @@ merge iterator over all memtables + SSTs; a reusable/seekable iterator handle wo
 1. ~~Serialization / value copy-in semantics.~~ **Decided: keep zero-copy** as a core principle —
    ownership-transfer / borrow contract rather than defensive copies (see *Serialization /
    value-ownership semantics*).
-2. ~~WAL~~ **(done — crash recovery via write-ahead log)** + ~~manifest~~ **(done — leveled manifest)**.
+2. ~~WAL~~ **(done — crash recovery via write-ahead log)** + ~~manifest~~ **(done — universal manifest)**.
 3. ~~Compaction~~ **(tiered + leveled done)** + ~~SST-level scan iterator so range scans include on-disk
    data~~ **(done)** + ~~leveling (needs a manifest)~~ **(done)** + ~~leveled output-splitting +
    partial-overlap selection~~ **(done)** + ~~parallelism (build/compact off the write path across

@@ -63,12 +63,11 @@ public static class LsmStorage
 
         var storageInner = new LsmStorageInner<TKey, TValue>(path, options);
 
-        // The manifest (leveled compaction only) is the authoritative record of which SSTs are live and how
-        // they map to levels. It only drives recovery when the store is being opened with leveled
-        // compaction: the other strategies never maintain it, so honoring a stale leveled manifest under a
-        // different strategy would treat every new (manifest-less) flush as an orphan and delete it. When
-        // ignored, recovery falls back to the id-ordered L0 load (where id ordering still encodes recency).
-        var manifest = options.CompactionStrategy == CompactionStrategy.Leveled ? Manifest.TryRead(path) : null;
+        // The manifest is the authoritative record of which SSTs are live and how they map to levels. It is
+        // read for every strategy so changing CompactionStrategy on reopen only changes future compactions,
+        // not how existing files are interpreted. Older stores without a manifest fall back to id-ordered L0
+        // recovery once and are migrated by the manifest write near the end of OpenAsync.
+        var manifest = Manifest.TryRead(path);
 
         // Ids of the SSTs whose data is actually present in the recovered state. Used below to decide
         // whether a surviving WAL is stale (its data was already flushed and committed and is loaded) or
@@ -179,9 +178,9 @@ public static class LsmStorage
 
             foreach (var (filename, id) in walFiles)
             {
-                // If a committed SST with this id exists the memtable was flushed (and, for leveled,
-                // committed to the manifest) before the crash and this WAL is stale; remove it and skip
-                // replay. This makes the flush/delete sequence idempotent.
+                // If a committed SST with this id exists the memtable was flushed and committed to the
+                // manifest before the crash and this WAL is stale; remove it and skip replay. This makes
+                // the flush/delete sequence idempotent.
                 if (committedSstIds.Contains(id!.Value))
                 {
                     TryDeleteFile(filename);
@@ -198,6 +197,10 @@ public static class LsmStorage
                 storageInner._state.ImmutableMemTables = ImmutableQueue.CreateRange(recovered);
             }
         }
+
+        // Ensure every successfully opened store has a manifest, including manifest-less stores created by
+        // older versions or by strategies that used to infer L0 from filenames.
+        storageInner.BuildManifestSnapshot().Write(path);
 
         var compacter = new Compacter<TKey, TValue>(storageInner, TimeProvider.System, options);
 
@@ -276,6 +279,14 @@ public class LsmStorage<TKey, TValue> : IDisposable, IAsyncDisposable where TKey
         return _inner.TryReadRawAsync(key, arg, reader, cancellationToken);
     }
 
+    /// <inheritdoc cref="LsmStorageInner{TKey, TValue}.ScanRawAsync{TArg}(TArg, ReadRawEntryAction{TArg}, long, CancellationToken)"/>
+    public ValueTask<long> ScanRawAsync<TArg>(TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries = long.MaxValue, CancellationToken cancellationToken = default)
+    {
+        CheckDisposed();
+
+        return _inner.ScanRawAsync(arg, reader, maxEntries, cancellationToken);
+    }
+
     /// <inheritdoc cref="LsmStorageInner.Put(TKey, TValue)"/>
     /// <remarks>
     /// Zero-copy: ownership of <paramref name="key"/> and <paramref name="value"/> transfers to the
@@ -322,6 +333,26 @@ public class LsmStorage<TKey, TValue> : IDisposable, IAsyncDisposable where TKey
     public async Task CloseAsync()
     {
         await DisposeAsync();
+    }
+
+    /// <summary>
+    /// Flushes pending writes and runs compaction until the configured compaction strategy reaches a stable
+    /// state. The background compacter is paused while this explicit maintenance pass runs.
+    /// </summary>
+    public async Task FlushAndCompactAsync(CancellationToken cancellationToken = default)
+    {
+        CheckDisposed();
+
+        await _compacter.StopBackgroundFlushAsync();
+
+        try
+        {
+            await _inner.FlushAndCompactAsync(cancellationToken);
+        }
+        finally
+        {
+            _compacter.StartBackgroundFlush();
+        }
     }
 
     public async ValueTask DisposeAsync()

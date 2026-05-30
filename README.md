@@ -268,6 +268,78 @@ foreach (var x in Enumerable.Range(0, 1_000_000))
 await db.CloseAsync(); // flush everything to disk
 ```
 
+## db_bench comparisons with RocksDB
+
+`Silex.DbBench` accepts the RocksDB-style options that affect the main LSM shape so comparisons can use
+the same strategy instead of comparing RocksDB's default leveled compaction with Silex's default tiered
+compaction. For fair runs, keep compression disabled on RocksDB (`--compression_type=none`) because Silex
+currently stores values uncompressed, use `--compression_ratio=1` so RocksDB generates fully random
+payloads like Silex, and use the same values for `--num`, `--key_size`, `--value_size`,
+`--write_buffer_size`, `--block_size`, `--bloom_bits`, `--threads`, `--seed`, and the compaction knobs.
+
+Tiered/universal comparison:
+
+```bash
+dotnet run --project Silex.DbBench -c Release -- \
+  --benchmarks=fillseq,readrandom,readseq \
+  --num=1000000 --key_size=16 --value_size=100 --threads=1 --seed=42 \
+  --write_buffer_size=67108864 --max_write_buffer_number=50 \
+  --block_size=4096 --cache_size=8388608 --bloom_bits=10 \
+  --compaction_style=1 \
+  --universal_max_read_amp=8 \
+  --universal_max_size_amplification_percent=200 \
+  --universal_size_ratio=1 \
+  --universal_min_merge_width=2 \
+  --compression_type=none --compression_ratio=1 --db=/tmp/silex-universal
+
+db_bench \
+  --benchmarks=fillseq,readrandom,readseq \
+  --num=1000000 --key_size=16 --value_size=100 --threads=1 --seed=42 \
+  --write_buffer_size=67108864 --max_write_buffer_number=50 \
+  --block_size=4096 --cache_size=8388608 --bloom_bits=10 \
+  --compaction_style=1 \
+  --universal_max_read_amp=8 \
+  --universal_max_size_amplification_percent=200 \
+  --universal_size_ratio=1 \
+  --universal_min_merge_width=2 \
+  --compression_type=none --compression_ratio=1 --db=/tmp/rocksdb-universal
+```
+
+Leveled comparison:
+
+```bash
+dotnet run --project Silex.DbBench -c Release -- \
+  --benchmarks=fillseq,readrandom,readseq \
+  --num=1000000 --key_size=16 --value_size=100 --threads=1 --seed=42 \
+  --write_buffer_size=67108864 --max_write_buffer_number=50 \
+  --block_size=4096 --cache_size=8388608 --bloom_bits=10 \
+  --compaction_style=0 \
+  --level0_file_num_compaction_trigger=4 \
+  --num_levels=7 \
+  --max_bytes_for_level_base=262144 \
+  --max_bytes_for_level_multiplier=10 \
+  --target_file_size_base=2097152 \
+  --compression_type=none --compression_ratio=1 --db=/tmp/silex-leveled
+
+db_bench \
+  --benchmarks=fillseq,readrandom,readseq \
+  --num=1000000 --key_size=16 --value_size=100 --threads=1 --seed=42 \
+  --write_buffer_size=67108864 --max_write_buffer_number=50 \
+  --block_size=4096 --cache_size=8388608 --bloom_bits=10 \
+  --compaction_style=0 \
+  --level0_file_num_compaction_trigger=4 \
+  --num_levels=7 \
+  --max_bytes_for_level_base=262144 \
+  --max_bytes_for_level_multiplier=10 \
+  --target_file_size_base=2097152 \
+  --compression_type=none --compression_ratio=1 --db=/tmp/rocksdb-leveled
+```
+
+The mappings are intentionally close but not identical to RocksDB internals: Silex runs one background
+compaction loop, maps `--bloom_bits` to an equivalent false-positive probability, and `Silex.DbBench`
+forces a flush/compaction barrier before read phases so reads measure on-disk SST state rather than
+leftover MemTables. `readseq` uses Silex's raw scan path for the `byte[]` benchmark workload.
+
 ## Project layout
 
 | Project                  | Description                                      |

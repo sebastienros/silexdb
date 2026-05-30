@@ -22,12 +22,13 @@ internal class Compacter<TKey, TValue> : IAsyncDisposable where TKey : notnull
 
     public void StartBackgroundFlush()
     {
-        if (_flushTimer == null)
+        if (_flushTimer == null || _flushTask != null)
         {
             return;
         }
 
-        _flushTask ??= BackgroundFlushAsync();
+        _flushTaskCts = new();
+        _flushTask = BackgroundFlushAsync(_flushTaskCts.Token);
     }
 
     public async Task StopBackgroundFlushAsync()
@@ -44,17 +45,15 @@ internal class Compacter<TKey, TValue> : IAsyncDisposable where TKey : notnull
         _flushTaskCts = null;
     }
 
-    private async Task BackgroundFlushAsync()
+    private async Task BackgroundFlushAsync(CancellationToken cancellationToken)
     {
         Debug.Assert(_flushTimer != null);
 
-        _flushTaskCts = new();
-
         try
         {
-            while (await _flushTimer.WaitForNextTickAsync(_flushTaskCts.Token))
+            while (await _flushTimer.WaitForNextTickAsync(cancellationToken))
             {
-                await TriggerFlushAsync();
+                await TriggerFlushAsync(cancellationToken);
             }
         }
         catch (OperationCanceledException)
@@ -63,18 +62,17 @@ internal class Compacter<TKey, TValue> : IAsyncDisposable where TKey : notnull
         }
     }
 
-    private async Task TriggerFlushAsync()
+    private async Task TriggerFlushAsync(CancellationToken cancellationToken)
     {
         if (_storage._state.ImmutableMemTables.Count() + 1 > _memTableTableMaxCount)
         {
-            await _storage.ForceFlushNextImmutableMemTableAsync();
+            await _storage.ForceFlushNextImmutableMemTableAsync(cancellationToken);
         }
 
-        // Flush and compaction are driven from this single loop so they never overlap; that ordering is
-        // what lets tiered compaction stay correct without a manifest.
-        var token = _flushTaskCts?.Token ?? CancellationToken.None;
-        await _storage.TryTieredCompactionAsync(token);
-        await _storage.TryLeveledCompactionAsync(token);
+        // Flush and compaction are driven from this single loop so they never overlap; that ordering keeps
+        // tiered compaction's L0 recency order stable while each structural change is committed.
+        await _storage.TryTieredCompactionAsync(cancellationToken);
+        await _storage.TryLeveledCompactionAsync(cancellationToken);
 
     }
 

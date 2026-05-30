@@ -123,6 +123,33 @@ public class Block<TKey, TValue> : IDisposable
         value = default;
         return false;
     }
+
+    internal bool ForEachRaw<TArg>(TArg arg, ReadRawEntryAction<TArg> reader, bool skipEmptyValues)
+    {
+        var memory = Memory;
+
+        for (var i = 0; i < Offsets.Count; i++)
+        {
+            var blockReader = new EncoderBinaryReader(memory, Offsets[i]);
+            var keyLength = blockReader.Read7BitEncodedInt();
+            var key = blockReader.ReadBytesSpan(keyLength);
+            var valueLength = blockReader.Read7BitEncodedInt();
+            var value = blockReader.ReadBytesSpan(valueLength);
+
+            if (skipEmptyValues && value.IsEmpty)
+            {
+                continue;
+            }
+
+            if (!reader(arg, key, value))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     /// <param name="entry"></param>
     /// <returns></returns>
     public ReadOnlySpan<byte> GetValue(RecordLocation<TKey> entry)

@@ -53,6 +53,19 @@ internal sealed class MergeIterator<TKey, TValue> : IStorageIterator<TKey, TValu
                 }
             }
 
+            if (enumerators.Count == 1)
+            {
+                var enumerator = enumerators[0];
+
+                do
+                {
+                    yield return enumerator.Current;
+                }
+                while (await enumerator.MoveNextAsync());
+
+                yield break;
+            }
+
             while (enumerators.Count > 0)
             {
                 // Assume the smallest is the element from the first iterator

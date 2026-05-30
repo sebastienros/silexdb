@@ -3,13 +3,12 @@ using System.Text.Json;
 namespace Silex;
 
 /// <summary>
-/// Records the on-disk LSM structure for <see cref="CompactionStrategy.Leveled"/>: which SST files are
-/// live and which level each belongs to. SST ids alone cannot encode this because a deeper level's SST is
-/// older data yet receives a fresh (higher) id every time it is rewritten by compaction, so id ordering no
-/// longer reflects recency. The manifest is rewritten atomically (temp file + rename) after every
-/// structural change and is the single commit point that makes flush and compaction crash-safe: a crash
-/// before the rewrite leaves the previous structure intact, and any SST not referenced by the committed
-/// manifest is an orphan that recovery deletes.
+/// Records the on-disk LSM structure: which SST files are live and which level each belongs to. SST ids
+/// alone cannot encode this once compaction rewrites data into fresh files, so the manifest is the
+/// authoritative source for recovery under every compaction strategy. The manifest is rewritten
+/// atomically (temp file + rename) after every structural change and is the single commit point that makes
+/// flush and compaction crash-safe: a crash before the rewrite leaves the previous structure intact, and
+/// any SST not referenced by the committed manifest is an orphan that recovery deletes.
 /// </summary>
 /// <remarks>
 /// All ids stored here are <em>filename</em> ids (parsed from <c>{id}.sst</c>), never the in-memory
@@ -21,6 +20,11 @@ internal sealed class Manifest
     private const string TempFileName = "manifest.tmp";
 
     private static readonly JsonSerializerOptions _jsonOptions = new() { WriteIndented = false };
+
+    /// <summary>
+    /// The manifest schema version.
+    /// </summary>
+    public int Version { get; set; } = 1;
 
     /// <summary>
     /// The L0 SST filename ids, oldest-first (the order in which they were flushed). The newest L0 SST is
@@ -41,7 +45,7 @@ internal sealed class Manifest
 
     /// <summary>
     /// Reads the manifest from <paramref name="storagePath"/>, or returns <see langword="null"/> when no
-    /// manifest exists (the store was never written with leveled compaction).
+    /// manifest exists (the store was created before every strategy wrote a manifest).
     /// </summary>
     public static Manifest? TryRead(string storagePath)
     {

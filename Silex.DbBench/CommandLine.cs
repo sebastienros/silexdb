@@ -73,6 +73,18 @@ internal static class CommandLine
         DefaultValueFactory = _ => 64L * 1024 * 1024,
     };
 
+    private static readonly Option<int> MaxWriteBufferNumber = new("--max_write_buffer_number")
+    {
+        Description = "Maximum number of memtables retained before Silex flushes one to L0.",
+        DefaultValueFactory = _ => 50,
+    };
+
+    private static readonly Option<int> BloomBits = new("--bloom_bits")
+    {
+        Description = "Bloom filter bits per key. Use 0 to disable Bloom filters.",
+        DefaultValueFactory = _ => 10,
+    };
+
     private static readonly Option<int> BlockSize = new("--block_size")
     {
         Description = "SSTable block size in bytes.",
@@ -98,6 +110,11 @@ internal static class CommandLine
         DefaultValueFactory = _ => CompactionStrategy.Tiered,
     };
 
+    private static readonly Option<string?> CompactionStyle = new("--compaction_style")
+    {
+        Description = "RocksDB-compatible compaction style: 0/level/leveled or 1/universal/tiered.",
+    };
+
     private static readonly Option<bool> Wal = new("--wal")
     {
         Description = "Enable the write-ahead log.",
@@ -109,10 +126,63 @@ internal static class CommandLine
         Description = "fsync the WAL on every write.",
     };
 
+    private static readonly Option<int> Level0FileNumCompactionTrigger = new("--level0_file_num_compaction_trigger")
+    {
+        Description = "Number of L0 SSTs that triggers leveled L0-to-L1 compaction.",
+        DefaultValueFactory = _ => 4,
+    };
+
+    private static readonly Option<int> NumLevels = new("--num_levels")
+    {
+        Description = "Maximum number of levels below L0 for leveled compaction.",
+        DefaultValueFactory = _ => 7,
+    };
+
+    private static readonly Option<long> MaxBytesForLevelBase = new("--max_bytes_for_level_base")
+    {
+        Description = "Target bytes for the base level (L1) in leveled compaction.",
+        DefaultValueFactory = _ => 256L * 1024,
+    };
+
+    private static readonly Option<int> MaxBytesForLevelMultiplier = new("--max_bytes_for_level_multiplier")
+    {
+        Description = "Size multiplier between adjacent leveled compaction levels.",
+        DefaultValueFactory = _ => 10,
+    };
+
     private static readonly Option<long> TargetSstSize = new("--target_sst_size")
     {
         Description = "Target size of a compacted SSTable in bytes.",
         DefaultValueFactory = _ => 2L * 1024 * 1024,
+    };
+
+    private static readonly Option<long?> TargetFileSizeBase = new("--target_file_size_base")
+    {
+        Description = "RocksDB-compatible alias for --target_sst_size.",
+    };
+
+    private static readonly Option<int> UniversalMaxReadAmp = new("--universal_max_read_amp")
+    {
+        Description = "Maximum sorted runs tolerated before tiered/universal compaction starts merging.",
+        DefaultValueFactory = _ => 8,
+    };
+
+    private static readonly Option<int> UniversalMaxSizeAmplificationPercent = new("--universal_max_size_amplification_percent")
+    {
+        Description = "Space-amplification trigger percentage for tiered/universal compaction.",
+        DefaultValueFactory = _ => 200,
+    };
+
+    private static readonly Option<int> UniversalSizeRatio = new("--universal_size_ratio")
+    {
+        Description = "Size-ratio trigger percentage for tiered/universal compaction.",
+        DefaultValueFactory = _ => 1,
+    };
+
+    private static readonly Option<int> UniversalMinMergeWidth = new("--universal_min_merge_width")
+    {
+        Description = "Minimum number of tiers participating in a tiered/universal merge.",
+        DefaultValueFactory = _ => 2,
     };
 
     private static readonly Option<int> CompactionParallelism = new("--compaction_parallelism")
@@ -127,10 +197,15 @@ internal static class CommandLine
         DefaultValueFactory = _ => Environment.ProcessorCount,
     };
 
+    private static readonly Option<int?> MaxBackgroundCompactions = new("--max_background_compactions")
+    {
+        Description = "Accepted for db_bench command compatibility; Silex runs one background compaction loop.",
+    };
+
     // Accepted-but-ignored db_bench flags, declared so they don't error out; they emit a warning instead.
     private static readonly Option<string?> CompressionType = new("--compression_type")
     {
-        Description = "Ignored: Silex stores values uncompressed.",
+        Description = "Accepted for db_bench compatibility. Silex stores values uncompressed; use none for fair RocksDB runs.",
     };
 
     private static readonly Option<double?> CompressionRatio = new("--compression_ratio")
@@ -148,15 +223,27 @@ internal static class CommandLine
         var root = new RootCommand("Silex DbBench — a RocksDB db_bench-style benchmark tool for the Silex LSM store.")
         {
             Benchmarks, Num, Reads, ValueSize, KeySize, Db, UseExistingDb, Seed, Histogram, Threads,
-            WriteBufferSize, BlockSize, CacheSize, SeekNexts,
-            Compaction, Wal, WalSync, TargetSstSize, CompactionParallelism, ReadParallelism,
+            WriteBufferSize, MaxWriteBufferNumber, BloomBits, BlockSize, CacheSize, SeekNexts,
+            Compaction, CompactionStyle, Wal, WalSync,
+            Level0FileNumCompactionTrigger, NumLevels, MaxBytesForLevelBase, MaxBytesForLevelMultiplier,
+            TargetSstSize, TargetFileSizeBase,
+            UniversalMaxReadAmp, UniversalMaxSizeAmplificationPercent, UniversalSizeRatio, UniversalMinMergeWidth,
+            CompactionParallelism, ReadParallelism, MaxBackgroundCompactions,
             CompressionType, CompressionRatio, BatchSize,
         };
 
         root.SetAction((parseResult, _) =>
         {
-            var (options, warnings) = ToOptions(parseResult);
-            return run(options, warnings);
+            try
+            {
+                var (options, warnings) = ToOptions(parseResult);
+                return run(options, warnings);
+            }
+            catch (ArgumentException ex)
+            {
+                Console.Error.WriteLine($"error: {ex.Message}");
+                return Task.FromResult(1);
+            }
         });
 
         return root;
@@ -165,6 +252,9 @@ internal static class CommandLine
     private static (BenchmarkOptions options, List<string> warnings) ToOptions(ParseResult parseResult)
     {
         var warnings = new List<string>();
+
+        var targetFileSizeBase = parseResult.GetValue(TargetFileSizeBase);
+        var compactionStyle = parseResult.GetValue(CompactionStyle);
 
         var options = new BenchmarkOptions
         {
@@ -179,20 +269,43 @@ internal static class CommandLine
             Histogram = parseResult.GetValue(Histogram),
             Threads = Math.Max(1, parseResult.GetValue(Threads)),
             WriteBufferSize = parseResult.GetValue(WriteBufferSize),
+            MaxWriteBufferNumber = parseResult.GetValue(MaxWriteBufferNumber),
+            BloomBits = parseResult.GetValue(BloomBits),
             BlockSize = parseResult.GetValue(BlockSize),
             CacheSize = parseResult.GetValue(CacheSize),
             SeekNexts = parseResult.GetValue(SeekNexts),
-            Compaction = parseResult.GetValue(Compaction),
+            Compaction = compactionStyle == null ? parseResult.GetValue(Compaction) : ParseCompactionStyle(compactionStyle),
             Wal = parseResult.GetValue(Wal),
             WalSync = parseResult.GetValue(WalSync),
-            TargetSstSize = parseResult.GetValue(TargetSstSize),
+            Level0FileNumCompactionTrigger = parseResult.GetValue(Level0FileNumCompactionTrigger),
+            NumLevels = parseResult.GetValue(NumLevels),
+            MaxBytesForLevelBase = parseResult.GetValue(MaxBytesForLevelBase),
+            MaxBytesForLevelMultiplier = parseResult.GetValue(MaxBytesForLevelMultiplier),
+            TargetSstSize = targetFileSizeBase ?? parseResult.GetValue(TargetSstSize),
+            UniversalMaxReadAmp = parseResult.GetValue(UniversalMaxReadAmp),
+            UniversalMaxSizeAmplificationPercent = parseResult.GetValue(UniversalMaxSizeAmplificationPercent),
+            UniversalSizeRatio = parseResult.GetValue(UniversalSizeRatio),
+            UniversalMinMergeWidth = parseResult.GetValue(UniversalMinMergeWidth),
             CompactionParallelism = Math.Max(1, parseResult.GetValue(CompactionParallelism)),
             ReadParallelism = Math.Max(1, parseResult.GetValue(ReadParallelism)),
         };
 
-        if (parseResult.GetValue(CompressionType) != null || parseResult.GetValue(CompressionRatio) != null)
+        var compressionType = parseResult.GetValue(CompressionType);
+        if (compressionType != null && !compressionType.Equals("none", StringComparison.OrdinalIgnoreCase))
         {
-            warnings.Add("--compression_* ignored: Silex stores values uncompressed. Run RocksDB with compression disabled for a fair comparison.");
+            warnings.Add($"--compression_type={compressionType} ignored: Silex stores values uncompressed. Use --compression_type=none for a fair RocksDB comparison.");
+        }
+
+        var compressionRatio = parseResult.GetValue(CompressionRatio);
+        if (compressionRatio is not null && compressionRatio != 1)
+        {
+            warnings.Add("--compression_ratio ignored: Silex generates uncompressed random values. Use --compression_ratio=1 for a fair RocksDB comparison.");
+        }
+
+        var maxBackgroundCompactions = parseResult.GetValue(MaxBackgroundCompactions);
+        if (maxBackgroundCompactions > 1)
+        {
+            warnings.Add("--max_background_compactions accepted for compatibility, but Silex currently runs one background compaction loop.");
         }
 
         var batch = parseResult.GetValue(BatchSize);
@@ -203,4 +316,12 @@ internal static class CommandLine
 
         return (options, warnings);
     }
+
+    private static CompactionStrategy ParseCompactionStyle(string value) => value.ToLowerInvariant() switch
+    {
+        "0" or "level" or "leveled" => CompactionStrategy.Leveled,
+        "1" or "universal" or "tiered" => CompactionStrategy.Tiered,
+        "none" => CompactionStrategy.None,
+        _ => throw new ArgumentException($"Unsupported --compaction_style='{value}'. Use 0/level, 1/universal, or none."),
+    };
 }
