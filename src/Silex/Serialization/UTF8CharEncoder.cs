@@ -1,24 +1,25 @@
 ﻿using Silex.Buffers;
-using System.Text;
+using System.Buffers.Binary;
+using System.Diagnostics;
 
 namespace Silex.Serialization;
 
+/// <summary>
+/// Encodes a <see cref="char"/> as a fixed-width, big-endian 16-bit value. A bytewise comparison of the
+/// encoded bytes therefore matches <see cref="Comparer{T}.Default"/> for <see cref="char"/> (which orders
+/// by UTF-16 code unit). A variable-length UTF-8 encoding is deliberately not used: a lone surrogate is
+/// not a valid scalar value and would otherwise be replaced (collapsing distinct chars to identical
+/// bytes), which would break the order-preserving, byte-comparable key contract.
+/// </summary>
 public sealed class UTF8CharEncoder : IBinaryEncoder<char>
 {
     public char Decode(ReadOnlySpan<byte> data)
     {
-        Span<char> span = stackalloc char[1];
-        Encoding.UTF8.TryGetChars(data, span, out int charsWritten);
-        return span[0];
+        Debug.Assert(data.Length == sizeof(char));
+        return (char)BinaryPrimitives.ReadUInt16BigEndian(data);
     }
 
-    public int GetLength(char value) 
-    { 
-        if (value < 0x80) return 1;
-
-        Span<char> span = [value];
-        return Encoding.UTF8.GetByteCount(span);
-    }
+    public int GetLength(char value) => sizeof(char);
 
     public char GetTombstoneValue() => '\0';
 
@@ -26,10 +27,11 @@ public sealed class UTF8CharEncoder : IBinaryEncoder<char>
 
     public int Encode(char value, ref EncoderBinaryWriter writer)
     {
-        Span<char> span = [value];
-        Span<byte> bytes = [0, 0, 0, 0]; // 4 bytes, max char size in UTF-8
-        Encoding.UTF8.TryGetBytes(span, bytes, out int bytesWritten);
-        writer.WriteRaw(bytes.Slice(0, bytesWritten));
-        return bytesWritten;
+        var length = sizeof(char);
+        Span<byte> span = stackalloc byte[length];
+        BinaryPrimitives.WriteUInt16BigEndian(span, value);
+        writer.WriteRaw(span);
+
+        return length;
     }
 }

@@ -7,6 +7,43 @@ public sealed class UTF8StringEncoder : IBinaryEncoder<string>
 {
     internal const int StackAllocThreshold = 100;
 
+    // String keys are encoded as UTF-8. UTF-8 byte order equals Unicode code-point (scalar) order, which is
+    // NOT the same as StringComparer.Ordinal: ordinal compares UTF-16 code units, so a supplementary
+    // character (encoded as a surrogate pair starting at U+D800) would sort before BMP characters such as
+    // U+E000 under ordinal, but after them by code point / UTF-8 bytes. To keep the on-disk byte order
+    // consistent with the typed comparison (required by the span-based byte core), keys are compared by
+    // code point. Equality only needs to agree for round-trippable strings, where ordinal equality matches.
+    IComparer<string> IBinaryEncoder<string>.Comparer => CodePointComparer.Instance;
+
+    IEqualityComparer<string> IBinaryEncoder<string>.EqualityComparer => StringComparer.Ordinal;
+
+    private sealed class CodePointComparer : IComparer<string>
+    {
+        public static readonly CodePointComparer Instance = new();
+
+        public int Compare(string? x, string? y)
+        {
+            if (ReferenceEquals(x, y)) return 0;
+            if (x is null) return -1;
+            if (y is null) return 1;
+
+            var ex = x.EnumerateRunes();
+            var ey = y.EnumerateRunes();
+
+            while (true)
+            {
+                var hasX = ex.MoveNext();
+                var hasY = ey.MoveNext();
+
+                if (!hasX) return hasY ? -1 : 0;
+                if (!hasY) return 1;
+
+                var diff = ex.Current.Value - ey.Current.Value;
+                if (diff != 0) return diff;
+            }
+        }
+    }
+
     public string Decode(ReadOnlySpan<byte> data)
     {
         return Encoding.UTF8.GetString(data);

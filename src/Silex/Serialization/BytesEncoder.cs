@@ -11,6 +11,14 @@ public sealed class BytesEncoder : IBinaryEncoder<Bytes>
         return new Bytes(data);
     }
 
+    public bool UsesEmptyTombstone => true;
+
+    public bool TryGetRawBytes(Bytes value, out ReadOnlySpan<byte> bytes)
+    {
+        bytes = value.Span;
+        return true;
+    }
+
     public int GetLength(Bytes value) => value.Length;
 
     public Bytes GetTombstoneValue() => Bytes.Empty;

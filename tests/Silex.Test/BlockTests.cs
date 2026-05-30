@@ -27,13 +27,13 @@ public class BlockTests
 
         await Assert.That(block.Offsets).HasSingleItem();
         await Assert.That(block.Memory.Length).IsEqualTo(expectedDataSize);
-        await Assert.That(block.Memory).IsEquivalentTo(new byte[] { 2, 7, 0, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, CollectionOrdering.Matching);
+        await Assert.That(block.Memory).IsEquivalentTo(new byte[] { 2, 0, 7, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, CollectionOrdering.Matching);
     }
 
     [Test]
     public async Task ShouldDecodeBlock()
     {
-        var raw = new byte[] { 2, 7, 0, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 };
+        var raw = new byte[] { 2, 0, 7, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 };
         var key = new Bytes((ushort)7);
 
         var encoder = new DefaultBlockEncoder<ushort, byte[]>();
@@ -127,10 +127,51 @@ public class BlockTests
         foreach (var i in allKeys)
         {
             var resultIsEmpty = block.GetValue(i).IsEmpty;
-            var resultBytes = new Bytes(block.GetValue(i));
+            var decoded = new Silex.Serialization.Int32Encoder().Decode(block.GetValue(i));
             await Assert.That(resultIsEmpty).IsFalse();
-            await Assert.That(resultBytes).IsEqualTo(new Bytes(BitConverter.GetBytes(i * i)));
+            await Assert.That(decoded).IsEqualTo(i * i);
         }
+    }
+
+    [Test]
+    public async Task TryGetValueByEncodedKeyShouldMatchTypedLookup()
+    {
+        var blockBuilder = new BlockBuilder<int, int>(new DefaultBlockEncoder<int, int>());
+
+        var allKeys = new int[] { -7, -1, 0, 1, 3, 5, 6, 7 };
+        foreach (var i in allKeys)
+        {
+            blockBuilder.Add(i, i * i);
+        }
+
+        var block = blockBuilder.BuildBlock();
+        var encoder = new Silex.Serialization.Int32Encoder();
+
+        foreach (var i in allKeys)
+        {
+            var bufferWriter = new Silex.Buffers.PooledArrayBufferWriter<byte>();
+            var writer = new Silex.Buffers.EncoderBinaryWriter(bufferWriter);
+            encoder.Encode(i, ref writer);
+            writer.Flush();
+
+            bool found;
+            int decodedValue;
+            {
+                found = block.TryGetValue((ReadOnlySpan<byte>)bufferWriter.WrittenMemory.Span, out var value);
+                decodedValue = found ? encoder.Decode(value) : 0;
+            }
+
+            await Assert.That(found).IsTrue();
+            await Assert.That(decodedValue).IsEqualTo(i * i);
+        }
+
+        // An absent in-range key must report a miss.
+        var missWriter = new Silex.Buffers.PooledArrayBufferWriter<byte>();
+        var w = new Silex.Buffers.EncoderBinaryWriter(missWriter);
+        encoder.Encode(4, ref w);
+        w.Flush();
+        var missFound = block.TryGetValue((ReadOnlySpan<byte>)missWriter.WrittenMemory.Span, out _);
+        await Assert.That(missFound).IsFalse();
     }
 
     [Test]

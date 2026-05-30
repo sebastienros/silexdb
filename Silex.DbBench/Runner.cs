@@ -234,19 +234,26 @@ internal sealed class Runner
             var keyGen = new KeyGenerator(_options.KeySize);
             var rng = RngStreams.Create(_options.Seed, threadId, RngStreams.Read);
 
+            // Reused per-thread buffers: the key array is mutated in place for each lookup (reads never take
+            // ownership of the key), and the value buffer receives the stored bytes via the raw read path so
+            // no per-op byte[] is allocated. Operations run sequentially within a thread, so reuse is safe.
+            var key = new byte[_options.KeySize];
+            var valueBuffer = new byte[_options.ValueSize];
+
             return new ThreadWorker(async op =>
             {
                 // readmissing reads from a key range that was never written ([num, 2*num)).
                 var keyIndex = rng.NextInt64(_options.Num) + (missing ? _options.Num : 0);
-                var value = await db.GetAsync(keyGen.Generate(keyIndex));
+                keyGen.GenerateInto(keyIndex, key);
+                var length = await db.GetRawAsync(key, valueBuffer);
 
                 stats.Ops++;
                 stats.Bytes += _options.KeySize;
 
-                if (value != null)
+                if (length >= 0)
                 {
                     stats.Found++;
-                    stats.Bytes += value.Length;
+                    stats.Bytes += length;
                 }
 
                 return true;

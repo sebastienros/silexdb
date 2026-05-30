@@ -6,10 +6,11 @@ namespace Silex.Serialization;
 
 public sealed class UInt16Serializer : IBinaryEncoder<ushort>
 {
+    // Encoded big-endian so a bytewise comparison of the encoded bytes matches the numeric ordering.
     public ushort Decode(ReadOnlySpan<byte> data)
     {
         Debug.Assert(data.Length == sizeof(ushort));
-        return BinaryPrimitives.ReadUInt16LittleEndian(data);
+        return BinaryPrimitives.ReadUInt16BigEndian(data);
     }
 
     public int GetLength(ushort value) => sizeof(ushort);
@@ -22,7 +23,7 @@ public sealed class UInt16Serializer : IBinaryEncoder<ushort>
     {
         var length = sizeof(ushort);
         Span<byte> span = stackalloc byte[length];
-        BinaryPrimitives.WriteUInt16LittleEndian(span, value);
+        BinaryPrimitives.WriteUInt16BigEndian(span, value);
         writer.WriteRaw(span);
 
         return length;

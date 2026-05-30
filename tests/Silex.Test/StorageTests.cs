@@ -1,6 +1,8 @@
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Globalization;
 using Silex.BloomFilters;
+using Silex.Serialization;
 using TUnit.Assertions.Enums;
 
 namespace Silex.Test;
@@ -1760,6 +1762,193 @@ public class StorageTests
                 await storage.DisposeAsync();
             }
         }
+    }
+
+    [Test]
+    public async Task TryGetRawAsyncWritesValueFromMemTable()
+    {
+        using var tempFolder = TempFolder.Create();
+        using var storage = new LsmStorageInner<byte[], byte[]>(tempFolder, _defaultStorageOptions);
+
+        byte[] key = [1, 2, 3];
+        byte[] value = [4, 5, 6, 7];
+        storage.Put(key, value);
+
+        var destination = new ArrayBufferWriter<byte>();
+        var found = await storage.TryGetRawAsync(key, destination);
+
+        await Assert.That(found).IsTrue();
+        await Assert.That(destination.WrittenSpan.ToArray()).IsEquivalentTo(value, CollectionOrdering.Matching);
+    }
+
+    [Test]
+    public async Task TryGetRawAsyncReturnsFalseForMissingKey()
+    {
+        using var tempFolder = TempFolder.Create();
+        using var storage = new LsmStorageInner<byte[], byte[]>(tempFolder, _defaultStorageOptions);
+
+        var destination = new ArrayBufferWriter<byte>();
+        var found = await storage.TryGetRawAsync([9, 9], destination);
+
+        await Assert.That(found).IsFalse();
+        await Assert.That(destination.WrittenCount).IsEqualTo(0);
+    }
+
+    [Test]
+    public async Task TryGetRawAsyncReturnsFalseForDeletedKeyInMemTable()
+    {
+        // Unlike GetAsync (which surfaces an empty array for a memtable tombstone), the raw API reports a
+        // deleted key as not found.
+        using var tempFolder = TempFolder.Create();
+        using var storage = new LsmStorageInner<byte[], byte[]>(tempFolder, _defaultStorageOptions);
+
+        byte[] key = [1, 2, 3];
+        storage.Put(key, [4, 5, 6]);
+        storage.Delete(key);
+
+        var destination = new ArrayBufferWriter<byte>();
+        var found = await storage.TryGetRawAsync(key, destination);
+
+        await Assert.That(found).IsFalse();
+        await Assert.That(destination.WrittenCount).IsEqualTo(0);
+    }
+
+    [Test]
+    public async Task GetRawAsyncCopiesIntoDestinationAndReturnsLength()
+    {
+        using var tempFolder = TempFolder.Create();
+        using var storage = new LsmStorageInner<byte[], byte[]>(tempFolder, _defaultStorageOptions);
+
+        byte[] key = [1, 2, 3];
+        byte[] value = [4, 5, 6, 7, 8];
+        storage.Put(key, value);
+
+        var destination = new byte[16];
+        var length = await storage.GetRawAsync(key, destination);
+
+        await Assert.That(length).IsEqualTo(value.Length);
+        await Assert.That(destination.AsSpan(0, length).ToArray()).IsEquivalentTo(value, CollectionOrdering.Matching);
+    }
+
+    [Test]
+    public async Task GetRawAsyncReturnsMinusOneForMissingKey()
+    {
+        using var tempFolder = TempFolder.Create();
+        using var storage = new LsmStorageInner<byte[], byte[]>(tempFolder, _defaultStorageOptions);
+
+        var length = await storage.GetRawAsync([7], new byte[8]);
+
+        await Assert.That(length).IsEqualTo(-1);
+    }
+
+    [Test]
+    public async Task GetRawAsyncReportsLengthWithoutWritingWhenDestinationTooSmall()
+    {
+        using var tempFolder = TempFolder.Create();
+        using var storage = new LsmStorageInner<byte[], byte[]>(tempFolder, _defaultStorageOptions);
+
+        byte[] key = [1];
+        byte[] value = [4, 5, 6, 7, 8];
+        storage.Put(key, value);
+
+        var destination = new byte[2];
+        var length = await storage.GetRawAsync(key, destination);
+
+        // The full length is reported so the caller can resize and retry; nothing was written.
+        await Assert.That(length).IsEqualTo(value.Length);
+        await Assert.That(destination).IsEquivalentTo(new byte[2], CollectionOrdering.Matching);
+    }
+
+    [Test]
+    public async Task TryReadRawAsyncInspectsValueWithoutCopy()
+    {
+        using var tempFolder = TempFolder.Create();
+        using var storage = new LsmStorageInner<byte[], byte[]>(tempFolder, _defaultStorageOptions);
+
+        byte[] key = [1, 2, 3];
+        byte[] value = [4, 5, 6, 7];
+        storage.Put(key, value);
+
+        var holder = new byte[1][];
+        var found = await storage.TryReadRawAsync(key, holder, static (state, span) =>
+        {
+            // The raw byte[] path borrows the stored array's own memory, so the span content matches.
+            state[0] = span.ToArray();
+        });
+
+        await Assert.That(found).IsTrue();
+        await Assert.That(holder[0]).IsEquivalentTo(value, CollectionOrdering.Matching);
+    }
+
+    [Test]
+    public async Task TryReadRawAsyncReturnsFalseForMissingKey()
+    {
+        using var tempFolder = TempFolder.Create();
+        using var storage = new LsmStorageInner<byte[], byte[]>(tempFolder, _defaultStorageOptions);
+
+        var invoked = false;
+        var found = await storage.TryReadRawAsync([5], invoked, static (_, _) => { });
+
+        await Assert.That(found).IsFalse();
+    }
+
+    [Test]
+    public async Task RawReadsResolveAgainstFlushedSsTable()
+    {
+        using var tempFolder = TempFolder.Create();
+        using var storage = await LsmStorage.OpenAsync<byte[], byte[]>(tempFolder, new() { UseWriteAheadLog = false });
+
+        byte[] liveKey = [1, 2, 3];
+        byte[] liveValue = [10, 20, 30, 40];
+        byte[] deletedKey = [4, 5, 6];
+
+        storage.Put(liveKey, liveValue);
+        storage.Put(deletedKey, [1]);
+        storage.Delete(deletedKey);
+
+        storage._inner.ForceFreezeMemTable();
+        await storage._inner.ForceFlushNextImmutableMemTableAsync();
+
+        await Assert.That(storage._inner._state.CurrentMemTable.Size).IsEqualTo(0L);
+
+        var destination = new ArrayBufferWriter<byte>();
+        var found = await storage.TryGetRawAsync(liveKey, destination);
+        await Assert.That(found).IsTrue();
+        await Assert.That(destination.WrittenSpan.ToArray()).IsEquivalentTo(liveValue, CollectionOrdering.Matching);
+
+        // A tombstone flushed to the SST must read back as not found, not as an empty value.
+        var deletedDestination = new ArrayBufferWriter<byte>();
+        var deletedFound = await storage.TryGetRawAsync(deletedKey, deletedDestination);
+        await Assert.That(deletedFound).IsFalse();
+        await Assert.That(deletedDestination.WrittenCount).IsEqualTo(0);
+
+        await storage.CloseAsync();
+    }
+
+    [Test]
+    public async Task RawReadsWorkWithSentinelTombstoneEncoder()
+    {
+        // int uses a sentinel tombstone (not an empty value); the raw path must decode to recognise it.
+        using var tempFolder = TempFolder.Create();
+        using var storage = await LsmStorage.OpenAsync<int, int>(tempFolder, new() { UseWriteAheadLog = false });
+
+        storage.Put(1, 42);
+        storage.Put(2, 7);
+        storage.Delete(2);
+
+        var destination = new byte[8];
+        var length = await storage.GetRawAsync(1, destination);
+        await Assert.That(length).IsEqualTo(sizeof(int));
+        // The stored bytes are the encoder's order-preserving form, so decode through the encoder.
+        await Assert.That(new Int32Encoder().Decode(destination.AsSpan(0, length))).IsEqualTo(42);
+
+        var deletedLength = await storage.GetRawAsync(2, destination);
+        await Assert.That(deletedLength).IsEqualTo(-1);
+
+        var missingLength = await storage.GetRawAsync(999, destination);
+        await Assert.That(missingLength).IsEqualTo(-1);
+
+        await storage.CloseAsync();
     }
 
     private static LsmStorageInner<int, byte[]> FillImmutableMemTables(string path, int entries = 100, int valueSize = 10, long memTableSizeLimit = 100)

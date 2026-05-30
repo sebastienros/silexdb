@@ -1,3 +1,4 @@
+using Silex.Buffers;
 using Silex.Serialization;
 using System.Buffers;
 
@@ -79,8 +80,49 @@ public class Block<TKey, TValue> : IDisposable
     }
 
     /// <summary>
-    /// Returns a block of memory containing the value associated with the specified <see cref="RecordLocation"/>.
+    /// Looks up a key by its already-encoded bytes, doing a binary search directly over the block bytes
+    /// without materializing a <typeparamref name="TKey"/> per visited entry. This is the zero-allocation
+    /// hot path for point lookups; it is correct because key encoders are order-preserving, so a bytewise
+    /// comparison of encoded keys matches the typed key comparison. As with the typed overload, a returned
+    /// empty span is a key stored with an empty value (a tombstone for empty-tombstone encoders).
     /// </summary>
+    public bool TryGetValue(ReadOnlySpan<byte> encodedKey, out ReadOnlySpan<byte> value)
+    {
+        var memory = Memory;
+
+        var start = 0;
+        var end = Offsets.Count - 1;
+
+        while (start <= end)
+        {
+            var m = start + (end - start) / 2;
+
+            var reader = new EncoderBinaryReader(memory, Offsets[m]);
+            var keyLength = reader.Read7BitEncodedInt();
+            var entryKey = reader.ReadBytesSpan(keyLength);
+
+            var cmp = encodedKey.SequenceCompareTo(entryKey);
+
+            if (cmp == 0)
+            {
+                var valueLength = reader.Read7BitEncodedInt();
+                value = reader.ReadBytesSpan(valueLength);
+                return true;
+            }
+
+            if (cmp > 0)
+            {
+                start = m + 1;
+            }
+            else
+            {
+                end = m - 1;
+            }
+        }
+
+        value = default;
+        return false;
+    }
     /// <param name="entry"></param>
     /// <returns></returns>
     public ReadOnlySpan<byte> GetValue(RecordLocation<TKey> entry)

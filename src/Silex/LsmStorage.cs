@@ -3,6 +3,7 @@ using Silex.Compaction;
 using Silex.MemTables;
 using Silex.Tables;
 using Silex.Wal;
+using System.Buffers;
 using System.Collections.Immutable;
 using System.Runtime.CompilerServices;
 
@@ -249,6 +250,30 @@ public class LsmStorage<TKey, TValue> : IDisposable, IAsyncDisposable where TKey
         CheckDisposed();
 
         return _inner.GetAsync(key);
+    }
+
+    /// <inheritdoc cref="LsmStorageInner{TKey, TValue}.TryGetRawAsync(TKey, IBufferWriter{byte}, CancellationToken)"/>
+    public ValueTask<bool> TryGetRawAsync(TKey key, IBufferWriter<byte> destination, CancellationToken cancellationToken = default)
+    {
+        CheckDisposed();
+
+        return _inner.TryGetRawAsync(key, destination, cancellationToken);
+    }
+
+    /// <inheritdoc cref="LsmStorageInner{TKey, TValue}.GetRawAsync(TKey, Memory{byte}, CancellationToken)"/>
+    public ValueTask<int> GetRawAsync(TKey key, Memory<byte> destination, CancellationToken cancellationToken = default)
+    {
+        CheckDisposed();
+
+        return _inner.GetRawAsync(key, destination, cancellationToken);
+    }
+
+    /// <inheritdoc cref="LsmStorageInner{TKey, TValue}.TryReadRawAsync{TArg}(TKey, TArg, ReadValueAction{TArg}, CancellationToken)"/>
+    public ValueTask<bool> TryReadRawAsync<TArg>(TKey key, TArg arg, ReadValueAction<TArg> reader, CancellationToken cancellationToken = default)
+    {
+        CheckDisposed();
+
+        return _inner.TryReadRawAsync(key, arg, reader, cancellationToken);
     }
 
     /// <inheritdoc cref="LsmStorageInner.Put(TKey, TValue)"/>

@@ -15,6 +15,14 @@ public sealed class ByteArrayEncoder : IBinaryEncoder<byte[]>
         return data.ToArray();
     }
 
+    public bool UsesEmptyTombstone => true;
+
+    public bool TryGetRawBytes(byte[] value, out ReadOnlySpan<byte> bytes)
+    {
+        bytes = value;
+        return true;
+    }
+
     public int GetLength(byte[] value) => value.Length;
 
     public byte[] GetTombstoneValue() => Array.Empty<byte>();

@@ -6,10 +6,15 @@ namespace Silex.Serialization;
 
 public sealed class Int32Encoder : IBinaryEncoder<int>
 {    
+    // Keys are encoded in an order-preserving form: the sign bit is flipped and the result is written
+    // big-endian, so a plain bytewise (lexicographic) comparison of the encoded bytes matches the
+    // signed numeric ordering of the values. This lets the engine compare keys as raw bytes.
+    private const uint SignMask = 0x8000_0000u;
+
     public int Decode(ReadOnlySpan<byte> data)
     {
         Debug.Assert(data.Length == sizeof(int));
-        return BinaryPrimitives.ReadInt32LittleEndian(data);
+        return (int)(BinaryPrimitives.ReadUInt32BigEndian(data) ^ SignMask);
     }
 
     public int GetLength(int value) => sizeof(int);
@@ -22,7 +27,7 @@ public sealed class Int32Encoder : IBinaryEncoder<int>
     {
         var length = sizeof(int);
         Span<byte> span = stackalloc byte[length];
-        BinaryPrimitives.WriteInt32LittleEndian(span, value);
+        BinaryPrimitives.WriteUInt32BigEndian(span, (uint)value ^ SignMask);
         writer.WriteRaw(span);
 
         return length;

@@ -26,7 +26,7 @@ public class TableTests
 
         await Assert.That(table.BlockMetadata).HasSingleItem();
         using var block = await table.ReadBlockAsync(0);
-        await Assert.That(block!.Memory).IsEquivalentTo(new byte[] { 2, 7, 0, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, CollectionOrdering.Matching);
+        await Assert.That(block!.Memory).IsEquivalentTo(new byte[] { 2, 0, 7, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, CollectionOrdering.Matching);
 
         table.Dispose();
     }
@@ -52,7 +52,7 @@ public class TableTests
 
         await Assert.That(table.BlockMetadata).HasSingleItem();
         using var block = await table.ReadBlockAsync(0);
-        await Assert.That(block!.Memory).IsEquivalentTo(new byte[] { 2, 7, 0, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, CollectionOrdering.Matching);
+        await Assert.That(block!.Memory).IsEquivalentTo(new byte[] { 2, 0, 7, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, CollectionOrdering.Matching);
 
         table.Dispose();
     }
@@ -202,8 +202,8 @@ public class TableTests
         await Assert.That(table.BlockMetadata).HasSingleItem();
         using var block1 = await table.ReadBlockCachedAsync(0, memoryCache, new());
         using var block2 = await table.ReadBlockCachedAsync(0, memoryCache, new());
-        await Assert.That(block1!.Memory).IsEquivalentTo(new byte[] { 2, 7, 0, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, CollectionOrdering.Matching);
-        await Assert.That(block2!.Memory).IsEquivalentTo(new byte[] { 2, 7, 0, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, CollectionOrdering.Matching);
+        await Assert.That(block1!.Memory).IsEquivalentTo(new byte[] { 2, 0, 7, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, CollectionOrdering.Matching);
+        await Assert.That(block2!.Memory).IsEquivalentTo(new byte[] { 2, 0, 7, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, CollectionOrdering.Matching);
         await Assert.That(block2).IsSameReferenceAs(block1);
 
         table.Dispose();
@@ -240,7 +240,7 @@ public class TableTests
         foreach (var block in blocks)
         {
             var result2 = await block;
-            await Assert.That(result2!.Memory).IsEquivalentTo(new byte[] { 2, 7, 0, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, CollectionOrdering.Matching);
+            await Assert.That(result2!.Memory).IsEquivalentTo(new byte[] { 2, 0, 7, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, CollectionOrdering.Matching);
             await Assert.That(result2).IsSameReferenceAs(result1);
         }
 
@@ -261,7 +261,7 @@ public class TableTests
         // Actual entries must always probe true (a bloom filter never produces false negatives).
         foreach (var e in entries)
         {
-            BinaryPrimitives.WriteInt32LittleEndian(bytes, e.Key);
+            BinaryPrimitives.WriteUInt32BigEndian(bytes, (uint)e.Key ^ 0x8000_0000u);
             await Assert.That(bloomFilter.Probe(bytes)).IsTrue();
         }
 
@@ -271,7 +271,7 @@ public class TableTests
 
         for (var i = entries.Count; i < iterations + entries.Count; i++)
         {
-            BinaryPrimitives.WriteInt32LittleEndian(bytes, i);
+            BinaryPrimitives.WriteUInt32BigEndian(bytes, (uint)i ^ 0x8000_0000u);
             if (bloomFilter.Probe(bytes))
             {
                 falsePositives++;

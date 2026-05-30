@@ -27,17 +27,25 @@ internal sealed class KeyGenerator
     public byte[] Generate(long value)
     {
         var key = new byte[_keySize];
+        GenerateInto(value, key);
+        return key;
+    }
 
+    /// <summary>
+    /// Writes the key for <paramref name="value"/> into <paramref name="destination"/> without allocating.
+    /// Use this only for reads/lookups, where Silex does not take ownership of the key buffer, so a single
+    /// per-thread scratch array can be reused across operations.
+    /// </summary>
+    public void GenerateInto(long value, Span<byte> destination)
+    {
         Span<byte> scratch = stackalloc byte[8];
         BinaryPrimitives.WriteUInt64BigEndian(scratch, (ulong)value);
-        scratch[(8 - _prefixBytes)..].CopyTo(key);
+        scratch[(8 - _prefixBytes)..].CopyTo(destination);
 
         for (var i = _prefixBytes; i < _keySize; i++)
         {
-            key[i] = (byte)'0';
+            destination[i] = (byte)'0';
         }
-
-        return key;
     }
 }
 

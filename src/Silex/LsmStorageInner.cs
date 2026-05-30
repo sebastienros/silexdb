@@ -6,6 +6,7 @@ using Silex.MemTables;
 using Silex.Serialization;
 using Silex.Tables;
 using Silex.Wal;
+using System.Buffers;
 using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Globalization;
@@ -266,9 +267,9 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     /// value is the stored value, or <c>default</c> when it is a tombstone), and <c>false</c> when the key
     /// is absent. Kept synchronous so the value span never crosses an <c>await</c> boundary.
     /// </summary>
-    private static bool TryResolveBlockValue(Block<TKey, TValue> block, TKey key, out TValue resolved)
+    private static bool TryResolveBlockValue(Block<TKey, TValue> block, ReadOnlySpan<byte> encodedKey, out TValue resolved)
     {
-        if (block.TryGetValue(key, out var value))
+        if (block.TryGetValue(encodedKey, out var value))
         {
             // An empty stored value is a deletion for empty-tombstone encoders (byte[]/Bytes); sentinel-based
             // encoders (e.g. int) store a fixed non-empty value, so decode and ask the serializer.
@@ -316,7 +317,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
 
             var block = await table.ReadBlockCachedAsync(metadata.Index, _blockCache, _cacheEntryOptions, cancellationToken);
 
-            if (block != null && TryResolveBlockValue(block, key, out var resolved))
+            if (block != null && TryResolveBlockValue(block, keyMemory.Span, out var resolved))
             {
                 // The key is present in this (newest matching) table, so it shadows any older one.
                 // A found tombstone resolves to default.
@@ -332,11 +333,372 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         return (false, default!);
     }
 
+    // ---------------------------------------------------------------------------------------------
+    // Raw (zero-copy) read path
+    //
+    // These overloads read an entry by its typed key but surface the value as raw bytes, avoiding the
+    // per-read value allocation that GetAsync(TKey) incurs (ByteArrayEncoder.Decode -> ToArray). They
+    // share a single sequential traversal driven by a struct sink so each destination shape (buffer
+    // writer, caller buffer, inspection callback) costs no extra allocation and no boxing.
+    //
+    // Tombstone semantics differ from GetAsync on purpose: a deleted key is reported as "not found"
+    // (false / -1) rather than surfacing an empty value. An internal tri-state keeps "absent" and
+    // "tombstone" distinct during traversal so a delete in a newer table correctly shadows older data
+    // instead of letting an older live value resurface.
+    // ---------------------------------------------------------------------------------------------
+
+    private enum RawLookup
+    {
+        // The key is absent from this source; keep searching older sources.
+        Miss,
+
+        // The key is present as a deletion; it shadows older sources and resolves to "not found".
+        Tombstone,
+
+        // The key is present with a live value, already handed to the sink.
+        Live,
+    }
+
     /// <summary>
-    /// Puts a value with the specified key in the current <see cref="IMemTable"/>. If one already exists it is replaced.
+    /// Receives the raw value bytes of a live entry. Implemented by allocation-free structs and passed by
+    /// value through the generic traversal so the JIT specialises each call site (no boxing, no closures).
     /// </summary>
-    /// <param name="key"></param>
-    /// <param name="value"></param>
+    private interface IValueByteSink
+    {
+        void Accept(ReadOnlySpan<byte> valueBytes);
+    }
+
+    private readonly struct BufferWriterSink(IBufferWriter<byte> writer) : IValueByteSink
+    {
+        public void Accept(ReadOnlySpan<byte> valueBytes) => writer.Write(valueBytes);
+    }
+
+    private readonly struct MemoryCopySink(Memory<byte> destination) : IValueByteSink
+    {
+        // Copy only when the value fits; the public GetRawAsync still reports the full length so the
+        // caller can detect the short buffer and retry without an exception.
+        public void Accept(ReadOnlySpan<byte> valueBytes)
+        {
+            if (valueBytes.Length <= destination.Length)
+            {
+                valueBytes.CopyTo(destination.Span);
+            }
+        }
+    }
+
+    private readonly struct DelegateSink<TArg>(TArg arg, ReadValueAction<TArg> reader) : IValueByteSink
+    {
+        public void Accept(ReadOnlySpan<byte> valueBytes) => reader(arg, valueBytes);
+    }
+
+    /// <summary>
+    /// Reads the raw value bytes for <paramref name="key"/> into <paramref name="destination"/>.
+    /// </summary>
+    /// <returns><c>true</c> when the key exists with a live value; <c>false</c> when it is missing or deleted.</returns>
+    /// <remarks>
+    /// The bytes are written to <paramref name="destination"/> synchronously while the entry's source is
+    /// locked. The caller must keep <paramref name="destination"/> valid and must not reuse it concurrently
+    /// until the returned task completes.
+    /// </remarks>
+    public ValueTask<bool> TryGetRawAsync(TKey key, IBufferWriter<byte> destination, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(destination);
+
+        return FoundAsync(TryReadRawCoreAsync(key, new BufferWriterSink(destination), cancellationToken));
+
+        static async ValueTask<bool> FoundAsync(ValueTask<int> length) => await length >= 0;
+    }
+
+    /// <summary>
+    /// Copies the raw value bytes for <paramref name="key"/> into <paramref name="destination"/>.
+    /// </summary>
+    /// <returns>
+    /// The length of the value in bytes when the key exists with a live value, or <c>-1</c> when it is
+    /// missing or deleted. When the returned length is greater than <paramref name="destination"/>'s length
+    /// the buffer was too small and nothing was written; retry with a buffer of at least that size.
+    /// </returns>
+    public async ValueTask<int> GetRawAsync(TKey key, Memory<byte> destination, CancellationToken cancellationToken = default)
+    {
+        return await TryReadRawCoreAsync(key, new MemoryCopySink(destination), cancellationToken);
+    }
+
+    /// <summary>
+    /// Invokes <paramref name="reader"/> with a read-only borrow of the raw value bytes for
+    /// <paramref name="key"/>, without copying them.
+    /// </summary>
+    /// <returns><c>true</c> when the key exists with a live value (the reader ran); otherwise <c>false</c>.</returns>
+    /// <remarks>
+    /// <paramref name="reader"/> runs synchronously while the entry's source is locked. It must not await,
+    /// block, store the span, or call back into this store; doing so risks deadlock or use of freed memory.
+    /// <paramref name="arg"/> is passed through to avoid a closure allocation.
+    /// </remarks>
+    public ValueTask<bool> TryReadRawAsync<TArg>(TKey key, TArg arg, ReadValueAction<TArg> reader, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(reader);
+
+        return FoundAsync(TryReadRawCoreAsync(key, new DelegateSink<TArg>(arg, reader), cancellationToken));
+
+        static async ValueTask<bool> FoundAsync(ValueTask<int> length) => await length >= 0;
+    }
+
+    /// <summary>
+    /// Shared sequential traversal for the raw read overloads. Hands the live value bytes to
+    /// <paramref name="sink"/> and returns the value length, or <c>-1</c> when the key is missing or deleted.
+    /// </summary>
+    private async ValueTask<int> TryReadRawCoreAsync<TSink>(TKey key, TSink sink, CancellationToken cancellationToken)
+        where TSink : struct, IValueByteSink
+    {
+        // Current and immutable memtables: see GetAsync for the locking rationale.
+        _currentMemTableLock.EnterReadLock();
+
+        IMemTable<TKey, TValue> currentMemTable;
+        ImmutableQueue<IMemTable<TKey, TValue>> immutableMemTables;
+
+        try
+        {
+            currentMemTable = _state.CurrentMemTable;
+            immutableMemTables = _state.ImmutableMemTables;
+
+            var memResult = TryResolveMemTableRaw(currentMemTable, key, sink, out var length);
+            if (memResult == RawLookup.Live)
+            {
+                return length;
+            }
+
+            if (memResult == RawLookup.Tombstone)
+            {
+                return -1;
+            }
+        }
+        finally
+        {
+            _currentMemTableLock.ExitReadLock();
+        }
+
+        if (!immutableMemTables.IsEmpty)
+        {
+            try
+            {
+                _immutableMemTablesLock.EnterReadLock();
+
+                foreach (var memTable in immutableMemTables.Reverse())
+                {
+                    var memResult = TryResolveMemTableRaw(memTable, key, sink, out var length);
+                    if (memResult == RawLookup.Live)
+                    {
+                        return length;
+                    }
+
+                    if (memResult == RawLookup.Tombstone)
+                    {
+                        return -1;
+                    }
+                }
+            }
+            finally
+            {
+                _immutableMemTablesLock.ExitReadLock();
+            }
+        }
+
+        var keyLength = _keySerializer.GetLength(key);
+        var bufferWriter = new PooledArrayBufferWriter<byte>(keyLength);
+        var writer = new EncoderBinaryWriter(bufferWriter);
+        _keySerializer.Encode(key, ref writer);
+        writer.Flush();
+        var keyMemory = bufferWriter.WrittenMemory;
+
+        try
+        {
+            await _level0Lock.EnterReadLockAsync();
+
+            var l0 = _state.LevelZeroTables;
+
+            // Probe L0 newest-first sequentially. Unlike GetAsync this path does not fan out across L0 with
+            // Parallel.ForEachAsync: the struct sink writes into a single shared destination, so concurrent
+            // probes could race on it. Point reads touch at most one block per table, so the sequential
+            // cost is bounded.
+            for (var i = l0.Count - 1; i >= 0; i--)
+            {
+                var (kind, length) = await TryReadRawFromTableAsync(l0[i], key, keyMemory, sink, cancellationToken);
+                if (kind == RawLookup.Live)
+                {
+                    return length;
+                }
+
+                if (kind == RawLookup.Tombstone)
+                {
+                    return -1;
+                }
+            }
+
+            var levels = _state.LeveledSsTables;
+
+            for (var level = 0; level < levels.Count; level++)
+            {
+                var tables = levels[level];
+
+                for (var i = 0; i < tables.Count; i++)
+                {
+                    var (kind, length) = await TryReadRawFromTableAsync(tables[i], key, keyMemory, sink, cancellationToken);
+                    if (kind == RawLookup.Live)
+                    {
+                        return length;
+                    }
+
+                    if (kind == RawLookup.Tombstone)
+                    {
+                        return -1;
+                    }
+                }
+            }
+        }
+        finally
+        {
+            bufferWriter.Dispose();
+
+            _level0Lock.ExitReadLock();
+        }
+
+        return -1;
+    }
+
+    /// <summary>
+    /// Resolves <paramref name="key"/> against a memtable, handing live value bytes to <paramref name="sink"/>.
+    /// Kept synchronous so the borrowed value span never crosses an <c>await</c>.
+    /// </summary>
+    private static RawLookup TryResolveMemTableRaw<TSink>(IMemTable<TKey, TValue> memTable, TKey key, TSink sink, out int length)
+        where TSink : struct, IValueByteSink
+    {
+        length = 0;
+
+        if (!memTable.TryGet(key, out var value))
+        {
+            return RawLookup.Miss;
+        }
+
+        // A present key shadows every older source, whether live or a tombstone.
+        if (_valueSerializer.IsTombstoneValue(value))
+        {
+            return RawLookup.Tombstone;
+        }
+
+        if (_valueSerializer.TryGetRawBytes(value, out var bytes))
+        {
+            // For empty-tombstone encoders an empty byte form is a deletion, applied uniformly with the
+            // SST path so a key never flips between "found empty" and "not found" across a flush.
+            if (_valueSerializer.UsesEmptyTombstone && bytes.IsEmpty)
+            {
+                return RawLookup.Tombstone;
+            }
+
+            sink.Accept(bytes);
+            length = bytes.Length;
+            return RawLookup.Live;
+        }
+
+        // The value cannot expose its bytes directly (non-identity encoder); encode it into a pooled buffer.
+        var bufferWriter = new PooledArrayBufferWriter<byte>(Math.Max(1, _valueSerializer.GetLength(value)));
+
+        try
+        {
+            var writer = new EncoderBinaryWriter(bufferWriter);
+            _valueSerializer.Encode(value, ref writer);
+            writer.Flush();
+            var encoded = bufferWriter.WrittenMemory.Span;
+
+            if (_valueSerializer.UsesEmptyTombstone && encoded.IsEmpty)
+            {
+                return RawLookup.Tombstone;
+            }
+
+            sink.Accept(encoded);
+            length = encoded.Length;
+            return RawLookup.Live;
+        }
+        finally
+        {
+            bufferWriter.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Probes a single SST for <paramref name="key"/> on the raw path, returning a tri-state result and the
+    /// live value length. Mirrors <see cref="TryReadFromTableAsync"/> but hands value bytes to the sink.
+    /// </summary>
+    private async ValueTask<(RawLookup kind, int length)> TryReadRawFromTableAsync<TSink>(SsTable<TKey, TValue> table, TKey key, ReadOnlyMemory<byte> keyMemory, TSink sink, CancellationToken cancellationToken)
+        where TSink : struct, IValueByteSink
+    {
+        if (_keyComparer.Compare(key, table.FirstKey) < 0 || _keyComparer.Compare(key, table.LastKey) > 0)
+        {
+            return (RawLookup.Miss, 0);
+        }
+
+        if (!table.BloomFilter.Probe(keyMemory.Span))
+        {
+            return (RawLookup.Miss, 0);
+        }
+
+        foreach (var metadata in table.BlockMetadata)
+        {
+            if (_keyComparer.Compare(key, metadata.FirstKey) < 0 || _keyComparer.Compare(key, metadata.LastKey) > 0)
+            {
+                continue;
+            }
+
+            var block = await table.ReadBlockCachedAsync(metadata.Index, _blockCache, _cacheEntryOptions, cancellationToken);
+
+            if (block != null)
+            {
+                var kind = TryResolveRawBlockValue(block, keyMemory.Span, sink, out var length);
+                if (kind != RawLookup.Miss)
+                {
+                    return (kind, length);
+                }
+            }
+
+            // Only one block can cover the key; a miss here is a bloom false positive, so fall through to
+            // older tables rather than masking them.
+            break;
+        }
+
+        return (RawLookup.Miss, 0);
+    }
+
+    /// <summary>
+    /// Resolves <paramref name="key"/> against a single block on the raw path. Kept synchronous so the
+    /// borrowed value span never crosses an <c>await</c>.
+    /// </summary>
+    private static RawLookup TryResolveRawBlockValue<TSink>(Block<TKey, TValue> block, ReadOnlySpan<byte> encodedKey, TSink sink, out int length)
+        where TSink : struct, IValueByteSink
+    {
+        length = 0;
+
+        if (!block.TryGetValue(encodedKey, out var value))
+        {
+            return RawLookup.Miss;
+        }
+
+        // Apply the same tombstone rules as the memtable raw path so a key never changes meaning across a
+        // flush. Empty-tombstone encoders (byte[]/Bytes) treat any empty stored value as a deletion and stay
+        // zero-copy; sentinel encoders store a fixed non-empty tombstone, so decode to recognise it.
+        if (_valueSerializer.UsesEmptyTombstone)
+        {
+            if (value.IsEmpty)
+            {
+                return RawLookup.Tombstone;
+            }
+        }
+        else if (_valueSerializer.IsTombstoneValue(_valueSerializer.Decode(value)))
+        {
+            return RawLookup.Tombstone;
+        }
+
+        sink.Accept(value);
+        length = value.Length;
+        return RawLookup.Live;
+    }
+
     public void Put(TKey key, TValue value)
     {
         _currentMemTableLock.EnterWriteLock();
