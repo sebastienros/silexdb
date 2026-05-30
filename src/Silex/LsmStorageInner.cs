@@ -104,7 +104,9 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         {
             _immutableMemTablesLock.EnterReadLock();
 
-            foreach (var memTable in snapshot.ImmutableMemTables)
+            // Immutable MemTables are enqueued oldest-first, so iterate in reverse to let the most
+            // recently frozen table win when the same key exists in several of them.
+            foreach (var memTable in snapshot.ImmutableMemTables.Reverse())
             {
                 if (memTable.TryGet(key, out var result))
                 {
@@ -470,7 +472,9 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
                 _state.CurrentMemTable.CreateIterator()
             };
 
-            foreach (var memTable in _state.ImmutableMemTables)
+            // Immutable MemTables are enqueued oldest-first; the MergeIterator keeps the value from
+            // the iterator listed first, so add them most-recent-first to preserve precedence.
+            foreach (var memTable in _state.ImmutableMemTables.Reverse())
             {
                 iterators.Add(memTable.CreateIterator());
             }

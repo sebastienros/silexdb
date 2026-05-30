@@ -100,7 +100,7 @@ public class SsTable<TKey, TValue> : IDisposable
         });
     }
 
-    public static async Task<SsTable<TKey, TValue>> LoadSsTableAsync(string filename, ISsTableEncoder<TKey, TValue> tableEncoder, BlockBuilder<TKey, TValue> blockBuilder, IBloomFilterFactory bloomFilterFactory, CancellationToken cancellationToken = default)
+    public static async Task<SsTable<TKey, TValue>> LoadSsTableAsync(string filename, ISsTableEncoder<TKey, TValue> tableEncoder, BlockBuilder<TKey, TValue> blockBuilder, IBloomFilterFactory bloomFilterFactory, long? id = null, CancellationToken cancellationToken = default)
     {
         byte[] uintBuffer = ArrayPool<byte>.Shared.Rent(sizeof(uint));
 
@@ -142,7 +142,7 @@ public class SsTable<TKey, TValue> : IDisposable
 
         ArrayPool<byte>.Shared.Return(uintBuffer);
 
-        var table = new SsTable<TKey, TValue>(IdGenerator.GetNextId(), stream, filename, blockMetadata, metaBlockOffset, blockBuilder, bloomFilter);
+        var table = new SsTable<TKey, TValue>(id ?? IdGenerator.GetNextId(), stream, filename, blockMetadata, metaBlockOffset, blockBuilder, bloomFilter);
 
         return table;
     }

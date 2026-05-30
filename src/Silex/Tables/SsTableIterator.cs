@@ -44,7 +44,9 @@ internal sealed class SsTableIterator<TKey, TValue> : IStorageIterator<TKey, TVa
 
         var compare = Array.BinarySearch(_firstKeys, from, _keyComparer);
 
-        startBlockIndex = (compare >= 0 ? compare : ~compare) - 1;
+        // The entry may live in the block whose FirstKey precedes 'from', so step back one block.
+        // Clamp to 0 so a 'from' smaller than every FirstKey still starts at the first block.
+        startBlockIndex = Math.Max(0, (compare >= 0 ? compare : ~compare) - 1);
 
         // If the key doesn't exist, exit
         if (startBlockIndex > _table.BlockMetadata.Count - 1)

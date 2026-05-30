@@ -67,4 +67,18 @@ public class EncoderTests
 
         Assert.Equal(value, decoded);
     }
+
+    [Fact]
+    public void ByteArrayEncoderEqualityComparerShouldUseContent()
+    {
+        IEqualityComparer<byte[]> comparer = ((IBinaryEncoder<byte[]>)new ByteArrayEncoder()).EqualityComparer;
+
+        var a = new byte[] { 1, 2, 3 };
+        var b = new byte[] { 1, 2, 3 };
+        var c = new byte[] { 1, 2, 4 };
+
+        Assert.True(comparer.Equals(a, b));
+        Assert.False(comparer.Equals(a, c));
+        Assert.Equal(comparer.GetHashCode(a), comparer.GetHashCode(b));
+    }
 }

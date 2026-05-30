@@ -461,6 +461,100 @@ public class StorageTests
         }
     }
 
+    [Fact]
+    public async Task GetShouldReturnMostRecentImmutableMemTableValue()
+    {
+        using var storage = new LsmStorageInner<int, int>(Path.GetTempPath(), new StorageOptions());
+
+        storage.Put(1, 100);
+        storage.ForceFreezeMemTable();
+
+        storage.Put(1, 200);
+        storage.ForceFreezeMemTable();
+
+        // Both immutable mem tables hold key 1; the most recently frozen value must win.
+        Assert.Equal(2, storage._state.ImmutableMemTables.Count());
+        Assert.Equal(200, await storage.GetAsync(1));
+    }
+
+    [Fact]
+    public void ScanShouldReturnMostRecentImmutableMemTableValue()
+    {
+        using var storage = new LsmStorageInner<int, int>(Path.GetTempPath(), new StorageOptions());
+
+        storage.Put(1, 100);
+        storage.ForceFreezeMemTable();
+
+        storage.Put(1, 200);
+        storage.ForceFreezeMemTable();
+
+        var list = storage.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToList();
+
+        Assert.Single(list);
+        Assert.Equal(200, list[0].Value);
+    }
+
+    [Fact]
+    public async Task GetShouldFindByteArrayKeyByContent()
+    {
+        using var storage = new LsmStorageInner<byte[], int>(Path.GetTempPath(), new StorageOptions());
+
+        storage.Put([1, 2, 3], 42);
+
+        // A different array instance with the same content must resolve to the stored value.
+        Assert.Equal(42, await storage.GetAsync([1, 2, 3]));
+    }
+
+    [Fact]
+    public async Task ReopenShouldPreserveLevelZeroRecency()
+    {
+        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        var options = new StorageOptions { FlushPeriod = TimeSpan.Zero };
+
+        var storage = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
+
+        storage.Put(1, 100);
+        storage._inner.ForceFreezeMemTable();
+        await storage._inner.ForceFlushNextImmutableMemTableAsync();
+
+        storage.Put(1, 200);
+        storage._inner.ForceFreezeMemTable();
+        await storage._inner.ForceFlushNextImmutableMemTableAsync();
+
+        Assert.Equal(2, Directory.EnumerateFiles(tempFolder, "*.sst").Count());
+        await storage.CloseAsync();
+
+        // After reopening, the SSTs must be ordered by creation so the newest value still wins.
+        var reopened = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
+        Assert.Equal(200, await reopened.GetAsync(1));
+
+        await reopened.CloseAsync();
+        Directory.Delete(tempFolder, true);
+    }
+
+    [Fact]
+    public async Task GetShouldReadBytesValueOfArbitraryLengthFromSsTable()
+    {
+        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        var options = new StorageOptions { FlushPeriod = TimeSpan.Zero };
+
+        var storage = await LsmStorage.OpenAsync<int, Bytes>(tempFolder, options);
+
+        // A Bytes value whose length is not 4 bytes used to trip an incorrect decode assertion.
+        Bytes value = new byte[] { 1, 2, 3, 4, 5, 6, 7 };
+        storage.Put(1, value);
+
+        storage._inner.ForceFreezeMemTable();
+        await storage._inner.ForceFlushNextImmutableMemTableAsync();
+        Assert.Single(Directory.EnumerateFiles(tempFolder, "*.sst"));
+
+        var result = await storage.GetAsync(1);
+        Assert.Equal(value, result);
+
+        await storage.CloseAsync();
+        Directory.Delete(tempFolder, true);
+    }
+
     private static LsmStorageInner<int, byte[]> FillImmutableMemTables(int entries = 100, int valueSize = 10, long memTableSizeLimit = 100)
     {
         var storageOptions = new StorageOptions { MemTableSizeLimit = memTableSizeLimit };

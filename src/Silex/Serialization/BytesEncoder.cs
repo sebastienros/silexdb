@@ -1,5 +1,4 @@
 ﻿using Silex.Buffers;
-using System.Diagnostics;
 
 namespace Silex.Serialization;
 
@@ -9,7 +8,6 @@ public sealed class BytesEncoder : IBinaryEncoder<Bytes>
 
     public Bytes Decode(ReadOnlySpan<byte> data)
     {
-        Debug.Assert(data.Length == sizeof(int));
         return new Bytes(data);
     }
 

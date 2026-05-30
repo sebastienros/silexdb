@@ -8,6 +8,8 @@ public sealed class ByteArrayEncoder : IBinaryEncoder<byte[]>
 
     IComparer<byte[]> IBinaryEncoder<byte[]>.Comparer => _comparer;
 
+    IEqualityComparer<byte[]> IBinaryEncoder<byte[]>.EqualityComparer => _comparer;
+
     public byte[] Decode(ReadOnlySpan<byte> data)
     {
         return data.ToArray();
@@ -25,7 +27,7 @@ public sealed class ByteArrayEncoder : IBinaryEncoder<byte[]>
         return value.Length;
     }
 
-    private sealed class Comparer : IComparer<byte[]>
+    private sealed class Comparer : IComparer<byte[]>, IEqualityComparer<byte[]>
     {
         public int Compare(byte[]? x, byte[]? y)
         {
@@ -34,6 +36,21 @@ public sealed class ByteArrayEncoder : IBinaryEncoder<byte[]>
             if (y == null) return -1;
             
             return x.AsSpan().SequenceCompareTo(y.AsSpan());
+        }
+
+        public bool Equals(byte[]? x, byte[]? y)
+        {
+            if (ReferenceEquals(x, y)) return true;
+            if (x == null || y == null) return false;
+
+            return x.AsSpan().SequenceEqual(y.AsSpan());
+        }
+
+        public int GetHashCode(byte[] obj)
+        {
+            var hash = new HashCode();
+            hash.AddBytes(obj);
+            return hash.ToHashCode();
         }
     }
 }

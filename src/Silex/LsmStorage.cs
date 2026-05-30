@@ -25,15 +25,26 @@ public static class LsmStorage
 
         var storageInner = new LsmStorageInner<TKey, TValue>(path, options);
 
-        var sstFilenames = Directory.EnumerateFiles(path, "*.sst");
+        // SST files are named "{id}.sst" with monotonically increasing ids. Level-0 precedence
+        // depends on creation order (the most recent table wins on duplicate keys), so load them
+        // ordered by id rather than in arbitrary filesystem enumeration order.
+        var sstFiles = Directory.EnumerateFiles(path, "*.sst")
+            .Select(filename => (filename, id: TryParseSstId(filename)))
+            .Where(x => x.id.HasValue)
+            .OrderBy(x => x.id!.Value)
+            .ToList();
 
         var ssTables = new List<SsTable<TKey, TValue>>();
 
         // TODO: [PERF] Can be parallelized
-        foreach (var sstFilename in sstFilenames)
+        foreach (var (filename, id) in sstFiles)
         {
+            // Preserve the original id so recency ordering and block-cache keys stay stable, and make
+            // sure newly generated ids never collide with one that already exists on disk.
+            IdGenerator.EnsureGreaterThan(id!.Value);
+
             var blockBuilder = new BlockBuilder<TKey, TValue>(options.BlockEncoderFactory.Create<TKey, TValue>());
-            var ssTable = await SsTable<TKey, TValue>.LoadSsTableAsync(sstFilename, options.SsTableEncoderFactory.Create<TKey, TValue>(), blockBuilder, options.BloomFilterFactory, cancellationToken);
+            var ssTable = await SsTable<TKey, TValue>.LoadSsTableAsync(filename, options.SsTableEncoderFactory.Create<TKey, TValue>(), blockBuilder, options.BloomFilterFactory, id, cancellationToken);
             ssTables.Add(ssTable);
         }
 
@@ -45,6 +56,11 @@ public static class LsmStorage
         compacter.StartBackgroundFlush();
 
         return new LsmStorage<TKey, TValue>(storageInner, compacter);
+    }
+
+    private static long? TryParseSstId(string filename)
+    {
+        return long.TryParse(Path.GetFileNameWithoutExtension(filename), out var id) ? id : null;
     }
 }
 

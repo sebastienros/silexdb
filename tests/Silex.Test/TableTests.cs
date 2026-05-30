@@ -154,6 +154,36 @@ public class TableTests
     }
 
     [Fact]
+    public async Task ShouldIterateFromKeyBeforeFirst()
+    {
+        var tempFilename = Path.GetRandomFileName();
+
+        using var builder = new BufferedSsTableBuilder<uint, byte[]>(tempFilename, new DefaultSsTableEncoder<uint, byte[]>(), new DefaultBlockEncoder<uint, byte[]>(), new DefaultBloomFilterFactory(), 100);
+
+        var value = new byte[100.B()];
+        Random.Shared.NextBytes(value);
+
+        // Keys start at 10, so a 'from' of 5 precedes every block's first key.
+        for (uint i = 10; i < 110; i++)
+        {
+            await builder.AddAsync(i, value);
+        }
+
+        var table = await builder.BuildAsync();
+
+        Assert.True(table.BlockMetadata.Count > 1);
+
+        var iterator = new SsTableIterator<uint, byte[]>(table);
+
+        var result = iterator.EnumerateAsync(5).ToBlockingEnumerable().Select(x => x.Key).ToArray();
+
+        Assert.Equivalent(Enumerable.Range(10, 100), result);
+
+        table.Dispose();
+        File.Delete(tempFilename);
+    }
+
+    [Fact]
     public async Task ShouldCacheBlocks()
     {
         var tempFilename = Path.GetRandomFileName();
