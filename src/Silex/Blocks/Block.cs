@@ -42,6 +42,15 @@ public class Block<TKey, TValue> : IDisposable
 
     public ReadOnlySpan<byte> GetValue(TKey key)
     {
+        return TryGetValue(key, out var value) ? value : default;
+    }
+
+    /// <summary>
+    /// Looks up <paramref name="key"/> and reports whether it is present, distinguishing a genuine miss
+    /// from a key stored with an empty value (a tombstone for empty-tombstone encoders).
+    /// </summary>
+    public bool TryGetValue(TKey key, out ReadOnlySpan<byte> value)
+    {
         double start = 0;
         var end = Offsets.Count - 1;
 
@@ -54,7 +63,8 @@ public class Block<TKey, TValue> : IDisposable
             switch (_keyComparer.Compare(key, entry.Key))
             {
                 case 0:
-                    return GetValue(entry);
+                    value = GetValue(entry);
+                    return true;
                 case > 0:
                     start = m + 1;
                     break;
@@ -64,7 +74,8 @@ public class Block<TKey, TValue> : IDisposable
             }
         }
 
-        return default;
+        value = default;
+        return false;
     }
 
     /// <summary>

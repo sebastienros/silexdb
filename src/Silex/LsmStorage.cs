@@ -26,6 +26,13 @@ public static class LsmStorage
             Directory.CreateDirectory(path);
         }
 
+        // Remove any leftover temporary SST files from a build that crashed before its atomic rename.
+        // These are never valid tables and must not be loaded.
+        foreach (var tmp in Directory.EnumerateFiles(path, "*.sst.tmp"))
+        {
+            TryDeleteFile(tmp);
+        }
+
         // Capture the WAL files that exist *before* the inner is constructed: the inner immediately
         // creates a fresh WAL for its initial current memtable, and that one must not be replayed.
         var walFiles = options.UseWriteAheadLog

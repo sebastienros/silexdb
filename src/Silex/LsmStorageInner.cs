@@ -30,6 +30,11 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     private readonly AsyncReaderWriterLock _level0Lock = new();
     private readonly AsyncReaderWriterLock _leveledTablesLock = new();
 
+    // Serializes flush and compaction so they never interleave. The manifest-free recovery scheme
+    // relies on a flush never appending a tier in the middle of a compaction (which would make older
+    // compacted data look newer than a fresh flush), and on two compactions never sharing inputs.
+    private readonly SemaphoreSlim _maintenanceLock = new(1, 1);
+
     internal StorageState<TKey, TValue> _state;
     private bool _disposed;
     private readonly IBlockEncoder<TKey, TValue> _blockEncoder;
@@ -41,6 +46,11 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     private readonly MemoryCacheEntryOptions _cacheEntryOptions;
     private readonly bool _useWriteAheadLog;
     private readonly bool _syncWriteAheadLogToDisk;
+    private readonly CompactionStrategy _compactionStrategy;
+    private readonly int _maxCompactionTiers;
+    private readonly int _maxSizeAmplificationPercent;
+    private readonly int _sizeRatioPercent;
+    private readonly int _minMergeWidth;
 
     public string StoragePath { get; }
 
@@ -56,6 +66,11 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         StoragePath = path;
         _useWriteAheadLog = options.UseWriteAheadLog;
         _syncWriteAheadLogToDisk = options.SyncWriteAheadLogToDisk;
+        _compactionStrategy = options.CompactionStrategy;
+        _maxCompactionTiers = options.MaxCompactionTiers;
+        _maxSizeAmplificationPercent = options.MaxSizeAmplificationPercent;
+        _sizeRatioPercent = options.SizeRatioPercent;
+        _minMergeWidth = options.MinMergeWidth;
         _state = new StorageState<TKey, TValue>() { CurrentMemTable = CreateCurrentMemTable(IdGenerator.GetNextId()) };
         _blockEncoder = options.BlockEncoderFactory.Create<TKey, TValue>();
         _ssTableEncoder = options.SsTableEncoderFactory.Create<TKey, TValue>();
@@ -138,7 +153,11 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         {
             await _level0Lock.EnterReadLockAsync();
 
-            var l0 = snapshot.LevelZeroTables;
+            // Read the live L0 list while holding the read lock rather than from a snapshot taken
+            // earlier: compaction disposes and deletes replaced SSTs under the write lock, so a table
+            // referenced from a stale pre-lock snapshot could already be disposed. While the read lock
+            // is held no writer runs, so the list and its tables are stable for the duration.
+            var l0 = _state.LevelZeroTables;
             
             // TODO: this can be parallelized, multiple table could return the value, but the one 
             // from the most recent table would be used.
@@ -168,18 +187,18 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
 
                     var block = await table.ReadBlockCachedAsync(metadata.Index, _blockCache, _cacheEntryOptions, cancellationToken);
 
-                    if (block != null)
+                    if (block != null && TryResolveBlockValue(block, key, out var resolved))
                     {
-                        var value = block.GetValue(key);
-                                
-                        if (!value.IsEmpty)
-                        {
-                            return _valueSerializer.Decode(value);
-                        }
+                        // The key is present in this (newest matching) table, so it shadows any older tier.
+                        // A found tombstone resolves to default.
+                        return resolved;
                     }
-                }
 
-                return default!;
+                    // The only block whose range can cover the key has been read and the key was not in it
+                    // (a bloom-filter false positive): the key is absent from this table, so fall through to
+                    // older tables instead of masking them with a premature default.
+                    break;
+                }
             }
         }
         finally
@@ -194,6 +213,30 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     }
 
     /// <summary>
+    /// Resolves a key against a single block. Returns <c>true</c> when the key is present (the resolved
+    /// value is the stored value, or <c>default</c> when it is a tombstone), and <c>false</c> when the key
+    /// is absent. Kept synchronous so the value span never crosses an <c>await</c> boundary.
+    /// </summary>
+    private static bool TryResolveBlockValue(Block<TKey, TValue> block, TKey key, out TValue resolved)
+    {
+        if (block.TryGetValue(key, out var value))
+        {
+            // An empty stored value is a deletion for empty-tombstone encoders (byte[]/Bytes); sentinel-based
+            // encoders (e.g. int) store a fixed non-empty value, so decode and ask the serializer.
+            if (value.IsEmpty)
+            {
+                resolved = default!;
+                return true;
+            }
+
+            var decoded = _valueSerializer.Decode(value);
+            resolved = _valueSerializer.IsTombstoneValue(decoded) ? default! : decoded;
+            return true;
+        }
+
+        resolved = default!;
+        return false;
+    }
     /// Puts a value with the specified key in the current <see cref="IMemTable">. If one already exists it is replaced.
     /// </summary>
     /// <param name="key"></param>
@@ -284,49 +327,59 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
             return;
         }
 
-        _immutableMemTablesLock.EnterWriteLock();
-
-        IMemTable<TKey, TValue> memTableToFlush;
+        // Hold the maintenance lock for the whole flush so it never interleaves with a compaction.
+        await _maintenanceLock.WaitAsync(cancellationToken);
 
         try
         {
-            // double-check lock
-            if (_state.ImmutableMemTables.IsEmpty)
+            _immutableMemTablesLock.EnterWriteLock();
+
+            IMemTable<TKey, TValue> memTableToFlush;
+
+            try
             {
-                return;
+                // double-check lock
+                if (_state.ImmutableMemTables.IsEmpty)
+                {
+                    return;
+                }
+
+                _state.ImmutableMemTables = _state.ImmutableMemTables.Dequeue(out memTableToFlush);
+            }
+            finally
+            {
+                _immutableMemTablesLock.ExitWriteLock();
             }
 
-            _state.ImmutableMemTables = _state.ImmutableMemTables.Dequeue(out memTableToFlush);
+            var sstFilename = GetSstPath(memTableToFlush.Id);
+            using var builder = _ssTableBuilderFactory.CreateSsTableBuilder(sstFilename, _ssTableEncoder, _blockEncoder, _bloomFilterFactory, memTableToFlush.Count);
+            await memTableToFlush.FlushAsync(builder);
+
+            var ssTable = await builder.BuildAsync(cancellationToken);
+
+            await _level0Lock.EnterWriteLockAsync();
+
+            try
+            {
+                _state.LevelZeroTables.Add(ssTable);
+            }
+            finally
+            {
+                _level0Lock.ExitWriteLock();
+
+                memTableToFlush.Dispose();
+            }
+
+            // The data is now durable in an SST and visible in L0, and the memtable (and its WAL handle)
+            // is disposed: the write-ahead log is obsolete and can be removed. If a crash happens before
+            // this point the WAL survives and is replayed on the next open; if it happens after the SST is
+            // durable but before the delete, recovery sees the matching SST and drops the stale WAL.
+            DeleteWal(memTableToFlush.Id);
         }
         finally
         {
-            _immutableMemTablesLock.ExitWriteLock();
+            _maintenanceLock.Release();
         }
-
-        var sstFilename = GetSstPath(memTableToFlush.Id);
-        using var builder = _ssTableBuilderFactory.CreateSsTableBuilder(sstFilename, _ssTableEncoder, _blockEncoder, _bloomFilterFactory, memTableToFlush.Count);
-        await memTableToFlush.FlushAsync(builder);
-
-        var ssTable = await builder.BuildAsync(cancellationToken);
-
-        await _level0Lock.EnterWriteLockAsync();
-
-        try
-        {
-            _state.LevelZeroTables.Add(ssTable);
-        }
-        finally
-        {
-            _level0Lock.ExitWriteLock();
-
-            memTableToFlush.Dispose();
-        }
-
-        // The data is now durable in an SST and visible in L0, and the memtable (and its WAL handle)
-        // is disposed: the write-ahead log is obsolete and can be removed. If a crash happens before
-        // this point the WAL survives and is replayed on the next open; if it happens after the SST is
-        // durable but before the delete, recovery sees the matching SST and drops the stale WAL.
-        DeleteWal(memTableToFlush.Id);
     }
 
     public string GetSstPath(long id)
@@ -337,6 +390,270 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     public string GetWalPath(long id)
     {
         return Path.Combine(StoragePath, $"{id.ToString(CultureInfo.InvariantCulture)}.wal");
+    }
+
+    /// <summary>
+    /// Runs at most one tiered (universal) compaction task if the configured triggers fire. Returns
+    /// <see langword="true"/> when a compaction was performed.
+    /// </summary>
+    /// <remarks>
+    /// This is driven sequentially by the single background compacter loop, the only component that
+    /// flushes to and compacts L0 at runtime, so it never runs concurrently with a flush. That
+    /// invariant is what keeps the manifest-free, reopen-by-id recovery correct: compaction always
+    /// merges a <em>newest suffix</em> of the tier list into a single output SST whose id is freshly
+    /// allocated (and therefore greater than every input), appended as the new newest tier.
+    /// </remarks>
+    public async Task<bool> TryTieredCompactionAsync(CancellationToken cancellationToken = default)
+    {
+        if (_compactionStrategy != CompactionStrategy.Tiered)
+        {
+            return false;
+        }
+
+        // Hold the maintenance lock for the whole compaction so no flush appends a tier mid-merge and no
+        // second compaction shares (and disposes) the same input handles.
+        await _maintenanceLock.WaitAsync(cancellationToken);
+
+        try
+        {
+            // Snapshot the tier list while briefly holding the read lock. The maintenance lock already
+            // excludes flush/compaction, so the snapshot stays valid through the merge below.
+            List<SsTable<TKey, TValue>> tiers;
+
+            await _level0Lock.EnterReadLockAsync();
+
+            try
+            {
+                tiers = _state.LevelZeroTables.ToList();
+            }
+            finally
+            {
+                _level0Lock.ExitReadLock();
+            }
+
+            var startIndex = SelectTieredCompaction(tiers);
+
+            if (startIndex < 0)
+            {
+                return false;
+            }
+
+            var count = tiers.Count - startIndex;
+
+            // The inputs are the suffix [startIndex, end). They are in ascending-id (oldest-first) order
+            // because tiers are appended on flush/compaction.
+            var inputs = new List<SsTable<TKey, TValue>>(count);
+
+            for (var i = startIndex; i < tiers.Count; i++)
+            {
+                inputs.Add(tiers[i]);
+            }
+
+            // Tombstones may only be dropped when the bottom-most tier participates: otherwise an older
+            // tier could still hold the deleted key and dropping the tombstone would resurrect it.
+            var dropTombstones = startIndex == 0;
+
+            var outputId = IdGenerator.GetNextId();
+            var outputPath = GetSstPath(outputId);
+
+            long totalInputBytes = 0;
+
+            foreach (var input in inputs)
+            {
+                totalInputBytes += input.Size;
+            }
+
+            // The bloom filter is sized from an estimate; an imperfect count only affects its false-positive
+            // rate, never correctness.
+            var estimatedCount = (int)Math.Min(int.MaxValue, Math.Max(1, totalInputBytes / 24));
+
+            SsTable<TKey, TValue>? output = null;
+            var addedEntries = 0;
+
+            using (var builder = _ssTableBuilderFactory.CreateSsTableBuilder(outputPath, _ssTableEncoder, _blockEncoder, _bloomFilterFactory, estimatedCount))
+            {
+                // Feed iterators newest-first so the MergeIterator keeps the most recent value per key.
+                var iterators = new List<IStorageIterator<TKey, TValue>>(count);
+
+                for (var i = tiers.Count - 1; i >= startIndex; i--)
+                {
+                    iterators.Add(new SsTableIterator<TKey, TValue>(tiers[i]));
+                }
+
+                var merge = new MergeIterator<TKey, TValue>(iterators);
+
+                await foreach (var entry in merge.EnumerateAsync(cancellationToken))
+                {
+                    if (dropTombstones && _valueSerializer.IsTombstoneValue(entry.Value))
+                    {
+                        continue;
+                    }
+
+                    await builder.AddAsync(entry.Key, entry.Value);
+                    addedEntries++;
+                }
+
+                if (addedEntries > 0)
+                {
+                    output = await builder.BuildAsync(cancellationToken);
+                }
+            }
+
+            // Install the result: drop the input tiers and append the merged output as the new newest tier.
+            // Mutate the live list in place (like a flush) rather than reassigning the field so a concurrent
+            // FreezeMemTable that copies the list reference observes a consistent collection.
+            var installed = false;
+
+            await _level0Lock.EnterWriteLockAsync();
+
+            try
+            {
+                var live = _state.LevelZeroTables;
+
+                // The maintenance lock guarantees the selected suffix is still the live tail; verify it at
+                // runtime anyway and bail safely (rather than corrupt the list) if that ever fails to hold.
+                if (live.Count == tiers.Count && SuffixMatches(live, inputs, startIndex))
+                {
+                    live.RemoveRange(startIndex, count);
+
+                    if (output != null)
+                    {
+                        live.Add(output);
+                    }
+
+                    installed = true;
+                }
+            }
+            finally
+            {
+                _level0Lock.ExitWriteLock();
+            }
+
+            if (!installed)
+            {
+                // The list changed unexpectedly: discard the output we built and leave the inputs in place.
+                output?.Dispose();
+                TryDeleteSstFile(outputPath);
+                return false;
+            }
+
+            // The inputs are no longer reachable by new readers and any in-flight reader finished before the
+            // write lock was granted, so their handles can be closed.
+            foreach (var input in inputs)
+            {
+                input.Dispose();
+            }
+
+            // Delete the files oldest-first and STOP at the first failure. This keeps the deleted set a
+            // prefix of the oldest tiers, so a newer tombstone is never removed while an older value it
+            // shadows still exists on disk: a crash (or a failed delete) can never resurrect dropped data.
+            foreach (var input in inputs)
+            {
+                if (!TryDeleteSstFile(input.Filename))
+                {
+                    break;
+                }
+            }
+
+            return true;
+        }
+        finally
+        {
+            _maintenanceLock.Release();
+        }
+    }
+
+    private static bool SuffixMatches(List<SsTable<TKey, TValue>> live, List<SsTable<TKey, TValue>> inputs, int startIndex)
+    {
+        for (var i = 0; i < inputs.Count; i++)
+        {
+            if (!ReferenceEquals(live[startIndex + i], inputs[i]))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Evaluates the tiered-compaction triggers over the tier list (oldest-first) and returns the start
+    /// index of the newest suffix to merge, or <c>-1</c> when no compaction is warranted.
+    /// </summary>
+    private int SelectTieredCompaction(List<SsTable<TKey, TValue>> tiers)
+    {
+        var n = tiers.Count;
+
+        // Only act once enough sorted runs have accumulated, and never try to merge fewer than two.
+        if (n < 2 || n < _maxCompactionTiers)
+        {
+            return -1;
+        }
+
+        // Trigger 1 - space amplification: when everything above the oldest tier together reaches
+        // MaxSizeAmplificationPercent of the oldest tier, merge all tiers into one.
+        var oldestSize = tiers[0].Size;
+        long sizeExceptOldest = 0;
+
+        for (var i = 1; i < n; i++)
+        {
+            sizeExceptOldest += tiers[i].Size;
+        }
+
+        if (oldestSize > 0 && sizeExceptOldest * 100 >= oldestSize * (long)_maxSizeAmplificationPercent)
+        {
+            return 0;
+        }
+
+        // Trigger 2 - size ratio: scanning from the newest tier, accumulate the size of all newer tiers.
+        // At the first (older) tier that is larger than (100 + SizeRatioPercent)% of that running sum,
+        // merge the newer tiers preceding it, provided there are at least MinMergeWidth of them.
+        long sumNewer = 0;
+
+        for (var k = 0; k < n; k++)
+        {
+            var thisSize = tiers[n - 1 - k].Size;
+
+            if (k >= _minMergeWidth && sumNewer > 0 && thisSize * 100 > sumNewer * (long)(100 + _sizeRatioPercent))
+            {
+                return n - k;
+            }
+
+            sumNewer += thisSize;
+        }
+
+        // Trigger 3 - reduce sorted runs: nothing else fired, so merge enough of the newest tiers to
+        // bring the count back below the limit (always at least two, so this makes real progress).
+        var merge = n - _maxCompactionTiers + 2;
+
+        if (merge < 2)
+        {
+            merge = 2;
+        }
+
+        if (merge > n)
+        {
+            merge = n;
+        }
+
+        return n - merge;
+    }
+
+    private bool TryDeleteSstFile(string filename)
+    {
+        try
+        {
+            File.Delete(filename);
+            return true;
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
     }
 
     /// <summary>

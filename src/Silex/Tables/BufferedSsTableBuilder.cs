@@ -22,6 +22,7 @@ internal sealed class BufferedSsTableBuilder<TKey, TValue> : ISsTableBuilder<TKe
 {
 
     private readonly string _filename;
+    private readonly string _tempFilename;
     private readonly ISsTableEncoder<TKey, TValue> _tableEncoder;
     private long _offset;
     private bool _isFirstKey = true;
@@ -40,6 +41,10 @@ internal sealed class BufferedSsTableBuilder<TKey, TValue> : ISsTableBuilder<TKe
     public BufferedSsTableBuilder(string filename, ISsTableEncoder<TKey, TValue> tableEncoder, IBlockEncoder<TKey, TValue> blockEncoder, IBloomFilterFactory bloomFilterFactory, int count)
     {
         _filename = filename;
+        // Write to a temporary file and atomically rename to the final ".sst" name on a successful
+        // build. This guarantees a crash never leaves a partial ".sst" that recovery would try to load
+        // (and, for a flush, mistake for a completed table and drop the still-needed WAL).
+        _tempFilename = filename + ".tmp";
         _tableEncoder = tableEncoder;
         _bloomFilter = bloomFilterFactory.CreateBloomFilter(count, 0.01);
         _blockBuilder = new BlockBuilder<TKey, TValue>(blockEncoder);
@@ -52,7 +57,7 @@ internal sealed class BufferedSsTableBuilder<TKey, TValue> : ISsTableBuilder<TKe
             FileOptions.Asynchronous // All operation are async
             ;
 
-        _stream = File.Create(filename, bufferSize, options);
+        _stream = File.Create(_tempFilename, bufferSize, options);
     }
 
     public async Task AddAsync(TKey key, TValue value)
@@ -166,6 +171,10 @@ internal sealed class BufferedSsTableBuilder<TKey, TValue> : ISsTableBuilder<TKe
         await FLushBufferToDiskAsync(cancellationToken);
         await _stream.DisposeAsync();
 
+        // The temporary file is now complete and closed; publish it under the final name atomically so
+        // readers and recovery only ever see a fully written SST.
+        File.Move(_tempFilename, _filename, overwrite: true);
+
         // Ownership of the block builder and metadata transfers to the SsTable, which uses them to
         // decode and locate blocks, so this builder must no longer dispose or clear them.
         _ownsBuiltResources = false;
@@ -215,6 +224,24 @@ internal sealed class BufferedSsTableBuilder<TKey, TValue> : ISsTableBuilder<TKe
             _blockBuilder?.Dispose();
             _metadata?.Clear();
             _metadata = null;
+
+            // The build never completed (otherwise the temp file was renamed to the final name), so
+            // remove the abandoned partial temp file rather than leaving it behind.
+            TryDeleteTempFile();
+        }
+    }
+
+    private void TryDeleteTempFile()
+    {
+        try
+        {
+            File.Delete(_tempFilename);
+        }
+        catch (IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
         }
     }
 }

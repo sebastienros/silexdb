@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Globalization;
+using Silex.BloomFilters;
 using Xunit.Abstractions;
 
 namespace Silex.Test;
@@ -714,6 +715,282 @@ public class StorageTests
 
         await reopened.CloseAsync();
         Directory.Delete(tempFolder, true);
+    }
+
+    [Fact]
+    public async Task TieredCompactionMergesAllTiersUnderSpaceAmplification()
+    {
+        // Three equally sized single-entry tiers hit the space-amplification trigger (sum of the newer
+        // tiers reaches MaxSizeAmplificationPercent of the oldest), so all three merge into one SST.
+        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tempFolder);
+        var options = new StorageOptions { UseWriteAheadLog = false, MaxCompactionTiers = 3 };
+        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+
+        try
+        {
+            await FlushTierAsync(storage, () => storage.Put(1, 10));
+            await FlushTierAsync(storage, () => storage.Put(2, 20));
+            await FlushTierAsync(storage, () => storage.Put(3, 30));
+            Assert.Equal(3, storage._state.LevelZeroTables.Count);
+
+            var compacted = await storage.TryTieredCompactionAsync();
+
+            Assert.True(compacted);
+            Assert.Single(storage._state.LevelZeroTables);
+            Assert.Single(Directory.EnumerateFiles(tempFolder, "*.sst"));
+            Assert.Equal(10, await storage.GetAsync(1));
+            Assert.Equal(20, await storage.GetAsync(2));
+            Assert.Equal(30, await storage.GetAsync(3));
+        }
+        finally
+        {
+            storage.Dispose();
+            Directory.Delete(tempFolder, true);
+        }
+    }
+
+    [Fact]
+    public async Task TieredCompactionDropsTombstonesOnFullCompaction()
+    {
+        // A full compaction (the oldest tier participates) may drop tombstones. The delete of key 1 in a
+        // newer tier shadows its value in the oldest tier and is then discarded entirely.
+        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tempFolder);
+        var options = new StorageOptions { UseWriteAheadLog = false, MaxCompactionTiers = 3 };
+        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+
+        try
+        {
+            await FlushTierAsync(storage, () => storage.Put(1, 100));
+            await FlushTierAsync(storage, () => storage.Delete(1));
+            await FlushTierAsync(storage, () => storage.Put(2, 200));
+
+            var compacted = await storage.TryTieredCompactionAsync();
+
+            Assert.True(compacted);
+            Assert.Single(storage._state.LevelZeroTables);
+            Assert.Equal(0, await storage.GetAsync(1));
+            Assert.Equal(200, await storage.GetAsync(2));
+        }
+        finally
+        {
+            storage.Dispose();
+            Directory.Delete(tempFolder, true);
+        }
+    }
+
+    [Fact]
+    public async Task TieredCompactionPartialMergeKeepsTombstones()
+    {
+        // A large oldest tier plus several tiny newest tiers avoids the space-amplification trigger and
+        // instead fires the size-ratio trigger, merging only the newest tiers. Because the oldest tier is
+        // excluded, a tombstone for a key it still holds must be preserved (the key stays logically gone).
+        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tempFolder);
+        var options = new StorageOptions { UseWriteAheadLog = false, MaxCompactionTiers = 4 };
+        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+
+        try
+        {
+            await FlushTierAsync(storage, () =>
+            {
+                for (var k = 1000; k < 1500; k++)
+                {
+                    storage.Put(k, k);
+                }
+            });
+            await FlushTierAsync(storage, () => storage.Put(1, 1));
+            await FlushTierAsync(storage, () => storage.Delete(1000));
+            await FlushTierAsync(storage, () => storage.Put(3, 3));
+            Assert.Equal(4, storage._state.LevelZeroTables.Count);
+
+            var compacted = await storage.TryTieredCompactionAsync();
+
+            Assert.True(compacted);
+            // The big oldest tier is untouched; the three newest tiers collapse into one.
+            Assert.Equal(2, storage._state.LevelZeroTables.Count);
+            // The tombstone was kept, so the key the oldest tier still holds remains logically deleted.
+            Assert.Equal(0, await storage.GetAsync(1000));
+            // Untouched keys from the oldest tier are still readable.
+            Assert.Equal(1001, await storage.GetAsync(1001));
+            Assert.Equal(1, await storage.GetAsync(1));
+            Assert.Equal(3, await storage.GetAsync(3));
+        }
+        finally
+        {
+            storage.Dispose();
+            Directory.Delete(tempFolder, true);
+        }
+    }
+
+    [Fact]
+    public async Task TieredCompactionBelowThresholdIsNoOp()
+    {
+        // With fewer tiers than MaxCompactionTiers there is nothing to do: the call is a no-op.
+        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tempFolder);
+        var options = new StorageOptions { UseWriteAheadLog = false, MaxCompactionTiers = 8 };
+        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+
+        try
+        {
+            await FlushTierAsync(storage, () => storage.Put(1, 10));
+            await FlushTierAsync(storage, () => storage.Put(2, 20));
+
+            var compacted = await storage.TryTieredCompactionAsync();
+
+            Assert.False(compacted);
+            Assert.Equal(2, storage._state.LevelZeroTables.Count);
+            Assert.Equal(2, Directory.EnumerateFiles(tempFolder, "*.sst").Count());
+        }
+        finally
+        {
+            storage.Dispose();
+            Directory.Delete(tempFolder, true);
+        }
+    }
+
+    [Fact]
+    public async Task TieredCompactionDisabledByStrategyIsNoOp()
+    {
+        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tempFolder);
+        var options = new StorageOptions { UseWriteAheadLog = false, MaxCompactionTiers = 2, CompactionStrategy = CompactionStrategy.None };
+        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+
+        try
+        {
+            await FlushTierAsync(storage, () => storage.Put(1, 10));
+            await FlushTierAsync(storage, () => storage.Put(2, 20));
+            await FlushTierAsync(storage, () => storage.Put(3, 30));
+
+            Assert.False(await storage.TryTieredCompactionAsync());
+            Assert.Equal(3, storage._state.LevelZeroTables.Count);
+        }
+        finally
+        {
+            storage.Dispose();
+            Directory.Delete(tempFolder, true);
+        }
+    }
+
+    [Fact]
+    public async Task TieredCompactionRecencySurvivesReopen()
+    {
+        // After a full compaction the merged output gets the highest id, so reopen-by-id still resolves
+        // the newest value for a key written across several tiers.
+        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        var options = new StorageOptions { FlushPeriod = TimeSpan.Zero, MaxCompactionTiers = 3 };
+
+        var storage = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
+
+        for (var v = 1; v <= 3; v++)
+        {
+            storage.Put(1, v * 100);
+            storage._inner.ForceFreezeMemTable();
+            await storage._inner.ForceFlushNextImmutableMemTableAsync();
+        }
+
+        Assert.True(await storage._inner.TryTieredCompactionAsync());
+        Assert.Single(Directory.EnumerateFiles(tempFolder, "*.sst"));
+        await storage.CloseAsync();
+
+        var reopened = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
+        Assert.Equal(300, await reopened.GetAsync(1));
+
+        await reopened.CloseAsync();
+        Directory.Delete(tempFolder, true);
+    }
+
+    [Fact]
+    public async Task GetContinuesToOlderSsTableOnBloomFalsePositive()
+    {
+        // A newer SST whose key range straddles the target key but does not contain it must not mask an
+        // older SST that does. Forcing the bloom filter to always report "maybe present" simulates the
+        // false positive that would otherwise make the lookup stop prematurely.
+        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tempFolder);
+        var options = new StorageOptions
+        {
+            UseWriteAheadLog = false,
+            BloomFilterFactory = new AlwaysPositiveBloomFilterFactory(),
+        };
+        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+
+        try
+        {
+            // Older table holds key 5.
+            await FlushTierAsync(storage, () => storage.Put(5, 50));
+            // Newer table spans [1, 10] (covering 5) but does not contain 5.
+            await FlushTierAsync(storage, () =>
+            {
+                storage.Put(1, 10);
+                storage.Put(10, 100);
+            });
+
+            Assert.Equal(50, await storage.GetAsync(5));
+            // Keys that really are in the newer table still resolve from it.
+            Assert.Equal(10, await storage.GetAsync(1));
+            Assert.Equal(100, await storage.GetAsync(10));
+        }
+        finally
+        {
+            storage.Dispose();
+            Directory.Delete(tempFolder, true);
+        }
+    }
+
+    private sealed class AlwaysPositiveBloomFilterFactory : IBloomFilterFactory
+    {
+        private static readonly DefaultBloomFilterFactory _inner = new();
+
+        public IBloomFilter CreateBloomFilter(int n, double p) => new AlwaysPositiveBloomFilter(_inner.CreateBloomFilter(n, p));
+
+        public IBloomFilter CreateBloomFilter(ReadOnlySpan<byte> bytes, int k) => new AlwaysPositiveBloomFilter(_inner.CreateBloomFilter(bytes, k));
+    }
+
+    private sealed class AlwaysPositiveBloomFilter(IBloomFilter inner) : IBloomFilter
+    {
+        public int K => inner.K;
+
+        public void Add(ReadOnlySpan<byte> value) => inner.Add(value);
+
+        public bool Probe(ReadOnlySpan<byte> item) => true;
+
+        public Span<byte> GetBytes() => inner.GetBytes();
+    }
+
+    private static async Task FlushTierAsync(LsmStorageInner<int, int> storage, Action write)
+    {
+        write();
+        storage.ForceFreezeMemTable();
+        await storage.ForceFlushNextImmutableMemTableAsync();
+    }
+
+    [Fact]
+    public async Task GetReturnsDefaultForSentinelTombstoneStoredInSsTable()
+    {
+        // Sentinel-based encoders (here int) persist a deletion as a fixed non-empty value. Reading that
+        // key back from an SST must resolve to the default (deleted), not the raw sentinel.
+        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tempFolder);
+        var options = new StorageOptions { UseWriteAheadLog = false };
+        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+
+        try
+        {
+            await FlushTierAsync(storage, () => storage.Put(1, 100));
+            await FlushTierAsync(storage, () => storage.Delete(1));
+
+            // The delete lives in the newest SST as a sentinel value; it must shadow the older value.
+            Assert.Equal(0, await storage.GetAsync(1));
+        }
+        finally
+        {
+            storage.Dispose();
+            Directory.Delete(tempFolder, true);
+        }
     }
 
     private static LsmStorageInner<int, byte[]> FillImmutableMemTables(int entries = 100, int valueSize = 10, long memTableSizeLimit = 100)

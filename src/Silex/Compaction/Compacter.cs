@@ -63,14 +63,16 @@ internal class Compacter<TKey, TValue> : IAsyncDisposable where TKey : notnull
         }
     }
 
-    private Task TriggerFlushAsync()
+    private async Task TriggerFlushAsync()
     {
         if (_storage._state.ImmutableMemTables.Count() + 1 > _memTableTableMaxCount)
         {
-            return _storage.ForceFlushNextImmutableMemTableAsync();
+            await _storage.ForceFlushNextImmutableMemTableAsync();
         }
 
-        return Task.CompletedTask;
+        // Flush and compaction are driven from this single loop so they never overlap; that ordering is
+        // what lets tiered compaction stay correct without a manifest.
+        await _storage.TryTieredCompactionAsync(_flushTaskCts?.Token ?? CancellationToken.None);
     }
 
     public Task CloseAsync()

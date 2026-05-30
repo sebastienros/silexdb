@@ -155,4 +155,44 @@ public class StorageOptions
     /// The default value is <c>false</c>.
     /// </value>
     public bool SyncWriteAheadLogToDisk { get; set; } = false;
+
+    /// <summary>
+    /// Gets or sets the compaction strategy used to merge on-disk SSTs in the background.
+    /// </summary>
+    /// <value>
+    /// The default value is <see cref="Silex.CompactionStrategy.Tiered"/>.
+    /// </value>
+    public CompactionStrategy CompactionStrategy { get; set; } = CompactionStrategy.Tiered;
+
+    /// <summary>
+    /// Gets or sets the number of sorted runs (tiers) tolerated before tiered compaction starts merging
+    /// them. This is the primary knob bounding read amplification under
+    /// <see cref="Silex.CompactionStrategy.Tiered"/>.
+    /// </summary>
+    /// <value>The default value is <c>8</c>.</value>
+    public int MaxCompactionTiers { get; set; } = 8;
+
+    /// <summary>
+    /// Gets or sets the space-amplification trigger for tiered compaction, as a percentage. When the
+    /// combined size of every tier except the oldest divided by the oldest tier's size reaches this
+    /// percentage, all tiers are merged into one. A value of <c>200</c> means a full compaction happens
+    /// when the upper tiers together reach twice the size of the bottom tier.
+    /// </summary>
+    /// <value>The default value is <c>200</c>.</value>
+    public int MaxSizeAmplificationPercent { get; set; } = 200;
+
+    /// <summary>
+    /// Gets or sets the size-ratio trigger for tiered compaction, as a percentage above 100%. Scanning
+    /// from the newest tier, the newest run of tiers is merged once the next (older) tier is larger than
+    /// <c>(100 + SizeRatioPercent)%</c> of the combined size of all newer tiers.
+    /// </summary>
+    /// <value>The default value is <c>1</c>.</value>
+    public int SizeRatioPercent { get; set; } = 1;
+
+    /// <summary>
+    /// Gets or sets the minimum number of tiers that must participate before the size-ratio trigger of
+    /// tiered compaction fires. Prevents merging a single tier.
+    /// </summary>
+    /// <value>The default value is <c>2</c>.</value>
+    public int MinMergeWidth { get; set; } = 2;
 }

@@ -42,6 +42,18 @@ public class SsTable<TKey, TValue> : IDisposable
 
     public string Filename => _filename;
 
+    /// <summary>
+    /// The numeric id of this table. For tables loaded from disk this matches the on-disk filename id;
+    /// for freshly built tables it is a generator id and may differ from the filename.
+    /// </summary>
+    public long Id => _id;
+
+    /// <summary>
+    /// The size of the backing SST file in bytes. Used by tiered compaction to measure the size of a
+    /// sorted run (tier).
+    /// </summary>
+    public long Size => _stream.Length;
+
     public TKey FirstKey => _firstKey!;
 
     public TKey LastKey => _lastKey!;
@@ -59,9 +71,22 @@ public class SsTable<TKey, TValue> : IDisposable
 
         var buffer = ArrayPool<byte>.Shared.Rent(length)!;
 
-        _stream.Seek(offset, SeekOrigin.Begin);
-        await _stream.ReadExactlyAsync(buffer, 0, length, cancellationToken);
-        
+        // Use positioned reads (RandomAccess) rather than Seek + Read so that several readers can read
+        // different blocks of the same SST concurrently without racing on the shared FileStream
+        // position. The file is immutable once built, so reads never conflict with writes.
+        var handle = _stream.SafeFileHandle;
+        var read = 0;
+        while (read < length)
+        {
+            var n = await RandomAccess.ReadAsync(handle, buffer.AsMemory(read, length - read), offset + read, cancellationToken);
+            if (n == 0)
+            {
+                break;
+            }
+
+            read += n;
+        }
+
         var block = _blockBuilder.Decode(new ReadOnlyMemory<byte>(buffer, 0, length));
 
         ArrayPool<byte>.Shared.Return(buffer);

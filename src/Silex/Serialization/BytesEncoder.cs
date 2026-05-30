@@ -15,7 +15,7 @@ public sealed class BytesEncoder : IBinaryEncoder<Bytes>
 
     public Bytes GetTombstoneValue() => Bytes.Empty;
 
-    public bool IsTombstoneValue(Bytes value) => value == Bytes.Empty;
+    public bool IsTombstoneValue(Bytes value) => value.IsEmpty;
 
     public int Encode(Bytes value, ref EncoderBinaryWriter writer)
     {

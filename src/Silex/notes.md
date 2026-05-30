@@ -101,9 +101,31 @@ not in the individual collections.
 - `Bytes` is a value-type wrapper that **rents a pooled copy** of the input on construction
   (`MemoryOwner<byte>.RentCopy`), giving the engine an owned copy independent of caller memory.
 
-### Background flush (`Compaction/Compacter.cs`)
-- A `PeriodicTimer` (default 50 ms; `TimeSpan.Zero` disables it) flushes immutable MemTables to L0
-  once their count exceeds `MemTableMaxCount`. Uses an injectable `TimeProvider` (testable).
+### Background flush & compaction (`Compaction/Compacter.cs`)
+- A `PeriodicTimer` (default 50 ms; `TimeSpan.Zero` disables it) drives a single background loop that
+  flushes immutable MemTables to L0 once their count exceeds `MemTableMaxCount`, then runs one
+  compaction step. Uses an injectable `TimeProvider` (testable). Each tick is awaited fully, so flush
+  and compaction never overlap.
+- **Tiered (RocksDB universal) compaction** (`LsmStorageInner.TryTieredCompactionAsync`). Configurable
+  via `StorageOptions.CompactionStrategy` (`Tiered` default, or `None` to disable). The tiers are the
+  existing L0 list (oldest-first; each flushed memtable and each compaction output is one SST = one
+  sorted run). `SelectTieredCompaction` evaluates, once `tierCount >= MaxCompactionTiers`, three
+  triggers in order: (1) **space amplification** — `sum(all but oldest)/oldest >=
+  MaxSizeAmplificationPercent%` → merge all; (2) **size ratio** — from the newest tier, the first older
+  tier larger than `(100+SizeRatioPercent)%` of the sum of newer tiers (with at least `MinMergeWidth`
+  newer tiers) → merge the newer suffix; (3) **reduce sorted runs** — merge the newest tiers to bring
+  the count back under the limit. Tier size is the SST file length in bytes. Merge uses
+  `SsTableIterator → MergeIterator` (newest wins); the output gets a fresh highest id appended at the
+  end, keeping reopen-by-id recency correct without a manifest.
+- **Tombstones** are dropped only when the oldest tier participates (a full compaction, `startIndex==0`);
+  otherwise they are kept because an older tier could still hold the deleted key.
+- **Concurrency / crash safety:** flush and compaction are serialized by a maintenance lock; the state
+  swap happens in place under the `_level0Lock` write lock (with a runtime guard that bails safely if
+  the tail unexpectedly changed); inputs are written via temp-file + atomic rename and replaced inputs
+  are deleted **oldest-first, stopping at the first failure** so a newer tombstone is never removed
+  while an older value it shadows still exists (no resurrection across a crash). Orphan `*.sst.tmp`
+  files are cleaned up on `OpenAsync`. `SsTable` block reads use `RandomAccess` positioned reads, so a
+  shared handle is safe for concurrent readers during compaction.
 
 ### Durability / crash recovery (`Wal/WriteAheadLog.cs`)
 - **Write-ahead log (WAL).** Each writable MemTable owns a `WriteAheadLog<TKey,TValue>` (file
@@ -167,13 +189,16 @@ not in the individual collections.
   deleting a WAL so the "SST exists ⇒ skip WAL" invariant also holds across power loss; and add a
   per-record CRC to the WAL to detect (not just truncated) corruption.
 
-### Compaction (missing — biggest gap)
-- `Compacter` only *flushes* L0; there is no real compaction. `LeveledSsTables` is declared but never
-  populated, and `GetAsync` never reads it.
-- Without compaction, L0 grows unbounded → read amplification, and stale/tombstoned data is never
-  reclaimed.
-- Needs a leveled and/or tiered strategy, plus an SST-level merge/concat iterator so on-disk tables
-  participate in range scans (today iteration covers MemTables only).
+### Compaction
+- **DONE — Tiered (RocksDB universal) compaction** (configurable via `StorageOptions.CompactionStrategy`,
+  default `Tiered`; `None` disables it). See *Background flush & compaction* above. Bounds the number of
+  L0 sorted runs and reclaims stale/tombstoned data on full compactions.
+- **Leveled compaction (still missing).** `LeveledSsTables` is declared but never populated, and
+  `GetAsync` never reads it. Leveled needs a persisted manifest (to record which SST is at which level
+  across reopen) — deferred with the manifest work below.
+- **Scans are still MemTable-only.** Range/full iteration covers MemTables (current + immutable) but not
+  on-disk SSTs, so a scan can miss already-flushed data. `GetAsync` (point reads) does read L0 SSTs.
+  Needs an SST-level merge/concat iterator wired into `LsmStorageIterator` (the next planned milestone).
 
 ### Serialization / value-ownership semantics
 - **Decision: zero-copy is a core principle.** The engine deliberately does **not** defensively copy
@@ -236,6 +261,19 @@ not in the individual collections.
     `Bytes` values read from an SST under Debug.
   - `SsTableIterator.EnumerateAsync(from)` clamps its start block index to 0 when the from-key
     precedes the first block's first key.
+- ~~Tiered compaction + L0 read-path tombstone fixes.~~ Implemented (with tests):
+  - Configurable **tiered compaction** (`CompactionStrategy.Tiered`/`None`) run from the single flush
+    loop; merges a newest suffix of L0, drops tombstones only on full compactions, atomic temp+rename
+    output, oldest-first stop-on-failure input deletion, serialized by a maintenance lock (see
+    *Background flush & compaction*).
+  - `GetAsync` now recognises **sentinel-based tombstones** in SSTs (e.g. `int`/`long`/`char`, whose
+    deletion is a fixed non-empty value): previously it returned the raw sentinel instead of the
+    default for a deleted key read from an SST.
+  - `GetAsync` no longer lets a **bloom-filter false positive** in a newer SST mask an older SST: a key
+    that is genuinely absent from the covering block falls through to older tables (via a presence-aware
+    `Block.TryGetValue`) instead of returning a premature default.
+  - `BytesEncoder.IsTombstoneValue` no longer throws on a non-empty value (it compared against
+    `Bytes.Empty`, whose `Span` dereferenced a null backing buffer); it is now an empty check.
 
 ---
 
@@ -272,6 +310,7 @@ write/space amplification and tombstone/ordering complexity. Speculative; defer 
    value-ownership semantics*).
 2. ~~WAL~~ **(done — crash recovery via write-ahead log)** + manifest (manifest deferred until
    compaction/levels exist).
-3. Compaction + leveling, then parallelism.
+3. ~~Compaction~~ **(tiered done)** + leveling (needs a manifest), then parallelism. Next: SST-level
+   scan iterator so range scans include on-disk data; then leveled compaction + minimal manifest.
 4. Finer sparse index.
 5. Defer: LRU block cache, entry-lifting.
