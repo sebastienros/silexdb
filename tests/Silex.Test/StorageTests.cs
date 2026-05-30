@@ -1463,6 +1463,177 @@ public class StorageTests
         }
     }
 
+    [Fact]
+    public async Task LeveledCompactionSplitsOutputIntoMultipleSsTables()
+    {
+        // With a small per-SST target, a level holds several size-bounded, non-overlapping runs instead of
+        // one giant SST.
+        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tempFolder);
+        var options = new StorageOptions
+        {
+            UseWriteAheadLog = false,
+            CompactionStrategy = CompactionStrategy.Leveled,
+            Level0CompactionThreshold = 1,
+            BlockSize = 128,
+            TargetSstSizeBytes = 128,
+        };
+        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+
+        try
+        {
+            await FlushTierAsync(storage, () =>
+            {
+                for (var k = 1; k <= 400; k++)
+                {
+                    storage.Put(k, k * 10);
+                }
+            });
+
+            Assert.True(await storage.TryLeveledCompactionAsync());
+
+            // The single L1 run was split into several SSTs.
+            var l1 = storage._state.LeveledSsTables[0];
+            Assert.True(l1.Count > 1, $"expected L1 to be split, got {l1.Count} SST(s)");
+
+            // They are sorted and non-overlapping.
+            for (var i = 1; i < l1.Count; i++)
+            {
+                Assert.True(l1[i - 1].LastKey < l1[i].FirstKey);
+            }
+
+            // Every key is still readable and a full scan returns them all in order.
+            Assert.Equal(2500, await storage.GetAsync(250));
+            var entries = storage.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToList();
+            Assert.Equal(Enumerable.Range(1, 400), entries.Select(e => e.Key));
+            Assert.Equal(Enumerable.Range(1, 400).Select(k => k * 10), entries.Select(e => e.Value));
+        }
+        finally
+        {
+            storage.Dispose();
+            Directory.Delete(tempFolder, true);
+        }
+    }
+
+    [Fact]
+    public async Task LeveledCompactionRewritesOnlyOverlappingTargetSsTables()
+    {
+        // Partial selection: an L0 batch that overlaps only the low key range rewrites just the overlapping
+        // L1 SSTs; the non-overlapping L1 SSTs keep their identity (same file) and data.
+        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tempFolder);
+        var options = new StorageOptions
+        {
+            UseWriteAheadLog = false,
+            CompactionStrategy = CompactionStrategy.Leveled,
+            Level0CompactionThreshold = 1,
+            BlockSize = 128,
+            TargetSstSizeBytes = 128,
+        };
+        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+
+        try
+        {
+            // Seed L1 with keys 1..400 split across several SSTs (default base target is large, so no
+            // size-triggered cascade fires).
+            await FlushTierAsync(storage, () =>
+            {
+                for (var k = 1; k <= 400; k++)
+                {
+                    storage.Put(k, k);
+                }
+            });
+            Assert.True(await storage.TryLeveledCompactionAsync());
+
+            // Record the L1 SSTs that do not overlap the low range [1,5]; these must survive untouched.
+            var untouchedBefore = storage._state.LeveledSsTables[0]
+                .Where(t => t.FirstKey > 5)
+                .Select(t => t.Filename)
+                .ToHashSet();
+            Assert.NotEmpty(untouchedBefore);
+
+            // A small batch overwriting only keys 1..5 overlaps just the first L1 SST.
+            await FlushTierAsync(storage, () =>
+            {
+                for (var k = 1; k <= 5; k++)
+                {
+                    storage.Put(k, k * 1000);
+                }
+            });
+            Assert.True(await storage.TryLeveledCompactionAsync());
+
+            // The non-overlapping L1 SSTs were carried over by reference (same files), not rewritten.
+            var l1After = storage._state.LeveledSsTables[0].Select(t => t.Filename).ToHashSet();
+            Assert.Subset(l1After, untouchedBefore);
+
+            // Updated keys reflect the new values; everything else is unchanged.
+            Assert.Equal(1000, await storage.GetAsync(1));
+            Assert.Equal(5000, await storage.GetAsync(5));
+            Assert.Equal(6, await storage.GetAsync(6));
+            Assert.Equal(400, await storage.GetAsync(400));
+
+            var entries = storage.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToList();
+            Assert.Equal(Enumerable.Range(1, 400), entries.Select(e => e.Key));
+        }
+        finally
+        {
+            storage.Dispose();
+            Directory.Delete(tempFolder, true);
+        }
+    }
+
+    [Fact]
+    public async Task LeveledReopenRestoresSplitLevelsViaManifest()
+    {
+        // A reopen restores a level made of multiple split SSTs from the manifest, with all data intact.
+        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tempFolder);
+        var options = new StorageOptions
+        {
+            UseWriteAheadLog = false,
+            FlushPeriod = TimeSpan.Zero,
+            CompactionStrategy = CompactionStrategy.Leveled,
+            Level0CompactionThreshold = 1,
+            BlockSize = 128,
+            TargetSstSizeBytes = 128,
+        };
+
+        try
+        {
+            var building = new LsmStorageInner<int, int>(tempFolder, options);
+            await FlushTierAsync(building, () =>
+            {
+                for (var k = 1; k <= 400; k++)
+                {
+                    building.Put(k, k * 10);
+                }
+            });
+            Assert.True(await building.TryLeveledCompactionAsync());
+            var splitCount = building._state.LeveledSsTables[0].Count;
+            Assert.True(splitCount > 1);
+            building.Dispose();
+
+            var storage = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
+
+            try
+            {
+                Assert.Equal(splitCount, storage._inner._state.LeveledSsTables[0].Count);
+
+                var entries = storage._inner.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToList();
+                Assert.Equal(Enumerable.Range(1, 400), entries.Select(e => e.Key));
+                Assert.Equal(Enumerable.Range(1, 400).Select(k => k * 10), entries.Select(e => e.Value));
+            }
+            finally
+            {
+                await storage.DisposeAsync();
+            }
+        }
+        finally
+        {
+            Directory.Delete(tempFolder, true);
+        }
+    }
+
     private static LsmStorageInner<int, byte[]> FillImmutableMemTables(int entries = 100, int valueSize = 10, long memTableSizeLimit = 100)
     {
         var storageOptions = new StorageOptions { MemTableSizeLimit = memTableSizeLimit, UseWriteAheadLog = false };

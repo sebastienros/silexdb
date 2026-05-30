@@ -228,4 +228,14 @@ public class StorageOptions
     /// </summary>
     /// <value>The default value is <c>7</c>.</value>
     public int MaxLevels { get; set; } = 7;
+
+    /// <summary>
+    /// Gets or sets the approximate target size, in bytes, of a single SST produced by a leveled
+    /// compaction. When a merge output reaches this size it is rolled over into a new SST, so a level is
+    /// a sequence of size-bounded, non-overlapping runs rather than one giant file. This is a soft target:
+    /// the estimate excludes the in-progress block and the metadata/bloom-filter trailer, so an output can
+    /// exceed it by roughly one block plus that overhead.
+    /// </summary>
+    /// <value>The default value is <c>2 MiB</c>.</value>
+    public long TargetSstSizeBytes { get; set; } = 2 * 1024 * 1024;
 }

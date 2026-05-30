@@ -55,6 +55,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     private readonly long _baseLevelTargetBytes;
     private readonly int _levelSizeMultiplier;
     private readonly int _maxLevels;
+    private readonly long _targetSstSizeBytes;
 
     public string StoragePath { get; }
 
@@ -79,6 +80,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         _baseLevelTargetBytes = options.BaseLevelTargetBytes;
         _levelSizeMultiplier = options.LevelSizeMultiplier;
         _maxLevels = options.MaxLevels;
+        _targetSstSizeBytes = Math.Max(1, options.TargetSstSizeBytes);
         _state = new StorageState<TKey, TValue>() { CurrentMemTable = CreateCurrentMemTable(IdGenerator.GetNextId()) };
         _blockEncoder = options.BlockEncoderFactory.Create<TKey, TValue>();
         _ssTableEncoder = options.SsTableEncoderFactory.Create<TKey, TValue>();
@@ -822,10 +824,12 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     }
 
     /// <summary>
-    /// Merges a source (either all of L0 when <paramref name="sourceLevelIndex"/> is <c>-1</c>, or leveled
-    /// level <paramref name="sourceLevelIndex"/>) together with the destination level into a single output
-    /// SST, installs the new structure under the level0 write lock, persists the manifest (the durable
-    /// commit point), and finally deletes the replaced input files.
+    /// Compacts a source into the level below it under <see cref="CompactionStrategy.Leveled"/>: either all
+    /// of L0 (when <paramref name="sourceLevelIndex"/> is <c>-1</c>) or a single picked SST from leveled
+    /// level <paramref name="sourceLevelIndex"/>. Only the destination SSTs whose key ranges overlap the
+    /// source are rewritten (partial selection); the merged data is split into size-bounded, non-overlapping
+    /// output SSTs. The structure is installed under the level0 write lock, the manifest is persisted (the
+    /// durable commit point), and finally the replaced input files are deleted.
     /// </summary>
     private async Task<bool> CompactLevelAsync(int sourceLevelIndex, List<SsTable<TKey, TValue>> level0, List<List<SsTable<TKey, TValue>>> levels, CancellationToken cancellationToken)
     {
@@ -834,49 +838,173 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
 
         var targetTables = targetLevelIndex < levels.Count ? levels[targetLevelIndex] : new List<SsTable<TKey, TValue>>();
 
-        // Inputs newest-first so the MergeIterator keeps the most recent value per key: the source is
-        // always newer than the destination. For an L0 flush, L0 itself is newest-first.
-        var inputs = new List<SsTable<TKey, TValue>>();
+        // Determine the source SSTs (newest-first for the merge) and what stays behind in the source level.
+        var sourceTables = new List<SsTable<TKey, TValue>>();
+        List<SsTable<TKey, TValue>>? remainingSource = null;
+        var clearLevel0 = sourceLevelIndex < 0;
 
-        if (sourceLevelIndex < 0)
+        if (clearLevel0)
         {
+            // L0 SSTs overlap each other arbitrarily, so the whole of L0 is always consumed together.
             for (var i = level0.Count - 1; i >= 0; i--)
             {
-                inputs.Add(level0[i]);
+                sourceTables.Add(level0[i]);
             }
         }
         else
         {
-            inputs.AddRange(levels[sourceLevelIndex]);
+            var source = levels[sourceLevelIndex];
+
+            // Pick the smallest-key SST. Each compaction removes one SST from the source level, so the
+            // level shrinks until it is back under its target (deterministic forward progress).
+            sourceTables.Add(source[0]);
+            remainingSource = source.GetRange(1, source.Count - 1);
         }
 
-        inputs.AddRange(targetTables);
-
-        if (inputs.Count == 0)
+        if (sourceTables.Count == 0)
         {
             return false;
         }
 
-        // Tombstones may only be dropped when the destination is the last non-empty level: otherwise a
-        // deeper level could still hold the deleted key and dropping the tombstone would resurrect it.
-        var dropTombstones = !HasDataBelow(levels, targetLevelIndex);
+        // Combined key range of the source SSTs.
+        var rangeFirst = sourceTables[0].FirstKey;
+        var rangeLast = sourceTables[0].LastKey;
 
-        var outputId = IdGenerator.GetNextId();
-        var outputPath = GetSstPath(outputId);
-
-        long totalInputBytes = 0;
-
-        foreach (var input in inputs)
+        foreach (var table in sourceTables)
         {
-            totalInputBytes += input.Size;
+            if (_keyComparer.Compare(table.FirstKey, rangeFirst) < 0)
+            {
+                rangeFirst = table.FirstKey;
+            }
+
+            if (_keyComparer.Compare(table.LastKey, rangeLast) > 0)
+            {
+                rangeLast = table.LastKey;
+            }
         }
 
-        var estimatedCount = (int)Math.Min(int.MaxValue, Math.Max(1, totalInputBytes / 24));
+        // The destination level is sorted and non-overlapping, so the SSTs that overlap [rangeFirst,
+        // rangeLast] form a contiguous run [lo, hi). Everything before lo / from hi on is kept untouched.
+        var lo = 0;
 
-        SsTable<TKey, TValue>? output = null;
-        var addedEntries = 0;
+        while (lo < targetTables.Count && _keyComparer.Compare(targetTables[lo].LastKey, rangeFirst) < 0)
+        {
+            lo++;
+        }
 
-        using (var builder = _ssTableBuilderFactory.CreateSsTableBuilder(outputPath, _ssTableEncoder, _blockEncoder, _bloomFilterFactory, estimatedCount))
+        var hi = lo;
+        var overlapTargets = new List<SsTable<TKey, TValue>>();
+
+        while (hi < targetTables.Count && _keyComparer.Compare(targetTables[hi].FirstKey, rangeLast) <= 0)
+        {
+            overlapTargets.Add(targetTables[hi]);
+            hi++;
+        }
+
+        // Tombstones may only be dropped when the destination is the last non-empty level: otherwise a
+        // deeper level could still hold the deleted key and dropping the tombstone would resurrect it. Kept
+        // (non-overlapping) SSTs in the destination level never hold a key in the source range, so they
+        // cannot resurrect a dropped key.
+        var dropTombstones = !HasDataBelow(levels, targetLevelIndex);
+
+        // Merge the source (newest) over the overlapping destination SSTs (older) into size-bounded outputs.
+        var mergeInputs = new List<SsTable<TKey, TValue>>(sourceTables.Count + overlapTargets.Count);
+        mergeInputs.AddRange(sourceTables);
+        mergeInputs.AddRange(overlapTargets);
+
+        var outputs = await MergeIntoSplitSsTablesAsync(mergeInputs, dropTombstones, cancellationToken);
+
+        // The new destination level: kept-before ++ freshly merged outputs ++ kept-after. This stays sorted
+        // and non-overlapping because the consumed targets were a contiguous run and the outputs cover only
+        // keys from the source and that run (see the level0 install assert below).
+        var newTargetLevel = new List<SsTable<TKey, TValue>>(lo + outputs.Count + (targetTables.Count - hi));
+
+        for (var i = 0; i < lo; i++)
+        {
+            newTargetLevel.Add(targetTables[i]);
+        }
+
+        newTargetLevel.AddRange(outputs);
+
+        for (var i = hi; i < targetTables.Count; i++)
+        {
+            newTargetLevel.Add(targetTables[i]);
+        }
+
+        // Install the new structure. Mutate the live collections in place (like a flush/tiered compaction)
+        // rather than reassigning the struct fields so a concurrent FreezeMemTable that copies the list
+        // references observes consistent collections.
+        Manifest manifest;
+
+        await _level0Lock.EnterWriteLockAsync();
+
+        try
+        {
+            if (clearLevel0)
+            {
+                // The maintenance lock guarantees L0 is unchanged since the snapshot; the whole of L0 was
+                // merged, so clear the live list.
+                _state.LevelZeroTables.Clear();
+            }
+            else
+            {
+                _state.LeveledSsTables[sourceLevelIndex] = remainingSource!;
+            }
+
+            // Grow the leveled structure with empty runs until the destination level exists, then publish it.
+            while (_state.LeveledSsTables.Count <= targetLevelIndex)
+            {
+                _state.LeveledSsTables.Add(new List<SsTable<TKey, TValue>>());
+            }
+
+            _state.LeveledSsTables[targetLevelIndex] = newTargetLevel;
+
+            Debug.Assert(IsSortedNonOverlapping(newTargetLevel), "leveled compaction produced an overlapping destination level");
+
+            manifest = BuildManifestSnapshot();
+        }
+        finally
+        {
+            _level0Lock.ExitWriteLock();
+        }
+
+        // The manifest rewrite is the durable commit point and must happen before the replaced inputs are
+        // deleted: a crash before it leaves the inputs intact (the not-yet-committed outputs are cleaned up
+        // as orphans on recovery), and a crash after it leaves committed outputs whose now-unreferenced
+        // inputs recovery deletes as orphans. Because the manifest is authoritative, a failed delete here is
+        // self-healing (the leftover file is an orphan on the next open), so no ordering guard is needed.
+        manifest.Write(StoragePath);
+
+        var consumed = mergeInputs;
+
+        foreach (var input in consumed)
+        {
+            input.Dispose();
+            TryDeleteSstFile(input.Filename);
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Merges the <paramref name="inputs"/> (listed newest-first so the most recent value per key wins) into
+    /// a sequence of size-bounded, key-ascending, non-overlapping output SSTs: a new output file is rolled
+    /// over once the current one reaches <see cref="_targetSstSizeBytes"/>. Returns an empty list when every
+    /// entry is a dropped tombstone. On failure all partially built outputs are disposed and deleted so no
+    /// file handles or orphan files leak.
+    /// </summary>
+    private async Task<List<SsTable<TKey, TValue>>> MergeIntoSplitSsTablesAsync(List<SsTable<TKey, TValue>> inputs, bool dropTombstones, CancellationToken cancellationToken)
+    {
+        var outputs = new List<SsTable<TKey, TValue>>();
+
+        // Per-output bloom sizing from the target file size; an imperfect estimate only affects the
+        // false-positive rate, never correctness.
+        var estimatedCount = (int)Math.Min(int.MaxValue, Math.Max(1, _targetSstSizeBytes / 24));
+
+        ISsTableBuilder<TKey, TValue>? builder = null;
+        string? builderPath = null;
+
+        try
         {
             var iterators = new List<IStorageIterator<TKey, TValue>>(inputs.Count);
 
@@ -894,72 +1022,70 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
                     continue;
                 }
 
+                if (builder == null)
+                {
+                    builderPath = GetSstPath(IdGenerator.GetNextId());
+                    builder = _ssTableBuilderFactory.CreateSsTableBuilder(builderPath, _ssTableEncoder, _blockEncoder, _bloomFilterFactory, estimatedCount);
+                }
+
                 await builder.AddAsync(entry.Key, entry.Value);
-                addedEntries++;
+
+                // Roll over to a new file once the current one reaches the target size. The split happens at
+                // a key boundary, so the outputs stay non-overlapping.
+                if (builder.EstimatedSize >= _targetSstSizeBytes)
+                {
+                    outputs.Add(await builder.BuildAsync(cancellationToken));
+                    builder.Dispose();
+                    builder = null;
+                    builderPath = null;
+                }
             }
 
-            if (addedEntries > 0)
+            if (builder != null)
             {
-                output = await builder.BuildAsync(cancellationToken);
+                outputs.Add(await builder.BuildAsync(cancellationToken));
+                builder.Dispose();
+                builder = null;
+                builderPath = null;
             }
+
+            return outputs;
         }
-
-        // Install the new structure. Mutate the live collections in place (like a flush/tiered compaction)
-        // rather than reassigning the struct fields so a concurrent FreezeMemTable that copies the list
-        // references observes consistent collections.
-        Manifest? manifest = null;
-
-        await _level0Lock.EnterWriteLockAsync();
-
-        try
+        catch
         {
-            if (sourceLevelIndex < 0)
+            // Roll back: discard the in-progress builder and every already-built output so the failed merge
+            // leaves no open handles or orphan files behind.
+            if (builder != null)
             {
-                // The maintenance lock guarantees L0 is unchanged since the snapshot; remove exactly the
-                // SSTs we merged (all of them) by clearing the live list.
-                _state.LevelZeroTables.Clear();
-            }
-            else
-            {
-                // The source level is fully consumed into the destination; leave it as an empty run.
-                _state.LeveledSsTables[sourceLevelIndex] = new List<SsTable<TKey, TValue>>();
+                builder.Dispose();
+
+                if (builderPath != null)
+                {
+                    TryDeleteSstFile(builderPath);
+                }
             }
 
-            var newTarget = output != null ? new List<SsTable<TKey, TValue>> { output } : new List<SsTable<TKey, TValue>>();
-
-            // Grow the leveled structure with empty runs until the destination level exists, then publish
-            // the merged output there.
-            while (_state.LeveledSsTables.Count <= targetLevelIndex)
+            foreach (var output in outputs)
             {
-                _state.LeveledSsTables.Add(new List<SsTable<TKey, TValue>>());
+                output.Dispose();
+                TryDeleteSstFile(output.Filename);
             }
 
-            _state.LeveledSsTables[targetLevelIndex] = newTarget;
-
-            manifest = BuildManifestSnapshot();
+            throw;
         }
-        finally
-        {
-            _level0Lock.ExitWriteLock();
-        }
+    }
 
-        // The manifest rewrite is the durable commit point and must happen before the replaced inputs are
-        // deleted: a crash before it leaves the inputs intact (the not-yet-committed output is cleaned up as
-        // an orphan on recovery), and a crash after it leaves a committed output whose inputs recovery drops.
-        manifest.Write(StoragePath);
-
-        // The inputs are no longer reachable by new readers and any in-flight reader finished before the
-        // write lock was granted, so their handles can be closed and files removed.
-        foreach (var input in inputs)
+    /// <summary>
+    /// Returns <see langword="true"/> when the SSTs are in ascending key order with non-overlapping ranges,
+    /// the invariant every leveled level must satisfy. Used only by debug assertions.
+    /// </summary>
+    private static bool IsSortedNonOverlapping(List<SsTable<TKey, TValue>> tables)
+    {
+        for (var i = 1; i < tables.Count; i++)
         {
-            input.Dispose();
-        }
-
-        foreach (var input in inputs)
-        {
-            if (!TryDeleteSstFile(input.Filename))
+            if (_keyComparer.Compare(tables[i - 1].LastKey, tables[i].FirstKey) >= 0)
             {
-                break;
+                return false;
             }
         }
 

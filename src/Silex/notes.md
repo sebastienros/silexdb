@@ -127,11 +127,16 @@ not in the individual collections.
   Level0CompactionThreshold` — merge all L0 (newest-first) + L1 into one new L1 SST; (2) **size-triggered
   Li → Li+1** otherwise — `SelectLeveledSourceLevel` picks the level with the highest `size/target` ratio
   above 1.0 (with room to push down), where `target(L1)=BaseLevelTargetBytes` and each deeper level
-  multiplies by `LevelSizeMultiplier` (capped at `MaxLevels`). Whole-level merges produce exactly **one**
-  output SST per level (output-splitting is a documented deferred follow-up; the `List<List<SsTable>>`
-  shape supports adding it later without touching read/scan/recovery). Tombstones are dropped only when
-  the destination is the **last non-empty level** (`HasDataBelow` is false), otherwise a deeper level
-  could still hold the key.
+  multiplies by `LevelSizeMultiplier` (capped at `MaxLevels`). Compaction uses **partial-overlap
+  selection**: for Li → Li+1 it picks one source SST (`levels[i][0]`, smallest keys) and rewrites only the
+  contiguous run of Li+1 SSTs that overlaps its key range, carrying non-overlapping target SSTs over by
+  reference (L0 → L1 still consumes all of L0 since L0 SSTs overlap arbitrarily). Merges are split into
+  size-bounded outputs via **output-splitting**: a new output SST rolls over once the builder's
+  `EstimatedSize >= TargetSstSizeBytes` (default 2 MiB, a soft target — the open block + bloom/metadata
+  trailer can push the file slightly over), so a level holds several non-overlapping runs
+  (`List<List<SsTable>>`). Lazy builder creation guarantees no empty SSTs (all-tombstone merges produce
+  zero files). Tombstones are dropped only when the destination is the **last non-empty level**
+  (`HasDataBelow` is false), otherwise a deeper level could still hold the key.
 - **Manifest (`Manifest.cs`, leveled only).** Leveled breaks reopen-by-id recency (a deeper level's SST
   is rewritten with a fresh higher id) and a crash mid-compaction could leave overlapping SSTs in a level,
   so leveled persists a manifest: `{ "l0": [filename ids oldest-first], "levels": [[L1 ids key-asc], ...] }`.
@@ -223,9 +228,13 @@ not in the individual collections.
   L0 sorted runs and reclaims stale/tombstoned data on full compactions.
 - **DONE — Leveled compaction** (`CompactionStrategy.Leveled`). L0 flushes into L1 once
   `Level0CompactionThreshold` L0 SSTs accumulate; over-target levels cascade down by size ratio
-  (`BaseLevelTargetBytes` × `LevelSizeMultiplier^(level-1)`, capped at `MaxLevels`). Each level is a single
-  sorted run; reads/scans consult L1..Ln after L0; a persisted manifest makes it crash-safe across reopen.
-  Deferred follow-ups: output-splitting into size-bounded SSTs and partial-overlap (bounded) selection.
+  (`BaseLevelTargetBytes` × `LevelSizeMultiplier^(level-1)`, capped at `MaxLevels`). Each level is a sorted,
+  non-overlapping set of size-bounded SSTs (`TargetSstSizeBytes`, default 2 MiB); reads/scans consult
+  L1..Ln after L0; a persisted manifest makes it crash-safe across reopen. Compaction uses partial-overlap
+  selection (rewrites only the overlapping target run, carrying the rest over by reference) and
+  output-splitting (rolls a new output SST once the builder passes the soft size target).
+  Deferred follow-ups: multi-threaded parallel compaction; smarter source-file pick
+  (round-robin / most-overlap); fsync durability.
 - **DONE — Scans include on-disk SST data.** Range/full iteration now merges the current MemTable, the
   immutable MemTables and the L0 SSTs (most-recent-first), so a scan no longer misses already-flushed
   data. The scan holds the level0 read lock for its whole duration (freezing L0 and preventing disposal
@@ -346,7 +355,7 @@ write/space amplification and tombstone/ordering complexity. Speculative; defer 
    value-ownership semantics*).
 2. ~~WAL~~ **(done — crash recovery via write-ahead log)** + ~~manifest~~ **(done — leveled manifest)**.
 3. ~~Compaction~~ **(tiered + leveled done)** + ~~SST-level scan iterator so range scans include on-disk
-   data~~ **(done)** + ~~leveling (needs a manifest)~~ **(done)**. Next: parallelism (build/compact off the
-   write path across CPUs); leveled output-splitting + partial-overlap selection.
+   data~~ **(done)** + ~~leveling (needs a manifest)~~ **(done)** + ~~leveled output-splitting +
+   partial-overlap selection~~ **(done)**. Next: parallelism (build/compact off the write path across CPUs).
 4. Finer sparse index.
 5. Defer: LRU block cache, entry-lifting.
