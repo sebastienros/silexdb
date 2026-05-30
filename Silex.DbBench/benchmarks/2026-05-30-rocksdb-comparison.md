@@ -59,6 +59,31 @@ Same setup (128 MiB cache, `readrandom` twice), median of repeated runs:
   decode, not the copy. Closing the remaining cold gap needs a synchronous-read fast path (proposed but not
   yet implemented, since it trades multi-reader concurrency for single-read latency).
 
+### Synchronous cache-miss read fast path
+
+A CPU sampling trace (`dotnet-trace`) of a cold `readrandom` showed the read path is ~92% file read
+(`SafeFileHandle.ThreadPoolValueTaskSource` → `pread`), ~6% decode, ~1% `MemoryPool.Rent`. On Unix there
+is no kernel async I/O for regular files, so `RandomAccess.ReadAsync` dispatches every cache-miss read to
+the thread pool. The miss path now reads the block synchronously on the calling thread via
+`RandomAccess.Read` (matching RocksDB's own `pread` model), removing the ~1.6 µs per-miss thread-pool
+dispatch. Async `ReadBlockAsync` is retained for iterators/compaction.
+
+A/B (single variable: sync vs async leaf read), miss-heavy + warm-page (8 KB cache, ~100% miss, steady state):
+
+| Workload                              | Async      | Sync       | Result            |
+|---------------------------------------|------------|------------|-------------------|
+| readrandom 1 thread (µs/op)           | 2.87       | **1.26**   | **−56%**          |
+| readrandom aggregate ops/s, 1 thread  | 333K       | **811K**   | **2.4×**          |
+| readrandom aggregate ops/s, 4 threads | 379K       | **573K**   | **1.5×**          |
+| readrandom aggregate ops/s, 8 threads | 337K       | **504K**   | **1.5×**          |
+
+- **No regression on the 128 MiB-cache case** above: cold first ~1.50 µs/op and warm ~0.52 µs/op are
+  unchanged, because only ~5,700 of 200K reads miss there and each is a real cold-disk `pread` (~30 µs)
+  that dominates — the dispatch saving is invisible against disk latency.
+- **Large win whenever the working set exceeds the block cache but lives in the OS page cache** (a common
+  real scenario): 1.5–2.4× higher throughput. No thread-pool starvation observed even at 8 threads, and the
+  model mirrors RocksDB's synchronous reads.
+
 ## Historical results — post-lookup-optimization targeted rerun
 
 Apples-to-apples: both engines hold all 200K keys, and the read/seek workloads both find
