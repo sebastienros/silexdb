@@ -62,33 +62,119 @@ public static class LsmStorage
 
         var storageInner = new LsmStorageInner<TKey, TValue>(path, options);
 
-        var ssTables = new List<SsTable<TKey, TValue>>();
-        var loadedSstIds = new HashSet<long>();
+        // The manifest (leveled compaction only) is the authoritative record of which SSTs are live and how
+        // they map to levels. It only drives recovery when the store is being opened with leveled
+        // compaction: the other strategies never maintain it, so honoring a stale leveled manifest under a
+        // different strategy would treat every new (manifest-less) flush as an orphan and delete it. When
+        // ignored, recovery falls back to the id-ordered L0 load (where id ordering still encodes recency).
+        var manifest = options.CompactionStrategy == CompactionStrategy.Leveled ? Manifest.TryRead(path) : null;
 
-        // TODO: [PERF] Can be parallelized
-        foreach (var (filename, id) in sstFiles)
+        // Ids of the SSTs whose data is actually present in the recovered state. Used below to decide
+        // whether a surviving WAL is stale (its data was already flushed and committed and is loaded) or
+        // must be replayed. Only successfully loaded SSTs count: if a referenced SST is missing (fail open),
+        // its WAL must still be replayed rather than discarded.
+        HashSet<long> committedSstIds;
+
+        if (manifest != null)
         {
-            var blockBuilder = new BlockBuilder<TKey, TValue>(options.BlockEncoderFactory.Create<TKey, TValue>());
-            var ssTable = await SsTable<TKey, TValue>.LoadSsTableAsync(filename, options.SsTableEncoderFactory.Create<TKey, TValue>(), blockBuilder, options.BloomFilterFactory, id!.Value, cancellationToken);
-            ssTables.Add(ssTable);
-            loadedSstIds.Add(id!.Value);
+            var fileById = sstFiles.ToDictionary(x => x.id!.Value, x => x.filename);
+            committedSstIds = new HashSet<long>();
+
+            async Task<SsTable<TKey, TValue>?> LoadByIdAsync(long id)
+            {
+                // Fail open: a manifest entry whose file is missing is skipped rather than aborting the
+                // whole open. The store loses that SST's data but remains usable.
+                if (!fileById.TryGetValue(id, out var filename))
+                {
+                    return null;
+                }
+
+                var blockBuilder = new BlockBuilder<TKey, TValue>(options.BlockEncoderFactory.Create<TKey, TValue>());
+                var table = await SsTable<TKey, TValue>.LoadSsTableAsync(filename, options.SsTableEncoderFactory.Create<TKey, TValue>(), blockBuilder, options.BloomFilterFactory, id, cancellationToken);
+                committedSstIds.Add(id);
+
+                return table;
+            }
+
+            var level0 = new List<SsTable<TKey, TValue>>();
+
+            foreach (var id in manifest.L0)
+            {
+                var table = await LoadByIdAsync(id);
+
+                if (table != null)
+                {
+                    level0.Add(table);
+                }
+            }
+
+            storageInner._state.LevelZeroTables = level0;
+
+            var levels = new List<List<SsTable<TKey, TValue>>>();
+
+            foreach (var levelIds in manifest.Levels)
+            {
+                var level = new List<SsTable<TKey, TValue>>();
+
+                foreach (var id in levelIds)
+                {
+                    var table = await LoadByIdAsync(id);
+
+                    if (table != null)
+                    {
+                        level.Add(table);
+                    }
+                }
+
+                levels.Add(level);
+            }
+
+            storageInner._state.LeveledSsTables = levels;
+
+            // Any SST on disk that the committed manifest does not reference is an orphan (a flush or
+            // compaction output that crashed before the manifest commit) and is deleted. This uses the
+            // full referenced set, not just the loaded ids, so a referenced-but-missing SST does not cause
+            // an unrelated file to be treated as an orphan.
+            var referencedSstIds = new HashSet<long>(manifest.AllSstIds());
+
+            foreach (var (filename, id) in sstFiles)
+            {
+                if (!referencedSstIds.Contains(id!.Value))
+                {
+                    TryDeleteFile(filename);
+                }
+            }
+        }
+        else
+        {
+            var ssTables = new List<SsTable<TKey, TValue>>();
+            committedSstIds = new HashSet<long>();
+
+            // TODO: [PERF] Can be parallelized
+            foreach (var (filename, id) in sstFiles)
+            {
+                var blockBuilder = new BlockBuilder<TKey, TValue>(options.BlockEncoderFactory.Create<TKey, TValue>());
+                var ssTable = await SsTable<TKey, TValue>.LoadSsTableAsync(filename, options.SsTableEncoderFactory.Create<TKey, TValue>(), blockBuilder, options.BloomFilterFactory, id!.Value, cancellationToken);
+                ssTables.Add(ssTable);
+                committedSstIds.Add(id!.Value);
+            }
+
+            storageInner._state.LevelZeroTables = ssTables;
         }
 
-        // TODO: For now we only load l0 SSTs
-        storageInner._state.LevelZeroTables = ssTables;
-
         // Recover memtables that hadn't been flushed when the previous process exited. Memtables are
-        // flushed oldest-id-first, so any WAL without a matching SST is newer than every loaded SST;
-        // enqueuing them oldest-first (reads reverse the queue) preserves recency above L0.
+        // flushed oldest-id-first, so any WAL without a matching committed SST is newer than every loaded
+        // SST; enqueuing them oldest-first (reads reverse the queue) preserves recency above L0.
         if (options.UseWriteAheadLog && walFiles.Count > 0)
         {
             var recovered = new List<IMemTable<TKey, TValue>>();
 
             foreach (var (filename, id) in walFiles)
             {
-                // If a matching SST exists the memtable was flushed before the crash and this WAL is
-                // stale; remove it and skip replay. This makes the flush/delete sequence idempotent.
-                if (loadedSstIds.Contains(id!.Value))
+                // If a committed SST with this id exists the memtable was flushed (and, for leveled,
+                // committed to the manifest) before the crash and this WAL is stale; remove it and skip
+                // replay. This makes the flush/delete sequence idempotent.
+                if (committedSstIds.Contains(id!.Value))
                 {
                     TryDeleteFile(filename);
                     continue;

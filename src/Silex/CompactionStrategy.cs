@@ -18,4 +18,12 @@ public enum CompactionStrategy
     /// write amplification. Best for write-heavy workloads.
     /// </summary>
     Tiered,
+
+    /// <summary>
+    /// Leveled compaction. SSTs are organised into levels of geometrically increasing size; each level
+    /// (below L0) is a single sorted run with non-overlapping key ranges. Trades higher write
+    /// amplification for the lowest read and space amplification. Best for read-heavy workloads. Requires
+    /// a manifest to record which SST belongs to which level across restarts.
+    /// </summary>
+    Leveled,
 }

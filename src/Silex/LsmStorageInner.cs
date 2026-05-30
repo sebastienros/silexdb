@@ -29,7 +29,6 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     private readonly ReaderWriterLockSlim _currentMemTableLock = new();
     private readonly ReaderWriterLockSlim _immutableMemTablesLock = new();
     private readonly AsyncReaderWriterLock _level0Lock = new();
-    private readonly AsyncReaderWriterLock _leveledTablesLock = new();
 
     // Serializes flush and compaction so they never interleave. The manifest-free recovery scheme
     // relies on a flush never appending a tier in the middle of a compaction (which would make older
@@ -52,6 +51,10 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     private readonly int _maxSizeAmplificationPercent;
     private readonly int _sizeRatioPercent;
     private readonly int _minMergeWidth;
+    private readonly int _level0CompactionThreshold;
+    private readonly long _baseLevelTargetBytes;
+    private readonly int _levelSizeMultiplier;
+    private readonly int _maxLevels;
 
     public string StoragePath { get; }
 
@@ -72,6 +75,10 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         _maxSizeAmplificationPercent = options.MaxSizeAmplificationPercent;
         _sizeRatioPercent = options.SizeRatioPercent;
         _minMergeWidth = options.MinMergeWidth;
+        _level0CompactionThreshold = options.Level0CompactionThreshold;
+        _baseLevelTargetBytes = options.BaseLevelTargetBytes;
+        _levelSizeMultiplier = options.LevelSizeMultiplier;
+        _maxLevels = options.MaxLevels;
         _state = new StorageState<TKey, TValue>() { CurrentMemTable = CreateCurrentMemTable(IdGenerator.GetNextId()) };
         _blockEncoder = options.BlockEncoderFactory.Create<TKey, TValue>();
         _ssTableEncoder = options.SsTableEncoderFactory.Create<TKey, TValue>();
@@ -165,40 +172,31 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
 
             for (var i = l0.Count - 1; i >= 0; i--)
             {
-                var table = l0[i];
+                var (found, resolved) = await TryReadFromTableAsync(l0[i], key, keyMemory, cancellationToken);
 
-                // The key could be in this table, if not will go to the next one
-                if (_keyComparer.Compare(key, table.FirstKey) < 0 || _keyComparer.Compare(key, table.LastKey) > 0)
+                if (found)
                 {
-                    continue;
+                    return resolved;
                 }
+            }
 
-                // Check if the bloom filter tells us to skip this table
-                if (!table.BloomFilter.Probe(keyMemory.Span))
+            // Below L0 come the compaction levels (leveled strategy). Level 1 holds the newest data and each
+            // deeper level is older, so scan them in order; the first level that contains the key wins. Each
+            // level is a single sorted run with non-overlapping ranges, so at most one of its SSTs matches.
+            var levels = _state.LeveledSsTables;
+
+            for (var level = 0; level < levels.Count; level++)
+            {
+                var tables = levels[level];
+
+                for (var i = 0; i < tables.Count; i++)
                 {
-                    continue; 
-                }
+                    var (found, resolved) = await TryReadFromTableAsync(tables[i], key, keyMemory, cancellationToken);
 
-                foreach (var metadata in table.BlockMetadata)
-                {
-                    if (_keyComparer.Compare(key, metadata.FirstKey) < 0 || _keyComparer.Compare(key, metadata.LastKey) > 0)
+                    if (found)
                     {
-                        continue;
-                    }
-
-                    var block = await table.ReadBlockCachedAsync(metadata.Index, _blockCache, _cacheEntryOptions, cancellationToken);
-
-                    if (block != null && TryResolveBlockValue(block, key, out var resolved))
-                    {
-                        // The key is present in this (newest matching) table, so it shadows any older tier.
-                        // A found tombstone resolves to default.
                         return resolved;
                     }
-
-                    // The only block whose range can cover the key has been read and the key was not in it
-                    // (a bloom-filter false positive): the key is absent from this table, so fall through to
-                    // older tables instead of masking them with a premature default.
-                    break;
                 }
             }
         }
@@ -238,7 +236,54 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         resolved = default!;
         return false;
     }
-    /// Puts a value with the specified key in the current <see cref="IMemTable">. If one already exists it is replaced.
+
+    /// <summary>
+    /// Probes a single SST for <paramref name="key"/>. Returns <c>found = true</c> with the resolved value
+    /// (a tombstone resolves to <c>default</c>) when the key is present in the table, and
+    /// <c>found = false</c> when the table cannot contain it (range/bloom miss) or a bloom false-positive
+    /// turns out absent, so the caller falls through to older tables.
+    /// </summary>
+    private async ValueTask<(bool found, TValue resolved)> TryReadFromTableAsync(SsTable<TKey, TValue> table, TKey key, ReadOnlyMemory<byte> keyMemory, CancellationToken cancellationToken)
+    {
+        // The key could be in this table, if not go to the next one.
+        if (_keyComparer.Compare(key, table.FirstKey) < 0 || _keyComparer.Compare(key, table.LastKey) > 0)
+        {
+            return (false, default!);
+        }
+
+        // Check if the bloom filter tells us to skip this table.
+        if (!table.BloomFilter.Probe(keyMemory.Span))
+        {
+            return (false, default!);
+        }
+
+        foreach (var metadata in table.BlockMetadata)
+        {
+            if (_keyComparer.Compare(key, metadata.FirstKey) < 0 || _keyComparer.Compare(key, metadata.LastKey) > 0)
+            {
+                continue;
+            }
+
+            var block = await table.ReadBlockCachedAsync(metadata.Index, _blockCache, _cacheEntryOptions, cancellationToken);
+
+            if (block != null && TryResolveBlockValue(block, key, out var resolved))
+            {
+                // The key is present in this (newest matching) table, so it shadows any older one.
+                // A found tombstone resolves to default.
+                return (true, resolved);
+            }
+
+            // The only block whose range can cover the key has been read and the key was not in it
+            // (a bloom-filter false positive): the key is absent from this table, so fall through to
+            // older tables instead of masking them with a premature default.
+            break;
+        }
+
+        return (false, default!);
+    }
+
+    /// <summary>
+    /// Puts a value with the specified key in the current <see cref="IMemTable"/>. If one already exists it is replaced.
     /// </summary>
     /// <param name="key"></param>
     /// <param name="value"></param>
@@ -360,6 +405,8 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
 
             var ssTable = await builder.BuildAsync(cancellationToken);
 
+            Manifest? manifest = null;
+
             await _level0Lock.EnterWriteLockAsync();
 
             try
@@ -380,6 +427,13 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
                 }
 
                 _state.LevelZeroTables.Add(ssTable);
+
+                // Snapshot the new structure while the lock is held so the persisted manifest exactly matches
+                // the installed state. The (small) JSON is written to disk after releasing the lock.
+                if (_compactionStrategy == CompactionStrategy.Leveled)
+                {
+                    manifest = BuildManifestSnapshot();
+                }
             }
             finally
             {
@@ -388,10 +442,17 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
                 memTableToFlush.Dispose();
             }
 
+            // For leveled compaction the manifest rewrite is the durable commit point and must happen before
+            // the WAL is deleted: a crash before it leaves the WAL to be replayed on open (the not-yet-committed
+            // SST is cleaned up as an orphan), and a crash after it leaves a committed SST whose WAL recovery
+            // correctly drops. Tiered/None keep the manifest-free, reopen-by-id recovery and skip this.
+            manifest?.Write(StoragePath);
+
             // The data is now durable in an SST and visible in L0, and the memtable (and its WAL handle)
             // is disposed: the write-ahead log is obsolete and can be removed. If a crash happens before
             // this point the WAL survives and is replayed on the next open; if it happens after the SST is
-            // durable but before the delete, recovery sees the matching SST and drops the stale WAL.
+            // durable (and, for leveled, committed to the manifest) but before the delete, recovery sees the
+            // matching SST and drops the stale WAL.
             DeleteWal(memTableToFlush.Id);
         }
         finally
@@ -408,6 +469,44 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     public string GetWalPath(long id)
     {
         return Path.Combine(StoragePath, $"{id.ToString(CultureInfo.InvariantCulture)}.wal");
+    }
+
+    /// <summary>
+    /// Parses the numeric <em>filename</em> id of an SST from its path. This is the id under which the file
+    /// is stored on disk (and recorded in the manifest), which is distinct from the transient runtime
+    /// <see cref="SsTable{TKey, TValue}.Id"/> assigned when the in-memory table object is created.
+    /// </summary>
+    private static long GetSstFileId(SsTable<TKey, TValue> table)
+    {
+        return long.Parse(Path.GetFileNameWithoutExtension(table.Filename), CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>
+    /// Captures the current L0 + leveled structure as a <see cref="Manifest"/> of filename ids. Must be
+    /// called while holding the <c>_level0Lock</c> (read or write) so the snapshot is consistent.
+    /// </summary>
+    private Manifest BuildManifestSnapshot()
+    {
+        var manifest = new Manifest();
+
+        foreach (var table in _state.LevelZeroTables)
+        {
+            manifest.L0.Add(GetSstFileId(table));
+        }
+
+        foreach (var level in _state.LeveledSsTables)
+        {
+            var ids = new List<long>(level.Count);
+
+            foreach (var table in level)
+            {
+                ids.Add(GetSstFileId(table));
+            }
+
+            manifest.Levels.Add(ids);
+        }
+
+        return manifest;
     }
 
     /// <summary>
@@ -592,6 +691,296 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// Runs at most one leveled-compaction task if a trigger fires. Returns <see langword="true"/> when a
+    /// compaction was performed.
+    /// </summary>
+    /// <remarks>
+    /// One action per invocation, ordered by priority: (1) flush L0 down into L1 once L0 has accumulated
+    /// <c>Level0CompactionThreshold</c> SSTs; (2) otherwise push the most over-sized level Li down into
+    /// Li+1. Each level L1..Ln is kept as a single sorted run, so a whole-level merge produces exactly one
+    /// output SST. The manifest rewrite under the level0 write lock is the durable commit point; replaced
+    /// input files are only deleted after it succeeds.
+    /// </remarks>
+    public async Task<bool> TryLeveledCompactionAsync(CancellationToken cancellationToken = default)
+    {
+        if (_compactionStrategy != CompactionStrategy.Leveled)
+        {
+            return false;
+        }
+
+        // Hold the maintenance lock for the whole compaction so no flush appends to L0 mid-merge and no
+        // second compaction shares (and disposes) the same input handles.
+        await _maintenanceLock.WaitAsync(cancellationToken);
+
+        try
+        {
+            // Snapshot the structure while briefly holding the read lock. The maintenance lock already
+            // excludes flush/compaction, so the snapshot stays valid through the merge below.
+            List<SsTable<TKey, TValue>> level0;
+            List<List<SsTable<TKey, TValue>>> levels;
+
+            await _level0Lock.EnterReadLockAsync();
+
+            try
+            {
+                level0 = _state.LevelZeroTables.ToList();
+                levels = _state.LeveledSsTables.Select(level => level.ToList()).ToList();
+            }
+            finally
+            {
+                _level0Lock.ExitReadLock();
+            }
+
+            // Trigger 1 - flush L0 into L1 once enough L0 SSTs have accumulated.
+            if (level0.Count >= _level0CompactionThreshold)
+            {
+                return await CompactLevelAsync(sourceLevelIndex: -1, level0, levels, cancellationToken);
+            }
+
+            // Trigger 2 - push the most over-sized level down into the next one.
+            var sourceLevelIndex = SelectLeveledSourceLevel(levels);
+
+            if (sourceLevelIndex >= 0)
+            {
+                return await CompactLevelAsync(sourceLevelIndex, level0, levels, cancellationToken);
+            }
+
+            return false;
+        }
+        finally
+        {
+            _maintenanceLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Selects the leveled source level (0-based, where index 0 is L1) with the highest size/target ratio
+    /// above 1.0 that still has room to push down, or <c>-1</c> when no level is over its target.
+    /// </summary>
+    private int SelectLeveledSourceLevel(List<List<SsTable<TKey, TValue>>> levels)
+    {
+        var best = -1;
+        var bestRatio = 1.0;
+
+        // A level may only be chosen as a source if there is room to push into the level below it
+        // (index + 1 must be a valid level, i.e. within MaxLevels). The deepest level never compacts down.
+        for (var s = 0; s < levels.Count && s < _maxLevels - 1; s++)
+        {
+            if (levels[s].Count == 0)
+            {
+                continue;
+            }
+
+            long size = 0;
+
+            foreach (var table in levels[s])
+            {
+                size += table.Size;
+            }
+
+            var target = LevelTargetBytes(s);
+
+            if (target <= 0)
+            {
+                continue;
+            }
+
+            var ratio = (double)size / target;
+
+            if (ratio > bestRatio)
+            {
+                bestRatio = ratio;
+                best = s;
+            }
+        }
+
+        return best;
+    }
+
+    /// <summary>
+    /// Target size in bytes for a leveled level (0-based, index 0 is L1): the base target grows by the
+    /// configured multiplier for each deeper level.
+    /// </summary>
+    private long LevelTargetBytes(int levelIndex)
+    {
+        var target = _baseLevelTargetBytes;
+
+        for (var i = 0; i < levelIndex; i++)
+        {
+            target *= _levelSizeMultiplier;
+
+            if (target < 0)
+            {
+                return long.MaxValue;
+            }
+        }
+
+        return target;
+    }
+
+    /// <summary>
+    /// Merges a source (either all of L0 when <paramref name="sourceLevelIndex"/> is <c>-1</c>, or leveled
+    /// level <paramref name="sourceLevelIndex"/>) together with the destination level into a single output
+    /// SST, installs the new structure under the level0 write lock, persists the manifest (the durable
+    /// commit point), and finally deletes the replaced input files.
+    /// </summary>
+    private async Task<bool> CompactLevelAsync(int sourceLevelIndex, List<SsTable<TKey, TValue>> level0, List<List<SsTable<TKey, TValue>>> levels, CancellationToken cancellationToken)
+    {
+        // Destination level index (0-based, 0 == L1). L0 flushes into L1; level s pushes into s+1.
+        var targetLevelIndex = sourceLevelIndex < 0 ? 0 : sourceLevelIndex + 1;
+
+        var targetTables = targetLevelIndex < levels.Count ? levels[targetLevelIndex] : new List<SsTable<TKey, TValue>>();
+
+        // Inputs newest-first so the MergeIterator keeps the most recent value per key: the source is
+        // always newer than the destination. For an L0 flush, L0 itself is newest-first.
+        var inputs = new List<SsTable<TKey, TValue>>();
+
+        if (sourceLevelIndex < 0)
+        {
+            for (var i = level0.Count - 1; i >= 0; i--)
+            {
+                inputs.Add(level0[i]);
+            }
+        }
+        else
+        {
+            inputs.AddRange(levels[sourceLevelIndex]);
+        }
+
+        inputs.AddRange(targetTables);
+
+        if (inputs.Count == 0)
+        {
+            return false;
+        }
+
+        // Tombstones may only be dropped when the destination is the last non-empty level: otherwise a
+        // deeper level could still hold the deleted key and dropping the tombstone would resurrect it.
+        var dropTombstones = !HasDataBelow(levels, targetLevelIndex);
+
+        var outputId = IdGenerator.GetNextId();
+        var outputPath = GetSstPath(outputId);
+
+        long totalInputBytes = 0;
+
+        foreach (var input in inputs)
+        {
+            totalInputBytes += input.Size;
+        }
+
+        var estimatedCount = (int)Math.Min(int.MaxValue, Math.Max(1, totalInputBytes / 24));
+
+        SsTable<TKey, TValue>? output = null;
+        var addedEntries = 0;
+
+        using (var builder = _ssTableBuilderFactory.CreateSsTableBuilder(outputPath, _ssTableEncoder, _blockEncoder, _bloomFilterFactory, estimatedCount))
+        {
+            var iterators = new List<IStorageIterator<TKey, TValue>>(inputs.Count);
+
+            foreach (var input in inputs)
+            {
+                iterators.Add(new SsTableIterator<TKey, TValue>(input));
+            }
+
+            var merge = new MergeIterator<TKey, TValue>(iterators);
+
+            await foreach (var entry in merge.EnumerateAsync(cancellationToken))
+            {
+                if (dropTombstones && _valueSerializer.IsTombstoneValue(entry.Value))
+                {
+                    continue;
+                }
+
+                await builder.AddAsync(entry.Key, entry.Value);
+                addedEntries++;
+            }
+
+            if (addedEntries > 0)
+            {
+                output = await builder.BuildAsync(cancellationToken);
+            }
+        }
+
+        // Install the new structure. Mutate the live collections in place (like a flush/tiered compaction)
+        // rather than reassigning the struct fields so a concurrent FreezeMemTable that copies the list
+        // references observes consistent collections.
+        Manifest? manifest = null;
+
+        await _level0Lock.EnterWriteLockAsync();
+
+        try
+        {
+            if (sourceLevelIndex < 0)
+            {
+                // The maintenance lock guarantees L0 is unchanged since the snapshot; remove exactly the
+                // SSTs we merged (all of them) by clearing the live list.
+                _state.LevelZeroTables.Clear();
+            }
+            else
+            {
+                // The source level is fully consumed into the destination; leave it as an empty run.
+                _state.LeveledSsTables[sourceLevelIndex] = new List<SsTable<TKey, TValue>>();
+            }
+
+            var newTarget = output != null ? new List<SsTable<TKey, TValue>> { output } : new List<SsTable<TKey, TValue>>();
+
+            // Grow the leveled structure with empty runs until the destination level exists, then publish
+            // the merged output there.
+            while (_state.LeveledSsTables.Count <= targetLevelIndex)
+            {
+                _state.LeveledSsTables.Add(new List<SsTable<TKey, TValue>>());
+            }
+
+            _state.LeveledSsTables[targetLevelIndex] = newTarget;
+
+            manifest = BuildManifestSnapshot();
+        }
+        finally
+        {
+            _level0Lock.ExitWriteLock();
+        }
+
+        // The manifest rewrite is the durable commit point and must happen before the replaced inputs are
+        // deleted: a crash before it leaves the inputs intact (the not-yet-committed output is cleaned up as
+        // an orphan on recovery), and a crash after it leaves a committed output whose inputs recovery drops.
+        manifest.Write(StoragePath);
+
+        // The inputs are no longer reachable by new readers and any in-flight reader finished before the
+        // write lock was granted, so their handles can be closed and files removed.
+        foreach (var input in inputs)
+        {
+            input.Dispose();
+        }
+
+        foreach (var input in inputs)
+        {
+            if (!TryDeleteSstFile(input.Filename))
+            {
+                break;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Returns <see langword="true"/> when any leveled level below <paramref name="targetLevelIndex"/>
+    /// still holds data, meaning tombstones must be preserved when compacting into the target level.
+    /// </summary>
+    private static bool HasDataBelow(List<List<SsTable<TKey, TValue>>> levels, int targetLevelIndex)
+    {
+        for (var i = targetLevelIndex + 1; i < levels.Count; i++)
+        {
+            if (levels[i].Count > 0)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -864,6 +1253,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
             List<KeyValuePair<TKey, TValue>> currentSnapshot;
             ImmutableQueue<IMemTable<TKey, TValue>> immutableMemTables;
             List<SsTable<TKey, TValue>> levelZeroTables;
+            List<List<SsTable<TKey, TValue>>> leveledTables;
 
             _storage._currentMemTableLock.EnterReadLock();
 
@@ -878,8 +1268,9 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
                 currentSnapshot = MaterializeCurrentMemTable(state.CurrentMemTable, cancellationToken);
 
                 immutableMemTables = state.ImmutableMemTables;
-                // The level0 read lock (held by the caller) keeps this list stable; copy it defensively anyway.
+                // The level0 read lock (held by the caller) keeps these stable; copy them defensively anyway.
                 levelZeroTables = state.LevelZeroTables.ToList();
+                leveledTables = state.LeveledSsTables.Select(level => level.ToList()).ToList();
             }
             finally
             {
@@ -901,6 +1292,16 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
             for (var i = levelZeroTables.Count - 1; i >= 0; i--)
             {
                 iterators.Add(new SsTableIterator<TKey, TValue>(levelZeroTables[i]));
+            }
+
+            // Then the compaction levels, newest-first (L1 before L2 ...). Within a level the SSTs are
+            // non-overlapping, so their relative order does not affect correctness.
+            foreach (var level in leveledTables)
+            {
+                foreach (var table in level)
+                {
+                    iterators.Add(new SsTableIterator<TKey, TValue>(table));
+                }
             }
 
             return iterators;

@@ -195,4 +195,37 @@ public class StorageOptions
     /// </summary>
     /// <value>The default value is <c>2</c>.</value>
     public int MinMergeWidth { get; set; } = 2;
+
+    /// <summary>
+    /// Gets or sets the number of L0 SSTs that triggers an L0-to-L1 compaction under
+    /// <see cref="Silex.CompactionStrategy.Leveled"/>. L0 SSTs have overlapping key ranges, so keeping
+    /// their count low bounds read amplification at the top of the tree.
+    /// </summary>
+    /// <value>The default value is <c>4</c>.</value>
+    public int Level0CompactionThreshold { get; set; } = 4;
+
+    /// <summary>
+    /// Gets or sets the target total size, in bytes, of the base level (L1) under
+    /// <see cref="Silex.CompactionStrategy.Leveled"/>. Each deeper level targets
+    /// <see cref="LevelSizeMultiplier"/> times the size of the level above it. A level is compacted down
+    /// once its total size exceeds its target.
+    /// </summary>
+    /// <value>The default value is <c>256 KiB</c> (<c>262144</c>).</value>
+    public long BaseLevelTargetBytes { get; set; } = 256 * 1024;
+
+    /// <summary>
+    /// Gets or sets the size multiplier between adjacent levels under
+    /// <see cref="Silex.CompactionStrategy.Leveled"/>. Level <c>k</c> targets
+    /// <see cref="BaseLevelTargetBytes"/> × <c>multiplier^(k-1)</c> bytes.
+    /// </summary>
+    /// <value>The default value is <c>10</c>.</value>
+    public int LevelSizeMultiplier { get; set; } = 10;
+
+    /// <summary>
+    /// Gets or sets the maximum number of levels below L0 under
+    /// <see cref="Silex.CompactionStrategy.Leveled"/>. Once data reaches the deepest level it is only
+    /// ever merged within that level.
+    /// </summary>
+    /// <value>The default value is <c>7</c>.</value>
+    public int MaxLevels { get; set; } = 7;
 }

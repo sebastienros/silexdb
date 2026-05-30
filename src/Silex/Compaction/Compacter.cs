@@ -72,7 +72,10 @@ internal class Compacter<TKey, TValue> : IAsyncDisposable where TKey : notnull
 
         // Flush and compaction are driven from this single loop so they never overlap; that ordering is
         // what lets tiered compaction stay correct without a manifest.
-        await _storage.TryTieredCompactionAsync(_flushTaskCts?.Token ?? CancellationToken.None);
+        var token = _flushTaskCts?.Token ?? CancellationToken.None;
+        await _storage.TryTieredCompactionAsync(token);
+        await _storage.TryLeveledCompactionAsync(token);
+
     }
 
     public Task CloseAsync()

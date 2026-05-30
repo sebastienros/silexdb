@@ -1195,6 +1195,274 @@ public class StorageTests
         }
     }
 
+    [Fact]
+    public async Task LeveledCompactionFlushesL0IntoL1()
+    {
+        // Once Level0CompactionThreshold L0 SSTs accumulate, leveled compaction merges them all into a
+        // single L1 sorted run and empties L0.
+        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tempFolder);
+        var options = new StorageOptions
+        {
+            UseWriteAheadLog = false,
+            CompactionStrategy = CompactionStrategy.Leveled,
+            Level0CompactionThreshold = 4,
+        };
+        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+
+        try
+        {
+            await FlushTierAsync(storage, () => storage.Put(1, 10));
+            await FlushTierAsync(storage, () => storage.Put(2, 20));
+            await FlushTierAsync(storage, () => storage.Put(3, 30));
+            await FlushTierAsync(storage, () => storage.Put(4, 40));
+            Assert.Equal(4, storage._state.LevelZeroTables.Count);
+
+            var compacted = await storage.TryLeveledCompactionAsync();
+
+            Assert.True(compacted);
+            Assert.Empty(storage._state.LevelZeroTables);
+            Assert.Single(storage._state.LeveledSsTables);
+            Assert.Single(storage._state.LeveledSsTables[0]);
+            Assert.Equal(10, await storage.GetAsync(1));
+            Assert.Equal(20, await storage.GetAsync(2));
+            Assert.Equal(30, await storage.GetAsync(3));
+            Assert.Equal(40, await storage.GetAsync(4));
+
+            // The merged run is also visible to a full scan in key order.
+            var entries = storage.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToList();
+            Assert.Equal(new[] { 1, 2, 3, 4 }, entries.Select(e => e.Key));
+            Assert.Equal(new[] { 10, 20, 30, 40 }, entries.Select(e => e.Value));
+        }
+        finally
+        {
+            storage.Dispose();
+            Directory.Delete(tempFolder, true);
+        }
+    }
+
+    [Fact]
+    public async Task LeveledCompactionPushesOverSizedLevelDown()
+    {
+        // With a tiny base target every level is over budget, so after L0 flushes into L1 a second
+        // compaction pushes L1 down into L2.
+        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tempFolder);
+        var options = new StorageOptions
+        {
+            UseWriteAheadLog = false,
+            CompactionStrategy = CompactionStrategy.Leveled,
+            Level0CompactionThreshold = 2,
+            BaseLevelTargetBytes = 1,
+        };
+        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+
+        try
+        {
+            await FlushTierAsync(storage, () => storage.Put(1, 10));
+            await FlushTierAsync(storage, () => storage.Put(2, 20));
+
+            Assert.True(await storage.TryLeveledCompactionAsync());
+            Assert.Single(storage._state.LeveledSsTables[0]); // L1 populated
+
+            // Second action: L1 is over its (tiny) target, so it is pushed down into L2.
+            Assert.True(await storage.TryLeveledCompactionAsync());
+            Assert.Equal(2, storage._state.LeveledSsTables.Count);
+            Assert.Empty(storage._state.LeveledSsTables[0]); // L1 now empty
+            Assert.Single(storage._state.LeveledSsTables[1]); // L2 populated
+
+            Assert.Equal(10, await storage.GetAsync(1));
+            Assert.Equal(20, await storage.GetAsync(2));
+        }
+        finally
+        {
+            storage.Dispose();
+            Directory.Delete(tempFolder, true);
+        }
+    }
+
+    [Fact]
+    public async Task LeveledCompactionDropsTombstonesAtBottomLevel()
+    {
+        // When the destination is the last non-empty level, a delete may be discarded entirely because no
+        // older value survives below it.
+        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tempFolder);
+        var options = new StorageOptions
+        {
+            UseWriteAheadLog = false,
+            CompactionStrategy = CompactionStrategy.Leveled,
+            Level0CompactionThreshold = 2,
+        };
+        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+
+        try
+        {
+            await FlushTierAsync(storage, () =>
+            {
+                storage.Put(1, 100);
+                storage.Put(2, 200);
+            });
+            await FlushTierAsync(storage, () => storage.Delete(1));
+
+            Assert.True(await storage.TryLeveledCompactionAsync());
+
+            Assert.Equal(0, await storage.GetAsync(1));
+            Assert.Equal(200, await storage.GetAsync(2));
+
+            // The tombstone for key 1 was dropped, so only key 2 survives in L1.
+            var entries = storage.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToList();
+            Assert.Equal(new[] { 2 }, entries.Select(e => e.Key));
+        }
+        finally
+        {
+            storage.Dispose();
+            Directory.Delete(tempFolder, true);
+        }
+    }
+
+    [Fact]
+    public async Task LeveledCompactionKeepsTombstoneWhenLowerLevelHoldsKey()
+    {
+        // A tombstone must be preserved when a deeper level still holds the key it shadows, otherwise the
+        // older value would be resurrected.
+        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tempFolder);
+        var options = new StorageOptions
+        {
+            UseWriteAheadLog = false,
+            CompactionStrategy = CompactionStrategy.Leveled,
+            Level0CompactionThreshold = 2,
+            BaseLevelTargetBytes = 1,
+        };
+        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+
+        try
+        {
+            // Seed L2 with key 1 = 100.
+            await FlushTierAsync(storage, () => storage.Put(1, 100));
+            await FlushTierAsync(storage, () => storage.Put(2, 200));
+            Assert.True(await storage.TryLeveledCompactionAsync()); // L0 -> L1
+            Assert.True(await storage.TryLeveledCompactionAsync()); // L1 -> L2
+
+            // Now delete key 1 in a fresh L0 batch and compact into L1 (which sits above the L2 that holds 1).
+            await FlushTierAsync(storage, () => storage.Delete(1));
+            await FlushTierAsync(storage, () => storage.Put(3, 300));
+            Assert.True(await storage.TryLeveledCompactionAsync()); // L0 -> L1, must keep the tombstone
+
+            // The delete is preserved: key 1 reads as deleted even though L2 still physically holds 100.
+            Assert.Equal(0, await storage.GetAsync(1));
+            Assert.Equal(200, await storage.GetAsync(2));
+            Assert.Equal(300, await storage.GetAsync(3));
+        }
+        finally
+        {
+            storage.Dispose();
+            Directory.Delete(tempFolder, true);
+        }
+    }
+
+    [Fact]
+    public async Task LeveledReopenRestoresLevelsViaManifest()
+    {
+        // The manifest persists the L0/level structure so a reopen restores the exact levels (and recency)
+        // even though leveled SST ids no longer encode it.
+        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tempFolder);
+        var options = new StorageOptions
+        {
+            UseWriteAheadLog = false,
+            FlushPeriod = TimeSpan.Zero,
+            CompactionStrategy = CompactionStrategy.Leveled,
+            Level0CompactionThreshold = 2,
+            BaseLevelTargetBytes = 1,
+        };
+
+        try
+        {
+            var building = new LsmStorageInner<int, int>(tempFolder, options);
+            await FlushTierAsync(building, () => building.Put(1, 10));
+            await FlushTierAsync(building, () => building.Put(2, 20));
+            Assert.True(await building.TryLeveledCompactionAsync()); // L0 -> L1
+            Assert.True(await building.TryLeveledCompactionAsync()); // L1 -> L2
+            await FlushTierAsync(building, () => building.Put(3, 30));
+            await FlushTierAsync(building, () => building.Put(4, 40));
+            Assert.True(await building.TryLeveledCompactionAsync()); // L0 -> L1
+            building.Dispose();
+
+            Assert.True(File.Exists(Path.Combine(tempFolder, "manifest")));
+
+            var storage = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
+
+            try
+            {
+                // L1 holds {3,4}; L2 holds {1,2}.
+                Assert.Equal(2, storage._inner._state.LeveledSsTables.Count);
+                Assert.Single(storage._inner._state.LeveledSsTables[0]);
+                Assert.Single(storage._inner._state.LeveledSsTables[1]);
+                Assert.Empty(storage._inner._state.LevelZeroTables);
+
+                var entries = storage._inner.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToList();
+                Assert.Equal(new[] { 1, 2, 3, 4 }, entries.Select(e => e.Key));
+                Assert.Equal(new[] { 10, 20, 30, 40 }, entries.Select(e => e.Value));
+            }
+            finally
+            {
+                await storage.DisposeAsync();
+            }
+        }
+        finally
+        {
+            Directory.Delete(tempFolder, true);
+        }
+    }
+
+    [Fact]
+    public async Task LeveledReopenDeletesOrphanSstNotInManifest()
+    {
+        // An SST left behind by a flush/compaction that crashed before the manifest commit is not
+        // referenced by the manifest and must be deleted on reopen.
+        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tempFolder);
+        var options = new StorageOptions
+        {
+            UseWriteAheadLog = false,
+            FlushPeriod = TimeSpan.Zero,
+            CompactionStrategy = CompactionStrategy.Leveled,
+            Level0CompactionThreshold = 2,
+        };
+
+        try
+        {
+            var building = new LsmStorageInner<int, int>(tempFolder, options);
+            await FlushTierAsync(building, () => building.Put(1, 10));
+            await FlushTierAsync(building, () => building.Put(2, 20));
+            Assert.True(await building.TryLeveledCompactionAsync());
+            building.Dispose();
+
+            // Simulate an orphan output (id far in the future, not referenced by the manifest).
+            var orphan = Path.Combine(tempFolder, "999999.sst");
+            File.WriteAllText(orphan, "not a real sst");
+
+            var storage = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
+
+            try
+            {
+                Assert.False(File.Exists(orphan));
+                Assert.Equal(10, await storage.GetAsync(1));
+                Assert.Equal(20, await storage.GetAsync(2));
+            }
+            finally
+            {
+                await storage.DisposeAsync();
+            }
+        }
+        finally
+        {
+            Directory.Delete(tempFolder, true);
+        }
+    }
+
     private static LsmStorageInner<int, byte[]> FillImmutableMemTables(int entries = 100, int valueSize = 10, long memTableSizeLimit = 100)
     {
         var storageOptions = new StorageOptions { MemTableSizeLimit = memTableSizeLimit, UseWriteAheadLog = false };
