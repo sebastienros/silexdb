@@ -1,25 +1,80 @@
 # Silex vs RocksDB `db_bench` — 2026-05-30
 
-First cross-engine comparison using RocksDB's `db_bench` ported workloads against
+Cross-engine comparison using RocksDB's `db_bench` ported workloads against
 `Silex.DbBench`. Captured for later reference / perf tracking.
 
-## Setup
+## Latest rerun setup
 
 - **Host**: macOS, Apple Silicon, 14 cores
 - **Threads**: 1 (single-threaded)
-- **Dataset**: 1,000,000 entries, 16-byte keys, 100-byte values (~110 MB raw)
+- **Dataset**: 200,000 entries, 16-byte keys, 100-byte values (~22 MB raw)
 - **Compression**: OFF on both (fairness — Silex does not compress)
 - **RocksDB**: built `db_bench` from `facebook/rocksdb` `main` (v11.4.0), release
   (`make db_bench DEBUG_LEVEL=0`), linked against Homebrew gflags. Run with
   `--compression_type=none`.
 - **Silex**: `Silex.DbBench` (Release), tiered compaction, WAL on, default options.
 
-> Caveat: the dataset (~110 MB) fits comfortably in memory, which favors Silex's
+> Caveat: the dataset (~22 MB) fits comfortably in memory, which favors Silex's
 > in-memory-heavy path. RocksDB also pays for bloom filters, per-block checksums,
 > and a more mature WAL that this micro-benchmark does not reward. These numbers
 > favor Silex more than a larger-than-RAM workload would.
 
-## Results — `fillseq` then reads over a fully-populated DB
+## Results — post-block-cache targeted rerun
+
+The custom decoded-block LRU cache keeps correctness under churn and removes most cache-hit overhead.
+This run uses a 128 MiB Silex block cache and runs `readrandom` twice so the second pass measures the
+warm cache-hit path.
+
+| Benchmark        | Silex                                | RocksDB                              | Result                 |
+|------------------|--------------------------------------|--------------------------------------|------------------------|
+| fillseq          | 1.186 µs/op · 831K ops/s · 92.0 MB/s | 1.407 µs/op · 711K ops/s · 78.7 MB/s | **Silex ~1.19×**       |
+| readrandom first | 1.515 µs/op · 660K ops/s · 73.0 MB/s | 0.614 µs/op · 1.63M ops/s · 180 MB/s | **RocksDB ~2.5×**      |
+| readrandom warm  | 0.631 µs/op · 1.58M ops/s · 175 MB/s | 0.556 µs/op · 1.80M ops/s · 199 MB/s | **RocksDB ~1.13×**     |
+
+The default 8 MiB cache still churns on the 200K-key random workload, but remains correct; the targeted
+default-cache run found 200,000 of 200,000 keys at 5.474 µs/op.
+
+## Results — post miss-path allocation rerun
+
+Two further no-allocation changes on the read path:
+
+1. **No double-buffer copy on a cache miss.** `SsTable.ReadBlockAsync` now reads straight into the
+   `MemoryPool`-owned buffer that backs the decoded block, and `DefaultBlockEncoder.Decode(IMemoryOwner, length)`
+   scans the offset section in place. This removes one pooled rent and a full ~4 KB block memcpy per miss.
+2. **No per-read closure.** `BlockCache.GetOrLoadAsync` now takes a generic `struct` loader instead of a
+   `Func<Task<Block?>>`, so every read — cache hit included — allocates no delegate/closure.
+
+Same setup (128 MiB cache, `readrandom` twice), median of repeated runs:
+
+| Benchmark        | Silex (before) | Silex (after)                        | RocksDB                              | Result             |
+|------------------|----------------|--------------------------------------|--------------------------------------|--------------------|
+| fillseq          | 1.186 µs/op    | 1.203 µs/op · 815K ops/s · 90.2 MB/s | 1.407 µs/op · 711K ops/s · 78.7 MB/s | **Silex ~1.17×**   |
+| readrandom first | 1.515 µs/op    | 1.52 µs/op · 658K ops/s · 72.8 MB/s  | 0.614 µs/op · 1.63M ops/s · 180 MB/s | **RocksDB ~2.5×**  |
+| readrandom warm  | 0.631 µs/op    | 0.50 µs/op · 2.0M ops/s · 222 MB/s   | 0.556 µs/op · 1.80M ops/s · 199 MB/s | **Silex ~1.11×**   |
+
+- **Warm path now beats RocksDB** (~0.50 vs 0.556 µs/op) — removing the per-read closure allocation cut
+  the cache-hit path by ~15–20%.
+- **Cold (first) path is unchanged within noise.** The copy elimination removes allocations/GC pressure but
+  the first-pass latency is dominated by the async positioned read (`RandomAccess.ReadAsync`) and block
+  decode, not the copy. Closing the remaining cold gap needs a synchronous-read fast path (proposed but not
+  yet implemented, since it trades multi-reader concurrency for single-read latency).
+
+## Historical results — post-lookup-optimization targeted rerun
+
+Apples-to-apples: both engines hold all 200K keys, and the read/seek workloads both find
+100,000 of 100,000 requested keys.
+
+| Benchmark  | Silex                                | RocksDB                              | Winner             |
+|------------|--------------------------------------|--------------------------------------|--------------------|
+| fillseq    | 1.233 µs/op · 796K ops/s · 88.0 MB/s | 1.435 µs/op · 697K ops/s · 77.1 MB/s | **Silex ~1.16×**   |
+| readrandom | 6.132 µs/op · 163K ops/s · 18.0 MB/s | 0.625 µs/op · 1.60M ops/s · 177 MB/s | **RocksDB ~9.8×**  |
+| seekrandom | 9.570 µs/op · 104K ops/s · 11.6 MB/s | 0.880 µs/op · 1.14M ops/s            | **RocksDB ~10.9×** |
+
+Silex `readrandom` improved from the earlier 200K clean-read baseline of 45.304 µs/op to
+6.132 µs/op after replacing the per-table block metadata scan with binary search, but
+RocksDB still has a large point/seek lookup advantage.
+
+## Historical results — `fillseq` then reads over a fully-populated 1M-key DB
 
 Apples-to-apples: both engines hold all 1M keys, both find 1,000,000 of 1,000,000.
 
@@ -46,11 +101,14 @@ write rows below are directly comparable; the read rows are not (different cover
 
 ## Takeaways
 
-- **Writes**: Silex is ~1.3–1.6× faster on `fillseq`/`fillrandom`/`overwrite` in
-  this configuration.
-- **Random reads**: Silex is faster here, but mostly because the working set fits
-  in memory; RocksDB's bloom/checksum/WAL overhead is not amortized at this scale.
-- **Sequential scans**: RocksDB wins decisively (~3× clean, up to ~22× under
+- **Writes**: Silex remains faster on the latest `fillseq` rerun and was also
+  faster on the historical `fillseq`/`fillrandom`/`overwrite` runs.
+- **Point lookups**: the block-metadata binary search and custom decoded-block
+  cache reduced Silex warm random-read latency to near RocksDB parity when the
+  working set fits in cache. The first pass and small-cache/churn cases remain slower.
+- **Seeks**: the latest seek rerun still favors RocksDB by roughly 11×; seekrandom
+  needs separate iterator/path work.
+- **Sequential scans**: historical data shows RocksDB wins decisively (~3× clean, up to ~22× under
   fragmentation). In the mixed pipeline (many SST sources) Silex `readseq`
   degraded to 6.9 µs/op while RocksDB stayed at ~0.3 µs/op. Each Silex scan
   rebuilds a merge iterator across all memtables + SSTs — the standout
@@ -62,7 +120,8 @@ Silex (clean read methodology):
 
 ```sh
 dotnet run --project Silex.DbBench -c Release -- \
-  --benchmarks=fillseq,readrandom,readseq --num=1000000 --value_size=100 --threads=1
+  --benchmarks=fillseq,readrandom,readrandom --num=200000 --reads=200000 \
+  --value_size=100 --threads=1 --cache_size=134217728
 ```
 
 RocksDB (build once, then run):
@@ -73,8 +132,8 @@ make db_bench DEBUG_LEVEL=0 DISABLE_WARNING_AS_ERROR=1 \
   EXTRA_CXXFLAGS="-I$(brew --prefix gflags)/include" \
   EXTRA_LDFLAGS="-L$(brew --prefix gflags)/lib" -j14
 
-./db_bench --benchmarks=fillseq,readrandom,readseq \
-  --num=1000000 --value_size=100 --key_size=16 --threads=1 \
+./db_bench --benchmarks=fillseq,readrandom,seekrandom \
+  --num=200000 --reads=100000 --value_size=100 --key_size=16 --threads=1 \
   --compression_type=none --db=/tmp/rocks-bench-db
 ```
 

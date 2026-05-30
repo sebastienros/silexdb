@@ -1,4 +1,3 @@
-using Microsoft.Extensions.Caching.Memory;
 using Silex.Blocks;
 using Silex.BloomFilters;
 using System.Buffers;
@@ -8,8 +7,6 @@ namespace Silex.Tables;
 
 public class SsTable<TKey, TValue> : IDisposable
 {
-    private static readonly WorkDispatcher<BlockCacheKey, Block<TKey, TValue>> _dispatcher = new();
-
     private readonly long _id;
     private readonly string _filename;
     private readonly TKey? _firstKey;
@@ -69,60 +66,63 @@ public class SsTable<TKey, TValue> : IDisposable
 
         var length = (int)(offsetEnd - offset);
 
-        var buffer = ArrayPool<byte>.Shared.Rent(length)!;
+        // Read straight into the buffer that will back the decoded block, so the block bytes are never
+        // copied a second time. The owner is handed to the block on success and disposed otherwise.
+        var owner = MemoryPool<byte>.Shared.Rent(length);
 
-        // Use positioned reads (RandomAccess) rather than Seek + Read so that several readers can read
-        // different blocks of the same SST concurrently without racing on the shared FileStream
-        // position. The file is immutable once built, so reads never conflict with writes.
-        var handle = _stream.SafeFileHandle;
-        var read = 0;
-        while (read < length)
+        try
         {
-            var n = await RandomAccess.ReadAsync(handle, buffer.AsMemory(read, length - read), offset + read, cancellationToken);
-            if (n == 0)
+            // Use positioned reads (RandomAccess) rather than Seek + Read so that several readers can read
+            // different blocks of the same SST concurrently without racing on the shared FileStream
+            // position. The file is immutable once built, so reads never conflict with writes.
+            var handle = _stream.SafeFileHandle;
+            var read = 0;
+            while (read < length)
             {
-                break;
-            }
-
-            read += n;
-        }
-
-        var block = _blockBuilder.Decode(new ReadOnlyMemory<byte>(buffer, 0, length));
-
-        ArrayPool<byte>.Shared.Return(buffer);
-
-        return block;
-    }
-
-    public Task<Block<TKey, TValue>?> ReadBlockCachedAsync(int index, IMemoryCache blockCache, MemoryCacheEntryOptions cacheEntryOptions, CancellationToken cancellationToken = default)
-    {
-        var key = new BlockCacheKey(_id, index);
-
-        // Try without the dispatcher first since this is a cheap lookup
-        if (blockCache.TryGetValue(key, out var block))
-        {
-            return Task.FromResult(block as Block<TKey, TValue>);
-        }
-
-        // Use a dispatcher to prevent cache stampede
-        return _dispatcher.ScheduleAsync(key, (key) =>
-        {
-            return blockCache.GetOrCreateAsync(key, async entry =>
-            {
-                var block = await ReadBlockAsync(index, cancellationToken);
-
-                if (block != null)
+                var n = await RandomAccess.ReadAsync(handle, owner.Memory.Slice(read, length - read), offset + read, cancellationToken);
+                if (n == 0)
                 {
-                    // Apply the shared options first, then the size, otherwise SetOptions would
-                    // overwrite the size with the (unset) value from the shared options and the
-                    // cache would reject the entry when a SizeLimit is configured.
-                    entry.SetOptions(cacheEntryOptions);
-                    entry.SetSize(block.Memory.Length);
+                    break;
                 }
 
-                return block;
-            });
-        });
+                read += n;
+            }
+
+            var block = _blockBuilder.Decode(owner, length);
+            owner = null;
+            return block;
+        }
+        finally
+        {
+            owner?.Dispose();
+        }
+    }
+
+    internal ValueTask<BlockLease<TKey, TValue>> ReadBlockCachedAsync(int index, BlockCache<TKey, TValue> blockCache, CancellationToken cancellationToken = default)
+    {
+        return blockCache.GetOrLoadAsync(
+            new BlockCacheKey(_id, index),
+            new BlockLoader(this, index, cancellationToken));
+    }
+
+    /// <summary>
+    /// Struct loader passed to <see cref="BlockCache{TKey, TValue}.GetOrLoadAsync"/> so the cache can populate a
+    /// miss without allocating a closure on every read (including cache hits, which never invoke it).
+    /// </summary>
+    private readonly struct BlockLoader : IBlockLoader<TKey, TValue>
+    {
+        private readonly SsTable<TKey, TValue> _table;
+        private readonly int _index;
+        private readonly CancellationToken _cancellationToken;
+
+        public BlockLoader(SsTable<TKey, TValue> table, int index, CancellationToken cancellationToken)
+        {
+            _table = table;
+            _index = index;
+            _cancellationToken = cancellationToken;
+        }
+
+        public Task<Block<TKey, TValue>?> LoadAsync() => _table.ReadBlockAsync(_index, _cancellationToken);
     }
 
     public static async Task<SsTable<TKey, TValue>> LoadSsTableAsync(string filename, ISsTableEncoder<TKey, TValue> tableEncoder, BlockBuilder<TKey, TValue> blockBuilder, IBloomFilterFactory bloomFilterFactory, long? id = null, CancellationToken cancellationToken = default)
@@ -194,6 +194,4 @@ public class SsTable<TKey, TValue> : IDisposable
     {
         DisposeInternal();
     }
-
-    private record struct BlockCacheKey(long Id, int Index);
 }

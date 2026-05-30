@@ -1,5 +1,4 @@
-﻿using Microsoft.Extensions.Caching.Memory;
-using Silex.Blocks;
+﻿using Silex.Blocks;
 using Silex.BloomFilters;
 using Silex.Buffers;
 using Silex.MemTables;
@@ -42,8 +41,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     private readonly ISsTableBuilderFactory _ssTableBuilderFactory;
     private readonly IBloomFilterFactory _bloomFilterFactory;
     private readonly long _memTableSizeLimit;
-    private readonly IMemoryCache _blockCache;
-    private readonly MemoryCacheEntryOptions _cacheEntryOptions;
+    private readonly BlockCache<TKey, TValue> _blockCache;
     private readonly bool _useWriteAheadLog;
     private readonly bool _syncWriteAheadLogToDisk;
     private readonly CompactionStrategy _compactionStrategy;
@@ -100,12 +98,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         _ssTableBuilderFactory = options.SsTableBuilderFactory;
         _bloomFilterFactory = options.BloomFilterFactory;
         _memTableSizeLimit = options.MemTableSizeLimit;
-        _blockCache = new MemoryCache(new MemoryCacheOptions { SizeLimit = options.BlockCacheSizeLimit });
-        _cacheEntryOptions = new MemoryCacheEntryOptions
-        {
-            AbsoluteExpirationRelativeToNow = options.BlockCacheAbsoluteExpiration == TimeSpan.Zero ? null : options.BlockCacheAbsoluteExpiration,
-            SlidingExpiration = options.BlockCacheSlidingExpiration == TimeSpan.Zero ? null : options.BlockCacheSlidingExpiration
-        };
+        _blockCache = new BlockCache<TKey, TValue>(options.BlockCacheSizeLimit);
     }
 
     /// <summary>
@@ -307,14 +300,11 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
             return (false, default!);
         }
 
-        foreach (var metadata in table.BlockMetadata)
+        var blockIndex = FindMatchingBlockIndex(table.BlockMetadata, key);
+        if (blockIndex >= 0)
         {
-            if (_keyComparer.Compare(key, metadata.FirstKey) < 0 || _keyComparer.Compare(key, metadata.LastKey) > 0)
-            {
-                continue;
-            }
-
-            var block = await table.ReadBlockCachedAsync(metadata.Index, _blockCache, _cacheEntryOptions, cancellationToken);
+            using var blockLease = await table.ReadBlockCachedAsync(blockIndex, _blockCache, cancellationToken);
+            var block = blockLease.Block;
 
             if (block != null && TryResolveBlockValue(block, keyMemory.Span, out var resolved))
             {
@@ -322,14 +312,36 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
                 // A found tombstone resolves to default.
                 return (true, resolved);
             }
-
-            // The only block whose range can cover the key has been read and the key was not in it
-            // (a bloom-filter false positive): the key is absent from this table, so fall through to
-            // older tables instead of masking them with a premature default.
-            break;
         }
 
         return (false, default!);
+    }
+
+    private static int FindMatchingBlockIndex(IReadOnlyList<BlockMetadata<TKey>> blockMetadata, TKey key)
+    {
+        var start = 0;
+        var end = blockMetadata.Count - 1;
+
+        while (start <= end)
+        {
+            var middle = start + (end - start) / 2;
+            var metadata = blockMetadata[middle];
+
+            if (_keyComparer.Compare(key, metadata.FirstKey) < 0)
+            {
+                end = middle - 1;
+            }
+            else if (_keyComparer.Compare(key, metadata.LastKey) > 0)
+            {
+                start = middle + 1;
+            }
+            else
+            {
+                return metadata.Index;
+            }
+        }
+
+        return -1;
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -820,14 +832,11 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
             return (RawLookup.Miss, 0);
         }
 
-        foreach (var metadata in table.BlockMetadata)
+        var blockIndex = FindMatchingBlockIndex(table.BlockMetadata, key);
+        if (blockIndex >= 0)
         {
-            if (_keyComparer.Compare(key, metadata.FirstKey) < 0 || _keyComparer.Compare(key, metadata.LastKey) > 0)
-            {
-                continue;
-            }
-
-            var block = await table.ReadBlockCachedAsync(metadata.Index, _blockCache, _cacheEntryOptions, cancellationToken);
+            using var blockLease = await table.ReadBlockCachedAsync(blockIndex, _blockCache, cancellationToken);
+            var block = blockLease.Block;
 
             if (block != null)
             {
@@ -838,9 +847,6 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
                 }
             }
 
-            // Only one block can cover the key; a miss here is a bloom false positive, so fall through to
-            // older tables rather than masking them.
-            break;
         }
 
         return (RawLookup.Miss, 0);
@@ -2080,6 +2086,8 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         {
             table.Dispose();
         }
+
+        _blockCache.Dispose();
     }
 
     ~LsmStorageInner()

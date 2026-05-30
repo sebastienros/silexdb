@@ -81,12 +81,12 @@ not in the individual collections.
 - Pluggable via `IBloomFilterFactory`.
 
 ### Block cache (read cache)
-- `LsmStorageInner` holds an `IMemoryCache` (`_blockCache`) sized by `BlockCacheSizeLimit`, with
-  configurable sliding/absolute expiration; entries sized by block byte length.
-- `SsTable.ReadBlockCachedAsync` checks the cache first, then funnels misses through a
-  `WorkDispatcher` to prevent cache stampede (one loader per `(tableId, blockIndex)` key; all
-  waiters share the result).
-- Note: `IMemoryCache` does size-based eviction, not strict LRU.
+- `LsmStorageInner` owns a typed decoded-block LRU cache sized by `BlockCacheSizeLimit`.
+  Set the size limit to `0` to disable caching.
+- `SsTable.ReadBlockCachedAsync` checks the cache first; misses are coalesced per
+  `(tableId, blockIndex)` key so concurrent waiters share one block load.
+- Cache hits return synchronous leases over decoded blocks. Evicted blocks stay alive until
+  all active leases are released.
 
 ### Concurrency
 - `_currentMemTableLock` and `_immutableMemTablesLock`: synchronous `ReaderWriterLockSlim`.

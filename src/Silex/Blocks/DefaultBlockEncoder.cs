@@ -65,14 +65,33 @@ public class DefaultBlockEncoder<TKey, TValue> : IBlockEncoder<TKey, TValue>
 
     public Block<TKey, TValue> Decode(ReadOnlyMemory<byte> buffer)
     {
+        var offsets = ReadOffsets(buffer, buffer.Length);
+
+        var memoryOwner = MemoryPool<byte>.Shared.Rent(buffer.Length);
+        buffer.CopyTo(memoryOwner.Memory);
+
+        return new Block<TKey, TValue>(this, memoryOwner, buffer.Length, offsets);
+    }
+
+    public Block<TKey, TValue> Decode(IMemoryOwner<byte> owner, int length)
+    {
+        // The block bytes were already read into the owned buffer, so build the block over it directly
+        // instead of renting a second buffer and copying. Only the offset section is scanned here.
+        var offsets = ReadOffsets(owner.Memory, length);
+
+        return new Block<TKey, TValue>(this, owner, length, offsets);
+    }
+
+    private static ushort[] ReadOffsets(ReadOnlyMemory<byte> buffer, int length)
+    {
         var binaryReader = new EncoderBinaryReader(buffer, 0);
 
         // Read the last two bytes
-        binaryReader.Seek(buffer.Length - 2);
+        binaryReader.Seek(length - 2);
         var totalEntries = binaryReader.ReadUInt16();
 
         // Read the offsets position
-        var offsetPosition = buffer.Length - (totalEntries + 1) * 2;
+        var offsetPosition = length - (totalEntries + 1) * 2;
         binaryReader.Seek(offsetPosition);
 
         var offsets = new ushort[totalEntries];
@@ -82,10 +101,7 @@ public class DefaultBlockEncoder<TKey, TValue> : IBlockEncoder<TKey, TValue>
             offsets[i] = binaryReader.ReadUInt16();
         }
 
-        var memoryOwner = MemoryPool<byte>.Shared.Rent(buffer.Length);
-        buffer.CopyTo(memoryOwner.Memory);
-
-        return new Block<TKey, TValue>(this, memoryOwner, buffer.Length, offsets);
+        return offsets;
     }
 
     public RecordLocation<TKey> DecodeEntry(ReadOnlyMemory<byte> data, int offset)

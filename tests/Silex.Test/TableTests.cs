@@ -1,5 +1,4 @@
-﻿using Microsoft.Extensions.Caching.Memory;
-using Silex.Blocks;
+﻿using Silex.Blocks;
 using Silex.BloomFilters;
 using Silex.Tables;
 using System.Buffers.Binary;
@@ -191,7 +190,7 @@ public class TableTests
         var tempFilename = tempFolder.GetRandomFileName();
 
         using var builder = new BufferedSsTableBuilder<ushort, string>(tempFilename, new DefaultSsTableEncoder<ushort, string>(), new DefaultBlockEncoder<ushort, string>(), new DefaultBloomFilterFactory(), 100);
-        var memoryCache = new MemoryCache(new MemoryCacheOptions());
+        using var blockCache = new BlockCache<ushort, string>(1.MiB());
         ushort key = 7;
         string value = "hello";
 
@@ -200,11 +199,11 @@ public class TableTests
         var table = await builder.BuildAsync();
 
         await Assert.That(table.BlockMetadata).HasSingleItem();
-        using var block1 = await table.ReadBlockCachedAsync(0, memoryCache, new());
-        using var block2 = await table.ReadBlockCachedAsync(0, memoryCache, new());
-        await Assert.That(block1!.Memory).IsEquivalentTo(new byte[] { 2, 0, 7, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, CollectionOrdering.Matching);
-        await Assert.That(block2!.Memory).IsEquivalentTo(new byte[] { 2, 0, 7, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, CollectionOrdering.Matching);
-        await Assert.That(block2).IsSameReferenceAs(block1);
+        using var block1 = await table.ReadBlockCachedAsync(0, blockCache);
+        using var block2 = await table.ReadBlockCachedAsync(0, blockCache);
+        await Assert.That(block1.Block!.Memory).IsEquivalentTo(new byte[] { 2, 0, 7, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, CollectionOrdering.Matching);
+        await Assert.That(block2.Block!.Memory).IsEquivalentTo(new byte[] { 2, 0, 7, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, CollectionOrdering.Matching);
+        await Assert.That(block2.Block).IsSameReferenceAs(block1.Block);
 
         table.Dispose();
     }
@@ -216,7 +215,7 @@ public class TableTests
         var tempFilename = tempFolder.GetRandomFileName();
 
         using var builder = new BufferedSsTableBuilder<ushort, string>(tempFilename, new DefaultSsTableEncoder<ushort, string>(), new DefaultBlockEncoder<ushort, string>(), new DefaultBloomFilterFactory(), 100);
-        var memoryCache = new MemoryCache(new MemoryCacheOptions());
+        using var blockCache = new BlockCache<ushort, string>(1.MiB());
         ushort key = 7;
         string value = "hello";
 
@@ -226,23 +225,87 @@ public class TableTests
 
         await Assert.That(table.BlockMetadata).HasSingleItem();
 
-        var blocks = new List<Task<Block<ushort, string>?>>();
+        var blocks = new List<Task<BlockLease<ushort, string>>>();
 
         for (var i = 0; i < 100; i++)
         {
-            blocks.Add(table.ReadBlockCachedAsync(0, memoryCache, new()));
+            blocks.Add(table.ReadBlockCachedAsync(0, blockCache).AsTask());
         }
 
-        await Task.WhenAll(blocks);
+        var leases = await Task.WhenAll(blocks);
 
-        var result1 = await blocks[0];
-
-        foreach (var block in blocks)
+        try
         {
-            var result2 = await block;
-            await Assert.That(result2!.Memory).IsEquivalentTo(new byte[] { 2, 0, 7, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, CollectionOrdering.Matching);
-            await Assert.That(result2).IsSameReferenceAs(result1);
+            var result1 = leases[0].Block;
+
+            foreach (var lease in leases)
+            {
+                var result2 = lease.Block;
+                await Assert.That(result2!.Memory).IsEquivalentTo(new byte[] { 2, 0, 7, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, CollectionOrdering.Matching);
+                await Assert.That(result2).IsSameReferenceAs(result1);
+            }
         }
+        finally
+        {
+            foreach (var lease in leases)
+            {
+                lease.Dispose();
+            }
+        }
+
+        table.Dispose();
+    }
+
+    [Test]
+    public async Task ShouldEvictBlocksWhenCacheIsFull()
+    {
+        using var tempFolder = TempFolder.Create();
+        var tempFilename = tempFolder.GetRandomFileName();
+
+        using var builder = new BufferedSsTableBuilder<uint, byte[]>(tempFilename, new DefaultSsTableEncoder<uint, byte[]>(), new DefaultBlockEncoder<uint, byte[]>(), new DefaultBloomFilterFactory(), 100);
+        using var blockCache = new BlockCache<uint, byte[]>(1);
+
+        var value = new byte[100.B()];
+        Random.Shared.NextBytes(value);
+
+        for (uint i = 0; i < 100; i++)
+        {
+            await builder.AddAsync(i, value);
+        }
+
+        var table = await builder.BuildAsync();
+
+        await Assert.That(table.BlockMetadata.Count > 1).IsTrue();
+
+        using var block1 = await table.ReadBlockCachedAsync(0, blockCache);
+        using var block2 = await table.ReadBlockCachedAsync(1, blockCache);
+        using var block3 = await table.ReadBlockCachedAsync(0, blockCache);
+
+        await Assert.That(block2.Block).IsNotNull();
+        await Assert.That(block3.Block).IsNotNull();
+        await Assert.That(ReferenceEquals(block3.Block, block1.Block)).IsFalse();
+
+        table.Dispose();
+    }
+
+    [Test]
+    public async Task ShouldNotCacheBlocksWhenCacheSizeIsZero()
+    {
+        using var tempFolder = TempFolder.Create();
+        var tempFilename = tempFolder.GetRandomFileName();
+
+        using var builder = new BufferedSsTableBuilder<ushort, string>(tempFilename, new DefaultSsTableEncoder<ushort, string>(), new DefaultBlockEncoder<ushort, string>(), new DefaultBloomFilterFactory(), 100);
+        using var blockCache = new BlockCache<ushort, string>(0);
+
+        await builder.AddAsync(7, "hello");
+        var table = await builder.BuildAsync();
+
+        using var block1 = await table.ReadBlockCachedAsync(0, blockCache);
+        using var block2 = await table.ReadBlockCachedAsync(0, blockCache);
+
+        await Assert.That(block1.Block).IsNotNull();
+        await Assert.That(block2.Block).IsNotNull();
+        await Assert.That(ReferenceEquals(block2.Block, block1.Block)).IsFalse();
 
         table.Dispose();
     }

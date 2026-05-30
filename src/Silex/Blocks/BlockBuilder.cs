@@ -90,6 +90,11 @@ public class BlockBuilder<TKey, TValue> : IDisposable
         return _blockEncoder.Decode(data);
     }
 
+    public Block<TKey, TValue> Decode(System.Buffers.IMemoryOwner<byte> owner, int length)
+    {
+        return _blockEncoder.Decode(owner, length);
+    }
+
     public void Dispose()
     {
         if (_disposed)

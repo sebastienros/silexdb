@@ -76,6 +76,34 @@ dotnet run --project Silex.DbBench -c Release -- \
   --benchmarks=fillseq,readrandom --num=1000000 --seed=42 --db=/tmp/silex-bench
 ```
 
+### Performance investigation recipes
+
+These runs keep the current RocksDB comparison gaps reproducible while working through point lookup,
+block sizing, WAL cost and concurrency changes:
+
+```bash
+# Point lookup and seek latency, with cache effects visible in histograms
+dbbench --benchmarks=fillseq,readrandom,seekrandom --num=1000000 --reads=200000 --histogram
+
+# Block-size sweep; compare 4 KiB default with larger blocks that reduce index/cache fan-out
+for block in 4096 8192 16384 32768; do
+  dbbench --benchmarks=fillseq,readrandom --num=500000 --reads=200000 --block_size=$block
+done
+
+# Cold-cache read path, useful for separating cache hit rate from block/index lookup work
+dbbench --benchmarks=fillseq,readrandom --num=500000 --reads=200000 --cache_size=0
+
+# WAL overhead and fsync durability cost
+dbbench --benchmarks=fillrandom --num=500000 --wal=true
+dbbench --benchmarks=fillrandom --num=500000 --wal=false
+dbbench --benchmarks=fillsync --num=100000 --wal_sync
+
+# Concurrent write/read scaling
+for threads in 1 2 4 8; do
+  dbbench --benchmarks=fillrandom,readrandom --num=500000 --reads=100000 --threads=$threads
+done
+```
+
 ## Benchmarks (`--benchmarks`, comma-separated, run in order)
 
 | Name           | Description                                                                 |

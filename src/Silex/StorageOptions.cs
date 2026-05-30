@@ -65,7 +65,7 @@ public class StorageOptions
     /// <summary>
     /// Gets or sets the size of a block in bytes.
     /// </summary>
-    /// <remarks>A block is the unit of data that is stored on the disk at once.</remarks>
+    /// <remarks>A block is the unit of data that is stored on the disk at once. Set to <c>0</c> to disable caching.</remarks>
     /// <value>
     /// The default value is <inheritdoc cref="_defaultBlockSize"/>.
     /// </value>
@@ -113,8 +113,9 @@ public class StorageOptions
     public long BlockCacheSizeLimit { get; set; } = _defaultBlockCacheSizeLimit;
 
     /// <summary>
-    /// Gets or sets how long a block cache entry can be inactive (e.g. not accessed) before it will be removed. This will not extend the entry lifetime beyond the absolute expiration (if set).
+    /// Gets or sets how long a block cache entry can be inactive (e.g. not accessed) before it will be removed.
     /// </summary>
+    /// <remarks>The current block cache is size-bounded LRU; this option is retained for compatibility and is not used.</remarks>
     /// <value>
     /// The default value is <inheritdoc cref="_defaultBlockCacheSlidingExpiration"/>. Use <c>TimeSpan.Zero</c> (<c>"00:00:00"</c>) to disable sliding expiration.
     /// </value>
@@ -123,6 +124,7 @@ public class StorageOptions
     /// <summary>
     /// Gets or sets an absolute expiration time, relative to when a block cache is added, even if it is effectively accessed.
     /// </summary>
+    /// <remarks>The current block cache is size-bounded LRU; this option is retained for compatibility and is not used.</remarks>
     /// <value>
     /// The default value is <inheritdoc cref="_defaultBlockCacheAbsoluteExpiration"/>. Use <c>TimeSpan.Zero</c> (<c>"00:00:00"</c>) to disable absolute expiration.
     /// </value>

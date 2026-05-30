@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Buffers.Binary;
 using System.Globalization;
 using Silex.BloomFilters;
+using Silex.Blocks;
 using Silex.Serialization;
 using TUnit.Assertions.Enums;
 
@@ -400,6 +401,90 @@ public class StorageTests
         await Assert.That(await storage.GetAsync(10000)).IsEqualTo(0);
 
         await storage.CloseAsync();
+    }
+
+    [Test]
+    public async Task GetRawShouldKeepRandomReadsCorrectWhenBlockCacheChurns()
+    {
+        const int count = 50_000;
+        const int keySize = 16;
+        const int valueSize = 100;
+
+        using var tempFolder = TempFolder.Create();
+        var options = new StorageOptions
+        {
+            UseWriteAheadLog = false,
+            FlushPeriod = TimeSpan.Zero,
+            MemTableSizeLimit = 1.KiB(),
+            BlockCacheSizeLimit = 1,
+        };
+
+        using var storage = new LsmStorageInner<byte[], byte[]>(tempFolder, options);
+        var value = new byte[valueSize];
+
+        for (var i = 0; i < value.Length; i++)
+        {
+            value[i] = (byte)i;
+        }
+
+        for (var i = 0; i < count; i++)
+        {
+            storage.Put(CreateBenchmarkKey(i), value.ToArray());
+        }
+
+        await storage.FlushAndCompactAsync();
+
+        var keyBuffer = new byte[keySize];
+        var valueBuffer = new byte[valueSize];
+        var rng = CreateDeterministicRandom(seed: 1000, threadId: 0, stream: 2);
+        var misses = 0;
+
+        for (var i = 0; i < count; i++)
+        {
+            WriteBenchmarkKey(rng.NextInt64(count), keyBuffer);
+
+            if (await storage.GetRawAsync(keyBuffer, valueBuffer) < 0)
+            {
+                misses++;
+            }
+        }
+
+        await Assert.That(misses).IsEqualTo(0);
+
+        static byte[] CreateBenchmarkKey(long value)
+        {
+            var key = new byte[keySize];
+            WriteBenchmarkKey(value, key);
+            return key;
+        }
+
+        static void WriteBenchmarkKey(long value, Span<byte> destination)
+        {
+            BinaryPrimitives.WriteUInt64BigEndian(destination[..8], (ulong)value);
+
+            for (var i = 8; i < destination.Length; i++)
+            {
+                destination[i] = (byte)'0';
+            }
+        }
+
+        static Random CreateDeterministicRandom(int seed, int threadId, int stream)
+        {
+            var hash = 0xcbf29ce484222325UL;
+
+            foreach (var value in stackalloc[] { seed, threadId, stream })
+            {
+                hash = (hash ^ (uint)value) * 0x100000001b3UL;
+            }
+
+            hash ^= hash >> 30;
+            hash *= 0xbf58476d1ce4e5b9UL;
+            hash ^= hash >> 27;
+            hash *= 0x94d049bb133111ebUL;
+            hash ^= hash >> 31;
+
+            return new Random((int)hash);
+        }
     }
 
     [Test]
@@ -1066,6 +1151,45 @@ public class StorageTests
             // Keys that really are in the newer table still resolve from it.
             await Assert.That(await storage.GetAsync(1)).IsEqualTo(10);
             await Assert.That(await storage.GetAsync(10)).IsEqualTo(100);
+        }
+        finally
+        {
+            storage.Dispose();
+        }
+    }
+
+    [Test]
+    public async Task GetFindsValuesAcrossManySsTableBlocks()
+    {
+        const ushort blockSize = 128;
+        using var tempFolder = TempFolder.Create();
+        var options = new StorageOptions
+        {
+            UseWriteAheadLog = false,
+            BlockSize = blockSize,
+            BlockEncoderFactory = new DefaultBlockEncoderFactory(blockSize),
+            BloomFilterFactory = new AlwaysPositiveBloomFilterFactory(),
+        };
+        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+
+        try
+        {
+            await FlushTierAsync(storage, () => storage.Put(20, 2000));
+            await FlushTierAsync(storage, () =>
+            {
+                for (var key = 1; key <= 199; key += 2)
+                {
+                    storage.Put(key, key * 10);
+                }
+            });
+
+            await Assert.That(storage._state.LevelZeroTables.Any(table => table.BlockMetadata.Count > 1)).IsTrue();
+
+            await Assert.That(await storage.GetAsync(1)).IsEqualTo(10);
+            await Assert.That(await storage.GetAsync(99)).IsEqualTo(990);
+            await Assert.That(await storage.GetAsync(199)).IsEqualTo(1990);
+            await Assert.That(await storage.GetAsync(20)).IsEqualTo(2000);
+            await Assert.That(await storage.GetAsync(200)).IsEqualTo(0);
         }
         finally
         {
