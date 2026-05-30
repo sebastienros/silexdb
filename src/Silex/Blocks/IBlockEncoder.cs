@@ -5,7 +5,13 @@ namespace Silex.Blocks;
 /// </summary>
 public interface IBlockEncoder<TKey, TValue>
 {
-    Block<TKey, TValue> Encode(IReadOnlyList<KeyValuePair<TKey, TValue>> entries);
+    /// <summary>
+    /// Encodes the given entries into a <see cref="Block"/>. The keys are read from <paramref name="encodedKeys"/>
+    /// using the offsets and lengths carried by each <see cref="BlockEntry{TValue}"/>, so they are not re-encoded.
+    /// </summary>
+    /// <param name="encodedKeys">The buffer holding every encoded key referenced by <paramref name="entries"/>.</param>
+    /// <param name="entries">The entries to encode, in ascending key order.</param>
+    Block<TKey, TValue> Encode(ReadOnlyMemory<byte> encodedKeys, IReadOnlyList<BlockEntry<TValue>> entries);
 
     /// <summary>
     /// Creates a <see cref="Block"/> instance that will hold the original memory block saved on this.
@@ -23,5 +29,8 @@ public interface IBlockEncoder<TKey, TValue>
     /// </summary>
     ushort BlockSize { get; }
 
-    int EstimateSize(TKey key, TValue value);
+    /// <summary>
+    /// Estimates the size, in bytes, that an entry with the given encoded key length and value takes in a block.
+    /// </summary>
+    int EstimateSize(int encodedKeyLength, TValue value);
 }

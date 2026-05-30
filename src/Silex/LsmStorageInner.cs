@@ -123,6 +123,8 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         var bufferWriter = new PooledArrayBufferWriter<byte>(keyLength);
         var writer = new EncoderBinaryWriter(bufferWriter);
         _keySerializer.Encode(key, ref writer);
+        // Commit the encoded bytes to the buffer so the bloom filter probes the actual key.
+        writer.Flush();
         var keyMemory = bufferWriter.WrittenMemory;
         
         try
@@ -403,8 +405,6 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
 
         public async IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
         {
-            List<IAsyncEnumerator<KeyValuePair<TKey, TValue>>> iterators = [];
-
             // In theory only the current MemTable needs to be synchronized,
             // but we need to keep the mutable MemTable iterator around to compare with immutable ones.
             // A solution to shorten the read-lock would be to copy the mutable MemTable keys. 
@@ -413,70 +413,13 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
 
             try
             {
-                var currentIterator = _state.CurrentMemTable.CreateIterator();
+                var merge = new MergeIterator<TKey, TValue>(CreateMemTableIterators());
 
-                var currentEnumerator = currentIterator.EnumerateAsync(cancellationToken).GetAsyncEnumerator(cancellationToken);
-
-                if (await currentEnumerator.MoveNextAsync())
+                await foreach (var entry in merge.EnumerateAsync(cancellationToken))
                 {
-                    iterators.Add(currentEnumerator);
-                }
-
-                foreach (var memTable in _state.ImmutableMemTables)
-                {
-                    var iterator = memTable.CreateIterator();
-
-                    var enumerator = iterator.EnumerateAsync(cancellationToken).GetAsyncEnumerator(cancellationToken);
-
-                    if (await enumerator.MoveNextAsync())
+                    if (!_valueSerializer.IsTombstoneValue(entry.Value))
                     {
-                        iterators.Add(enumerator);
-                    }
-                }
-
-                while (iterators.Count > 0)
-                {
-                    // Assume the smallest is the element from the first iterator
-                    var smallest = iterators[0].Current;
-
-                    var smallestIndex = 0;
-
-                    for (var i = 1; i < iterators.Count; i++)
-                    {
-                        var iterator = iterators[i];
-
-                        var current = iterator.Current;
-
-                        switch (_keyComparer.Compare(smallest.Key, current.Key))
-                        {
-                            // Discard the entry since there is the same key from a more recent table
-                            case 0:
-                                if (!await iterator.MoveNextAsync())
-                                {
-                                    iterators.RemoveAt(i);
-                                    i--;
-                                }
-                                break;
-
-                            case > 0:
-                                smallestIndex = i;
-                                smallest = current;
-                                break;
-
-                            default:
-                                break;
-                        }
-                    }
-
-                    // Consume the smallest element
-                    if (!await iterators[smallestIndex].MoveNextAsync())
-                    {
-                        iterators.RemoveAt(smallestIndex);
-                    }
-
-                    if (!_valueSerializer.IsTombstoneValue(smallest.Value))
-                    {
-                        yield return smallest;
+                        yield return entry;
                     }
                 }
             }
@@ -487,14 +430,11 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         }
 
         /// <summary>
-        /// Returns all the values currently stored in memory.
+        /// Returns all the values currently stored in memory whose key is greater than or equal to <paramref name="from"/>.
         /// </summary>
         /// <remarks>Uses a merge iterator.</remarks>
-        /// <returns></returns>
         public async IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateAsync(TKey from, [EnumeratorCancellation] CancellationToken cancellationToken = default)
         {
-            List<IAsyncEnumerator<KeyValuePair<TKey, TValue>>> iterators = [];
-
             // In theory only the current MemTable needs to be synchronized,
             // but we need to keep the mutable MemTable iterator around to compare with immutable ones.
             // A solution to shorten the read-lock would be to copy the mutable MemTable keys. 
@@ -503,71 +443,13 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
 
             try
             {
-                var currentIterator = _state.CurrentMemTable.CreateIterator();
+                var merge = new MergeIterator<TKey, TValue>(CreateMemTableIterators());
 
-                var currentEnumerator = currentIterator.EnumerateAsync(from, cancellationToken).GetAsyncEnumerator(cancellationToken);
-
-                if (await currentEnumerator.MoveNextAsync())
+                await foreach (var entry in merge.EnumerateAsync(from, cancellationToken))
                 {
-                    iterators.Add(currentEnumerator);
-                }
-
-                foreach (var memTable in _state.ImmutableMemTables)
-                {
-                    var iterator = memTable.CreateIterator();
-
-                    var enumerator = iterator.EnumerateAsync(from, cancellationToken).GetAsyncEnumerator(cancellationToken);
-
-                    if (await enumerator.MoveNextAsync())
+                    if (!_valueSerializer.IsTombstoneValue(entry.Value))
                     {
-                        iterators.Add(enumerator);
-                    }
-                }
-
-                while (iterators.Count > 0)
-                {
-                    // Assume the smallest is the element from the first iterator
-                    var smallest = iterators[0].Current;
-
-                    var smallestIndex = 0;
-
-                    for (var i = 1; i < iterators.Count; i++)
-                    {
-                        var iterator = iterators[i];
-
-                        var current = iterator.Current;
-
-                        switch (_keyComparer.Compare(smallest.Key, current.Key))
-                        {
-                            // Discard the entry since there is the same key from a more recent table
-                            case 0:
-                                if (!await iterator.MoveNextAsync())
-                                {
-                                    iterators.RemoveAt(i);
-                                    i--;
-                                }
-                                break;
-
-                            case > 0:
-                                smallestIndex = i;
-                                smallest = current;
-                                break;
-                            
-                            default:
-                                break;
-                        }
-                    }
-
-                    // Consume the smallest element
-                    if (!await iterators[smallestIndex].MoveNextAsync())
-                    {
-                        iterators.RemoveAt(smallestIndex);
-                    }
-
-                    // Don't return tombstones
-                    if (!_valueSerializer.IsTombstoneValue(smallest.Value))
-                    {
-                        yield return smallest;
+                        yield return entry;
                     }
                 }
             }
@@ -575,6 +457,25 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
             {
                 _memTableLock.ExitReadLock();
             }
+        }
+
+        /// <summary>
+        /// Builds the list of MemTable iterators in most-recent-first order so that the
+        /// <see cref="MergeIterator{TKey, TValue}"/> keeps the latest value on duplicate keys.
+        /// </summary>
+        private List<IStorageIterator<TKey, TValue>> CreateMemTableIterators()
+        {
+            var iterators = new List<IStorageIterator<TKey, TValue>>
+            {
+                _state.CurrentMemTable.CreateIterator()
+            };
+
+            foreach (var memTable in _state.ImmutableMemTables)
+            {
+                iterators.Add(memTable.CreateIterator());
+            }
+
+            return iterators;
         }
     }
 }

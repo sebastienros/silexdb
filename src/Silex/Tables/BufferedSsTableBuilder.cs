@@ -21,7 +21,6 @@ public sealed class BufferedSsTableBuilderFactory : ISsTableBuilderFactory
 internal sealed class BufferedSsTableBuilder<TKey, TValue> : ISsTableBuilder<TKey, TValue>
 {
 
-    private static readonly IBinaryEncoder<TKey> _keySerializer = BinaryEncoderFactory<TKey>.BinarySerializer;
     private readonly string _filename;
     private readonly ISsTableEncoder<TKey, TValue> _tableEncoder;
     private long _offset;
@@ -32,14 +31,11 @@ internal sealed class BufferedSsTableBuilder<TKey, TValue> : ISsTableBuilder<TKe
     private readonly BlockBuilder<TKey, TValue> _blockBuilder;
     private List<BlockMetadata<TKey>>? _metadata;
     private bool _disposed;
+    private bool _ownsBuiltResources = true;
     private readonly FileStream _stream;
 
     private static readonly int _flushBufferSize = (int)32.KiB();
     private readonly PooledArrayBufferWriter<byte> _bufferWriter = new(_flushBufferSize);
-
-    // Used to serialize the key contents as they are added to the bloom filter. At max it will contain the biggest key 
-    // for the current block. After each block the buffer is returned. Between two values the buffer is cleared().
-    private readonly PooledArrayBufferWriter<byte> _valueWriter = new();
 
     public BufferedSsTableBuilder(string filename, ISsTableEncoder<TKey, TValue> tableEncoder, IBlockEncoder<TKey, TValue> blockEncoder, IBloomFilterFactory bloomFilterFactory, int count)
     {
@@ -67,16 +63,11 @@ internal sealed class BufferedSsTableBuilder<TKey, TValue> : ISsTableBuilder<TKe
             _isFirstKey = false;
         }
 
-        var binaryWriter = new EncoderBinaryWriter(_valueWriter);
-        _keySerializer.Encode(key, ref binaryWriter);
-        _bloomFilter.Add(_valueWriter.WrittenMemory.Span);
-
-        // Clear this buffer to reuse it for next key/value pair
-        _valueWriter.Clear();
-
         // Is the key added in the current block?
         if (_blockBuilder.Add(key, value))
         {
+            // The key was encoded once by the block builder; reuse those exact bytes for the bloom filter.
+            _bloomFilter.Add(_blockBuilder.LastEncodedKey);
             _lastKey = key;
             return;
         }
@@ -90,6 +81,8 @@ internal sealed class BufferedSsTableBuilder<TKey, TValue> : ISsTableBuilder<TKe
             // the size is over the block size
             throw new InvalidOperationException("The data was not successfully added to a block.");
         }
+
+        _bloomFilter.Add(_blockBuilder.LastEncodedKey);
 
         _firstKey = key;
         _lastKey = key;
@@ -172,7 +165,11 @@ internal sealed class BufferedSsTableBuilder<TKey, TValue> : ISsTableBuilder<TKe
 
         await FLushBufferToDiskAsync(cancellationToken);
         await _stream.DisposeAsync();
-        
+
+        // Ownership of the block builder and metadata transfers to the SsTable, which uses them to
+        // decode and locate blocks, so this builder must no longer dispose or clear them.
+        _ownsBuiltResources = false;
+
         return new SsTable<TKey, TValue>(IdGenerator.GetNextId(), File.OpenRead(_filename), _filename, _metadata, metadataOffset, _blockBuilder, _bloomFilter);
     }
 
@@ -207,9 +204,15 @@ internal sealed class BufferedSsTableBuilder<TKey, TValue> : ISsTableBuilder<TKe
     {
         _stream.Dispose();
         _bufferWriter.Dispose();
-        _valueWriter.Dispose();
-        _metadata?.Clear();
-        _metadata = null;
+
+        // After a successful build, the block builder and metadata are owned by the SsTable, so the
+        // builder must not dispose the block builder nor clear the metadata list the SsTable now uses.
+        if (_ownsBuiltResources)
+        {
+            _blockBuilder.Dispose();
+            _metadata?.Clear();
+            _metadata = null;
+        }
     }
 
     ~BufferedSsTableBuilder()

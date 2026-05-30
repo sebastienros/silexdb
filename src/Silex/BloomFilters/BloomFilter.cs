@@ -11,7 +11,6 @@ public class BloomFilter : IBloomFilter
 {
     private readonly int _k = 5; // Number of hashing iterations
     private readonly int _m = 2048; // Size of the bloom filter in bits
-    private readonly int[] _hashBuffer; // A reusable buffer of bit positions for hash
 
     private readonly BitArray _bits;
 
@@ -25,7 +24,6 @@ public class BloomFilter : IBloomFilter
 
         _k = CalculateK(n, _m);
         _bits = new BitArray(_m);
-        _hashBuffer = new int[_k];
     }
 
     public BloomFilter(byte[] span, int k)
@@ -33,7 +31,6 @@ public class BloomFilter : IBloomFilter
         _bits = new BitArray(span);
         _m = _bits.Length;
         _k = k;
-        _hashBuffer = new int[_k];
     }
 
     public Span<byte> GetBytes()
@@ -47,8 +44,11 @@ public class BloomFilter : IBloomFilter
 
     public void Add(ReadOnlySpan<byte> item)
     {
-        ComputeHashPositions(item, _hashBuffer);
-        foreach (var b in _hashBuffer)
+        if (_k == 0) return;
+
+        Span<int> positions = stackalloc int[_k];
+        ComputeHashPositions(item, positions);
+        foreach (var b in positions)
         {
             _bits[b] = true;
         }
@@ -56,8 +56,12 @@ public class BloomFilter : IBloomFilter
 
     public bool Probe(ReadOnlySpan<byte> item)
     {
-        ComputeHashPositions(item, _hashBuffer);
-        foreach (var b in _hashBuffer)
+        if (_k == 0) return true;
+
+        // A per-call buffer keeps Probe thread-safe, as multiple reads can run concurrently.
+        Span<int> positions = stackalloc int[_k];
+        ComputeHashPositions(item, positions);
+        foreach (var b in positions)
         {
             if (!_bits[b]) return false;
         }
@@ -65,7 +69,7 @@ public class BloomFilter : IBloomFilter
         return true;
     }
 
-    private void ComputeHashPositions(ReadOnlySpan<byte> item, int[] positions)
+    private void ComputeHashPositions(ReadOnlySpan<byte> item, Span<int> positions)
     {
         // Read-only bloom filter?
         if (_k == 0) return;

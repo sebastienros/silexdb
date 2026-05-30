@@ -328,6 +328,42 @@ public class StorageTests
     }
 
     [Fact]
+    public async Task GetShouldReadFromFlushedSsTable()
+    {
+        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+
+        var storage = await LsmStorage.OpenAsync<int, int>(tempFolder, new());
+
+        const int count = 200;
+
+        // Values are offset by 1 so a missing key (default 0) is distinguishable from a stored value.
+        for (var i = 0; i < count; i++)
+        {
+            storage.Put(i, i + 1);
+        }
+
+        storage._inner.ForceFreezeMemTable();
+        await storage._inner.ForceFlushNextImmutableMemTableAsync();
+
+        // Everything has been flushed: a single SST, no immutable mem tables, and an empty current mem table.
+        Assert.Single(Directory.EnumerateFiles(tempFolder, "*.sst"));
+        Assert.Empty(storage._inner._state.ImmutableMemTables);
+        Assert.Equal(0L, storage._inner._state.CurrentMemTable.Size);
+
+        // Reads must go through the bloom filter and block decoding of the SST.
+        for (var i = 0; i < count; i++)
+        {
+            Assert.Equal(i + 1, await storage.GetAsync(i));
+        }
+
+        // A key that was never inserted returns the default value.
+        Assert.Equal(0, await storage.GetAsync(10000));
+
+        await storage.CloseAsync();
+        Directory.Delete(tempFolder, true);
+    }
+
+    [Fact]
     public async Task CompacterShouldCreateSst()
     {
         // When the number of mem tables is higher than MemTableMaxCount it should

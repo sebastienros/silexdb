@@ -88,8 +88,11 @@ public class SsTable<TKey, TValue> : IDisposable
 
                 if (block != null)
                 {
-                    entry.SetSize(block.Memory.Length);
+                    // Apply the shared options first, then the size, otherwise SetOptions would
+                    // overwrite the size with the (unset) value from the shared options and the
+                    // cache would reject the entry when a SizeLimit is configured.
                     entry.SetOptions(cacheEntryOptions);
+                    entry.SetSize(block.Memory.Length);
                 }
 
                 return block;
@@ -160,6 +163,7 @@ public class SsTable<TKey, TValue> : IDisposable
     private void DisposeInternal()
     {
         _stream.Dispose();
+        _blockBuilder.Dispose();
     }
 
     ~SsTable()

@@ -99,9 +99,16 @@ public class DefaultBlockEncoder<TKey, TValue> : IBlockEncoder<TKey, TValue>
         return data.Slice(offset, length);
     }
 
-    public Block<TKey, TValue> Encode(IReadOnlyList<KeyValuePair<TKey, TValue>> entries)
+    public Block<TKey, TValue> Encode(ReadOnlyMemory<byte> encodedKeys, IReadOnlyList<BlockEntry<TValue>> entries)
     {
-        var size = entries.Sum(x => EstimateSize(x.Key, x.Value)) + sizeof(ushort);
+        var size = 0;
+
+        for (var i = 0; i < entries.Count; i++)
+        {
+            size += EstimateSize(entries[i].KeyLength, entries[i].Value);
+        }
+
+        size += sizeof(ushort);
 
         // This buffer can extend its memory dynamically using an ArrayPool<byte> as we keep
         // writing on it. We pass it along as an IMemoryOwner so it can be disposed once used.
@@ -112,19 +119,21 @@ public class DefaultBlockEncoder<TKey, TValue> : IBlockEncoder<TKey, TValue>
 
         var offsets = new List<ushort>(entries.Count);
 
+        var keysSpan = encodedKeys.Span;
+
         foreach (var entry in entries)
         {
             offsets.Add((ushort)writer.BytesWritten);
 
-            var keyLength = _keySerializer.GetLength(entry.Key);
-
-            if (keyLength <= 0)
+            if (entry.KeyLength <= 0)
             {
-                throw new InvalidOperationException($"Invalid key length: {keyLength}");
+                throw new InvalidOperationException($"Invalid key length: {entry.KeyLength}");
             }
 
-            writer.Write7BitEncodedInt(keyLength);
-            _keySerializer.Encode(entry.Key, ref writer);
+            writer.Write7BitEncodedInt(entry.KeyLength);
+
+            // The key was already encoded when it was added to the block, so write its bytes as-is.
+            writer.WriteRaw(keysSpan.Slice(entry.KeyOffset, entry.KeyLength));
 
             writer.Write7BitEncodedInt(_valueSerializer.GetLength(entry.Value));
             _valueSerializer.Encode(entry.Value, ref writer);
@@ -150,10 +159,10 @@ public class DefaultBlockEncoder<TKey, TValue> : IBlockEncoder<TKey, TValue>
         return new Block<TKey, TValue>(this, memory, (int)buffer.Length, offsets);
     }
 
-    public int EstimateSize(TKey key, TValue value)
+    public int EstimateSize(int encodedKeyLength, TValue value)
     {
         return 2 // key length
-            + _keySerializer.GetLength(key)
+            + encodedKeyLength
             + 2 // value length
             + _valueSerializer.GetLength(value)
             + 2 // offset

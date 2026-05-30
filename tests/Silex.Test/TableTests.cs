@@ -1,7 +1,6 @@
 ﻿using Microsoft.Extensions.Caching.Memory;
 using Silex.Blocks;
 using Silex.BloomFilters;
-using Silex.Serialization;
 using Silex.Tables;
 using System.Buffers.Binary;
 
@@ -223,35 +222,32 @@ public class TableTests
         var entries = Enumerable.Range(0, 100).Select(x => new KeyValuePair<int, int>(x, x)).ToList();
         var table = await CreateAndLoadSsTableAsync(entries);
 
-        var serializer = BinaryEncoderFactory<int>.BinarySerializer;
-
         var bloomFilter = table.BloomFilter;
 
         Span<byte> bytes = stackalloc byte[sizeof(int)];
 
-        var falseNegative = 0;
+        // Actual entries must always probe true (a bloom filter never produces false negatives).
+        foreach (var e in entries)
+        {
+            BinaryPrimitives.WriteInt32LittleEndian(bytes, e.Key);
+            Assert.True(bloomFilter.Probe(bytes));
+        }
 
-        // Actual entries should always say "maybe" with a tolerable rate
+        // Non-inserted keys should mostly probe false, within a tolerable false positive rate.
+        var falsePositives = 0;
         var iterations = 1000;
 
-        for (var i = entries.Count; i < 1000 + entries.Count; i++)
+        for (var i = entries.Count; i < iterations + entries.Count; i++)
         {
             BinaryPrimitives.WriteInt32LittleEndian(bytes, i);
             if (bloomFilter.Probe(bytes))
             {
-                falseNegative++;
+                falsePositives++;
             }
         }
 
         // Assume 10% or better
-        Assert.True(falseNegative < iterations * 0.1);
-
-        // Wrong entries should always true false
-        foreach (var e in entries)
-        {
-            BinaryPrimitives.WriteInt32LittleEndian(bytes, e.Key);
-            Assert.False(bloomFilter.Probe(bytes));            
-        }
+        Assert.True(falsePositives < iterations * 0.1, $"Too many false positives: {falsePositives}");
 
         table.Dispose();
         File.Delete(table.Filename);
