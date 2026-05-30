@@ -1,0 +1,16 @@
+<Solution>
+  <Configurations>
+    <Platform Name="Any CPU" />
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Folder Name="/Solution Items/">
+    <File Path="../.editorconfig" />
+  </Folder>
+  <Folder Name="/src/" />
+  <Project Path="Silex.DbBench/Silex.DbBench.csproj" />
+  <Project Path="Silex.Playground/Silex.Playground.csproj" />
+  <Project Path="src/Silex/Silex.csproj" />
+  <Project Path="tests/Silex.Benchmarks/Silex.Benchmarks.csproj" />
+  <Project Path="tests/Silex.Test/Silex.Test.csproj" />
+</Solution>

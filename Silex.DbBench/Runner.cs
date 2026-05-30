@@ -1,0 +1,479 @@
+using System.Diagnostics;
+using Silex;
+
+namespace Silex.DbBench;
+
+/// <summary>Per-thread accumulators for a single benchmark run.</summary>
+internal sealed class ThreadStats
+{
+    public long Ops;
+    public long Bytes;
+    public long Found;
+    public double ElapsedMicros;
+    public Histogram? Histogram;
+}
+
+/// <summary>Aggregated outcome of one benchmark, formatted db_bench style.</summary>
+internal sealed class BenchmarkResult
+{
+    public required string Name;
+    public long TotalOps;
+    public long TotalBytes;
+    public long Found;
+    public double SumThreadMicros;
+    public double WallSeconds;
+    public string Extra = string.Empty;
+    public Histogram? Histogram;
+}
+
+/// <summary>
+/// A thread's per-operation work plus an optional resource (e.g. an iterator's async enumerator) that must
+/// be disposed when the thread finishes — including early termination — so engine locks are released.
+/// </summary>
+internal readonly record struct ThreadWorker(Func<long, ValueTask<bool>> RunOp, IAsyncDisposable? Resource = null);
+
+/// <summary>
+/// Drives the benchmark list against a single Silex database, managing the per-benchmark database
+/// lifecycle (fresh-open for fill benchmarks, reuse for reads) and printing db_bench-style results.
+/// </summary>
+internal sealed class Runner
+{
+    private readonly BenchmarkOptions _options;
+    private readonly string _dbPath;
+    private LsmStorage<byte[], byte[]>? _db;
+    private bool _currentWalSync;
+
+    public Runner(BenchmarkOptions options, string dbPath)
+    {
+        _options = options;
+        _dbPath = dbPath;
+    }
+
+    public async Task RunAsync()
+    {
+        PrintHeader();
+
+        try
+        {
+            foreach (var name in _options.Benchmarks.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                await RunOneAsync(name);
+            }
+        }
+        finally
+        {
+            if (_db != null)
+            {
+                await _db.DisposeAsync();
+            }
+        }
+    }
+
+    private async Task RunOneAsync(string name)
+    {
+        switch (name)
+        {
+            case "fillseq":
+                await OpenFreshAsync(walSync: false);
+                Report(await RunWritesAsync(name, _options.Num, sequential: true));
+                break;
+            case "fillrandom":
+                await OpenFreshAsync(walSync: false);
+                Report(await RunWritesAsync(name, _options.Num, sequential: false));
+                break;
+            case "fillsync":
+                await OpenFreshAsync(walSync: true);
+                Report(await RunWritesAsync(name, Math.Max(1, _options.Num / 1000), sequential: false, extra: "(num/1000 ops, WAL fsync per write)"));
+                break;
+            case "overwrite":
+                await EnsureWriteableAsync();
+                Report(await RunWritesAsync(name, _options.Num, sequential: false));
+                break;
+            case "deleterandom":
+                await EnsureWriteableAsync();
+                Report(await RunDeletesAsync(name));
+                break;
+            case "readrandom":
+                await EnsureOpenAsync();
+                Report(await RunReadsAsync(name, missing: false));
+                break;
+            case "readmissing":
+                await EnsureOpenAsync();
+                Report(await RunReadsAsync(name, missing: true));
+                break;
+            case "readseq":
+                await EnsureOpenAsync();
+                Report(await RunReadSeqAsync(name));
+                break;
+            case "seekrandom":
+                await EnsureOpenAsync();
+                Report(await RunSeekRandomAsync(name));
+                break;
+            case "readreverse":
+                Console.WriteLine($"{name,-14} : not supported (Silex iterators are forward-only)");
+                break;
+            default:
+                Console.WriteLine($"{name,-14} : unknown benchmark, skipped");
+                break;
+        }
+    }
+
+    // ----- database lifecycle -----
+
+    private async Task EnsureOpenAsync()
+    {
+        if (_db == null)
+        {
+            await OpenAsync(walSync: false);
+        }
+    }
+
+    /// <summary>
+    /// Ensures the database is open for writing without WAL sync. A preceding <c>fillsync</c> leaves the
+    /// database open with sync enabled (it is an open-time option in Silex); reopen it without sync so a
+    /// following write benchmark is not unintentionally measured with fsync-per-write.
+    /// </summary>
+    private async Task EnsureWriteableAsync()
+    {
+        await EnsureOpenAsync();
+
+        if (_currentWalSync)
+        {
+            await _db!.DisposeAsync();
+            _db = null;
+            await OpenAsync(walSync: false); // reuse the same directory, no wipe
+        }
+    }
+
+    private async Task OpenFreshAsync(bool walSync)
+    {
+        if (_db != null)
+        {
+            await _db.DisposeAsync();
+            _db = null;
+        }
+
+        if (!_options.UseExistingDb && Directory.Exists(_dbPath))
+        {
+            Directory.Delete(_dbPath, true);
+        }
+
+        await OpenAsync(walSync);
+    }
+
+    private async Task OpenAsync(bool walSync)
+    {
+        Directory.CreateDirectory(_dbPath);
+        _db = await LsmStorage.OpenAsync<byte[], byte[]>(_dbPath, _options.ToStorageOptions(walSync));
+        _currentWalSync = walSync;
+    }
+
+    // ----- benchmark bodies -----
+    //
+    // Each benchmark provides a per-thread "setup" delegate that creates thread-local generators/RNG once
+    // and returns a per-operation delegate. The per-op delegate returns false to stop the thread early
+    // (e.g. when a sequential scan is exhausted). Keeping setup out of the op loop is what lets histogram
+    // mode time individual ops without resetting the RNG between them.
+
+    private Task<BenchmarkResult> RunWritesAsync(string name, long totalOps, bool sequential, string extra = "")
+    {
+        var db = _db!;
+        var entryBytes = _options.KeySize + _options.ValueSize;
+
+        // Writes total exactly totalOps so the resulting database is well defined for later read
+        // benchmarks; the work is partitioned across threads (sequential fills stay globally ordered).
+        return RunParallelAsync(name, totalOps, partitioned: true, extra, (threadId, start, count, stats) =>
+        {
+            var keyGen = new KeyGenerator(_options.KeySize);
+            var valueGen = new ValueGenerator(_options.Seed + threadId, _options.ValueSize);
+            var rng = RngStreams.Create(_options.Seed, threadId, RngStreams.Write);
+
+            return new ThreadWorker(op =>
+            {
+                var keyIndex = sequential ? start + op : rng.NextInt64(totalOps);
+                db.Put(keyGen.Generate(keyIndex), valueGen.Generate(_options.ValueSize));
+                stats.Ops++;
+                stats.Bytes += entryBytes;
+                return new ValueTask<bool>(true);
+            });
+        });
+    }
+
+    private Task<BenchmarkResult> RunDeletesAsync(string name)
+    {
+        var db = _db!;
+
+        return RunParallelAsync(name, _options.Num, partitioned: true, extra: string.Empty, (threadId, start, count, stats) =>
+        {
+            var keyGen = new KeyGenerator(_options.KeySize);
+            var rng = RngStreams.Create(_options.Seed, threadId, RngStreams.Write);
+
+            return new ThreadWorker(op =>
+            {
+                db.Delete(keyGen.Generate(rng.NextInt64(_options.Num)));
+                stats.Ops++;
+                stats.Bytes += _options.KeySize;
+                return new ValueTask<bool>(true);
+            });
+        });
+    }
+
+    private Task<BenchmarkResult> RunReadsAsync(string name, bool missing)
+    {
+        var db = _db!;
+
+        // Each thread performs a full Reads budget; total work scales with thread count.
+        return RunParallelAsync(name, _options.EffectiveReads, partitioned: false, extra: string.Empty, (threadId, start, count, stats) =>
+        {
+            var keyGen = new KeyGenerator(_options.KeySize);
+            var rng = RngStreams.Create(_options.Seed, threadId, RngStreams.Read);
+
+            return new ThreadWorker(async op =>
+            {
+                // readmissing reads from a key range that was never written ([num, 2*num)).
+                var keyIndex = rng.NextInt64(_options.Num) + (missing ? _options.Num : 0);
+                var value = await db.GetAsync(keyGen.Generate(keyIndex));
+
+                stats.Ops++;
+                stats.Bytes += _options.KeySize;
+
+                if (value != null)
+                {
+                    stats.Found++;
+                    stats.Bytes += value.Length;
+                }
+
+                return true;
+            });
+        });
+    }
+
+    private Task<BenchmarkResult> RunReadSeqAsync(string name)
+    {
+        var db = _db!;
+
+        // Each thread independently scans forward from the start, up to the Reads budget. The op loop stops
+        // when the iterator is exhausted (per-op delegate returns false).
+        return RunParallelAsync(name, _options.EffectiveReads, partitioned: false, extra: string.Empty, (threadId, start, count, stats) =>
+        {
+            var enumerator = db.CreateIterator().EnumerateAsync().GetAsyncEnumerator();
+
+            return new ThreadWorker(async op =>
+            {
+                if (!await enumerator.MoveNextAsync())
+                {
+                    return false;
+                }
+
+                var entry = enumerator.Current;
+                stats.Ops++;
+                stats.Found++;
+                stats.Bytes += entry.Key.Length + entry.Value.Length;
+                return true;
+            }, enumerator);
+        });
+    }
+
+    private Task<BenchmarkResult> RunSeekRandomAsync(string name)
+    {
+        var db = _db!;
+
+        // One op == one seek; after landing we materialize up to SeekNexts following entries.
+        return RunParallelAsync(name, _options.EffectiveReads, partitioned: false, extra: string.Empty, (threadId, start, count, stats) =>
+        {
+            var keyGen = new KeyGenerator(_options.KeySize);
+            var rng = RngStreams.Create(_options.Seed, threadId, RngStreams.Seek);
+            var toRead = 1 + _options.SeekNexts;
+
+            return new ThreadWorker(async op =>
+            {
+                var target = keyGen.Generate(rng.NextInt64(_options.Num));
+                var read = 0;
+
+                await foreach (var entry in db.CreateIterator().EnumerateAsync(target))
+                {
+                    if (read == 0 && entry.Key.AsSpan().SequenceEqual(target))
+                    {
+                        stats.Found++;
+                    }
+
+                    stats.Bytes += entry.Key.Length + entry.Value.Length;
+
+                    if (++read >= toRead)
+                    {
+                        break;
+                    }
+                }
+
+                stats.Ops++;
+                return true;
+            });
+        });
+    }
+
+    // ----- parallel scaffolding + reporting -----
+
+    /// <summary>
+    /// Runs <paramref name="setup"/> on <see cref="BenchmarkOptions.Threads"/> threads. When
+    /// <paramref name="partitioned"/> is true the <paramref name="totalOps"/> are split into disjoint
+    /// contiguous ranges (one per thread); otherwise every thread runs the full <paramref name="totalOps"/>
+    /// budget and the totals scale with the thread count. <paramref name="setup"/> returns a per-operation
+    /// delegate; returning false from it stops that thread early.
+    /// </summary>
+    private async Task<BenchmarkResult> RunParallelAsync(
+        string name,
+        long totalOps,
+        bool partitioned,
+        string extra,
+        Func<int, long, long, ThreadStats, ThreadWorker> setup)
+    {
+        var threads = _options.Threads;
+        var perThread = new ThreadStats[threads];
+        var tasks = new Task[threads];
+
+        var wall = Stopwatch.StartNew();
+
+        for (var t = 0; t < threads; t++)
+        {
+            var threadId = t;
+            var stats = new ThreadStats { Histogram = _options.Histogram ? new Histogram() : null };
+            perThread[t] = stats;
+
+            long start;
+            long count;
+
+            if (partitioned)
+            {
+                var baseCount = totalOps / threads;
+                var remainder = totalOps % threads;
+                count = baseCount + (threadId < remainder ? 1 : 0);
+                start = threadId * baseCount + Math.Min(threadId, remainder);
+            }
+            else
+            {
+                start = 0;
+                count = totalOps;
+            }
+
+            tasks[t] = Task.Run(async () =>
+            {
+                var worker = setup(threadId, start, count, stats);
+                var runOp = worker.RunOp;
+                var histogram = stats.Histogram;
+                var sw = Stopwatch.StartNew();
+
+                try
+                {
+                    for (long i = 0; i < count; i++)
+                    {
+                        bool more;
+
+                        if (histogram == null)
+                        {
+                            more = await runOp(i);
+                        }
+                        else
+                        {
+                            var opWatch = Stopwatch.StartNew();
+                            more = await runOp(i);
+                            opWatch.Stop();
+
+                            if (more)
+                            {
+                                histogram.Add(opWatch.Elapsed.TotalMicroseconds);
+                            }
+                        }
+
+                        if (!more)
+                        {
+                            break;
+                        }
+                    }
+
+                    stats.ElapsedMicros = sw.Elapsed.TotalMicroseconds;
+                }
+                finally
+                {
+                    // Dispose any per-thread resource (e.g. a scan enumerator) so engine locks it holds are
+                    // released even when the loop stops early at the read budget.
+                    if (worker.Resource != null)
+                    {
+                        await worker.Resource.DisposeAsync();
+                    }
+                }
+            });
+        }
+
+        await Task.WhenAll(tasks);
+        wall.Stop();
+
+        var result = new BenchmarkResult { Name = name, WallSeconds = wall.Elapsed.TotalSeconds, Extra = extra };
+
+        foreach (var stats in perThread)
+        {
+            result.TotalOps += stats.Ops;
+            result.TotalBytes += stats.Bytes;
+            result.Found += stats.Found;
+            result.SumThreadMicros += stats.ElapsedMicros;
+
+            if (stats.Histogram != null)
+            {
+                result.Histogram ??= new Histogram();
+                result.Histogram.Merge(stats.Histogram);
+            }
+        }
+
+        return result;
+    }
+
+    private void Report(BenchmarkResult result)
+    {
+        if (result.TotalOps == 0)
+        {
+            Console.WriteLine($"{result.Name,-14} : no operations");
+            return;
+        }
+
+        var microsPerOp = result.SumThreadMicros / result.TotalOps;
+        var opsPerSec = result.WallSeconds > 0 ? result.TotalOps / result.WallSeconds : 0;
+        var mbPerSec = result.WallSeconds > 0 ? result.TotalBytes / 1_048_576.0 / result.WallSeconds : 0;
+
+        var line = $"{result.Name,-14} : {microsPerOp,11:F3} micros/op {opsPerSec,12:N0} ops/sec; {mbPerSec,8:F1} MB/s";
+
+        if (result.Name is "readrandom" or "readmissing" or "seekrandom")
+        {
+            line += $" (found {result.Found:N0} of {result.TotalOps:N0})";
+        }
+
+        if (!string.IsNullOrEmpty(result.Extra))
+        {
+            line += $" {result.Extra}";
+        }
+
+        Console.WriteLine(line);
+
+        if (result.Histogram != null)
+        {
+            var summary = result.Histogram.Summary();
+            if (summary.Length > 0)
+            {
+                Console.WriteLine(summary);
+            }
+        }
+    }
+
+    private void PrintHeader()
+    {
+        var rawSizeMb = (_options.KeySize + _options.ValueSize) * (double)_options.Num / 1_048_576.0;
+
+        Console.WriteLine($"Silex DbBench");
+        Console.WriteLine($"Keys:       {_options.KeySize} bytes each");
+        Console.WriteLine($"Values:     {_options.ValueSize} bytes each (uncompressed)");
+        Console.WriteLine($"Entries:    {_options.Num:N0}");
+        Console.WriteLine($"RawSize:    {rawSizeMb:F1} MB (estimated)");
+        Console.WriteLine($"Threads:    {_options.Threads}");
+        Console.WriteLine($"Compaction: {_options.Compaction}  WAL: {(_options.Wal ? "on" : "off")}{(_options.WalSync ? " (sync)" : "")}");
+        Console.WriteLine($"DB path:    {_dbPath}");
+        Console.WriteLine(new string('-', 64));
+    }
+}

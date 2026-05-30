@@ -373,6 +373,30 @@ write/space amplification and tombstone/ordering complexity. Speculative; defer 
 
 ---
 
+## Tooling
+
+### Benchmarking — `Silex.DbBench`
+A standalone console app (`Silex.DbBench/`) modelled on RocksDB's `db_bench`, for cross-engine
+comparison and for the upcoming perf work. Uses `LsmStorage<byte[], byte[]>`; keys are generated exactly
+like `db_bench`'s `GenerateKeyFromInt` (integer big-endian in the first `min(8, key_size)` bytes, rest
+padded with `'0'`, so byte order == numeric order). Command line is parsed with System.CommandLine and
+mirrors `db_bench` flag names (`--benchmarks`, `--num`, `--reads`, `--value_size`, `--key_size`,
+`--threads`, `--histogram`, `--write_buffer_size`, `--block_size`, `--cache_size`, `--use_existing_db`,
+`--seed`, `--seek_nexts`) plus Silex knobs (`--compaction`, `--wal`, `--wal_sync`, `--target_sst_size`,
+`--compaction_parallelism`, `--read_parallelism`). Benchmarks: `fillseq`, `fillrandom`, `fillsync`,
+`overwrite`, `readrandom`, `readmissing`, `readseq`, `seekrandom`, `deleterandom` (`readreverse` is
+unsupported — iterators are forward-only). Fill benchmarks open a fresh DB (wiped unless
+`--use_existing_db`); reads reuse the prior DB. Read key streams are seeded independently of the write
+streams so found-counts reflect real coverage. Output is `db_bench`-style (`micros/op`, `ops/sec`,
+`MB/s`, optional latency percentiles). This work added a public `LsmStorage<TKey,TValue>.CreateIterator()`
+on the wrapper (previously only on the inner) to support `readseq`/`seekrandom`. Values are stored
+uncompressed and there is no write-batch API, so compare against RocksDB with compression disabled and
+`--batch_size=1` (these flags are accepted but ignored, with a warning). The solution now uses the XML
+`Silex.slnx` format.
+
+Known perf observation (for the later perf step): `seekrandom` is slow because each seek builds a fresh
+merge iterator over all memtables + SSTs; a reusable/seekable iterator handle would help.
+
 ## Suggested priority
 
 1. ~~Serialization / value copy-in semantics.~~ **Decided: keep zero-copy** as a core principle —

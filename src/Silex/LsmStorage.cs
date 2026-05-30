@@ -273,6 +273,22 @@ public class LsmStorage<TKey, TValue> : IDisposable, IAsyncDisposable where TKey
     }
 
     /// <summary>
+    /// Creates a forward iterator over the entire key space, or from a given key when one is supplied via
+    /// <see cref="IStorageIterator{TKey, TValue}.EnumerateAsync(TKey, CancellationToken)"/>. Entries are
+    /// yielded in ascending key order across every memtable and on-disk level.
+    /// </summary>
+    /// <remarks>
+    /// Zero-copy: each yielded key/value is a read-only borrow of engine-owned memory. Do not mutate or
+    /// dispose it. Copy it yourself if you need independently owned memory.
+    /// </remarks>
+    public IStorageIterator<TKey, TValue> CreateIterator()
+    {
+        CheckDisposed();
+
+        return _inner.CreateIterator();
+    }
+
+    /// <summary>
     /// Flushes any pending data to disk and stops the compacter background threads.
     /// </summary>
     /// <remarks>
