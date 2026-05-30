@@ -19,7 +19,66 @@ Cross-engine comparison using RocksDB's `db_bench` ported workloads against
 > and a more mature WAL that this micro-benchmark does not reward. These numbers
 > favor Silex more than a larger-than-RAM workload would.
 
-## Results — post-block-cache targeted rerun
+## Fresh comparison — post synchronous cache-miss read fast path (2026-05-30, latest)
+
+Captured after the synchronous cache-miss read landed (`22af4a7`). Same host (macOS, Apple
+Silicon, 14 cores), 200,000 entries, 16-byte keys, 100-byte values, compression off, single
+thread unless noted. Silex numbers are medians of 3 runs.
+
+### Point reads & writes — 128 MiB cache, `fillseq`-only DB (full key coverage)
+
+| Benchmark         | Silex                                 | RocksDB                               | Result            |
+|-------------------|---------------------------------------|---------------------------------------|-------------------|
+| fillseq           | 1.161 µs/op · 849K ops/s · 93.9 MB/s  | 1.344 µs/op · 744K ops/s · 82.3 MB/s  | **Silex ~1.16×**  |
+| readrandom first  | 1.512 µs/op · 661K ops/s · 73.2 MB/s  | 0.618 µs/op · 1.62M ops/s · 179 MB/s  | **RocksDB ~2.4×** |
+| readrandom warm   | 0.516 µs/op · 1.94M ops/s · 214 MB/s  | 0.554 µs/op · 1.81M ops/s · 200 MB/s  | **Silex ~1.07×**  |
+
+### Miss-heavy + warm-page — 8 KiB cache (~100% block-cache miss, OS pages warm)
+
+Working set exceeds the block cache but is resident in the OS page cache — the scenario the
+synchronous read targets. Steady-state (passes 2–3), aggregate throughput across all threads.
+
+| Threads | Silex (sync)              | RocksDB                   | Result            |
+|---------|---------------------------|---------------------------|-------------------|
+| 1       | 1.24 µs/op · 824K ops/s   | 0.60 µs/op · 1.67M ops/s  | **RocksDB ~2.0×** |
+| 4       | 7.16 µs/op · 557K ops/s   | 3.77 µs/op · 1.06M ops/s  | **RocksDB ~1.9×** |
+| 8       | 15.3 µs/op · 522K ops/s   | 13.4 µs/op · 594K ops/s   | **RocksDB ~1.14×** |
+
+> The synchronous read cut Silex's single-thread miss path from 2.87 → 1.24 µs/op (−57%),
+> roughly halving the gap to RocksDB. The remaining ~2× at low thread counts is Silex's heavier
+> miss machinery (cache `_gate` lock + LRU mutation + decode) vs RocksDB's lean sharded cache.
+> Both engines scale negatively past 4 threads here because every op contends on the cache lock;
+> they converge near 8 threads.
+
+### Scans & seeks — 128 MiB cache, `fillseq`-only DB
+
+| Benchmark   | Silex                                 | RocksDB                                | Result            |
+|-------------|---------------------------------------|----------------------------------------|-------------------|
+| readseq     | 0.159 µs/op · 6.2M ops/s · 686 MB/s   | 0.041 µs/op · 24.5M ops/s · 2713 MB/s  | **RocksDB ~3.9×** |
+| seekrandom  | 7.137 µs/op · 140K ops/s · 15.5 MB/s  | 0.852 µs/op · 1.17M ops/s              | **RocksDB ~8.4×** |
+
+### Writes — mixed pipeline (`fillseq,fillrandom,overwrite`, comparable rows)
+
+| Benchmark   | Silex                                 | RocksDB                               | Result            |
+|-------------|---------------------------------------|---------------------------------------|-------------------|
+| fillseq     | 1.191 µs/op · 828K ops/s · 91.6 MB/s  | 1.444 µs/op · 692K ops/s · 76.6 MB/s  | **Silex ~1.21×**  |
+| fillrandom  | 1.081 µs/op · 914K ops/s · 101 MB/s   | 1.735 µs/op · 576K ops/s · 63.8 MB/s  | **Silex ~1.61×**  |
+| overwrite   | 1.134 µs/op · 872K ops/s · 96.5 MB/s  | 2.032 µs/op · 492K ops/s · 54.4 MB/s  | **Silex ~1.79×**  |
+
+### Summary
+
+- **Writes**: Silex wins across the board (1.16–1.79×) — fillseq, fillrandom, overwrite.
+- **Warm point reads** (working set in block cache): Silex slightly ahead (1.07×).
+- **Cold first read** (128 MiB cache): RocksDB ~2.4× — disk-latency-bound on the ~5,700 first-touch
+  misses; the synchronous read doesn't help here (and doesn't regress).
+- **Miss-heavy warm-page reads**: RocksDB ~2× at low concurrency (down from ~4.8× pre-sync-read),
+  converging near 8 threads. Silex's remaining gap is the cache lock + miss machinery.
+- **Scans & seeks**: RocksDB still dominates (readseq ~3.9×, seekrandom ~8.4×) — the standout
+  optimization targets; each Silex scan/seek rebuilds a merge iterator across all sources.
+
+---
+
+
 
 The custom decoded-block LRU cache keeps correctness under churn and removes most cache-hit overhead.
 This run uses a 128 MiB Silex block cache and runs `readrandom` twice so the second pass measures the
