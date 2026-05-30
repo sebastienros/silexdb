@@ -51,12 +51,12 @@ public class Block<TKey, TValue> : IDisposable
     /// </summary>
     public bool TryGetValue(TKey key, out ReadOnlySpan<byte> value)
     {
-        double start = 0;
+        var start = 0;
         var end = Offsets.Count - 1;
 
         while (start <= end)
         {
-            var m = (int)Math.Round((start + end) / 2);
+            var m = start + (end - start) / 2;
 
             var entry = GetEntry(Offsets[m]);
 

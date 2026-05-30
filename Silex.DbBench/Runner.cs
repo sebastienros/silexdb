@@ -24,6 +24,12 @@ internal sealed class BenchmarkResult
     public double WallSeconds;
     public string Extra = string.Empty;
     public Histogram? Histogram;
+
+    // Allocation accounting for the benchmark body (captured only when SILEX_BENCH_GC is set).
+    public long AllocatedBytes;
+    public int Gen0Collections;
+    public int Gen1Collections;
+    public int Gen2Collections;
 }
 
 /// <summary>
@@ -331,6 +337,14 @@ internal sealed class Runner
         var perThread = new ThreadStats[threads];
         var tasks = new Task[threads];
 
+        // Capture process-wide allocation/GC counters around the benchmark body so a before/after run can
+        // attribute allocation changes to a specific benchmark. Only reported when SILEX_BENCH_GC is set.
+        var gcStats = Environment.GetEnvironmentVariable("SILEX_BENCH_GC") is { Length: > 0 };
+        var allocBefore = gcStats ? GC.GetTotalAllocatedBytes(precise: false) : 0;
+        var gen0Before = gcStats ? GC.CollectionCount(0) : 0;
+        var gen1Before = gcStats ? GC.CollectionCount(1) : 0;
+        var gen2Before = gcStats ? GC.CollectionCount(2) : 0;
+
         var wall = Stopwatch.StartNew();
 
         for (var t = 0; t < threads; t++)
@@ -409,6 +423,14 @@ internal sealed class Runner
 
         var result = new BenchmarkResult { Name = name, WallSeconds = wall.Elapsed.TotalSeconds, Extra = extra };
 
+        if (gcStats)
+        {
+            result.AllocatedBytes = GC.GetTotalAllocatedBytes(precise: false) - allocBefore;
+            result.Gen0Collections = GC.CollectionCount(0) - gen0Before;
+            result.Gen1Collections = GC.CollectionCount(1) - gen1Before;
+            result.Gen2Collections = GC.CollectionCount(2) - gen2Before;
+        }
+
         foreach (var stats in perThread)
         {
             result.TotalOps += stats.Ops;
@@ -451,6 +473,12 @@ internal sealed class Runner
         }
 
         Console.WriteLine(line);
+
+        if (result.AllocatedBytes > 0 || result.Gen0Collections > 0 || result.Gen1Collections > 0 || result.Gen2Collections > 0)
+        {
+            var bytesPerOp = (double)result.AllocatedBytes / result.TotalOps;
+            Console.WriteLine($"{"",-14}   alloc: {result.AllocatedBytes / 1_048_576.0,8:F1} MB total, {bytesPerOp,8:F1} B/op; GC g0/g1/g2: {result.Gen0Collections}/{result.Gen1Collections}/{result.Gen2Collections}");
+        }
 
         if (result.Histogram != null)
         {

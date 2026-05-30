@@ -68,9 +68,25 @@ internal static class CollectionsExtensions
         public static IEnumerable<KeyValuePair<TKey, TValue>> Enumerate(SortedDictionary<TKey, TValue> dic, TKey from, TKey to, bool lowerBoundActive, bool upperBoundActive)
         {
             var sortedSet = _getSetValue(dic);
-            var kvpTo = lowerBoundActive ? new(from, default!) : sortedSet.Min;
-            var kvpFrom = upperBoundActive ? new(to, default!) : sortedSet.Max;
-            return sortedSet.GetViewBetween(kvpTo, kvpFrom);
+
+            // Min/Max are undefined on an empty set, and there is nothing to enumerate anyway.
+            if (sortedSet.Count == 0)
+            {
+                return [];
+            }
+
+            var lower = lowerBoundActive ? new(from, default!) : sortedSet.Min;
+            var upper = upperBoundActive ? new KeyValuePair<TKey, TValue>(to, default!) : sortedSet.Max;
+
+            // GetViewBetween throws when lower > upper. That happens for an out-of-range request, e.g. a
+            // seek to a key past the last element (from > Max) or an upper bound below the first element
+            // (to < Min); both legitimately select no entries, so return an empty sequence instead.
+            if (sortedSet.Comparer.Compare(lower, upper) > 0)
+            {
+                return [];
+            }
+
+            return sortedSet.GetViewBetween(lower, upper);
         }
     }
 }

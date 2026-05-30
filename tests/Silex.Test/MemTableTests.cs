@@ -41,5 +41,26 @@ public class MemTableTests
 
         items = dic.Enumerate(-1, 100, true, true);
         await Assert.That(items.Select(x => x.Key)).IsEquivalentTo(new int[] { 0, 10, 20, 30, 40, 50, 60, 70, 80, 90 });
+
+        // A lower bound past the last key (from > Max) selects nothing rather than throwing.
+        items = dic.Enumerate(95, 95, true, false);
+        await Assert.That(items.Select(x => x.Key)).IsEquivalentTo(Array.Empty<int>());
+
+        // An upper bound below the first key (to < Min) selects nothing rather than throwing.
+        items = dic.Enumerate(-5, -5, false, true);
+        await Assert.That(items.Select(x => x.Key)).IsEquivalentTo(Array.Empty<int>());
+
+        // A two-sided range entirely above the data selects nothing.
+        items = dic.Enumerate(100, 200, true, true);
+        await Assert.That(items.Select(x => x.Key)).IsEquivalentTo(Array.Empty<int>());
+    }
+
+    [Test]
+    public async Task EnumerateOnEmptyDictionaryReturnsEmpty()
+    {
+        var dic = new SortedDictionary<int, int>();
+
+        await Assert.That(dic.Enumerate(5, 5, true, false).Select(x => x.Key)).IsEquivalentTo(Array.Empty<int>());
+        await Assert.That(dic.Enumerate(0, 0, false, false).Select(x => x.Key)).IsEquivalentTo(Array.Empty<int>());
     }
 }

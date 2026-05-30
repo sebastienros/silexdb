@@ -59,11 +59,11 @@ public class DefaultBlockEncoder<TKey, TValue> : IBlockEncoder<TKey, TValue>
         var offsetPosition = buffer.Length - (totalEntries + 1) * 2;
         binaryReader.Seek(offsetPosition);
 
-        var offsets = new List<ushort>(totalEntries);
+        var offsets = new ushort[totalEntries];
 
         for (var i = 0; i < totalEntries; i++)
         {
-            offsets.Add(binaryReader.ReadUInt16());
+            offsets[i] = binaryReader.ReadUInt16();
         }
 
         var memoryOwner = MemoryPool<byte>.Shared.Rent(buffer.Length);

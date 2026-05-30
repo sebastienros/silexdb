@@ -14,7 +14,15 @@ internal sealed class BlockIterator<TKey, TValue> : IStorageIterator<TKey, TValu
     public BlockIterator(Block<TKey, TValue> block)
     {
         _block = block;
-        _entries = _block.Offsets.Select(x => _block.GetEntry(x)).ToArray();
+
+        var offsets = block.Offsets;
+        var entries = new RecordLocation<TKey>[offsets.Count];
+        for (var i = 0; i < entries.Length; i++)
+        {
+            entries[i] = block.GetEntry(offsets[i]);
+        }
+
+        _entries = entries;
     }
 
     public async IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)

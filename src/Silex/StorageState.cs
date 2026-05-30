@@ -42,15 +42,4 @@ internal struct StorageState<TKey, TValue> where TKey : notnull
     /// Each level has ordered tables related to each other so a Concat Iterator can be used.
     /// </remarks>
     public List<List<SsTable<TKey, TValue>>> LeveledSsTables { get; set; } = [];
-
-    public StorageState<TKey, TValue> Clone()
-    {
-        return new StorageState<TKey, TValue>
-        {
-            CurrentMemTable = CurrentMemTable,
-            ImmutableMemTables = ImmutableMemTables,
-            LevelZeroTables = LevelZeroTables.ToList(),
-            LeveledSsTables = LeveledSsTables.ToList()
-        };
-    }
 }

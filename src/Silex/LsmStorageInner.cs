@@ -122,15 +122,23 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         // other transaction is creating a new MemTable while we are reading variables. This is only
         // to ensure the mutable MemTable and immutable ones are coherent.
 
+        // Capture just the references the read needs instead of cloning the whole state: the L0 and
+        // leveled lists are read live under _level0Lock below, so cloning them here would allocate two
+        // throwaway lists on every read. CurrentMemTable must be captured under the lock; ImmutableMemTables
+        // is an immutable reference captured here to keep a coherent view with CurrentMemTable.
         _currentMemTableLock.EnterReadLock();
 
-        var snapshot = _state.Clone();
+        IMemTable<TKey, TValue> currentMemTable;
+        ImmutableQueue<IMemTable<TKey, TValue>> immutableMemTables;
 
         try
         {
+            currentMemTable = _state.CurrentMemTable;
+            immutableMemTables = _state.ImmutableMemTables;
+
             // CurrentMemTable is the only thing that needs to be locked
             // since all other collections are immutable
-            if (snapshot.CurrentMemTable.TryGet(key, out var result))
+            if (currentMemTable.TryGet(key, out var result))
             {
                 return result;
             }
@@ -143,23 +151,26 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         // If any new immutable MemTable(s) was created after this call then we just ignore it, as 
         // the newly created MemTable(s).
 
-        try
+        if (!immutableMemTables.IsEmpty)
         {
-            _immutableMemTablesLock.EnterReadLock();
-
-            // Immutable MemTables are enqueued oldest-first, so iterate in reverse to let the most
-            // recently frozen table win when the same key exists in several of them.
-            foreach (var memTable in snapshot.ImmutableMemTables.Reverse())
+            try
             {
-                if (memTable.TryGet(key, out var result))
+                _immutableMemTablesLock.EnterReadLock();
+
+                // Immutable MemTables are enqueued oldest-first, so iterate in reverse to let the most
+                // recently frozen table win when the same key exists in several of them.
+                foreach (var memTable in immutableMemTables.Reverse())
                 {
-                    return result;
+                    if (memTable.TryGet(key, out var result))
+                    {
+                        return result;
+                    }
                 }
             }
-        }
-        finally
-        {
-            _immutableMemTablesLock.ExitReadLock();
+            finally
+            {
+                _immutableMemTablesLock.ExitReadLock();
+            }
         }
 
         // Process L0 tables in reverse order since the last one to be flush is at the end
