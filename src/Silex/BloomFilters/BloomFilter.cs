@@ -35,9 +35,9 @@ public class BloomFilter : IBloomFilter
         _bytes = new byte[_m / 8];
     }
 
-    public BloomFilter(byte[] span, int k)
+    public BloomFilter(byte[] bytes, int k)
     {
-        _bytes = span;
+        _bytes = bytes;
         _m = _bytes.Length * 8;
         _k = k;
     }

@@ -75,7 +75,7 @@ internal sealed class ValueGenerator
         }
 
         var value = new byte[valueSize];
-        Array.Copy(_data, _offset, value, 0, valueSize);
+        _data.AsSpan(_offset, valueSize).CopyTo(value);
         _offset += valueSize;
 
         return value;

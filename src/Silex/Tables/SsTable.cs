@@ -145,11 +145,10 @@ public class SsTable<TKey, TValue> : IDisposable
         var bloomKLength = 4;
         var bloomFilterLength = stream.Length - bloomContentLength - bloomKLength - bloomFilterOffset;
 
-        var buffer = ArrayPool<byte>.Shared.Rent((int)bloomFilterLength);
+        var bloomFilterBytes = new byte[(int)bloomFilterLength];
         stream.Seek(bloomFilterOffset, SeekOrigin.Begin);
-        await stream.ReadExactlyAsync(buffer, 0, (int)bloomFilterLength, cancellationToken);
-        var bloomFilter = bloomFilterFactory.CreateBloomFilter(buffer.AsSpan().Slice(0, (int)bloomFilterLength), bloomFilterK);
-        ArrayPool<byte>.Shared.Return(buffer);
+        await stream.ReadExactlyAsync(bloomFilterBytes, 0, (int)bloomFilterLength, cancellationToken);
+        var bloomFilter = bloomFilterFactory.CreateBloomFilterFromOwnedBytes(bloomFilterBytes, bloomFilterK);
 
         // Read the metadata block offset in the last four bytes before the bloom filter
         stream.Seek(bloomFilterOffset - 4, SeekOrigin.Begin);
@@ -159,7 +158,7 @@ public class SsTable<TKey, TValue> : IDisposable
         // Read the metadata block content
         var metadataLength = bloomFilterOffset - 4 - metaBlockOffset;
 
-        buffer = ArrayPool<byte>.Shared.Rent((int)metadataLength);
+        var buffer = ArrayPool<byte>.Shared.Rent((int)metadataLength);
         stream.Seek(metaBlockOffset, SeekOrigin.Begin);
         await stream.ReadExactlyAsync(buffer, 0, (int)metadataLength, cancellationToken);
         var blockMetadata = tableEncoder.DecodeMetadata(buffer, 0);

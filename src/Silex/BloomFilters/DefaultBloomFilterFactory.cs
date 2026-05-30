@@ -12,4 +12,10 @@ public class DefaultBloomFilterFactory : IBloomFilterFactory
         var bloomFilter = new BloomFilter(bytes.ToArray(), k);
         return bloomFilter;
     }
+
+    public IBloomFilter CreateBloomFilterFromOwnedBytes(byte[] bytes, int k)
+    {
+        var bloomFilter = new BloomFilter(bytes, k);
+        return bloomFilter;
+    }
 }

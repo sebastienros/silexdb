@@ -9,7 +9,6 @@ internal sealed class SsTableIterator<TKey, TValue> : IStorageIterator<TKey, TVa
     private static readonly IComparer<TKey> _keyComparer = BinaryEncoderFactory<TKey>.BinarySerializer.Comparer;
 
     private readonly SsTable<TKey, TValue> _table;
-    private TKey[]? _firstKeys;
 
     public SsTableIterator(SsTable<TKey, TValue> table)
     {
@@ -37,16 +36,7 @@ internal sealed class SsTableIterator<TKey, TValue> : IStorageIterator<TKey, TVa
 
     public async IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateAsync(TKey from, [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        var startBlockIndex = 0;
-
-        // Create a reusable index for binary search
-        _firstKeys ??= _table.BlockMetadata.Select(x => x.FirstKey).ToArray();
-
-        var compare = Array.BinarySearch(_firstKeys, from, _keyComparer);
-
-        // The entry may live in the block whose FirstKey precedes 'from', so step back one block.
-        // Clamp to 0 so a 'from' smaller than every FirstKey still starts at the first block.
-        startBlockIndex = Math.Max(0, (compare >= 0 ? compare : ~compare) - 1);
+        var startBlockIndex = FindStartBlockIndex(from);
 
         // If the key doesn't exist, exit
         if (startBlockIndex > _table.BlockMetadata.Count - 1)
@@ -100,5 +90,35 @@ internal sealed class SsTableIterator<TKey, TValue> : IStorageIterator<TKey, TVa
         }
 
         yield break;
+    }
+
+    private int FindStartBlockIndex(TKey from)
+    {
+        var start = 0;
+        var end = _table.BlockMetadata.Count - 1;
+
+        while (start <= end)
+        {
+            var m = start + (end - start) / 2;
+            var compare = _keyComparer.Compare(_table.BlockMetadata[m].FirstKey, from);
+
+            if (compare == 0)
+            {
+                // The entry may live in the block whose FirstKey precedes 'from'.
+                return Math.Max(0, m - 1);
+            }
+
+            if (compare < 0)
+            {
+                start = m + 1;
+            }
+            else
+            {
+                end = m - 1;
+            }
+        }
+
+        // 'start' is the insertion index. Step back one block and clamp to the first block.
+        return Math.Max(0, start - 1);
     }
 }

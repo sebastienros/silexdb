@@ -44,6 +44,18 @@ internal readonly record struct ThreadWorker(Func<long, ValueTask<bool>> RunOp, 
 /// </summary>
 internal sealed class Runner
 {
+    private const string FillSeq = "fillseq";
+    private const string FillRandom = "fillrandom";
+    private const string FillSync = "fillsync";
+    private const string Overwrite = "overwrite";
+    private const string DeleteRandom = "deleterandom";
+    private const string ReadRandom = "readrandom";
+    private const string ReadMissing = "readmissing";
+    private const string ReadSeq = "readseq";
+    private const string SeekRandom = "seekrandom";
+    private const string ReadReverse = "readreverse";
+    private const string Separator = "----------------------------------------------------------------";
+
     private readonly BenchmarkOptions _options;
     private readonly string _dbPath;
     private LsmStorage<byte[], byte[]>? _db;
@@ -61,9 +73,30 @@ internal sealed class Runner
 
         try
         {
-            foreach (var name in _options.Benchmarks.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            var benchmarks = _options.Benchmarks.AsMemory();
+
+            while (!benchmarks.IsEmpty)
             {
-                await RunOneAsync(name);
+                var comma = benchmarks.Span.IndexOf(',');
+                ReadOnlyMemory<char> name;
+
+                if (comma < 0)
+                {
+                    name = benchmarks;
+                    benchmarks = ReadOnlyMemory<char>.Empty;
+                }
+                else
+                {
+                    name = benchmarks[..comma];
+                    benchmarks = benchmarks[(comma + 1)..];
+                }
+
+                name = Trim(name);
+
+                if (!name.IsEmpty)
+                {
+                    await RunOneAsync(name);
+                }
             }
         }
         finally
@@ -75,53 +108,115 @@ internal sealed class Runner
         }
     }
 
-    private async Task RunOneAsync(string name)
+    private Task RunOneAsync(ReadOnlyMemory<char> name)
+    {
+        var span = name.Span;
+        var benchmarkName = GetBenchmarkName(span);
+
+        if (benchmarkName is null)
+        {
+            WriteSkippedBenchmark(span, "unknown benchmark, skipped");
+            return Task.CompletedTask;
+        }
+
+        return RunKnownBenchmarkAsync(benchmarkName);
+    }
+
+    private async Task RunKnownBenchmarkAsync(string name)
     {
         switch (name)
         {
-            case "fillseq":
+            case FillSeq:
                 await OpenFreshAsync(walSync: false);
                 Report(await RunWritesAsync(name, _options.Num, sequential: true));
                 break;
-            case "fillrandom":
+            case FillRandom:
                 await OpenFreshAsync(walSync: false);
                 Report(await RunWritesAsync(name, _options.Num, sequential: false));
                 break;
-            case "fillsync":
+            case FillSync:
                 await OpenFreshAsync(walSync: true);
                 Report(await RunWritesAsync(name, Math.Max(1, _options.Num / 1000), sequential: false, extra: "(num/1000 ops, WAL fsync per write)"));
                 break;
-            case "overwrite":
+            case Overwrite:
                 await EnsureWriteableAsync();
                 Report(await RunWritesAsync(name, _options.Num, sequential: false));
                 break;
-            case "deleterandom":
+            case DeleteRandom:
                 await EnsureWriteableAsync();
                 Report(await RunDeletesAsync(name));
                 break;
-            case "readrandom":
+            case ReadRandom:
                 await EnsureOpenAsync();
                 Report(await RunReadsAsync(name, missing: false));
                 break;
-            case "readmissing":
+            case ReadMissing:
                 await EnsureOpenAsync();
                 Report(await RunReadsAsync(name, missing: true));
                 break;
-            case "readseq":
+            case ReadSeq:
                 await EnsureOpenAsync();
                 Report(await RunReadSeqAsync(name));
                 break;
-            case "seekrandom":
+            case SeekRandom:
                 await EnsureOpenAsync();
                 Report(await RunSeekRandomAsync(name));
                 break;
-            case "readreverse":
-                Console.WriteLine($"{name,-14} : not supported (Silex iterators are forward-only)");
-                break;
-            default:
-                Console.WriteLine($"{name,-14} : unknown benchmark, skipped");
+            case ReadReverse:
+                WriteSkippedBenchmark(name, "not supported (Silex iterators are forward-only)");
                 break;
         }
+    }
+
+    private static string? GetBenchmarkName(ReadOnlySpan<char> value)
+    {
+        if (BenchmarkEquals(value, FillSeq)) return FillSeq;
+        if (BenchmarkEquals(value, FillRandom)) return FillRandom;
+        if (BenchmarkEquals(value, FillSync)) return FillSync;
+        if (BenchmarkEquals(value, Overwrite)) return Overwrite;
+        if (BenchmarkEquals(value, DeleteRandom)) return DeleteRandom;
+        if (BenchmarkEquals(value, ReadRandom)) return ReadRandom;
+        if (BenchmarkEquals(value, ReadMissing)) return ReadMissing;
+        if (BenchmarkEquals(value, ReadSeq)) return ReadSeq;
+        if (BenchmarkEquals(value, SeekRandom)) return SeekRandom;
+        if (BenchmarkEquals(value, ReadReverse)) return ReadReverse;
+
+        return null;
+    }
+
+    private static bool BenchmarkEquals(ReadOnlySpan<char> value, string benchmark) =>
+        MemoryExtensions.Equals(value, benchmark.AsSpan(), StringComparison.Ordinal);
+
+    private static ReadOnlyMemory<char> Trim(ReadOnlyMemory<char> value)
+    {
+        var span = value.Span;
+        var start = 0;
+
+        while (start < span.Length && char.IsWhiteSpace(span[start]))
+        {
+            start++;
+        }
+
+        var end = span.Length - 1;
+
+        while (end >= start && char.IsWhiteSpace(span[end]))
+        {
+            end--;
+        }
+
+        return start > end ? ReadOnlyMemory<char>.Empty : value.Slice(start, end - start + 1);
+    }
+
+    private static void WriteSkippedBenchmark(ReadOnlySpan<char> name, string message)
+    {
+        Console.Out.Write(name);
+
+        for (var i = name.Length; i < 14; i++)
+        {
+            Console.Write(' ');
+        }
+
+        Console.WriteLine($" : {message}");
     }
 
     // ----- database lifecycle -----
@@ -509,6 +604,6 @@ internal sealed class Runner
         Console.WriteLine($"Threads:    {_options.Threads}");
         Console.WriteLine($"Compaction: {_options.Compaction}  WAL: {(_options.Wal ? "on" : "off")}{(_options.WalSync ? " (sync)" : "")}");
         Console.WriteLine($"DB path:    {_dbPath}");
-        Console.WriteLine(new string('-', 64));
+        Console.WriteLine(Separator);
     }
 }
