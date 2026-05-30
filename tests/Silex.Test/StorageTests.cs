@@ -15,7 +15,9 @@ public class StorageTests
     [Test]
     public async Task CanPutArray()
     {
-        using var storage = new LsmStorageInner<byte[], byte[]>(Path.GetTempPath(), _defaultStorageOptions);
+        using var tempFolder = TempFolder.Create();
+
+        using var storage = new LsmStorageInner<byte[], byte[]>(tempFolder, _defaultStorageOptions);
 
         byte[] key = [1, 2, 3];
         byte[] value = [4, 5, 6];
@@ -32,7 +34,9 @@ public class StorageTests
     {
         // Zero-copy is a core principle: a value served from a memtable is the same instance that was
         // put (a read-only borrow), not a defensive copy. This locks in that contract.
-        using var storage = new LsmStorageInner<byte[], byte[]>(Path.GetTempPath(), _defaultStorageOptions);
+        using var tempFolder = TempFolder.Create();
+
+        using var storage = new LsmStorageInner<byte[], byte[]>(tempFolder, _defaultStorageOptions);
 
         byte[] key = [1, 2, 3];
         byte[] value = [4, 5, 6];
@@ -50,7 +54,9 @@ public class StorageTests
     [Test]
     public async Task PutValueIsCopied()
     {
-        using var storage = new LsmStorageInner<byte[], byte[]>(Path.GetTempPath(), _defaultStorageOptions);
+        using var tempFolder = TempFolder.Create();
+
+        using var storage = new LsmStorageInner<byte[], byte[]>(tempFolder, _defaultStorageOptions);
 
         byte[] key1 = [1];
         byte[] key2 = [2];
@@ -70,7 +76,9 @@ public class StorageTests
     [Test]
     public async Task DeleteShouldStoreTombStone()
     {
-        using var storage = new LsmStorageInner<byte[], byte[]>(Path.GetTempPath(), _defaultStorageOptions);
+        using var tempFolder = TempFolder.Create();
+
+        using var storage = new LsmStorageInner<byte[], byte[]>(tempFolder, _defaultStorageOptions);
 
         byte[] key = [1, 2, 3];
 
@@ -91,7 +99,9 @@ public class StorageTests
         var memTableSizeLimit = 100;
 
         var storageOptions = new StorageOptions { MemTableSizeLimit = memTableSizeLimit, UseWriteAheadLog = false };
-        using var storage = new LsmStorageInner<int, byte[]>(Path.GetTempPath(), storageOptions);
+        using var tempFolder = TempFolder.Create();
+
+        using var storage = new LsmStorageInner<int, byte[]>(tempFolder, storageOptions);
 
         for (var i = 1; i <= entries; i++)
         {
@@ -115,7 +125,9 @@ public class StorageTests
         var dictionary = new Dictionary<int, byte[]>();
 
         var storageOptions = new StorageOptions { MemTableSizeLimit = memTableSizeLimit, UseWriteAheadLog = false };
-        using var storage = new LsmStorageInner<int, byte[]>(Path.GetTempPath(), storageOptions);
+        using var tempFolder = TempFolder.Create();
+
+        using var storage = new LsmStorageInner<int, byte[]>(tempFolder, storageOptions);
 
         for (var i = 1; i <= entries; i++)
         {
@@ -133,20 +145,21 @@ public class StorageTests
             var actualValue = await storage.GetAsync(i);
 
             await Assert.That(actualValue).IsEqualTo(expectedValue);
-        }            
+        }
     }
 
     [Test]
-    public async Task DeletedEntriesShouldAppearAfterPuts ()
+    public async Task DeletedEntriesShouldAppearAfterPuts()
     {
-        using var storage = FillImmutableMemTables();
+        using var tempFolder = TempFolder.Create();
+        using var storage = FillImmutableMemTables(tempFolder);
 
         int key = 10;
 
         var result = await storage.GetAsync(key);
         await Assert.That(result?.Length).IsEqualTo(10);
 
-         storage.Delete(key);
+        storage.Delete(key);
         result = await storage.GetAsync(key);
 
         await Assert.That(result?.Length).IsEqualTo(0);
@@ -155,7 +168,9 @@ public class StorageTests
     [Test]
     public async Task ScanListsAllMemTables()
     {
-        using var storage = new LsmStorageInner<char, byte[]>(Path.GetTempPath(), new StorageOptions { UseWriteAheadLog = false });
+        using var tempFolder = TempFolder.Create();
+
+        using var storage = new LsmStorageInner<char, byte[]>(tempFolder, new StorageOptions { UseWriteAheadLog = false });
 
         // table1: b->del, c->4, d->5
         // table2: a->1, b->2, c->3
@@ -196,7 +211,9 @@ public class StorageTests
         var maxKeysValue = 50; // Limit the number of unique ids to generate collisions
         var iterations = 50;
         var storageOptions = new StorageOptions { MemTableSizeLimit = 100, UseWriteAheadLog = false };
-        using var storage = new LsmStorageInner<long, byte[]>(Path.GetTempPath(), storageOptions);
+        using var tempFolder = TempFolder.Create();
+
+        using var storage = new LsmStorageInner<long, byte[]>(tempFolder, storageOptions);
         var iterator = storage.CreateIterator();
 
         var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5)).Token;
@@ -276,7 +293,8 @@ public class StorageTests
     {
         var count = 10;
 
-        using var storage = FillImmutableMemTables(entries: count, memTableSizeLimit: 1.KiB());
+        using var tempFolder = TempFolder.Create();
+        using var storage = FillImmutableMemTables(tempFolder, entries: count, memTableSizeLimit: 1.KiB());
         int lowerBytes = lowerBound == null ? -1 : lowerBound.Value;
 
         var expectedKeys = Enumerable.Range(1, count);
@@ -301,20 +319,19 @@ public class StorageTests
     [Test]
     public async Task OpenAsyncShouldCreateFolder()
     {
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        using var tempFolder = TempFolder.Create();
 
         var storage = await LsmStorage.OpenAsync<int, int>(tempFolder, _defaultStorageOptions);
 
         await Assert.That(Directory.Exists(tempFolder)).IsTrue();
 
         await storage.CloseAsync();
-        Directory.Delete(tempFolder, true);
     }
 
     [Test]
     public async Task ForceFlushShouldNotFailWithNoImmutableMemTable()
     {
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        using var tempFolder = TempFolder.Create();
 
         var storage = await LsmStorage.OpenAsync<char, byte[]>(tempFolder, new StorageOptions());
 
@@ -329,13 +346,12 @@ public class StorageTests
         await Assert.That(Directory.EnumerateFiles(tempFolder, "*.sst")).IsEmpty();
 
         await storage.CloseAsync();
-        Directory.Delete(tempFolder, true);
     }
 
     [Test]
     public async Task ForceFlushShouldFlushMemTable()
     {
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        using var tempFolder = TempFolder.Create();
 
         var storage = await LsmStorage.OpenAsync<char, byte[]>(tempFolder, new());
 
@@ -347,13 +363,12 @@ public class StorageTests
         await Assert.That(Directory.EnumerateFiles(tempFolder, "*.sst")).HasSingleItem();
 
         await storage.CloseAsync();
-        Directory.Delete(tempFolder, true);
     }
 
     [Test]
     public async Task GetShouldReadFromFlushedSsTable()
     {
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        using var tempFolder = TempFolder.Create();
 
         var storage = await LsmStorage.OpenAsync<int, int>(tempFolder, new());
 
@@ -383,7 +398,6 @@ public class StorageTests
         await Assert.That(await storage.GetAsync(10000)).IsEqualTo(0);
 
         await storage.CloseAsync();
-        Directory.Delete(tempFolder, true);
     }
 
     [Test]
@@ -392,7 +406,7 @@ public class StorageTests
         // When the number of mem tables is higher than MemTableMaxCount it should
         // flush the oldest mem table to disk
 
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { MemTableMaxCount = 2 };
         var storage = await LsmStorage.OpenAsync<char, int>(tempFolder, options);
 
@@ -415,13 +429,12 @@ public class StorageTests
         await Assert.That(storage._inner._state.ImmutableMemTables.Peek().TryGet('b', out _)).IsTrue();
 
         await storage.CloseAsync();
-        Directory.Delete(tempFolder, true);
     }
 
     [Test]
     public async Task CloseAsyncShouldFlushToDisk()
     {
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        using var tempFolder = TempFolder.Create();
         var storage = await LsmStorage.OpenAsync<char, int>(tempFolder, new StorageOptions());
 
         storage.Put('a', 1);
@@ -429,13 +442,12 @@ public class StorageTests
         await Assert.That(Directory.EnumerateFiles(tempFolder, "*.sst")).HasSingleItem();
 
         await storage.CloseAsync();
-        Directory.Delete(tempFolder, true);
     }
 
     [Test]
     public async Task CloseAsyncCanBeInvokedMultipleTimes()
     {
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        using var tempFolder = TempFolder.Create();
         var storage = await LsmStorage.OpenAsync<char, int>(tempFolder, new StorageOptions());
 
         storage.Put('a', 1);
@@ -451,7 +463,6 @@ public class StorageTests
         await Assert.That(Directory.EnumerateFiles(tempFolder, "*.sst").Count()).IsEqualTo(2);
 
         await storage.CloseAsync();
-        Directory.Delete(tempFolder, true);
     }
 
     [Test]
@@ -460,11 +471,10 @@ public class StorageTests
         // A storage that is never closed must not flush to disk during finalization (no WAL exists,
         // durability is only guaranteed by CloseAsync). Even when its directory has been removed, the
         // finalizer must be a no-op and never crash the process.
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        using var tempFolder = TempFolder.Create();
 
         await CreateUnclosedStorageAsync(tempFolder);
-
-        Directory.Delete(tempFolder, true);
+        tempFolder.Dispose();
 
         GC.Collect();
         GC.WaitForPendingFinalizers();
@@ -485,7 +495,9 @@ public class StorageTests
     [Test]
     public async Task GetShouldReturnMostRecentImmutableMemTableValue()
     {
-        using var storage = new LsmStorageInner<int, int>(Path.GetTempPath(), new StorageOptions { UseWriteAheadLog = false });
+        using var tempFolder = TempFolder.Create();
+
+        using var storage = new LsmStorageInner<int, int>(tempFolder, new StorageOptions { UseWriteAheadLog = false });
 
         storage.Put(1, 100);
         storage.ForceFreezeMemTable();
@@ -501,7 +513,9 @@ public class StorageTests
     [Test]
     public async Task ScanShouldReturnMostRecentImmutableMemTableValue()
     {
-        using var storage = new LsmStorageInner<int, int>(Path.GetTempPath(), new StorageOptions { UseWriteAheadLog = false });
+        using var tempFolder = TempFolder.Create();
+
+        using var storage = new LsmStorageInner<int, int>(tempFolder, new StorageOptions { UseWriteAheadLog = false });
 
         storage.Put(1, 100);
         storage.ForceFreezeMemTable();
@@ -518,7 +532,9 @@ public class StorageTests
     [Test]
     public async Task GetShouldFindByteArrayKeyByContent()
     {
-        using var storage = new LsmStorageInner<byte[], int>(Path.GetTempPath(), new StorageOptions { UseWriteAheadLog = false });
+        using var tempFolder = TempFolder.Create();
+
+        using var storage = new LsmStorageInner<byte[], int>(tempFolder, new StorageOptions { UseWriteAheadLog = false });
 
         storage.Put([1, 2, 3], 42);
 
@@ -529,7 +545,7 @@ public class StorageTests
     [Test]
     public async Task ReopenShouldPreserveLevelZeroRecency()
     {
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { FlushPeriod = TimeSpan.Zero };
 
         var storage = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
@@ -550,13 +566,12 @@ public class StorageTests
         await Assert.That(await reopened.GetAsync(1)).IsEqualTo(200);
 
         await reopened.CloseAsync();
-        Directory.Delete(tempFolder, true);
     }
 
     [Test]
     public async Task GetShouldReadBytesValueOfArbitraryLengthFromSsTable()
     {
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { FlushPeriod = TimeSpan.Zero };
 
         var storage = await LsmStorage.OpenAsync<int, Bytes>(tempFolder, options);
@@ -573,13 +588,12 @@ public class StorageTests
         await Assert.That(result).IsEqualTo(value);
 
         await storage.CloseAsync();
-        Directory.Delete(tempFolder, true);
     }
 
     [Test]
     public async Task WriteAheadLogRecoversUnflushedEntriesAfterCrash()
     {
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        using var tempFolder = TempFolder.Create();
         // Disable background flushing so the data stays only in the memtable + WAL (never an SST).
         var options = new StorageOptions { FlushPeriod = TimeSpan.Zero };
 
@@ -602,8 +616,6 @@ public class StorageTests
         }
 
         await reopened.CloseAsync();
-        Directory.Delete(tempFolder, true);
-
         static async Task SimulateCrashAfterPutsAsync(string folder, StorageOptions options)
         {
             var storage = await LsmStorage.OpenAsync<int, int>(folder, options);
@@ -622,7 +634,7 @@ public class StorageTests
     {
         // Sanity check that the recovery above is genuinely driven by the WAL: with the WAL removed
         // (and nothing flushed), the data is gone after a crash.
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { FlushPeriod = TimeSpan.Zero };
 
         await SimulateCrashAfterPutsAsync(tempFolder, options);
@@ -640,8 +652,6 @@ public class StorageTests
         await Assert.That(await reopened.GetAsync(0)).IsEqualTo(0);
 
         await reopened.CloseAsync();
-        Directory.Delete(tempFolder, true);
-
         static async Task SimulateCrashAfterPutsAsync(string folder, StorageOptions options)
         {
             var storage = await LsmStorage.OpenAsync<int, int>(folder, options);
@@ -652,7 +662,7 @@ public class StorageTests
     [Test]
     public async Task WriteAheadLogRecoveryToleratesTornTrailingRecord()
     {
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { FlushPeriod = TimeSpan.Zero };
 
         await SimulateCrashAfterPutsAsync(tempFolder, options);
@@ -671,8 +681,6 @@ public class StorageTests
         await Assert.That(await reopened.GetAsync(0)).IsEqualTo(1);
 
         await reopened.CloseAsync();
-        Directory.Delete(tempFolder, true);
-
         static async Task SimulateCrashAfterPutsAsync(string folder, StorageOptions options)
         {
             var storage = await LsmStorage.OpenAsync<int, int>(folder, options);
@@ -687,7 +695,7 @@ public class StorageTests
     [Test]
     public async Task RecoveryDeletesStaleWalWhenSstAlreadyExists()
     {
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { FlushPeriod = TimeSpan.Zero };
 
         var storage = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
@@ -712,7 +720,6 @@ public class StorageTests
         await Assert.That(File.Exists(staleWal)).IsFalse();
 
         await reopened.CloseAsync();
-        Directory.Delete(tempFolder, true);
     }
 
     [Test]
@@ -720,8 +727,7 @@ public class StorageTests
     {
         // Three equally sized single-entry tiers hit the space-amplification trigger (sum of the newer
         // tiers reaches MaxSizeAmplificationPercent of the oldest), so all three merge into one SST.
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-        Directory.CreateDirectory(tempFolder);
+        using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { UseWriteAheadLog = false, MaxCompactionTiers = 3 };
         var storage = new LsmStorageInner<int, int>(tempFolder, options);
 
@@ -744,7 +750,6 @@ public class StorageTests
         finally
         {
             storage.Dispose();
-            Directory.Delete(tempFolder, true);
         }
     }
 
@@ -753,8 +758,7 @@ public class StorageTests
     {
         // A full compaction (the oldest tier participates) may drop tombstones. The delete of key 1 in a
         // newer tier shadows its value in the oldest tier and is then discarded entirely.
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-        Directory.CreateDirectory(tempFolder);
+        using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { UseWriteAheadLog = false, MaxCompactionTiers = 3 };
         var storage = new LsmStorageInner<int, int>(tempFolder, options);
 
@@ -774,7 +778,6 @@ public class StorageTests
         finally
         {
             storage.Dispose();
-            Directory.Delete(tempFolder, true);
         }
     }
 
@@ -784,8 +787,7 @@ public class StorageTests
         // A large oldest tier plus several tiny newest tiers avoids the space-amplification trigger and
         // instead fires the size-ratio trigger, merging only the newest tiers. Because the oldest tier is
         // excluded, a tombstone for a key it still holds must be preserved (the key stays logically gone).
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-        Directory.CreateDirectory(tempFolder);
+        using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { UseWriteAheadLog = false, MaxCompactionTiers = 4 };
         var storage = new LsmStorageInner<int, int>(tempFolder, options);
 
@@ -818,7 +820,6 @@ public class StorageTests
         finally
         {
             storage.Dispose();
-            Directory.Delete(tempFolder, true);
         }
     }
 
@@ -826,8 +827,7 @@ public class StorageTests
     public async Task TieredCompactionBelowThresholdIsNoOp()
     {
         // With fewer tiers than MaxCompactionTiers there is nothing to do: the call is a no-op.
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-        Directory.CreateDirectory(tempFolder);
+        using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { UseWriteAheadLog = false, MaxCompactionTiers = 8 };
         var storage = new LsmStorageInner<int, int>(tempFolder, options);
 
@@ -845,15 +845,13 @@ public class StorageTests
         finally
         {
             storage.Dispose();
-            Directory.Delete(tempFolder, true);
         }
     }
 
     [Test]
     public async Task TieredCompactionDisabledByStrategyIsNoOp()
     {
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-        Directory.CreateDirectory(tempFolder);
+        using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { UseWriteAheadLog = false, MaxCompactionTiers = 2, CompactionStrategy = CompactionStrategy.None };
         var storage = new LsmStorageInner<int, int>(tempFolder, options);
 
@@ -869,7 +867,6 @@ public class StorageTests
         finally
         {
             storage.Dispose();
-            Directory.Delete(tempFolder, true);
         }
     }
 
@@ -878,7 +875,7 @@ public class StorageTests
     {
         // After a full compaction the merged output gets the highest id, so reopen-by-id still resolves
         // the newest value for a key written across several tiers.
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { FlushPeriod = TimeSpan.Zero, MaxCompactionTiers = 3 };
 
         var storage = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
@@ -898,7 +895,6 @@ public class StorageTests
         await Assert.That(await reopened.GetAsync(1)).IsEqualTo(300);
 
         await reopened.CloseAsync();
-        Directory.Delete(tempFolder, true);
     }
 
     [Test]
@@ -907,8 +903,7 @@ public class StorageTests
         // A newer SST whose key range straddles the target key but does not contain it must not mask an
         // older SST that does. Forcing the bloom filter to always report "maybe present" simulates the
         // false positive that would otherwise make the lookup stop prematurely.
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-        Directory.CreateDirectory(tempFolder);
+        using var tempFolder = TempFolder.Create();
         var options = new StorageOptions
         {
             UseWriteAheadLog = false,
@@ -935,7 +930,6 @@ public class StorageTests
         finally
         {
             storage.Dispose();
-            Directory.Delete(tempFolder, true);
         }
     }
 
@@ -965,8 +959,7 @@ public class StorageTests
         // Regression guard for the flush/scan race: while an immutable MemTable is mid-flush (dequeued from
         // the queue but its SST not yet published), a concurrent scan must still observe its data. Flush makes
         // that transition atomic under the level0 write lock, so every previously committed key stays visible.
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-        Directory.CreateDirectory(tempFolder);
+        using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { UseWriteAheadLog = false, FlushPeriod = TimeSpan.Zero };
         var storage = new LsmStorageInner<int, int>(tempFolder, options);
 
@@ -1009,7 +1002,6 @@ public class StorageTests
         finally
         {
             storage.Dispose();
-            Directory.Delete(tempFolder, true);
         }
     }
 
@@ -1024,8 +1016,7 @@ public class StorageTests
     public async Task FullScanIncludesFlushedSsTableData()
     {
         // Data flushed to L0 SSTs (with nothing left in the MemTables) must still appear in a full scan.
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-        Directory.CreateDirectory(tempFolder);
+        using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { UseWriteAheadLog = false };
         var storage = new LsmStorageInner<int, int>(tempFolder, options);
 
@@ -1043,7 +1034,6 @@ public class StorageTests
         finally
         {
             storage.Dispose();
-            Directory.Delete(tempFolder, true);
         }
     }
 
@@ -1051,8 +1041,7 @@ public class StorageTests
     public async Task ScanReturnsNewestValueAcrossMemTableAndSsTable()
     {
         // A key written to an SST and later overwritten in the current MemTable must scan as the newer value.
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-        Directory.CreateDirectory(tempFolder);
+        using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { UseWriteAheadLog = false };
         var storage = new LsmStorageInner<int, int>(tempFolder, options);
 
@@ -1072,7 +1061,6 @@ public class StorageTests
         finally
         {
             storage.Dispose();
-            Directory.Delete(tempFolder, true);
         }
     }
 
@@ -1080,8 +1068,7 @@ public class StorageTests
     public async Task ScanHidesKeysDeletedAfterFlush()
     {
         // A key present in an SST but deleted afterwards (tombstone in the MemTable) must be absent from scans.
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-        Directory.CreateDirectory(tempFolder);
+        using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { UseWriteAheadLog = false };
         var storage = new LsmStorageInner<int, int>(tempFolder, options);
 
@@ -1100,7 +1087,6 @@ public class StorageTests
         finally
         {
             storage.Dispose();
-            Directory.Delete(tempFolder, true);
         }
     }
 
@@ -1108,8 +1094,7 @@ public class StorageTests
     public async Task RangeScanIncludesSsTableData()
     {
         // A bounded scan (keys >= from) must include matching entries that live only in SSTs.
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-        Directory.CreateDirectory(tempFolder);
+        using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { UseWriteAheadLog = false };
         var storage = new LsmStorageInner<int, int>(tempFolder, options);
 
@@ -1128,7 +1113,6 @@ public class StorageTests
         finally
         {
             storage.Dispose();
-            Directory.Delete(tempFolder, true);
         }
     }
 
@@ -1136,11 +1120,9 @@ public class StorageTests
     public async Task ScanAfterReopenIncludesSsTableData()
     {
         // After reopening, all live data is in SSTs (MemTables are empty), so the scan exercises the SST path.
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-        Directory.CreateDirectory(tempFolder);
+        using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { UseWriteAheadLog = false, FlushPeriod = TimeSpan.Zero };
 
-        try
         {
             var storage = new LsmStorageInner<int, int>(tempFolder, options);
             await FlushTierAsync(storage, () => storage.Put(1, 10));
@@ -1161,10 +1143,6 @@ public class StorageTests
                 reopened.Dispose();
             }
         }
-        finally
-        {
-            Directory.Delete(tempFolder, true);
-        }
     }
 
 
@@ -1173,8 +1151,7 @@ public class StorageTests
     {
         // Sentinel-based encoders (here int) persist a deletion as a fixed non-empty value. Reading that
         // key back from an SST must resolve to the default (deleted), not the raw sentinel.
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-        Directory.CreateDirectory(tempFolder);
+        using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { UseWriteAheadLog = false };
         var storage = new LsmStorageInner<int, int>(tempFolder, options);
 
@@ -1189,7 +1166,6 @@ public class StorageTests
         finally
         {
             storage.Dispose();
-            Directory.Delete(tempFolder, true);
         }
     }
 
@@ -1198,8 +1174,7 @@ public class StorageTests
     {
         // Once Level0CompactionThreshold L0 SSTs accumulate, leveled compaction merges them all into a
         // single L1 sorted run and empties L0.
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-        Directory.CreateDirectory(tempFolder);
+        using var tempFolder = TempFolder.Create();
         var options = new StorageOptions
         {
             UseWriteAheadLog = false,
@@ -1235,7 +1210,6 @@ public class StorageTests
         finally
         {
             storage.Dispose();
-            Directory.Delete(tempFolder, true);
         }
     }
 
@@ -1244,8 +1218,7 @@ public class StorageTests
     {
         // With a tiny base target every level is over budget, so after L0 flushes into L1 a second
         // compaction pushes L1 down into L2.
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-        Directory.CreateDirectory(tempFolder);
+        using var tempFolder = TempFolder.Create();
         var options = new StorageOptions
         {
             UseWriteAheadLog = false,
@@ -1275,7 +1248,6 @@ public class StorageTests
         finally
         {
             storage.Dispose();
-            Directory.Delete(tempFolder, true);
         }
     }
 
@@ -1284,8 +1256,7 @@ public class StorageTests
     {
         // When the destination is the last non-empty level, a delete may be discarded entirely because no
         // older value survives below it.
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-        Directory.CreateDirectory(tempFolder);
+        using var tempFolder = TempFolder.Create();
         var options = new StorageOptions
         {
             UseWriteAheadLog = false,
@@ -1315,7 +1286,6 @@ public class StorageTests
         finally
         {
             storage.Dispose();
-            Directory.Delete(tempFolder, true);
         }
     }
 
@@ -1324,8 +1294,7 @@ public class StorageTests
     {
         // A tombstone must be preserved when a deeper level still holds the key it shadows, otherwise the
         // older value would be resurrected.
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-        Directory.CreateDirectory(tempFolder);
+        using var tempFolder = TempFolder.Create();
         var options = new StorageOptions
         {
             UseWriteAheadLog = false,
@@ -1356,7 +1325,6 @@ public class StorageTests
         finally
         {
             storage.Dispose();
-            Directory.Delete(tempFolder, true);
         }
     }
 
@@ -1365,8 +1333,7 @@ public class StorageTests
     {
         // The manifest persists the L0/level structure so a reopen restores the exact levels (and recency)
         // even though leveled SST ids no longer encode it.
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-        Directory.CreateDirectory(tempFolder);
+        using var tempFolder = TempFolder.Create();
         var options = new StorageOptions
         {
             UseWriteAheadLog = false,
@@ -1376,7 +1343,6 @@ public class StorageTests
             BaseLevelTargetBytes = 1,
         };
 
-        try
         {
             var building = new LsmStorageInner<int, int>(tempFolder, options);
             await FlushTierAsync(building, () => building.Put(1, 10));
@@ -1409,10 +1375,6 @@ public class StorageTests
                 await storage.DisposeAsync();
             }
         }
-        finally
-        {
-            Directory.Delete(tempFolder, true);
-        }
     }
 
     [Test]
@@ -1420,8 +1382,7 @@ public class StorageTests
     {
         // An SST left behind by a flush/compaction that crashed before the manifest commit is not
         // referenced by the manifest and must be deleted on reopen.
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-        Directory.CreateDirectory(tempFolder);
+        using var tempFolder = TempFolder.Create();
         var options = new StorageOptions
         {
             UseWriteAheadLog = false,
@@ -1430,7 +1391,6 @@ public class StorageTests
             Level0CompactionThreshold = 2,
         };
 
-        try
         {
             var building = new LsmStorageInner<int, int>(tempFolder, options);
             await FlushTierAsync(building, () => building.Put(1, 10));
@@ -1455,10 +1415,6 @@ public class StorageTests
                 await storage.DisposeAsync();
             }
         }
-        finally
-        {
-            Directory.Delete(tempFolder, true);
-        }
     }
 
     [Test]
@@ -1466,8 +1422,7 @@ public class StorageTests
     {
         // With a small per-SST target, a level holds several size-bounded, non-overlapping runs instead of
         // one giant SST.
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-        Directory.CreateDirectory(tempFolder);
+        using var tempFolder = TempFolder.Create();
         var options = new StorageOptions
         {
             UseWriteAheadLog = false,
@@ -1509,7 +1464,6 @@ public class StorageTests
         finally
         {
             storage.Dispose();
-            Directory.Delete(tempFolder, true);
         }
     }
 
@@ -1518,8 +1472,7 @@ public class StorageTests
     {
         // Partial selection: an L0 batch that overlaps only the low key range rewrites just the overlapping
         // L1 SSTs; the non-overlapping L1 SSTs keep their identity (same file) and data.
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-        Directory.CreateDirectory(tempFolder);
+        using var tempFolder = TempFolder.Create();
         var options = new StorageOptions
         {
             UseWriteAheadLog = false,
@@ -1576,7 +1529,6 @@ public class StorageTests
         finally
         {
             storage.Dispose();
-            Directory.Delete(tempFolder, true);
         }
     }
 
@@ -1584,8 +1536,7 @@ public class StorageTests
     public async Task LeveledReopenRestoresSplitLevelsViaManifest()
     {
         // A reopen restores a level made of multiple split SSTs from the manifest, with all data intact.
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-        Directory.CreateDirectory(tempFolder);
+        using var tempFolder = TempFolder.Create();
         var options = new StorageOptions
         {
             UseWriteAheadLog = false,
@@ -1596,7 +1547,6 @@ public class StorageTests
             TargetSstSizeBytes = 128,
         };
 
-        try
         {
             var building = new LsmStorageInner<int, int>(tempFolder, options);
             await FlushTierAsync(building, () =>
@@ -1626,10 +1576,6 @@ public class StorageTests
                 await storage.DisposeAsync();
             }
         }
-        finally
-        {
-            Directory.Delete(tempFolder, true);
-        }
     }
 
     [Test]
@@ -1637,8 +1583,7 @@ public class StorageTests
     {
         // With parallelism enabled and an input large enough to split across several key-range partitions,
         // the parallel leveled subcompaction must produce sorted, non-overlapping SSTs holding every key.
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-        Directory.CreateDirectory(tempFolder);
+        using var tempFolder = TempFolder.Create();
         var options = new StorageOptions
         {
             UseWriteAheadLog = false,
@@ -1677,7 +1622,6 @@ public class StorageTests
         finally
         {
             storage.Dispose();
-            Directory.Delete(tempFolder, true);
         }
     }
 
@@ -1687,8 +1631,7 @@ public class StorageTests
         // DOP=1 and DOP>1 must yield identical logical contents (same keys/values on a full scan).
         static async Task<List<KeyValuePair<int, int>>> RunAsync(int dop)
         {
-            var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-            Directory.CreateDirectory(tempFolder);
+            using var tempFolder = TempFolder.Create();
             var options = new StorageOptions
             {
                 UseWriteAheadLog = false,
@@ -1714,7 +1657,6 @@ public class StorageTests
             finally
             {
                 storage.Dispose();
-                Directory.Delete(tempFolder, true);
             }
         }
 
@@ -1731,8 +1673,7 @@ public class StorageTests
     {
         // With read parallelism on and enough accumulated L0 tables to cross the probe threshold, point reads
         // must still honor recency (newest table wins), tombstones, and absent keys.
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-        Directory.CreateDirectory(tempFolder);
+        using var tempFolder = TempFolder.Create();
         var options = new StorageOptions
         {
             UseWriteAheadLog = false,
@@ -1775,7 +1716,6 @@ public class StorageTests
         finally
         {
             storage.Dispose();
-            Directory.Delete(tempFolder, true);
         }
     }
 
@@ -1783,8 +1723,7 @@ public class StorageTests
     public async Task ParallelReopenRestoresData()
     {
         // OpenAsync loads SSTs in parallel when read parallelism is enabled; a reopen must restore all data.
-        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-        Directory.CreateDirectory(tempFolder);
+        using var tempFolder = TempFolder.Create();
         var options = new StorageOptions
         {
             UseWriteAheadLog = false,
@@ -1793,7 +1732,6 @@ public class StorageTests
             MaxReadParallelism = 8,
         };
 
-        try
         {
             var building = new LsmStorageInner<int, int>(tempFolder, options);
             for (var t = 0; t < 10; t++)
@@ -1822,16 +1760,12 @@ public class StorageTests
                 await storage.DisposeAsync();
             }
         }
-        finally
-        {
-            Directory.Delete(tempFolder, true);
-        }
     }
 
-    private static LsmStorageInner<int, byte[]> FillImmutableMemTables(int entries = 100, int valueSize = 10, long memTableSizeLimit = 100)
+    private static LsmStorageInner<int, byte[]> FillImmutableMemTables(string path, int entries = 100, int valueSize = 10, long memTableSizeLimit = 100)
     {
         var storageOptions = new StorageOptions { MemTableSizeLimit = memTableSizeLimit, UseWriteAheadLog = false };
-        var storage = new LsmStorageInner<int, byte[]>(Path.GetTempPath(), storageOptions);
+        var storage = new LsmStorageInner<int, byte[]>(path, storageOptions);
 
         for (var i = 1; i <= entries; i++)
         {

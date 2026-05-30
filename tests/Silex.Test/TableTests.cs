@@ -12,7 +12,8 @@ public class TableTests
     [Test]
     public async Task ShouldCreateTable()
     {
-        var tempFilename = Path.GetRandomFileName();
+        using var tempFolder = TempFolder.Create();
+        var tempFilename = tempFolder.GetRandomFileName();
 
         using var builder = new BufferedSsTableBuilder<ushort, string>(tempFilename, new DefaultSsTableEncoder<ushort, string>(), new DefaultBlockEncoder<ushort, string>(), new DefaultBloomFilterFactory(), 100);
 
@@ -28,13 +29,13 @@ public class TableTests
         await Assert.That(block!.Memory).IsEquivalentTo(new byte[] { 2, 7, 0, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, CollectionOrdering.Matching);
 
         table.Dispose();
-        File.Delete(tempFilename);
     }
 
     [Test]
     public async Task ShouldLoadExistingTable()
     {
-        var tempFilename = Path.GetRandomFileName();
+        using var tempFolder = TempFolder.Create();
+        var tempFilename = tempFolder.GetRandomFileName();
         var blockBuilder = new BlockBuilder<ushort, string>(new DefaultBlockEncoder<ushort, string>());
 
         using var builder = new BufferedSsTableBuilder<ushort, string>(tempFilename, new DefaultSsTableEncoder<ushort, string>(), new DefaultBlockEncoder<ushort, string>(), new DefaultBloomFilterFactory(), 100);
@@ -44,7 +45,7 @@ public class TableTests
 
         await builder.AddAsync(key, value);
 
-        var table =  await builder.BuildAsync();
+        var table = await builder.BuildAsync();
         table.Dispose();
 
         table = await SsTable<ushort, string>.LoadSsTableAsync(tempFilename, new DefaultSsTableEncoder<ushort, string>(), blockBuilder, new DefaultBloomFilterFactory());
@@ -54,7 +55,6 @@ public class TableTests
         await Assert.That(block!.Memory).IsEquivalentTo(new byte[] { 2, 7, 0, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, CollectionOrdering.Matching);
 
         table.Dispose();
-        File.Delete(tempFilename);
     }
 
     [Test]
@@ -65,14 +65,15 @@ public class TableTests
     [Arguments(1000)]
     public async Task ShouldIterateAllEntries(int count)
     {
-        var tempFilename = Path.GetRandomFileName();
+        using var tempFolder = TempFolder.Create();
+        var tempFilename = tempFolder.GetRandomFileName();
 
         using var builder = new BufferedSsTableBuilder<uint, byte[]>(tempFilename, new DefaultSsTableEncoder<uint, byte[]>(), new DefaultBlockEncoder<uint, byte[]>(), new DefaultBloomFilterFactory(), 100);
 
         // Random 100 B values
         var value = new byte[100.B()];
         Random.Shared.NextBytes(value);
-        
+
         for (uint i = 0; i < count; i++)
         {
             await builder.AddAsync(i, value);
@@ -89,13 +90,13 @@ public class TableTests
         await Assert.That(result).IsEquivalentTo(Enumerable.Range(0, count).Select(i => (uint)i));
 
         table.Dispose();
-        File.Delete(tempFilename);
     }
 
     [Test]
     public async Task ShouldIterateFromKey()
     {
-        var tempFilename = Path.GetRandomFileName();
+        using var tempFolder = TempFolder.Create();
+        var tempFilename = tempFolder.GetRandomFileName();
 
         using var builder = new BufferedSsTableBuilder<uint, byte[]>(tempFilename, new DefaultSsTableEncoder<uint, byte[]>(), new DefaultBlockEncoder<uint, byte[]>(), new DefaultBloomFilterFactory(), 100);
 
@@ -120,13 +121,13 @@ public class TableTests
         await Assert.That(result).IsEquivalentTo(Enumerable.Range(13, 100 - 13).Select(i => (uint)i));
 
         table.Dispose();
-        File.Delete(tempFilename);
     }
 
     [Test]
     public async Task ShouldIterateFromUnknownKey()
     {
-        var tempFilename = Path.GetRandomFileName();
+        using var tempFolder = TempFolder.Create();
+        var tempFilename = tempFolder.GetRandomFileName();
 
         using var builder = new BufferedSsTableBuilder<uint, byte[]>(tempFilename, new DefaultSsTableEncoder<uint, byte[]>(), new DefaultBlockEncoder<uint, byte[]>(), new DefaultBloomFilterFactory(), 100);
 
@@ -151,13 +152,13 @@ public class TableTests
         await Assert.That(result).IsEmpty();
 
         table.Dispose();
-        File.Delete(tempFilename);
     }
 
     [Test]
     public async Task ShouldIterateFromKeyBeforeFirst()
     {
-        var tempFilename = Path.GetRandomFileName();
+        using var tempFolder = TempFolder.Create();
+        var tempFilename = tempFolder.GetRandomFileName();
 
         using var builder = new BufferedSsTableBuilder<uint, byte[]>(tempFilename, new DefaultSsTableEncoder<uint, byte[]>(), new DefaultBlockEncoder<uint, byte[]>(), new DefaultBloomFilterFactory(), 100);
 
@@ -181,13 +182,13 @@ public class TableTests
         await Assert.That(result).IsEquivalentTo(Enumerable.Range(10, 100).Select(i => (uint)i));
 
         table.Dispose();
-        File.Delete(tempFilename);
     }
 
     [Test]
     public async Task ShouldCacheBlocks()
     {
-        var tempFilename = Path.GetRandomFileName();
+        using var tempFolder = TempFolder.Create();
+        var tempFilename = tempFolder.GetRandomFileName();
 
         using var builder = new BufferedSsTableBuilder<ushort, string>(tempFilename, new DefaultSsTableEncoder<ushort, string>(), new DefaultBlockEncoder<ushort, string>(), new DefaultBloomFilterFactory(), 100);
         var memoryCache = new MemoryCache(new MemoryCacheOptions());
@@ -206,13 +207,13 @@ public class TableTests
         await Assert.That(block2).IsSameReferenceAs(block1);
 
         table.Dispose();
-        File.Delete(tempFilename);
     }
 
     [Test]
     public async Task ShouldCacheBlocksConcurrently()
     {
-        var tempFilename = Path.GetRandomFileName();
+        using var tempFolder = TempFolder.Create();
+        var tempFilename = tempFolder.GetRandomFileName();
 
         using var builder = new BufferedSsTableBuilder<ushort, string>(tempFilename, new DefaultSsTableEncoder<ushort, string>(), new DefaultBlockEncoder<ushort, string>(), new DefaultBloomFilterFactory(), 100);
         var memoryCache = new MemoryCache(new MemoryCacheOptions());
@@ -224,7 +225,7 @@ public class TableTests
         var table = await builder.BuildAsync();
 
         await Assert.That(table.BlockMetadata).HasSingleItem();
-        
+
         var blocks = new List<Task<Block<ushort, string>?>>();
 
         for (var i = 0; i < 100; i++)
@@ -244,14 +245,14 @@ public class TableTests
         }
 
         table.Dispose();
-        File.Delete(tempFilename);
     }
 
     [Test]
     public async Task ShouldLoadBloomFilter()
     {
         var entries = Enumerable.Range(0, 100).Select(x => new KeyValuePair<int, int>(x, x)).ToList();
-        var table = await CreateAndLoadSsTableAsync(entries);
+        using var tempFolder = TempFolder.Create();
+        var table = await CreateAndLoadSsTableAsync(entries, tempFolder);
 
         var bloomFilter = table.BloomFilter;
 
@@ -281,12 +282,11 @@ public class TableTests
         await Assert.That(falsePositives < iterations * 0.1).IsTrue();
 
         table.Dispose();
-        File.Delete(table.Filename);
     }
 
-    private async Task<SsTable<TKey, TValue>> CreateAndLoadSsTableAsync<TKey, TValue>(IReadOnlyList<KeyValuePair<TKey, TValue>> entries)
+    private async Task<SsTable<TKey, TValue>> CreateAndLoadSsTableAsync<TKey, TValue>(IReadOnlyList<KeyValuePair<TKey, TValue>> entries, TempFolder tempFolder)
     {
-        var tempFilename = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        var tempFilename = tempFolder.GetRandomFileName();
         var blockEncoder = new DefaultBlockEncoder<TKey, TValue>();
         var blockBuilder = new BlockBuilder<TKey, TValue>(blockEncoder);
         var ssTableEncoder = new DefaultSsTableEncoder<TKey, TValue>();
@@ -303,4 +303,3 @@ public class TableTests
         return await SsTable<TKey, TValue>.LoadSsTableAsync(tempFilename, ssTableEncoder, blockBuilder, new DefaultBloomFilterFactory());
     }
 }
-
