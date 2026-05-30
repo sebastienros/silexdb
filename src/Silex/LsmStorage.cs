@@ -142,18 +142,8 @@ public class LsmStorage<TKey, TValue> : IDisposable, IAsyncDisposable where TKey
         ObjectDisposedException.ThrowIf(_disposed, this);
     }
 
-    ~LsmStorage()
-    {
-        // A finalizer must never throw, otherwise the exception is unhandled and terminates the
-        // process. When the storage is collected without being closed (for example after its
-        // directory has already been removed), the best-effort flush below can legitimately fail.
-        try
-        {
-            Dispose();
-        }
-        catch
-        {
-            // Best-effort flush during finalization; failures are ignored on purpose.
-        }
-    }
+    // No finalizer on purpose: persisting data requires blocking disk I/O, which must never run
+    // during finalization. Durability is provided solely by deterministic disposal
+    // (CloseAsync/DisposeAsync/Dispose). Any file handles held by the inner storage are released by
+    // its own finalizer, so an undisposed instance leaks no native resources (it just isn't flushed).
 }

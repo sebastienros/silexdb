@@ -202,8 +202,9 @@ internal sealed class BufferedSsTableBuilder<TKey, TValue> : ISsTableBuilder<TKe
 
     private void DisposeInternal()
     {
-        // The constructor can fail (for example File.Create throwing when the directory was removed),
-        // leaving a partially constructed instance whose finalizer still runs, so guard against null.
+        // Defensive null checks: the constructor can fail (for example File.Create throwing when the
+        // directory was removed), leaving a partially constructed instance. The underlying FileStream
+        // releases its OS handle through its own finalizer, so no native resource leaks even then.
         _stream?.Dispose();
         _bufferWriter?.Dispose();
 
@@ -214,19 +215,6 @@ internal sealed class BufferedSsTableBuilder<TKey, TValue> : ISsTableBuilder<TKe
             _blockBuilder?.Dispose();
             _metadata?.Clear();
             _metadata = null;
-        }
-    }
-
-    ~BufferedSsTableBuilder()
-    {
-        // A finalizer must never throw, otherwise the unhandled exception terminates the process.
-        try
-        {
-            DisposeInternal();
-        }
-        catch
-        {
-            // Best-effort cleanup during finalization; failures are ignored on purpose.
         }
     }
 }
