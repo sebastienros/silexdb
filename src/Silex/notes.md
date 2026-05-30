@@ -105,6 +105,19 @@ not in the individual collections.
 - A `PeriodicTimer` (default 50 ms; `TimeSpan.Zero` disables it) flushes immutable MemTables to L0
   once their count exceeds `MemTableMaxCount`. Uses an injectable `TimeProvider` (testable).
 
+### Resource management & disposal
+- `LsmStorage` is `IDisposable` + `IAsyncDisposable`; `CloseAsync()` == `DisposeAsync()`. Disposal is
+  idempotent (`_disposed` guard) and the only durability boundary: it stops the compacter, freezes
+  and flushes all immutable MemTables to L0, then disposes the inner.
+- **No flushing during finalization.** There is intentionally no `~LsmStorage()` /
+  `~BufferedSsTableBuilder()` finalizer — persisting requires blocking disk I/O, which must never run
+  during GC. An unclosed storage is simply never flushed (acceptable: there is no WAL, so GC-timed
+  flushing was never reliable). Native file handles are still released by `LsmStorageInner`'s and
+  `FileStream`'s own finalizers, so leaving a storage unclosed leaks no OS resources and can never
+  crash the process.
+- Callers (and tests) must `CloseAsync()` before relying on data being on disk. Tests dispose
+  deterministically before deleting their temp folders so finalizers stay true no-ops.
+
 ### Memory management buffers (`Buffers/`)
 - `RecyclableMemoryStream : IBufferWriter` — grows by chaining pooled blocks; buffers returned to the
   pool on dispose. `GetReadOnlySequence()` exposes the chained blocks; `GetBuffer()` returns one
@@ -121,7 +134,8 @@ not in the individual collections.
 ## What's left to do
 
 ### Durability / crash recovery (missing)
-- **No write-ahead log (WAL).** Unflushed MemTable data is lost on crash.
+- **No write-ahead log (WAL).** Unflushed MemTable data is lost on crash. Data is persisted *only* by
+  explicit `CloseAsync`/`DisposeAsync` (or background flush of frozen tables) — never by GC/finalizers.
 - **No manifest.** No persisted record of which SSTs exist or which level they belong to.
 - Recovery on `OpenAsync` is partial: only `*.sst` files are loaded and all are treated as L0
   (`// TODO: For now we only load l0 SSTs`); higher levels would be ignored once they exist.
@@ -155,10 +169,18 @@ not in the individual collections.
   many places).
 - Should the encoder own file creation? Allow choosing which files an SST produces (e.g. split
   content vs. metadata) or where they live (e.g. blobs).
-- Use `IStorageIterator` for MemTables and a `MergeIterator` implementing it, reused by
-  `LsmStorageInner`.
-- In `BufferedSsTableBuilder.AddAsync`, a key is encoded once for the bloom filter and again into
-  block memory; encode it once as entries are added.
+
+#### Done
+- ~~Use `IStorageIterator` for MemTables and a `MergeIterator` implementing it, reused by
+  `LsmStorageInner`.~~ Implemented: a single reusable `MergeIterator` merges MemTable iterators and
+  is reused by `LsmStorageInner` for scans.
+- ~~In `BufferedSsTableBuilder.AddAsync`, a key is encoded once for the bloom filter and again into
+  block memory.~~ Implemented: `BlockBuilder` now encodes each key once into a pooled buffer
+  (`LastEncodedKey`) and reuses it for the bloom filter. (Also fixed a latent bloom-filter bug where
+  unflushed writer bytes meant empty keys were fed to the filter.)
+- ~~Make disposal idempotent and finalizers no-ops.~~ Implemented: deterministic
+  `CloseAsync`/`DisposeAsync` is the sole flush path; finalizers were removed (see
+  *Resource management & disposal*).
 
 ---
 
