@@ -46,6 +46,31 @@ dotnet publish Silex.DbBench -c Release -o ./dist
 ./dist/dbbench --benchmarks=fillseq,readrandom --num=1000000
 ```
 
+### Target frameworks (.NET 8 vs .NET 10)
+
+`Silex` multi-targets `net8.0` and `net10.0`, and `dbbench` multi-targets
+`net10.0` (default) and `net8.0`. A `dotnet build -c Release` produces both
+binaries:
+
+```
+Silex.DbBench/bin/Release/net10.0/dbbench   # default
+Silex.DbBench/bin/Release/net8.0/dbbench
+```
+
+Run a specific runtime to compare framework/JIT/GC differences:
+
+```bash
+# Directly
+./Silex.DbBench/bin/Release/net10.0/dbbench --benchmarks=readrandom --num=1000000
+./Silex.DbBench/bin/Release/net8.0/dbbench  --benchmarks=readrandom --num=1000000
+
+# Or via dotnet run with an explicit -f
+dotnet run --project Silex.DbBench -c Release -f net8.0 -- --benchmarks=readrandom --num=1000000
+```
+
+A recorded net8-vs-net10 comparison is in
+[`benchmarks/2026-05-30-net8-vs-net10.md`](benchmarks/2026-05-30-net8-vs-net10.md).
+
 Use `--help` to list every flag (full output in [All flags](#all-flags) below).
 
 ### Examples
