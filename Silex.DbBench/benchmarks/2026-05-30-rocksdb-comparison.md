@@ -77,3 +77,56 @@ make db_bench DEBUG_LEVEL=0 DISABLE_WARNING_AS_ERROR=1 \
   --num=1000000 --value_size=100 --key_size=16 --threads=1 \
   --compression_type=none --db=/tmp/rocks-bench-db
 ```
+
+---
+
+## Multi-threaded thread sweep (1 / 4 / 8 threads)
+
+Same host/dataset (1M entries, 100-byte values, compression off).
+`--benchmarks=fillseq,fillrandom,readrandom`.
+
+> **Methodology difference — read carefully.** The two tools partition work
+> differently:
+> - **Silex.DbBench**: *writes* are partitioned (total ops = `--num` regardless
+>   of thread count, split into disjoint ranges); *reads* are NOT partitioned
+>   (each thread runs the full `--num` budget, so total reads = `threads × num`).
+> - **RocksDB db_bench**: every thread runs `--num` ops for *all* benchmarks, so
+>   total ops = `threads × num` for both writes and reads.
+>
+> Therefore compare **ops/sec and MB/s (throughput)**, not total operations. The
+> Silex write benchmark does a *fixed* total amount of work regardless of threads,
+> so any throughput change is pure concurrency overhead/scaling.
+
+### Throughput (ops/sec)
+
+| Benchmark  | Engine  | 1 thread | 4 threads | 8 threads | Scaling 1→8 |
+|------------|---------|----------|-----------|-----------|-------------|
+| fillrandom | Silex   | 165,775  | 94,259    | 96,462    | 0.58× (degrades) |
+| fillrandom | RocksDB | 84,138   | 81,874    | 106,740   | 1.27×       |
+| readrandom | Silex   | 716,674  | 1,891,737 | 2,319,771 | **3.24×**   |
+| readrandom | RocksDB | 98,926   | 536,826   | 534,250   | 5.40× (plateaus at 4) |
+
+### Throughput (MB/s)
+
+| Benchmark  | Engine  | 1 thread | 4 threads | 8 threads |
+|------------|---------|----------|-----------|-----------|
+| fillrandom | Silex   | 18.3     | 10.4      | 10.7      |
+| fillrandom | RocksDB | 9.3      | 9.1       | 11.8      |
+| readrandom | Silex   | 54.1     | 142.9     | 175.2     |
+| readrandom | RocksDB | 6.9      | 58.3      | 59.1      |
+
+### Takeaways
+
+- **Reads scale on both, Silex stays well ahead in absolute throughput** at this
+  in-memory dataset size: Silex hits ~2.3M ops/s (175 MB/s) at 8 threads vs
+  RocksDB ~534K ops/s (59 MB/s). RocksDB read throughput plateaus past 4 threads
+  here; Silex keeps gaining but sub-linearly (3.2× over 8 threads).
+- **Writes do not parallelize on Silex** — the single global writer lock means
+  more threads only add contention, so throughput *drops* (166K → 96K ops/s) even
+  though the total write work is fixed. This is expected and by design (single
+  writer, parallelism is in compaction + read path, not the write lock).
+- **RocksDB writes are roughly flat** (~84K → 107K ops/s) — WAL/memtable is the
+  bottleneck, but it does not degrade with more threads.
+- Net: Silex's threading story is "scale reads, serialize writes." If concurrent
+  write throughput becomes a goal, the global writer lock is the thing to revisit
+  (e.g. sharded memtables or a concurrent skip-list write path).
