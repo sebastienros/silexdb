@@ -160,29 +160,4 @@ public class BlockTests
         Assert.True(r1);
         Assert.False(r2);
     }
-
-    [Test, Skip("Requires values to be serialized in the MemTable buffer")]
-    public void EntryBuffersShouldBeCopied()
-    {
-        var blockBuilder = new BlockBuilder<int, byte[]>(new DefaultBlockEncoder<int, byte[]>());
-
-        byte[] bytes = [111];
-        var value = bytes;
-        blockBuilder.Add(1, value);
-
-        // The value should be copied, so 222 should not update the value stored with key '1'
-        bytes[0] = 222;
-
-        blockBuilder.Add(2, value);
-
-        var block = blockBuilder.BuildBlock();
-        var iterator = new BlockIterator<int, byte[]>(block);
-
-        var locations = iterator.EnumerateAsync().ToBlockingEnumerable().ToArray();
-        var v1 = locations[0].Value;
-        var v2 = locations[1].Value;
-
-        Assert.Equal(111, v1[0]);
-        Assert.Equal(222, v2[0]);
-    }
 }

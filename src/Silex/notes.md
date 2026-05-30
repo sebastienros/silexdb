@@ -263,9 +263,12 @@ not in the individual collections.
   - Rejected alternative: a defensive `IBinaryEncoder.Copy` with copy-in at `Put` and copy-out at
     `Get`/scan. It made the engine safe against caller misuse but added an allocation on every write
     and every read, which conflicts with the zero-allocation principle. Not adopted.
-- Open follow-up (separate from the contract above): a block-builder-level copy so values are
-  serialized into the SST buffer at `Add` time instead of holding the `TValue` reference until
-  `BuildBlock` (see the skipped `EntryBuffersShouldBeCopied` test).
+- Rejected follow-up (consistent with the zero-copy contract above): a block-builder-level copy so
+  values are serialized into the SST buffer at `Add` time instead of holding the `TValue` reference
+  until `BuildBlock`. This would defend against a caller mutating a value between `Put` and the
+  eventual SST flush, but that is exactly the misuse the ownership-transfer contract disallows, and it
+  would add a second full value copy on the flush path (encode into the value buffer, then re-copy into
+  the block stream). Not adopted; the corresponding `EntryBuffersShouldBeCopied` test was removed.
 - Open follow-up: returning engine-owned pooled buffers to the `ArrayPool` on memtable dispose. This
   needs reference-counted memtables first, because `ForceFlushNextImmutableMemTableAsync` disposes a
   memtable outside `_immutableMemTablesLock` while a snapshot reader may still be borrowing it — naive
