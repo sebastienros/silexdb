@@ -95,33 +95,42 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
         // and the size need to be consistent.
         // This also needs to handle when the same key is updated concurrently
 
-        var keyLength = _keySerializer.GetLength(key);
+        // Copy the value into engine-owned memory so the store never aliases caller memory (the
+        // caller may mutate or release a pooled buffer after this call). The copy is an identity
+        // no-op for value/immutable types.
+        var copiedValue = _valueSerializer.Copy(value);
+        var newValueLength = _valueSerializer.GetLength(value);
 
         var dic = _dic;
         if (dic != null)
         {
-            // Retrieve the previous value to keep its size consistent.
-            if (dic.Remove(key, out var previousValue))
+            if (dic.TryGetValue(key, out var previousValue))
             {
-                _size -= _valueSerializer.GetLength(previousValue) + keyLength + sizeof(int);
+                // Overwrite: keep the already-stored (engine-owned) key and swap the value only.
+                _size += newValueLength - _valueSerializer.GetLength(previousValue);
+                dic[key] = copiedValue;
             }
-
-            dic.Add(key, value);
+            else
+            {
+                // Insert: copy the key as well so the store owns it independently of the caller.
+                _size += newValueLength + _keySerializer.GetLength(key) + sizeof(int);
+                dic[_keySerializer.Copy(key)] = copiedValue;
+            }
         }
         else
         {
             Debug.Assert(_sorted != null);
-            // Retrieve the previous value to keep its size consistent.
-            if (_sorted.Remove(key, out var previousValue))
+            if (_sorted.TryGetValue(key, out var previousValue))
             {
-                _size -= _valueSerializer.GetLength(previousValue) + keyLength + sizeof(int);
+                _size += newValueLength - _valueSerializer.GetLength(previousValue);
+                _sorted[key] = copiedValue;
             }
-
-            _sorted.Add(key, value);
+            else
+            {
+                _size += newValueLength + _keySerializer.GetLength(key) + sizeof(int);
+                _sorted[_keySerializer.Copy(key)] = copiedValue;
+            }
         }
-
-        _size += _valueSerializer.GetLength(value) + keyLength + sizeof(int);
-        return;
     }
 
     public IStorageIterator<TKey, TValue> CreateIterator()

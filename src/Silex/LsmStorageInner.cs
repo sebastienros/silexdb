@@ -89,7 +89,9 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
             // since all other collections are immutable
             if (snapshot.CurrentMemTable.TryGet(key, out var result))
             {
-                return result;
+                // Return a copy so the caller can never mutate the engine-owned stored value. The
+                // tombstone (empty) value is copied as-is and surfaced to the caller as today.
+                return _valueSerializer.Copy(result);
             }
         }
         finally 
@@ -110,7 +112,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
             {
                 if (memTable.TryGet(key, out var result))
                 {
-                    return result;
+                    return _valueSerializer.Copy(result);
                 }
             }
         }
@@ -421,7 +423,9 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
                 {
                     if (!_valueSerializer.IsTombstoneValue(entry.Value))
                     {
-                        yield return entry;
+                        // Copy out of engine-owned memory so the caller can mutate or release the
+                        // returned key/value without corrupting the store.
+                        yield return new KeyValuePair<TKey, TValue>(_keySerializer.Copy(entry.Key), _valueSerializer.Copy(entry.Value));
                     }
                 }
             }
@@ -451,7 +455,9 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
                 {
                     if (!_valueSerializer.IsTombstoneValue(entry.Value))
                     {
-                        yield return entry;
+                        // Copy out of engine-owned memory so the caller can mutate or release the
+                        // returned key/value without corrupting the store.
+                        yield return new KeyValuePair<TKey, TValue>(_keySerializer.Copy(entry.Key), _valueSerializer.Copy(entry.Value));
                     }
                 }
             }
