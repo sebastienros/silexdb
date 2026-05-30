@@ -3,6 +3,7 @@ using Silex.Blocks;
 using Silex.BloomFilters;
 using Silex.Tables;
 using System.Buffers.Binary;
+using TUnit.Assertions.Enums;
 
 namespace Silex.Test;
 
@@ -22,9 +23,9 @@ public class TableTests
 
         var table = await builder.BuildAsync();
 
-        Assert.Single(table.BlockMetadata);
+        await Assert.That(table.BlockMetadata).HasSingleItem();
         using var block = await table.ReadBlockAsync(0);
-        Assert.Equal(new byte[] { 2, 7, 0, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, block!.Memory);
+        await Assert.That(block!.Memory).IsEquivalentTo(new byte[] { 2, 7, 0, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, CollectionOrdering.Matching);
 
         table.Dispose();
         File.Delete(tempFilename);
@@ -48,9 +49,9 @@ public class TableTests
 
         table = await SsTable<ushort, string>.LoadSsTableAsync(tempFilename, new DefaultSsTableEncoder<ushort, string>(), blockBuilder, new DefaultBloomFilterFactory());
 
-        Assert.Single(table.BlockMetadata);
+        await Assert.That(table.BlockMetadata).HasSingleItem();
         using var block = await table.ReadBlockAsync(0);
-        Assert.Equal(new byte[] { 2, 7, 0, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, block!.Memory);
+        await Assert.That(block!.Memory).IsEquivalentTo(new byte[] { 2, 7, 0, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, CollectionOrdering.Matching);
 
         table.Dispose();
         File.Delete(tempFilename);
@@ -79,13 +80,13 @@ public class TableTests
 
         var table = await builder.BuildAsync();
 
-        Assert.True(table.BlockMetadata.Count > 0);
+        await Assert.That(table.BlockMetadata.Count > 0).IsTrue();
 
         var iterator = new SsTableIterator<uint, byte[]>(table);
 
         var result = iterator.EnumerateAsync().ToBlockingEnumerable().Select(x => x.Key).ToArray();
 
-        Assert.Equivalent(Enumerable.Range(0, count), result);
+        await Assert.That(result).IsEquivalentTo(Enumerable.Range(0, count).Select(i => (uint)i));
 
         table.Dispose();
         File.Delete(tempFilename);
@@ -110,13 +111,13 @@ public class TableTests
         var table = await builder.BuildAsync();
 
         // Check we have one table with multiple blocks
-        Assert.True(table.BlockMetadata.Count > 0);
+        await Assert.That(table.BlockMetadata.Count > 0).IsTrue();
 
         var iterator = new SsTableIterator<uint, byte[]>(table);
 
         var result = iterator.EnumerateAsync(13).ToBlockingEnumerable().Select(x => x.Key).ToArray();
 
-        Assert.Equivalent(Enumerable.Range(13, 100 - 13), result);
+        await Assert.That(result).IsEquivalentTo(Enumerable.Range(13, 100 - 13).Select(i => (uint)i));
 
         table.Dispose();
         File.Delete(tempFilename);
@@ -141,13 +142,13 @@ public class TableTests
         var table = await builder.BuildAsync();
 
         // Check we have one table with multiple blocks
-        Assert.True(table.BlockMetadata.Count > 0);
+        await Assert.That(table.BlockMetadata.Count > 0).IsTrue();
 
         var iterator = new SsTableIterator<uint, byte[]>(table);
 
         var result = iterator.EnumerateAsync(101).ToBlockingEnumerable().Select(x => x.Key).ToArray();
 
-        Assert.Empty(result);
+        await Assert.That(result).IsEmpty();
 
         table.Dispose();
         File.Delete(tempFilename);
@@ -171,13 +172,13 @@ public class TableTests
 
         var table = await builder.BuildAsync();
 
-        Assert.True(table.BlockMetadata.Count > 1);
+        await Assert.That(table.BlockMetadata.Count > 1).IsTrue();
 
         var iterator = new SsTableIterator<uint, byte[]>(table);
 
         var result = iterator.EnumerateAsync(5).ToBlockingEnumerable().Select(x => x.Key).ToArray();
 
-        Assert.Equivalent(Enumerable.Range(10, 100), result);
+        await Assert.That(result).IsEquivalentTo(Enumerable.Range(10, 100).Select(i => (uint)i));
 
         table.Dispose();
         File.Delete(tempFilename);
@@ -197,12 +198,12 @@ public class TableTests
 
         var table = await builder.BuildAsync();
 
-        Assert.Single(table.BlockMetadata);
+        await Assert.That(table.BlockMetadata).HasSingleItem();
         using var block1 = await table.ReadBlockCachedAsync(0, memoryCache, new());
         using var block2 = await table.ReadBlockCachedAsync(0, memoryCache, new());
-        Assert.Equal(new byte[] { 2, 7, 0, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, block1!.Memory);
-        Assert.Equal(new byte[] { 2, 7, 0, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, block2!.Memory);
-        Assert.Same(block1, block2);
+        await Assert.That(block1!.Memory).IsEquivalentTo(new byte[] { 2, 7, 0, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, CollectionOrdering.Matching);
+        await Assert.That(block2!.Memory).IsEquivalentTo(new byte[] { 2, 7, 0, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, CollectionOrdering.Matching);
+        await Assert.That(block2).IsSameReferenceAs(block1);
 
         table.Dispose();
         File.Delete(tempFilename);
@@ -222,7 +223,7 @@ public class TableTests
 
         var table = await builder.BuildAsync();
 
-        Assert.Single(table.BlockMetadata);
+        await Assert.That(table.BlockMetadata).HasSingleItem();
         
         var blocks = new List<Task<Block<ushort, string>?>>();
 
@@ -238,8 +239,8 @@ public class TableTests
         foreach (var block in blocks)
         {
             var result2 = await block;
-            Assert.Equal(new byte[] { 2, 7, 0, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, result2!.Memory);
-            Assert.Same(result1, result2);
+            await Assert.That(result2!.Memory).IsEquivalentTo(new byte[] { 2, 7, 0, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, CollectionOrdering.Matching);
+            await Assert.That(result2).IsSameReferenceAs(result1);
         }
 
         table.Dispose();
@@ -254,13 +255,13 @@ public class TableTests
 
         var bloomFilter = table.BloomFilter;
 
-        Span<byte> bytes = stackalloc byte[sizeof(int)];
+        var bytes = new byte[sizeof(int)];
 
         // Actual entries must always probe true (a bloom filter never produces false negatives).
         foreach (var e in entries)
         {
             BinaryPrimitives.WriteInt32LittleEndian(bytes, e.Key);
-            Assert.True(bloomFilter.Probe(bytes));
+            await Assert.That(bloomFilter.Probe(bytes)).IsTrue();
         }
 
         // Non-inserted keys should mostly probe false, within a tolerable false positive rate.
@@ -277,7 +278,7 @@ public class TableTests
         }
 
         // Assume 10% or better
-        Assert.True(falsePositives < iterations * 0.1, $"Too many false positives: {falsePositives}");
+        await Assert.That(falsePositives < iterations * 0.1).IsTrue();
 
         table.Dispose();
         File.Delete(table.Filename);

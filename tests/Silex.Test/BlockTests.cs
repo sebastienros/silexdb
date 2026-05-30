@@ -1,11 +1,12 @@
 ﻿using Silex.Blocks;
+using TUnit.Assertions.Enums;
 
 namespace Silex.Test;
 
 public class BlockTests
 {
     [Test]
-    public void ShouldEncodeBlock()
+    public async Task ShouldEncodeBlock()
     {
         var blockBuilder = new BlockBuilder<ushort, string> (new DefaultBlockEncoder<ushort, string>());
 
@@ -24,13 +25,13 @@ public class BlockTests
             2 + // 2 bytes for offset of 1st entry (should be 00:00)
             2;  // 2 bytes for number of elements (should be 01:00)
 
-        Assert.Single(block.Offsets);
-        Assert.Equal(expectedDataSize, block.Memory.Length);
-        Assert.Equal(new byte[] { 2, 7, 0, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, block.Memory);
+        await Assert.That(block.Offsets).HasSingleItem();
+        await Assert.That(block.Memory.Length).IsEqualTo(expectedDataSize);
+        await Assert.That(block.Memory).IsEquivalentTo(new byte[] { 2, 7, 0, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, CollectionOrdering.Matching);
     }
 
     [Test]
-    public void ShouldDecodeBlock()
+    public async Task ShouldDecodeBlock()
     {
         var raw = new byte[] { 2, 7, 0, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 };
         var key = new Bytes((ushort)7);
@@ -41,15 +42,15 @@ public class BlockTests
 
         var entry = encoder.DecodeEntry(block.Memory, block.Offsets[0]);
         
-        Assert.Single(block.Offsets);
-        Assert.Equal(0, block.Offsets[0]);
-        Assert.Equal(key, entry.Key);
-        Assert.Equal(4, entry.BlockOffset);
-        Assert.Equal(5, entry.Length);
+        await Assert.That(block.Offsets).HasSingleItem();
+        await Assert.That((int)block.Offsets[0]).IsEqualTo(0);
+        await Assert.That(new Bytes(entry.Key)).IsEqualTo(key);
+        await Assert.That((int)entry.BlockOffset).IsEqualTo(4);
+        await Assert.That((int)entry.Length).IsEqualTo(5);
     }
 
     [Test]
-    public void ShouldIterateAllEntries()
+    public async Task ShouldIterateAllEntries()
     {
         var blockBuilder = new BlockBuilder<int, string>(new DefaultBlockEncoder<int, string>());
 
@@ -65,11 +66,11 @@ public class BlockTests
 
         var result = iterator.EnumerateAsync().ToBlockingEnumerable().Select(x => x.Key).ToArray();
 
-        Assert.Equivalent(allKeys, result);
+        await Assert.That(result).IsEquivalentTo(allKeys);
     }
 
     [Test]
-    public void ShouldIterateFromKey()
+    public async Task ShouldIterateFromKey()
     {
         var blockBuilder = new BlockBuilder<int, string>(new DefaultBlockEncoder<int, string>());
 
@@ -85,11 +86,11 @@ public class BlockTests
 
         var result = iterator.EnumerateAsync(2).ToBlockingEnumerable().Select(x => x.Key).ToArray();
 
-        Assert.Equivalent(allKeys.Skip(1), result);
+        await Assert.That(result).IsEquivalentTo(allKeys.Skip(1));
     }
 
     [Test]
-    public void ShouldIterateFromUnknownKey()
+    public async Task ShouldIterateFromUnknownKey()
     {
         var blockBuilder = new BlockBuilder<int, string>(new DefaultBlockEncoder<int, string>());
 
@@ -105,11 +106,11 @@ public class BlockTests
 
         var result = iterator.EnumerateAsync(8).ToBlockingEnumerable().Select(x => x.Key).ToArray();
 
-        Assert.Empty(result);
+        await Assert.That(result).IsEmpty();
     }
 
     [Test]
-    public void TryGetValueShouldReturnCorrectValues()
+    public async Task TryGetValueShouldReturnCorrectValues()
     {
         var blockBuilder = new BlockBuilder<int, int>(new DefaultBlockEncoder<int, int>());
 
@@ -125,14 +126,15 @@ public class BlockTests
 
         foreach (var i in allKeys)
         {
-            var result = block.GetValue(i);
-            Assert.False(result.IsEmpty);
-            Assert.Equal(BitConverter.GetBytes(i * i), new Bytes(result));
+            var resultIsEmpty = block.GetValue(i).IsEmpty;
+            var resultBytes = new Bytes(block.GetValue(i));
+            await Assert.That(resultIsEmpty).IsFalse();
+            await Assert.That(resultBytes).IsEqualTo(new Bytes(BitConverter.GetBytes(i * i)));
         }
     }
 
     [Test]
-    public void ShouldNotAcceptEntriesWhenFull()
+    public async Task ShouldNotAcceptEntriesWhenFull()
     {
         var blockBuilder = new BlockBuilder<int, byte[]>(new DefaultBlockEncoder<int, byte[]>());
 
@@ -142,14 +144,14 @@ public class BlockTests
         var r3 = blockBuilder.Add(3, value);
         var r4 = blockBuilder.Add(4, value);
 
-        Assert.True(r1);
-        Assert.True(r2);
-        Assert.True(r3);
-        Assert.False(r4);
+        await Assert.That(r1).IsTrue();
+        await Assert.That(r2).IsTrue();
+        await Assert.That(r3).IsTrue();
+        await Assert.That(r4).IsFalse();
     }
 
     [Test]
-    public void NewBlocksShouldAcceptFirstEntryBiggerThanBlockSize()
+    public async Task NewBlocksShouldAcceptFirstEntryBiggerThanBlockSize()
     {
         var blockBuilder = new BlockBuilder<int, byte[]>(new DefaultBlockEncoder<int, byte[]>());
 
@@ -157,7 +159,7 @@ public class BlockTests
         var r1 = blockBuilder.Add(1, value);
         var r2 = blockBuilder.Add(1, [1] );
 
-        Assert.True(r1);
-        Assert.False(r2);
+        await Assert.That(r1).IsTrue();
+        await Assert.That(r2).IsFalse();
     }
 }

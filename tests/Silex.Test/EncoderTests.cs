@@ -14,15 +14,15 @@ public class EncoderTests
     [Arguments(UTF8StringEncoder.StackAllocThreshold + 1)]
     [Arguments(500)]
     [Arguments(64000)]
-    public void UTF8StringEncoderShouldEncodeAsciiStrings(int length)
+    public async Task UTF8StringEncoderShouldEncodeAsciiStrings(int length)
     {
         var array = Random.Shared.GetItems<char>("abcdefghijklmnopqrstuvw", length);
         var value = new string(array);
 
         var encoder = new UTF8StringEncoder();
 
-        Assert.Equal(length, value.Length);
-        Assert.Equal(length, encoder.GetLength(value));
+        await Assert.That(value.Length).IsEqualTo(length);
+        await Assert.That(encoder.GetLength(value)).IsEqualTo(length);
 
         var _bufferWriter = new PooledArrayBufferWriter<byte>();
         var writer = new EncoderBinaryWriter(_bufferWriter);
@@ -31,8 +31,8 @@ public class EncoderTests
         var memory = _bufferWriter.WrittenMemory;
         var decoded = encoder.Decode(memory.Span);
 
-        Assert.Equal(length, memory.Length);
-        Assert.Equal(value, decoded);
+        await Assert.That(memory.Length).IsEqualTo(length);
+        await Assert.That(decoded).IsEqualTo(value);
     }
 
     [Test]
@@ -44,18 +44,18 @@ public class EncoderTests
     [Arguments(UTF8StringEncoder.StackAllocThreshold + 1)]
     [Arguments(500)]
     [Arguments(64000)]
-    public void UTF8StringEncoderShouldEncodeNonAsciiStrings(int length)
+    public async Task UTF8StringEncoderShouldEncodeNonAsciiStrings(int length)
     {
         var array = Random.Shared.GetItems<char>("ちこそしいはきくにまのりもみらせたすとかなひてさんつ", length);
         var value = new string(array);
 
         var encoder = new UTF8StringEncoder();
 
-        Assert.Equal(length, value.Length);
+        await Assert.That(value.Length).IsEqualTo(length);
 
         if (length != 0)
         {
-            Assert.True(length < encoder.GetLength(value));
+            await Assert.That(length < encoder.GetLength(value)).IsTrue();
         }
 
         var _bufferWriter = new PooledArrayBufferWriter<byte>();
@@ -65,11 +65,11 @@ public class EncoderTests
         var memory = _bufferWriter.WrittenMemory;
         var decoded = encoder.Decode(memory.Span);
 
-        Assert.Equal(value, decoded);
+        await Assert.That(decoded).IsEqualTo(value);
     }
 
     [Test]
-    public void ByteArrayEncoderEqualityComparerShouldUseContent()
+    public async Task ByteArrayEncoderEqualityComparerShouldUseContent()
     {
         IEqualityComparer<byte[]> comparer = ((IBinaryEncoder<byte[]>)new ByteArrayEncoder()).EqualityComparer;
 
@@ -77,8 +77,8 @@ public class EncoderTests
         var b = new byte[] { 1, 2, 3 };
         var c = new byte[] { 1, 2, 4 };
 
-        Assert.True(comparer.Equals(a, b));
-        Assert.False(comparer.Equals(a, c));
-        Assert.Equal(comparer.GetHashCode(a), comparer.GetHashCode(b));
+        await Assert.That(comparer.Equals(a, b)).IsTrue();
+        await Assert.That(comparer.Equals(a, c)).IsFalse();
+        await Assert.That(comparer.GetHashCode(b)).IsEqualTo(comparer.GetHashCode(a));
     }
 }

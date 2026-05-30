@@ -77,21 +77,21 @@ public class AsyncReaderWriterLockTests
     {
         var loq = new AsyncReaderWriterLock();
 
-        Assert.True(await loq.TryEnterWriteLockAsync().AsTask().WaitAsync(_timeout));
+        await Assert.That(await loq.TryEnterWriteLockAsync().AsTask().WaitAsync(_timeout)).IsTrue();
         loq.ExitWriteLock();
 
         await loq.EnterReadLockAsync().WaitAsync(_timeout);
-        Assert.False(await loq.TryEnterWriteLockAsync().AsTask().WaitAsync(_timeout));
+        await Assert.That(await loq.TryEnterWriteLockAsync().AsTask().WaitAsync(_timeout)).IsFalse();
         
         loq.ExitReadLock();
-        Assert.True(await loq.TryEnterWriteLockAsync().AsTask().WaitAsync(_timeout));
+        await Assert.That(await loq.TryEnterWriteLockAsync().AsTask().WaitAsync(_timeout)).IsTrue();
         loq.ExitWriteLock();
 
         await loq.EnterWriteLockAsync().WaitAsync(_timeout);
-        Assert.False(await loq.TryEnterWriteLockAsync().AsTask().WaitAsync(_timeout));
+        await Assert.That(await loq.TryEnterWriteLockAsync().AsTask().WaitAsync(_timeout)).IsFalse();
 
         loq.ExitWriteLock();
-        Assert.True(await loq.TryEnterWriteLockAsync().AsTask().WaitAsync(_timeout));
+        await Assert.That(await loq.TryEnterWriteLockAsync().AsTask().WaitAsync(_timeout)).IsTrue();
     }
 
     [Test]
@@ -100,13 +100,13 @@ public class AsyncReaderWriterLockTests
         var loq = new AsyncReaderWriterLock();
 
         await loq.EnterReadLockAsync().WaitAsync(_timeout);
-        Assert.Equal((uint)1, loq._state.Readers);
+        await Assert.That(loq._state.Readers).IsEqualTo((uint)1);
         loq.ExitReadLock();
-        Assert.Equal((uint)0, loq._state.Readers);
+        await Assert.That(loq._state.Readers).IsEqualTo((uint)0);
         await loq.EnterWriteLockAsync().WaitAsync(_timeout);
-        Assert.Equal((uint)1, loq._state.Writers);
+        await Assert.That(loq._state.Writers).IsEqualTo((uint)1);
         loq.ExitWriteLock();
-        Assert.Equal((uint)0, loq._state.Writers);
+        await Assert.That(loq._state.Writers).IsEqualTo((uint)0);
     }
 
     [Test]
@@ -121,26 +121,26 @@ public class AsyncReaderWriterLockTests
     }
 
     [Test]
-    public void WriteWriteRead()
+    public async Task WriteWriteRead()
     {
         var loq = new AsyncReaderWriterLock();
 
         var w3 = loq.EnterWriteLockAsync().WaitAsync(_timeout);
-        Assert.True(w3.IsCompleted);
+        await Assert.That(w3.IsCompleted).IsTrue();
 
         var w1 = loq.EnterWriteLockAsync().WaitAsync(_timeout);
-        Assert.False(w1.IsCompleted);
+        await Assert.That(w1.IsCompleted).IsFalse();
 
         var r2 = loq.EnterReadLockAsync().WaitAsync(_timeout);
-        Assert.False(r2.IsCompleted);
+        await Assert.That(r2.IsCompleted).IsFalse();
 
         loq.ExitWriteLock();
-        Assert.True(w1.IsCompleted);
-        Assert.False(r2.IsCompleted);
+        await Assert.That(w1.IsCompleted).IsTrue();
+        await Assert.That(r2.IsCompleted).IsFalse();
 
         loq.ExitReadLock();
-        Assert.True(w3.IsCompleted);
-        Assert.True(r2.IsCompleted);
+        await Assert.That(w3.IsCompleted).IsTrue();
+        await Assert.That(r2.IsCompleted).IsTrue();
     }
 
     [Test]
@@ -173,15 +173,15 @@ public class AsyncReaderWriterLockTests
 
         var lock1 = loq.EnterWriteLockAsync().WaitAsync(_timeout);
 
-        Assert.True(lock1.IsCompletedSuccessfully);
+        await Assert.That(lock1.IsCompletedSuccessfully).IsTrue();
 
         var lock2 = loq.EnterWriteLockAsync();
 
-        Assert.False(lock2.IsCompletedSuccessfully);
+        await Assert.That(lock2.IsCompletedSuccessfully).IsFalse();
 
         loq.ExitWriteLock();
 
-        Assert.True(lock2.IsCompletedSuccessfully);
+        await Assert.That(lock2.IsCompletedSuccessfully).IsTrue();
 
         await lock2;
     }
@@ -208,15 +208,15 @@ public class AsyncReaderWriterLockTests
 
         var lock1 = loq.EnterWriteLockAsync().WaitAsync(_timeout);
 
-        Assert.True(lock1.IsCompletedSuccessfully);
+        await Assert.That(lock1.IsCompletedSuccessfully).IsTrue();
 
         var lock2 = loq.EnterReadLockAsync();
 
-        Assert.False(lock2.IsCompletedSuccessfully);
+        await Assert.That(lock2.IsCompletedSuccessfully).IsFalse();
 
         loq.ExitWriteLock();
 
-        Assert.True(lock2.IsCompletedSuccessfully);
+        await Assert.That(lock2.IsCompletedSuccessfully).IsTrue();
 
         await lock2;
     }
@@ -228,21 +228,21 @@ public class AsyncReaderWriterLockTests
 
         var lock1 = loq.EnterReadLockAsync().WaitAsync(_timeout);
 
-        Assert.True(lock1.IsCompletedSuccessfully);
+        await Assert.That(lock1.IsCompletedSuccessfully).IsTrue();
 
         var lock2 = loq.EnterWriteLockAsync();
 
-        Assert.False(lock2.IsCompletedSuccessfully);
+        await Assert.That(lock2.IsCompletedSuccessfully).IsFalse();
 
         loq.ExitReadLock();
 
-        Assert.True(lock2.IsCompletedSuccessfully);
+        await Assert.That(lock2.IsCompletedSuccessfully).IsTrue();
 
         await lock2;
     }
 
     [Test]
-    public void WriterShouldUnblockWriterInOrder()
+    public async Task WriterShouldUnblockWriterInOrder()
     {
         var loq = new AsyncReaderWriterLock();
 
@@ -250,27 +250,27 @@ public class AsyncReaderWriterLockTests
         var t2 = loq.EnterWriteLockAsync();
         var t3 = loq.EnterWriteLockAsync();
 
-        Assert.True(t1.IsCompletedSuccessfully);
-        Assert.False(t2.IsCompletedSuccessfully);
-        Assert.False(t3.IsCompletedSuccessfully);
+        await Assert.That(t1.IsCompletedSuccessfully).IsTrue();
+        await Assert.That(t2.IsCompletedSuccessfully).IsFalse();
+        await Assert.That(t3.IsCompletedSuccessfully).IsFalse();
 
         loq.ExitWriteLock();
 
-        Assert.True(t1.IsCompletedSuccessfully);
-        Assert.True(t2.IsCompletedSuccessfully);
-        Assert.False(t3.IsCompletedSuccessfully);
+        await Assert.That(t1.IsCompletedSuccessfully).IsTrue();
+        await Assert.That(t2.IsCompletedSuccessfully).IsTrue();
+        await Assert.That(t3.IsCompletedSuccessfully).IsFalse();
 
         loq.ExitWriteLock();
 
-        Assert.True(t1.IsCompletedSuccessfully);
-        Assert.True(t2.IsCompletedSuccessfully);
-        Assert.True(t3.IsCompletedSuccessfully);
+        await Assert.That(t1.IsCompletedSuccessfully).IsTrue();
+        await Assert.That(t2.IsCompletedSuccessfully).IsTrue();
+        await Assert.That(t3.IsCompletedSuccessfully).IsTrue();
 
         loq.ExitWriteLock();
     }
 
     [Test]
-    public void WriterShouldUnblockAllReadersInOrder()
+    public async Task WriterShouldUnblockAllReadersInOrder()
     {
         var loq = new AsyncReaderWriterLock();
 
@@ -279,31 +279,31 @@ public class AsyncReaderWriterLockTests
         var r3 = loq.EnterReadLockAsync();
         var w4 = loq.EnterWriteLockAsync();
 
-        Assert.True(w1.IsCompletedSuccessfully);
-        Assert.False(r2.IsCompletedSuccessfully);
-        Assert.False(r3.IsCompletedSuccessfully);
-        Assert.False(w4.IsCompletedSuccessfully);
+        await Assert.That(w1.IsCompletedSuccessfully).IsTrue();
+        await Assert.That(r2.IsCompletedSuccessfully).IsFalse();
+        await Assert.That(r3.IsCompletedSuccessfully).IsFalse();
+        await Assert.That(w4.IsCompletedSuccessfully).IsFalse();
 
         loq.ExitWriteLock();
 
-        Assert.True(w1.IsCompletedSuccessfully);
-        Assert.True(r2.IsCompletedSuccessfully);
-        Assert.True(r3.IsCompletedSuccessfully);
-        Assert.False(w4.IsCompletedSuccessfully);
+        await Assert.That(w1.IsCompletedSuccessfully).IsTrue();
+        await Assert.That(r2.IsCompletedSuccessfully).IsTrue();
+        await Assert.That(r3.IsCompletedSuccessfully).IsTrue();
+        await Assert.That(w4.IsCompletedSuccessfully).IsFalse();
 
         loq.ExitReadLock();
 
-        Assert.True(w1.IsCompletedSuccessfully);
-        Assert.True(r2.IsCompletedSuccessfully);
-        Assert.True(r3.IsCompletedSuccessfully);
-        Assert.False(w4.IsCompletedSuccessfully);
+        await Assert.That(w1.IsCompletedSuccessfully).IsTrue();
+        await Assert.That(r2.IsCompletedSuccessfully).IsTrue();
+        await Assert.That(r3.IsCompletedSuccessfully).IsTrue();
+        await Assert.That(w4.IsCompletedSuccessfully).IsFalse();
 
         loq.ExitReadLock();
 
-        Assert.True(w1.IsCompletedSuccessfully);
-        Assert.True(r2.IsCompletedSuccessfully);
-        Assert.True(r3.IsCompletedSuccessfully);
-        Assert.True(w4.IsCompletedSuccessfully);
+        await Assert.That(w1.IsCompletedSuccessfully).IsTrue();
+        await Assert.That(r2.IsCompletedSuccessfully).IsTrue();
+        await Assert.That(r3.IsCompletedSuccessfully).IsTrue();
+        await Assert.That(w4.IsCompletedSuccessfully).IsTrue();
 
         loq.ExitWriteLock();
     }
@@ -315,7 +315,7 @@ public class AsyncReaderWriterLockTests
 
         await loq.EnterWriteLockAsync().WaitAsync(_timeout);
         
-        Assert.Throws<SynchronizationLockException>(loq.ExitReadLock);
+        await Assert.That(loq.ExitReadLock).Throws<SynchronizationLockException>();
     }
 
     [Test]
@@ -325,6 +325,6 @@ public class AsyncReaderWriterLockTests
 
         await loq.EnterReadLockAsync().WaitAsync(_timeout);
 
-        Assert.Throws<SynchronizationLockException>(loq.ExitWriteLock);
+        await Assert.That(loq.ExitWriteLock).Throws<SynchronizationLockException>();
     }
 }

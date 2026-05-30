@@ -1,0 +1,1 @@
+[assembly: TUnit.Core.NotInParallel]

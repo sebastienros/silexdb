@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.Globalization;
 using Silex.BloomFilters;
+using TUnit.Assertions.Enums;
 
 namespace Silex.Test;
 
@@ -22,8 +23,8 @@ public class StorageTests
         storage.Put(key, value);
         var result = await storage.GetAsync(key);
 
-        Assert.Equal(value, result);
-        Assert.Equal(10, storage._state.CurrentMemTable.Size);
+        await Assert.That(result).IsEqualTo(value);
+        await Assert.That(storage._state.CurrentMemTable.Size).IsEqualTo(10);
     }
 
     [Test]
@@ -39,11 +40,11 @@ public class StorageTests
         storage.Put(key, value);
 
         var result = await storage.GetAsync(key);
-        Assert.Same(value, result);
+        await Assert.That(result).IsSameReferenceAs(value);
 
         var scanned = storage.CreateIterator().EnumerateAsync().ToBlockingEnumerable().Single();
-        Assert.Same(key, scanned.Key);
-        Assert.Same(value, scanned.Value);
+        await Assert.That(scanned.Key).IsSameReferenceAs(key);
+        await Assert.That(scanned.Value).IsSameReferenceAs(value);
     }
 
     [Test]
@@ -61,9 +62,9 @@ public class StorageTests
         var result1 = await storage.GetAsync(key1);
         var result2 = await storage.GetAsync(key2);
 
-        Assert.Equal(value, result1);
-        Assert.Equal(value, result2);
-        Assert.Equal(16, storage._state.CurrentMemTable.Size);
+        await Assert.That(result1).IsEqualTo(value);
+        await Assert.That(result2).IsEqualTo(value);
+        await Assert.That(storage._state.CurrentMemTable.Size).IsEqualTo(16);
     }
 
     [Test]
@@ -76,8 +77,8 @@ public class StorageTests
         storage.Delete(key);
         var result = await storage.GetAsync(key);
 
-        Assert.True(result?.Length == 0);
-        Assert.Equal(7, storage._state.CurrentMemTable.Size);
+        await Assert.That(result?.Length == 0).IsTrue();
+        await Assert.That(storage._state.CurrentMemTable.Size).IsEqualTo(7);
     }
 
     [Test]
@@ -85,7 +86,7 @@ public class StorageTests
     [Arguments(7, 10, 1)]
     [Arguments(100, 100, 100)]
     [Arguments(10, 500, 83)]
-    public void ShouldFreezeMemTablesWhenSizeIsOverLimit(int valueSize, int entries, int expectedImmutableTables)
+    public async Task ShouldFreezeMemTablesWhenSizeIsOverLimit(int valueSize, int entries, int expectedImmutableTables)
     {
         var memTableSizeLimit = 100;
 
@@ -101,7 +102,7 @@ public class StorageTests
             storage.Put(key, value);
         }
 
-        Assert.Equal(expectedImmutableTables, storage._state.ImmutableMemTables.Count());
+        await Assert.That(storage._state.ImmutableMemTables.Count()).IsEqualTo(expectedImmutableTables);
     }
 
     [Test]
@@ -131,7 +132,7 @@ public class StorageTests
             var expectedValue = dictionary[i];
             var actualValue = await storage.GetAsync(i);
 
-            Assert.Equal(expectedValue, actualValue);
+            await Assert.That(actualValue).IsEqualTo(expectedValue);
         }            
     }
 
@@ -143,16 +144,16 @@ public class StorageTests
         int key = 10;
 
         var result = await storage.GetAsync(key);
-        Assert.Equal(10, result?.Length);
+        await Assert.That(result?.Length).IsEqualTo(10);
 
          storage.Delete(key);
         result = await storage.GetAsync(key);
 
-        Assert.Equal(0, result?.Length);
+        await Assert.That(result?.Length).IsEqualTo(0);
     }
 
     [Test]
-    public void ScanListsAllMemTables()
+    public async Task ScanListsAllMemTables()
     {
         using var storage = new LsmStorageInner<char, byte[]>(Path.GetTempPath(), new StorageOptions { UseWriteAheadLog = false });
 
@@ -177,12 +178,12 @@ public class StorageTests
 
         // a->1, c->4, d->5, e->4 and b->del should be discarded
 
-        Assert.Equal(4, list.Count);
+        await Assert.That(list.Count).IsEqualTo(4);
 
-        Assert.Equal((Bytes)'a', list[0].Key);
-        Assert.Equal((Bytes)'c', list[1].Key);
-        Assert.Equal((Bytes)'d', list[2].Key);
-        Assert.Equal((Bytes)'e', list[3].Key);
+        await Assert.That((int)list[0].Key).IsEqualTo((int)'a');
+        await Assert.That((int)list[1].Key).IsEqualTo((int)'c');
+        await Assert.That((int)list[2].Key).IsEqualTo((int)'d');
+        await Assert.That((int)list[3].Key).IsEqualTo((int)'e');
     }
 
     [Test]
@@ -227,7 +228,7 @@ public class StorageTests
             _output?.WriteLine($"{key} -> {value}");
         }
 
-        Assert.True(allEntries.Count <= maxKeysValue);
+        await Assert.That(allEntries.Count <= maxKeysValue).IsTrue();
 
         async ValueTask Work(LsmStorageInner<long, byte[]> storage)
         {
@@ -271,7 +272,7 @@ public class StorageTests
     [Arguments(0)]
     [Arguments(1)]
     [Arguments(5)]
-    public void ScanWithBoundsShouldFilterResults(int? lowerBound)
+    public async Task ScanWithBoundsShouldFilterResults(int? lowerBound)
     {
         var count = 10;
 
@@ -286,12 +287,15 @@ public class StorageTests
         {
             expectedKeys = expectedKeys.Where(x => x >= lowerBound);
 
-            Assert.All(entries, e => Assert.True(lowerBytes <= e.Key));
+            foreach (var e in entries)
+            {
+                await Assert.That(lowerBytes <= e.Key).IsTrue();
+            }
         }
 
         var actualKeys = storage.CreateIterator().EnumerateAsync(lowerBytes).ToBlockingEnumerable().Select(x => x.Key).ToArray();
 
-        Assert.Equal(expectedKeys, actualKeys);
+        await Assert.That(actualKeys).IsEquivalentTo(expectedKeys, CollectionOrdering.Matching);
     }
 
     [Test]
@@ -301,7 +305,7 @@ public class StorageTests
 
         var storage = await LsmStorage.OpenAsync<int, int>(tempFolder, _defaultStorageOptions);
 
-        Assert.True(Directory.Exists(tempFolder));
+        await Assert.That(Directory.Exists(tempFolder)).IsTrue();
 
         await storage.CloseAsync();
         Directory.Delete(tempFolder, true);
@@ -321,8 +325,8 @@ public class StorageTests
         // Nothing to flush
         await storage._inner.ForceFlushNextImmutableMemTableAsync();
 
-        Assert.True(Directory.Exists(tempFolder));
-        Assert.Empty(Directory.EnumerateFiles(tempFolder, "*.sst"));
+        await Assert.That(Directory.Exists(tempFolder)).IsTrue();
+        await Assert.That(Directory.EnumerateFiles(tempFolder, "*.sst")).IsEmpty();
 
         await storage.CloseAsync();
         Directory.Delete(tempFolder, true);
@@ -339,8 +343,8 @@ public class StorageTests
         storage._inner.ForceFreezeMemTable();
         await storage._inner.ForceFlushNextImmutableMemTableAsync();
 
-        Assert.True(Directory.Exists(tempFolder));
-        Assert.Single(Directory.EnumerateFiles(tempFolder, "*.sst"));
+        await Assert.That(Directory.Exists(tempFolder)).IsTrue();
+        await Assert.That(Directory.EnumerateFiles(tempFolder, "*.sst")).HasSingleItem();
 
         await storage.CloseAsync();
         Directory.Delete(tempFolder, true);
@@ -365,18 +369,18 @@ public class StorageTests
         await storage._inner.ForceFlushNextImmutableMemTableAsync();
 
         // Everything has been flushed: a single SST, no immutable mem tables, and an empty current mem table.
-        Assert.Single(Directory.EnumerateFiles(tempFolder, "*.sst"));
-        Assert.Empty(storage._inner._state.ImmutableMemTables);
-        Assert.Equal(0L, storage._inner._state.CurrentMemTable.Size);
+        await Assert.That(Directory.EnumerateFiles(tempFolder, "*.sst")).HasSingleItem();
+        await Assert.That(storage._inner._state.ImmutableMemTables).IsEmpty();
+        await Assert.That(storage._inner._state.CurrentMemTable.Size).IsEqualTo(0L);
 
         // Reads must go through the bloom filter and block decoding of the SST.
         for (var i = 0; i < count; i++)
         {
-            Assert.Equal(i + 1, await storage.GetAsync(i));
+            await Assert.That(await storage.GetAsync(i)).IsEqualTo(i + 1);
         }
 
         // A key that was never inserted returns the default value.
-        Assert.Equal(0, await storage.GetAsync(10000));
+        await Assert.That(await storage.GetAsync(10000)).IsEqualTo(0);
 
         await storage.CloseAsync();
         Directory.Delete(tempFolder, true);
@@ -396,19 +400,19 @@ public class StorageTests
         storage._inner.ForceFreezeMemTable();
 
         await Task.Delay(100);
-        Assert.Empty(Directory.EnumerateFiles(tempFolder, "*.sst"));
-        Assert.Single(storage._inner._state.ImmutableMemTables);
-        Assert.True(storage._inner._state.ImmutableMemTables.Peek().TryGet('a', out _));
-        Assert.False(storage._inner._state.ImmutableMemTables.Peek().TryGet('b', out _));
+        await Assert.That(Directory.EnumerateFiles(tempFolder, "*.sst")).IsEmpty();
+        await Assert.That(storage._inner._state.ImmutableMemTables).HasSingleItem();
+        await Assert.That(storage._inner._state.ImmutableMemTables.Peek().TryGet('a', out _)).IsTrue();
+        await Assert.That(storage._inner._state.ImmutableMemTables.Peek().TryGet('b', out _)).IsFalse();
 
         storage.Put('b', 2);
         storage._inner.ForceFreezeMemTable();
 
         await Task.Delay(100);
-        Assert.Single(Directory.EnumerateFiles(tempFolder, "*.sst"));
-        Assert.Single(storage._inner._state.ImmutableMemTables);
-        Assert.False(storage._inner._state.ImmutableMemTables.Peek().TryGet('a', out _));
-        Assert.True(storage._inner._state.ImmutableMemTables.Peek().TryGet('b', out _));
+        await Assert.That(Directory.EnumerateFiles(tempFolder, "*.sst")).HasSingleItem();
+        await Assert.That(storage._inner._state.ImmutableMemTables).HasSingleItem();
+        await Assert.That(storage._inner._state.ImmutableMemTables.Peek().TryGet('a', out _)).IsFalse();
+        await Assert.That(storage._inner._state.ImmutableMemTables.Peek().TryGet('b', out _)).IsTrue();
 
         await storage.CloseAsync();
         Directory.Delete(tempFolder, true);
@@ -422,7 +426,7 @@ public class StorageTests
 
         storage.Put('a', 1);
         await storage.CloseAsync();
-        Assert.Single(Directory.EnumerateFiles(tempFolder, "*.sst"));
+        await Assert.That(Directory.EnumerateFiles(tempFolder, "*.sst")).HasSingleItem();
 
         await storage.CloseAsync();
         Directory.Delete(tempFolder, true);
@@ -436,15 +440,15 @@ public class StorageTests
 
         storage.Put('a', 1);
         await storage.CloseAsync();
-        Assert.Single(Directory.EnumerateFiles(tempFolder, "*.sst"));
+        await Assert.That(Directory.EnumerateFiles(tempFolder, "*.sst")).HasSingleItem();
 
         await storage.CloseAsync();
-        Assert.Single(Directory.EnumerateFiles(tempFolder, "*.sst"));
+        await Assert.That(Directory.EnumerateFiles(tempFolder, "*.sst")).HasSingleItem();
 
         storage = await LsmStorage.OpenAsync<char, int>(tempFolder, new StorageOptions());
         storage.Put('a', 2);
         await storage.CloseAsync();
-        Assert.Equal(2, Directory.EnumerateFiles(tempFolder, "*.sst").Count());
+        await Assert.That(Directory.EnumerateFiles(tempFolder, "*.sst").Count()).IsEqualTo(2);
 
         await storage.CloseAsync();
         Directory.Delete(tempFolder, true);
@@ -467,7 +471,7 @@ public class StorageTests
         GC.Collect();
 
         // Reaching this point means finalization neither flushed to the deleted folder nor crashed.
-        Assert.False(Directory.Exists(tempFolder));
+        await Assert.That(Directory.Exists(tempFolder)).IsFalse();
 
         // The storage was never closed, so nothing was ever persisted.
         static async Task CreateUnclosedStorageAsync(string folder)
@@ -490,12 +494,12 @@ public class StorageTests
         storage.ForceFreezeMemTable();
 
         // Both immutable mem tables hold key 1; the most recently frozen value must win.
-        Assert.Equal(2, storage._state.ImmutableMemTables.Count());
-        Assert.Equal(200, await storage.GetAsync(1));
+        await Assert.That(storage._state.ImmutableMemTables.Count()).IsEqualTo(2);
+        await Assert.That(await storage.GetAsync(1)).IsEqualTo(200);
     }
 
     [Test]
-    public void ScanShouldReturnMostRecentImmutableMemTableValue()
+    public async Task ScanShouldReturnMostRecentImmutableMemTableValue()
     {
         using var storage = new LsmStorageInner<int, int>(Path.GetTempPath(), new StorageOptions { UseWriteAheadLog = false });
 
@@ -507,8 +511,8 @@ public class StorageTests
 
         var list = storage.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToList();
 
-        Assert.Single(list);
-        Assert.Equal(200, list[0].Value);
+        await Assert.That(list).HasSingleItem();
+        await Assert.That(list[0].Value).IsEqualTo(200);
     }
 
     [Test]
@@ -519,7 +523,7 @@ public class StorageTests
         storage.Put([1, 2, 3], 42);
 
         // A different array instance with the same content must resolve to the stored value.
-        Assert.Equal(42, await storage.GetAsync([1, 2, 3]));
+        await Assert.That(await storage.GetAsync([1, 2, 3])).IsEqualTo(42);
     }
 
     [Test]
@@ -538,12 +542,12 @@ public class StorageTests
         storage._inner.ForceFreezeMemTable();
         await storage._inner.ForceFlushNextImmutableMemTableAsync();
 
-        Assert.Equal(2, Directory.EnumerateFiles(tempFolder, "*.sst").Count());
+        await Assert.That(Directory.EnumerateFiles(tempFolder, "*.sst").Count()).IsEqualTo(2);
         await storage.CloseAsync();
 
         // After reopening, the SSTs must be ordered by creation so the newest value still wins.
         var reopened = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
-        Assert.Equal(200, await reopened.GetAsync(1));
+        await Assert.That(await reopened.GetAsync(1)).IsEqualTo(200);
 
         await reopened.CloseAsync();
         Directory.Delete(tempFolder, true);
@@ -563,10 +567,10 @@ public class StorageTests
 
         storage._inner.ForceFreezeMemTable();
         await storage._inner.ForceFlushNextImmutableMemTableAsync();
-        Assert.Single(Directory.EnumerateFiles(tempFolder, "*.sst"));
+        await Assert.That(Directory.EnumerateFiles(tempFolder, "*.sst")).HasSingleItem();
 
         var result = await storage.GetAsync(1);
-        Assert.Equal(value, result);
+        await Assert.That(result).IsEqualTo(value);
 
         await storage.CloseAsync();
         Directory.Delete(tempFolder, true);
@@ -587,14 +591,14 @@ public class StorageTests
         GC.Collect();
 
         // Nothing was ever flushed, yet the WAL is on disk holding the unflushed writes.
-        Assert.Empty(Directory.EnumerateFiles(tempFolder, "*.sst"));
-        Assert.NotEmpty(Directory.EnumerateFiles(tempFolder, "*.wal"));
+        await Assert.That(Directory.EnumerateFiles(tempFolder, "*.sst")).IsEmpty();
+        await Assert.That(Directory.EnumerateFiles(tempFolder, "*.wal")).IsNotEmpty();
 
         var reopened = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
 
         for (var i = 0; i < 10; i++)
         {
-            Assert.Equal(i + 1, await reopened.GetAsync(i));
+            await Assert.That(await reopened.GetAsync(i)).IsEqualTo(i + 1);
         }
 
         await reopened.CloseAsync();
@@ -633,7 +637,7 @@ public class StorageTests
         }
 
         var reopened = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
-        Assert.Equal(0, await reopened.GetAsync(0));
+        await Assert.That(await reopened.GetAsync(0)).IsEqualTo(0);
 
         await reopened.CloseAsync();
         Directory.Delete(tempFolder, true);
@@ -664,7 +668,7 @@ public class StorageTests
 
         // Recovery must not throw and the earlier, intact records must still be recovered.
         var reopened = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
-        Assert.Equal(1, await reopened.GetAsync(0));
+        await Assert.That(await reopened.GetAsync(0)).IsEqualTo(1);
 
         await reopened.CloseAsync();
         Directory.Delete(tempFolder, true);
@@ -702,10 +706,10 @@ public class StorageTests
 
         var reopened = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
 
-        Assert.Equal(42, await reopened.GetAsync(1));
+        await Assert.That(await reopened.GetAsync(1)).IsEqualTo(42);
         // The stale WAL was deleted (and never replayed) because its SST was already loaded. The
         // reopened store has its own fresh current-memtable WAL, so only assert the stale one is gone.
-        Assert.False(File.Exists(staleWal));
+        await Assert.That(File.Exists(staleWal)).IsFalse();
 
         await reopened.CloseAsync();
         Directory.Delete(tempFolder, true);
@@ -726,16 +730,16 @@ public class StorageTests
             await FlushTierAsync(storage, () => storage.Put(1, 10));
             await FlushTierAsync(storage, () => storage.Put(2, 20));
             await FlushTierAsync(storage, () => storage.Put(3, 30));
-            Assert.Equal(3, storage._state.LevelZeroTables.Count);
+            await Assert.That(storage._state.LevelZeroTables.Count).IsEqualTo(3);
 
             var compacted = await storage.TryTieredCompactionAsync();
 
-            Assert.True(compacted);
-            Assert.Single(storage._state.LevelZeroTables);
-            Assert.Single(Directory.EnumerateFiles(tempFolder, "*.sst"));
-            Assert.Equal(10, await storage.GetAsync(1));
-            Assert.Equal(20, await storage.GetAsync(2));
-            Assert.Equal(30, await storage.GetAsync(3));
+            await Assert.That(compacted).IsTrue();
+            await Assert.That(storage._state.LevelZeroTables).HasSingleItem();
+            await Assert.That(Directory.EnumerateFiles(tempFolder, "*.sst")).HasSingleItem();
+            await Assert.That(await storage.GetAsync(1)).IsEqualTo(10);
+            await Assert.That(await storage.GetAsync(2)).IsEqualTo(20);
+            await Assert.That(await storage.GetAsync(3)).IsEqualTo(30);
         }
         finally
         {
@@ -762,10 +766,10 @@ public class StorageTests
 
             var compacted = await storage.TryTieredCompactionAsync();
 
-            Assert.True(compacted);
-            Assert.Single(storage._state.LevelZeroTables);
-            Assert.Equal(0, await storage.GetAsync(1));
-            Assert.Equal(200, await storage.GetAsync(2));
+            await Assert.That(compacted).IsTrue();
+            await Assert.That(storage._state.LevelZeroTables).HasSingleItem();
+            await Assert.That(await storage.GetAsync(1)).IsEqualTo(0);
+            await Assert.That(await storage.GetAsync(2)).IsEqualTo(200);
         }
         finally
         {
@@ -797,19 +801,19 @@ public class StorageTests
             await FlushTierAsync(storage, () => storage.Put(1, 1));
             await FlushTierAsync(storage, () => storage.Delete(1000));
             await FlushTierAsync(storage, () => storage.Put(3, 3));
-            Assert.Equal(4, storage._state.LevelZeroTables.Count);
+            await Assert.That(storage._state.LevelZeroTables.Count).IsEqualTo(4);
 
             var compacted = await storage.TryTieredCompactionAsync();
 
-            Assert.True(compacted);
+            await Assert.That(compacted).IsTrue();
             // The big oldest tier is untouched; the three newest tiers collapse into one.
-            Assert.Equal(2, storage._state.LevelZeroTables.Count);
+            await Assert.That(storage._state.LevelZeroTables.Count).IsEqualTo(2);
             // The tombstone was kept, so the key the oldest tier still holds remains logically deleted.
-            Assert.Equal(0, await storage.GetAsync(1000));
+            await Assert.That(await storage.GetAsync(1000)).IsEqualTo(0);
             // Untouched keys from the oldest tier are still readable.
-            Assert.Equal(1001, await storage.GetAsync(1001));
-            Assert.Equal(1, await storage.GetAsync(1));
-            Assert.Equal(3, await storage.GetAsync(3));
+            await Assert.That(await storage.GetAsync(1001)).IsEqualTo(1001);
+            await Assert.That(await storage.GetAsync(1)).IsEqualTo(1);
+            await Assert.That(await storage.GetAsync(3)).IsEqualTo(3);
         }
         finally
         {
@@ -834,9 +838,9 @@ public class StorageTests
 
             var compacted = await storage.TryTieredCompactionAsync();
 
-            Assert.False(compacted);
-            Assert.Equal(2, storage._state.LevelZeroTables.Count);
-            Assert.Equal(2, Directory.EnumerateFiles(tempFolder, "*.sst").Count());
+            await Assert.That(compacted).IsFalse();
+            await Assert.That(storage._state.LevelZeroTables.Count).IsEqualTo(2);
+            await Assert.That(Directory.EnumerateFiles(tempFolder, "*.sst").Count()).IsEqualTo(2);
         }
         finally
         {
@@ -859,8 +863,8 @@ public class StorageTests
             await FlushTierAsync(storage, () => storage.Put(2, 20));
             await FlushTierAsync(storage, () => storage.Put(3, 30));
 
-            Assert.False(await storage.TryTieredCompactionAsync());
-            Assert.Equal(3, storage._state.LevelZeroTables.Count);
+            await Assert.That(await storage.TryTieredCompactionAsync()).IsFalse();
+            await Assert.That(storage._state.LevelZeroTables.Count).IsEqualTo(3);
         }
         finally
         {
@@ -886,12 +890,12 @@ public class StorageTests
             await storage._inner.ForceFlushNextImmutableMemTableAsync();
         }
 
-        Assert.True(await storage._inner.TryTieredCompactionAsync());
-        Assert.Single(Directory.EnumerateFiles(tempFolder, "*.sst"));
+        await Assert.That(await storage._inner.TryTieredCompactionAsync()).IsTrue();
+        await Assert.That(Directory.EnumerateFiles(tempFolder, "*.sst")).HasSingleItem();
         await storage.CloseAsync();
 
         var reopened = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
-        Assert.Equal(300, await reopened.GetAsync(1));
+        await Assert.That(await reopened.GetAsync(1)).IsEqualTo(300);
 
         await reopened.CloseAsync();
         Directory.Delete(tempFolder, true);
@@ -923,10 +927,10 @@ public class StorageTests
                 storage.Put(10, 100);
             });
 
-            Assert.Equal(50, await storage.GetAsync(5));
+            await Assert.That(await storage.GetAsync(5)).IsEqualTo(50);
             // Keys that really are in the newer table still resolve from it.
-            Assert.Equal(10, await storage.GetAsync(1));
-            Assert.Equal(100, await storage.GetAsync(10));
+            await Assert.That(await storage.GetAsync(1)).IsEqualTo(10);
+            await Assert.That(await storage.GetAsync(10)).IsEqualTo(100);
         }
         finally
         {
@@ -972,7 +976,7 @@ public class StorageTests
             var committedCount = 0;
             using var done = new CancellationTokenSource();
 
-            var scanner = Task.Run(() =>
+            var scanner = Task.Run(async () =>
             {
                 while (!done.IsCancellationRequested)
                 {
@@ -984,7 +988,7 @@ public class StorageTests
 
                     for (var k = 1; k <= expected; k++)
                     {
-                        Assert.Contains(k, keys);
+                        await Assert.That(keys).Contains(k);
                     }
                 }
             });
@@ -1033,8 +1037,8 @@ public class StorageTests
 
             var entries = storage.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToList();
 
-            Assert.Equal(new[] { 1, 2, 3 }, entries.Select(e => e.Key));
-            Assert.Equal(new[] { 10, 20, 30 }, entries.Select(e => e.Value));
+            await Assert.That(entries.Select(e => e.Key)).IsEquivalentTo(new[] { 1, 2, 3 }, CollectionOrdering.Matching);
+            await Assert.That(entries.Select(e => e.Value)).IsEquivalentTo(new[] { 10, 20, 30 }, CollectionOrdering.Matching);
         }
         finally
         {
@@ -1062,8 +1066,8 @@ public class StorageTests
 
             var entries = storage.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToList();
 
-            Assert.Equal(new[] { 1, 2 }, entries.Select(e => e.Key));
-            Assert.Equal(new[] { 999, 20 }, entries.Select(e => e.Value));
+            await Assert.That(entries.Select(e => e.Key)).IsEquivalentTo(new[] { 1, 2 }, CollectionOrdering.Matching);
+            await Assert.That(entries.Select(e => e.Value)).IsEquivalentTo(new[] { 999, 20 }, CollectionOrdering.Matching);
         }
         finally
         {
@@ -1090,8 +1094,8 @@ public class StorageTests
 
             var entries = storage.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToList();
 
-            Assert.Equal(new[] { 2 }, entries.Select(e => e.Key));
-            Assert.Equal(new[] { 20 }, entries.Select(e => e.Value));
+            await Assert.That(entries.Select(e => e.Key)).IsEquivalentTo(new[] { 2 }, CollectionOrdering.Matching);
+            await Assert.That(entries.Select(e => e.Value)).IsEquivalentTo(new[] { 20 }, CollectionOrdering.Matching);
         }
         finally
         {
@@ -1118,8 +1122,8 @@ public class StorageTests
 
             var entries = storage.CreateIterator().EnumerateAsync(2).ToBlockingEnumerable().ToList();
 
-            Assert.Equal(new[] { 2, 3, 4 }, entries.Select(e => e.Key));
-            Assert.Equal(new[] { 20, 30, 40 }, entries.Select(e => e.Value));
+            await Assert.That(entries.Select(e => e.Key)).IsEquivalentTo(new[] { 2, 3, 4 }, CollectionOrdering.Matching);
+            await Assert.That(entries.Select(e => e.Value)).IsEquivalentTo(new[] { 20, 30, 40 }, CollectionOrdering.Matching);
         }
         finally
         {
@@ -1149,8 +1153,8 @@ public class StorageTests
             {
                 var entries = reopened._inner.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToList();
 
-                Assert.Equal(new[] { 1, 2 }, entries.Select(e => e.Key));
-                Assert.Equal(new[] { 10, 20 }, entries.Select(e => e.Value));
+                await Assert.That(entries.Select(e => e.Key)).IsEquivalentTo(new[] { 1, 2 }, CollectionOrdering.Matching);
+                await Assert.That(entries.Select(e => e.Value)).IsEquivalentTo(new[] { 10, 20 }, CollectionOrdering.Matching);
             }
             finally
             {
@@ -1180,7 +1184,7 @@ public class StorageTests
             await FlushTierAsync(storage, () => storage.Delete(1));
 
             // The delete lives in the newest SST as a sentinel value; it must shadow the older value.
-            Assert.Equal(0, await storage.GetAsync(1));
+            await Assert.That(await storage.GetAsync(1)).IsEqualTo(0);
         }
         finally
         {
@@ -1210,23 +1214,23 @@ public class StorageTests
             await FlushTierAsync(storage, () => storage.Put(2, 20));
             await FlushTierAsync(storage, () => storage.Put(3, 30));
             await FlushTierAsync(storage, () => storage.Put(4, 40));
-            Assert.Equal(4, storage._state.LevelZeroTables.Count);
+            await Assert.That(storage._state.LevelZeroTables.Count).IsEqualTo(4);
 
             var compacted = await storage.TryLeveledCompactionAsync();
 
-            Assert.True(compacted);
-            Assert.Empty(storage._state.LevelZeroTables);
-            Assert.Single(storage._state.LeveledSsTables);
-            Assert.Single(storage._state.LeveledSsTables[0]);
-            Assert.Equal(10, await storage.GetAsync(1));
-            Assert.Equal(20, await storage.GetAsync(2));
-            Assert.Equal(30, await storage.GetAsync(3));
-            Assert.Equal(40, await storage.GetAsync(4));
+            await Assert.That(compacted).IsTrue();
+            await Assert.That(storage._state.LevelZeroTables).IsEmpty();
+            await Assert.That(storage._state.LeveledSsTables).HasSingleItem();
+            await Assert.That(storage._state.LeveledSsTables[0]).HasSingleItem();
+            await Assert.That(await storage.GetAsync(1)).IsEqualTo(10);
+            await Assert.That(await storage.GetAsync(2)).IsEqualTo(20);
+            await Assert.That(await storage.GetAsync(3)).IsEqualTo(30);
+            await Assert.That(await storage.GetAsync(4)).IsEqualTo(40);
 
             // The merged run is also visible to a full scan in key order.
             var entries = storage.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToList();
-            Assert.Equal(new[] { 1, 2, 3, 4 }, entries.Select(e => e.Key));
-            Assert.Equal(new[] { 10, 20, 30, 40 }, entries.Select(e => e.Value));
+            await Assert.That(entries.Select(e => e.Key)).IsEquivalentTo(new[] { 1, 2, 3, 4 }, CollectionOrdering.Matching);
+            await Assert.That(entries.Select(e => e.Value)).IsEquivalentTo(new[] { 10, 20, 30, 40 }, CollectionOrdering.Matching);
         }
         finally
         {
@@ -1256,17 +1260,17 @@ public class StorageTests
             await FlushTierAsync(storage, () => storage.Put(1, 10));
             await FlushTierAsync(storage, () => storage.Put(2, 20));
 
-            Assert.True(await storage.TryLeveledCompactionAsync());
-            Assert.Single(storage._state.LeveledSsTables[0]); // L1 populated
+            await Assert.That(await storage.TryLeveledCompactionAsync()).IsTrue();
+            await Assert.That(storage._state.LeveledSsTables[0]).HasSingleItem(); // L1 populated
 
             // Second action: L1 is over its (tiny) target, so it is pushed down into L2.
-            Assert.True(await storage.TryLeveledCompactionAsync());
-            Assert.Equal(2, storage._state.LeveledSsTables.Count);
-            Assert.Empty(storage._state.LeveledSsTables[0]); // L1 now empty
-            Assert.Single(storage._state.LeveledSsTables[1]); // L2 populated
+            await Assert.That(await storage.TryLeveledCompactionAsync()).IsTrue();
+            await Assert.That(storage._state.LeveledSsTables.Count).IsEqualTo(2);
+            await Assert.That(storage._state.LeveledSsTables[0]).IsEmpty(); // L1 now empty
+            await Assert.That(storage._state.LeveledSsTables[1]).HasSingleItem(); // L2 populated
 
-            Assert.Equal(10, await storage.GetAsync(1));
-            Assert.Equal(20, await storage.GetAsync(2));
+            await Assert.That(await storage.GetAsync(1)).IsEqualTo(10);
+            await Assert.That(await storage.GetAsync(2)).IsEqualTo(20);
         }
         finally
         {
@@ -1299,14 +1303,14 @@ public class StorageTests
             });
             await FlushTierAsync(storage, () => storage.Delete(1));
 
-            Assert.True(await storage.TryLeveledCompactionAsync());
+            await Assert.That(await storage.TryLeveledCompactionAsync()).IsTrue();
 
-            Assert.Equal(0, await storage.GetAsync(1));
-            Assert.Equal(200, await storage.GetAsync(2));
+            await Assert.That(await storage.GetAsync(1)).IsEqualTo(0);
+            await Assert.That(await storage.GetAsync(2)).IsEqualTo(200);
 
             // The tombstone for key 1 was dropped, so only key 2 survives in L1.
             var entries = storage.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToList();
-            Assert.Equal(new[] { 2 }, entries.Select(e => e.Key));
+            await Assert.That(entries.Select(e => e.Key)).IsEquivalentTo(new[] { 2 }, CollectionOrdering.Matching);
         }
         finally
         {
@@ -1336,18 +1340,18 @@ public class StorageTests
             // Seed L2 with key 1 = 100.
             await FlushTierAsync(storage, () => storage.Put(1, 100));
             await FlushTierAsync(storage, () => storage.Put(2, 200));
-            Assert.True(await storage.TryLeveledCompactionAsync()); // L0 -> L1
-            Assert.True(await storage.TryLeveledCompactionAsync()); // L1 -> L2
+            await Assert.That(await storage.TryLeveledCompactionAsync()).IsTrue(); // L0 -> L1
+            await Assert.That(await storage.TryLeveledCompactionAsync()).IsTrue(); // L1 -> L2
 
             // Now delete key 1 in a fresh L0 batch and compact into L1 (which sits above the L2 that holds 1).
             await FlushTierAsync(storage, () => storage.Delete(1));
             await FlushTierAsync(storage, () => storage.Put(3, 300));
-            Assert.True(await storage.TryLeveledCompactionAsync()); // L0 -> L1, must keep the tombstone
+            await Assert.That(await storage.TryLeveledCompactionAsync()).IsTrue(); // L0 -> L1, must keep the tombstone
 
             // The delete is preserved: key 1 reads as deleted even though L2 still physically holds 100.
-            Assert.Equal(0, await storage.GetAsync(1));
-            Assert.Equal(200, await storage.GetAsync(2));
-            Assert.Equal(300, await storage.GetAsync(3));
+            await Assert.That(await storage.GetAsync(1)).IsEqualTo(0);
+            await Assert.That(await storage.GetAsync(2)).IsEqualTo(200);
+            await Assert.That(await storage.GetAsync(3)).IsEqualTo(300);
         }
         finally
         {
@@ -1377,28 +1381,28 @@ public class StorageTests
             var building = new LsmStorageInner<int, int>(tempFolder, options);
             await FlushTierAsync(building, () => building.Put(1, 10));
             await FlushTierAsync(building, () => building.Put(2, 20));
-            Assert.True(await building.TryLeveledCompactionAsync()); // L0 -> L1
-            Assert.True(await building.TryLeveledCompactionAsync()); // L1 -> L2
+            await Assert.That(await building.TryLeveledCompactionAsync()).IsTrue(); // L0 -> L1
+            await Assert.That(await building.TryLeveledCompactionAsync()).IsTrue(); // L1 -> L2
             await FlushTierAsync(building, () => building.Put(3, 30));
             await FlushTierAsync(building, () => building.Put(4, 40));
-            Assert.True(await building.TryLeveledCompactionAsync()); // L0 -> L1
+            await Assert.That(await building.TryLeveledCompactionAsync()).IsTrue(); // L0 -> L1
             building.Dispose();
 
-            Assert.True(File.Exists(Path.Combine(tempFolder, "manifest")));
+            await Assert.That(File.Exists(Path.Combine(tempFolder, "manifest"))).IsTrue();
 
             var storage = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
 
             try
             {
                 // L1 holds {3,4}; L2 holds {1,2}.
-                Assert.Equal(2, storage._inner._state.LeveledSsTables.Count);
-                Assert.Single(storage._inner._state.LeveledSsTables[0]);
-                Assert.Single(storage._inner._state.LeveledSsTables[1]);
-                Assert.Empty(storage._inner._state.LevelZeroTables);
+                await Assert.That(storage._inner._state.LeveledSsTables.Count).IsEqualTo(2);
+                await Assert.That(storage._inner._state.LeveledSsTables[0]).HasSingleItem();
+                await Assert.That(storage._inner._state.LeveledSsTables[1]).HasSingleItem();
+                await Assert.That(storage._inner._state.LevelZeroTables).IsEmpty();
 
                 var entries = storage._inner.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToList();
-                Assert.Equal(new[] { 1, 2, 3, 4 }, entries.Select(e => e.Key));
-                Assert.Equal(new[] { 10, 20, 30, 40 }, entries.Select(e => e.Value));
+                await Assert.That(entries.Select(e => e.Key)).IsEquivalentTo(new[] { 1, 2, 3, 4 }, CollectionOrdering.Matching);
+                await Assert.That(entries.Select(e => e.Value)).IsEquivalentTo(new[] { 10, 20, 30, 40 }, CollectionOrdering.Matching);
             }
             finally
             {
@@ -1431,7 +1435,7 @@ public class StorageTests
             var building = new LsmStorageInner<int, int>(tempFolder, options);
             await FlushTierAsync(building, () => building.Put(1, 10));
             await FlushTierAsync(building, () => building.Put(2, 20));
-            Assert.True(await building.TryLeveledCompactionAsync());
+            await Assert.That(await building.TryLeveledCompactionAsync()).IsTrue();
             building.Dispose();
 
             // Simulate an orphan output (id far in the future, not referenced by the manifest).
@@ -1442,9 +1446,9 @@ public class StorageTests
 
             try
             {
-                Assert.False(File.Exists(orphan));
-                Assert.Equal(10, await storage.GetAsync(1));
-                Assert.Equal(20, await storage.GetAsync(2));
+                await Assert.That(File.Exists(orphan)).IsFalse();
+                await Assert.That(await storage.GetAsync(1)).IsEqualTo(10);
+                await Assert.That(await storage.GetAsync(2)).IsEqualTo(20);
             }
             finally
             {
@@ -1484,23 +1488,23 @@ public class StorageTests
                 }
             });
 
-            Assert.True(await storage.TryLeveledCompactionAsync());
+            await Assert.That(await storage.TryLeveledCompactionAsync()).IsTrue();
 
             // The single L1 run was split into several SSTs.
             var l1 = storage._state.LeveledSsTables[0];
-            Assert.True(l1.Count > 1, $"expected L1 to be split, got {l1.Count} SST(s)");
+            await Assert.That(l1.Count > 1).IsTrue();
 
             // They are sorted and non-overlapping.
             for (var i = 1; i < l1.Count; i++)
             {
-                Assert.True(l1[i - 1].LastKey < l1[i].FirstKey);
+                await Assert.That(l1[i - 1].LastKey < l1[i].FirstKey).IsTrue();
             }
 
             // Every key is still readable and a full scan returns them all in order.
-            Assert.Equal(2500, await storage.GetAsync(250));
+            await Assert.That(await storage.GetAsync(250)).IsEqualTo(2500);
             var entries = storage.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToList();
-            Assert.Equal(Enumerable.Range(1, 400), entries.Select(e => e.Key));
-            Assert.Equal(Enumerable.Range(1, 400).Select(k => k * 10), entries.Select(e => e.Value));
+            await Assert.That(entries.Select(e => e.Key)).IsEquivalentTo(Enumerable.Range(1, 400), CollectionOrdering.Matching);
+            await Assert.That(entries.Select(e => e.Value)).IsEquivalentTo(Enumerable.Range(1, 400).Select(k => k * 10), CollectionOrdering.Matching);
         }
         finally
         {
@@ -1537,14 +1541,14 @@ public class StorageTests
                     storage.Put(k, k);
                 }
             });
-            Assert.True(await storage.TryLeveledCompactionAsync());
+            await Assert.That(await storage.TryLeveledCompactionAsync()).IsTrue();
 
             // Record the L1 SSTs that do not overlap the low range [1,5]; these must survive untouched.
             var untouchedBefore = storage._state.LeveledSsTables[0]
                 .Where(t => t.FirstKey > 5)
                 .Select(t => t.Filename)
                 .ToHashSet();
-            Assert.NotEmpty(untouchedBefore);
+            await Assert.That(untouchedBefore).IsNotEmpty();
 
             // A small batch overwriting only keys 1..5 overlaps just the first L1 SST.
             await FlushTierAsync(storage, () =>
@@ -1554,20 +1558,20 @@ public class StorageTests
                     storage.Put(k, k * 1000);
                 }
             });
-            Assert.True(await storage.TryLeveledCompactionAsync());
+            await Assert.That(await storage.TryLeveledCompactionAsync()).IsTrue();
 
             // The non-overlapping L1 SSTs were carried over by reference (same files), not rewritten.
             var l1After = storage._state.LeveledSsTables[0].Select(t => t.Filename).ToHashSet();
-            Assert.Subset(l1After, untouchedBefore);
+            await Assert.That(l1After.IsSupersetOf(untouchedBefore)).IsTrue();
 
             // Updated keys reflect the new values; everything else is unchanged.
-            Assert.Equal(1000, await storage.GetAsync(1));
-            Assert.Equal(5000, await storage.GetAsync(5));
-            Assert.Equal(6, await storage.GetAsync(6));
-            Assert.Equal(400, await storage.GetAsync(400));
+            await Assert.That(await storage.GetAsync(1)).IsEqualTo(1000);
+            await Assert.That(await storage.GetAsync(5)).IsEqualTo(5000);
+            await Assert.That(await storage.GetAsync(6)).IsEqualTo(6);
+            await Assert.That(await storage.GetAsync(400)).IsEqualTo(400);
 
             var entries = storage.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToList();
-            Assert.Equal(Enumerable.Range(1, 400), entries.Select(e => e.Key));
+            await Assert.That(entries.Select(e => e.Key)).IsEquivalentTo(Enumerable.Range(1, 400), CollectionOrdering.Matching);
         }
         finally
         {
@@ -1602,20 +1606,20 @@ public class StorageTests
                     building.Put(k, k * 10);
                 }
             });
-            Assert.True(await building.TryLeveledCompactionAsync());
+            await Assert.That(await building.TryLeveledCompactionAsync()).IsTrue();
             var splitCount = building._state.LeveledSsTables[0].Count;
-            Assert.True(splitCount > 1);
+            await Assert.That(splitCount > 1).IsTrue();
             building.Dispose();
 
             var storage = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
 
             try
             {
-                Assert.Equal(splitCount, storage._inner._state.LeveledSsTables[0].Count);
+                await Assert.That(storage._inner._state.LeveledSsTables[0].Count).IsEqualTo(splitCount);
 
                 var entries = storage._inner.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToList();
-                Assert.Equal(Enumerable.Range(1, 400), entries.Select(e => e.Key));
-                Assert.Equal(Enumerable.Range(1, 400).Select(k => k * 10), entries.Select(e => e.Value));
+                await Assert.That(entries.Select(e => e.Key)).IsEquivalentTo(Enumerable.Range(1, 400), CollectionOrdering.Matching);
+                await Assert.That(entries.Select(e => e.Value)).IsEquivalentTo(Enumerable.Range(1, 400).Select(k => k * 10), CollectionOrdering.Matching);
             }
             finally
             {
@@ -1656,19 +1660,19 @@ public class StorageTests
                 }
             });
 
-            Assert.True(await storage.TryLeveledCompactionAsync());
+            await Assert.That(await storage.TryLeveledCompactionAsync()).IsTrue();
 
             var l1 = storage._state.LeveledSsTables[0];
-            Assert.True(l1.Count > 1, $"expected L1 to be split across partitions, got {l1.Count} SST(s)");
+            await Assert.That(l1.Count > 1).IsTrue();
             for (var i = 1; i < l1.Count; i++)
             {
-                Assert.True(l1[i - 1].LastKey < l1[i].FirstKey);
+                await Assert.That(l1[i - 1].LastKey < l1[i].FirstKey).IsTrue();
             }
 
             var entries = storage.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToList();
-            Assert.Equal(Enumerable.Range(1, 800), entries.Select(e => e.Key));
-            Assert.Equal(Enumerable.Range(1, 800).Select(k => k * 7), entries.Select(e => e.Value));
-            Assert.Equal(700 * 7, await storage.GetAsync(700));
+            await Assert.That(entries.Select(e => e.Key)).IsEquivalentTo(Enumerable.Range(1, 800), CollectionOrdering.Matching);
+            await Assert.That(entries.Select(e => e.Value)).IsEquivalentTo(Enumerable.Range(1, 800).Select(k => k * 7), CollectionOrdering.Matching);
+            await Assert.That(await storage.GetAsync(700)).IsEqualTo(700 * 7);
         }
         finally
         {
@@ -1704,7 +1708,7 @@ public class StorageTests
                         storage.Put(k, k * 3);
                     }
                 });
-                Assert.True(await storage.TryLeveledCompactionAsync());
+                await Assert.That(await storage.TryLeveledCompactionAsync()).IsTrue();
                 return storage.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToList();
             }
             finally
@@ -1717,9 +1721,9 @@ public class StorageTests
         var sequential = await RunAsync(1);
         var parallel = await RunAsync(8);
 
-        Assert.Equal(sequential.Select(e => e.Key), parallel.Select(e => e.Key));
-        Assert.Equal(sequential.Select(e => e.Value), parallel.Select(e => e.Value));
-        Assert.Equal(Enumerable.Range(1, 600), parallel.Select(e => e.Key));
+        await Assert.That(parallel.Select(e => e.Key)).IsEquivalentTo(sequential.Select(e => e.Key), CollectionOrdering.Matching);
+        await Assert.That(parallel.Select(e => e.Value)).IsEquivalentTo(sequential.Select(e => e.Value), CollectionOrdering.Matching);
+        await Assert.That(parallel.Select(e => e.Key)).IsEquivalentTo(Enumerable.Range(1, 600), CollectionOrdering.Matching);
     }
 
     [Test]
@@ -1762,11 +1766,11 @@ public class StorageTests
                 });
             }
 
-            Assert.True(storage._state.LevelZeroTables.Count >= 8);
-            Assert.Equal(1100, await storage.GetAsync(1)); // newest write wins
-            Assert.Equal(333, await storage.GetAsync(3));
-            Assert.Equal(0, await storage.GetAsync(2)); // tombstoned -> default
-            Assert.Equal(0, await storage.GetAsync(99)); // never written -> default
+            await Assert.That(storage._state.LevelZeroTables.Count >= 8).IsTrue();
+            await Assert.That(await storage.GetAsync(1)).IsEqualTo(1100); // newest write wins
+            await Assert.That(await storage.GetAsync(3)).IsEqualTo(333);
+            await Assert.That(await storage.GetAsync(2)).IsEqualTo(0); // tombstoned -> default
+            await Assert.That(await storage.GetAsync(99)).IsEqualTo(0); // never written -> default
         }
         finally
         {
@@ -1810,7 +1814,7 @@ public class StorageTests
             {
                 for (var k = 1; k <= 100; k++)
                 {
-                    Assert.Equal(k * 2, await storage._inner.GetAsync(k));
+                    await Assert.That(await storage._inner.GetAsync(k)).IsEqualTo(k * 2);
                 }
             }
             finally

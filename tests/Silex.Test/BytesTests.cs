@@ -2,7 +2,7 @@
 public class BytesTests
 {
     [Test]
-    public void BytesShouldConvertData()
+    public async Task BytesShouldConvertData()
     {
         byte byteValue = byte.MaxValue;
         short shortValue = short.MaxValue;
@@ -24,39 +24,39 @@ public class BytesTests
         Bytes stringBytes = stringValue;
         Bytes byteArrayBytes = byteArrayValue;
 
-        Assert.Equal(sizeof(byte), byteBytes.Length);
-        Assert.Equal(sizeof(short), shortBytes.Length);
-        Assert.Equal(sizeof(ushort), ushortBytes.Length);
-        Assert.Equal(sizeof(int), intBytes.Length);
-        Assert.Equal(sizeof(uint), uintBytes.Length);
-        Assert.Equal(sizeof(long), longBytes.Length);
-        Assert.Equal(sizeof(ulong), ulongBytes.Length);
-        Assert.Equal(stringValue.Length, stringBytes.Length);
-        Assert.Equal(byteArrayValue.Length, byteArrayBytes.Length);
+        await Assert.That(byteBytes.Length).IsEqualTo(sizeof(byte));
+        await Assert.That(shortBytes.Length).IsEqualTo(sizeof(short));
+        await Assert.That(ushortBytes.Length).IsEqualTo(sizeof(ushort));
+        await Assert.That(intBytes.Length).IsEqualTo(sizeof(int));
+        await Assert.That(uintBytes.Length).IsEqualTo(sizeof(uint));
+        await Assert.That(longBytes.Length).IsEqualTo(sizeof(long));
+        await Assert.That(ulongBytes.Length).IsEqualTo(sizeof(ulong));
+        await Assert.That(stringBytes.Length).IsEqualTo(stringValue.Length);
+        await Assert.That(byteArrayBytes.Length).IsEqualTo(byteArrayValue.Length);
     }
 
     [Test]
-    public void BytesShouldCopyMemory()
+    public async Task BytesShouldCopyMemory()
     {
         byte[] array = [1, 2, 3];
 
         Bytes bytes1 = array;
         Bytes bytes2 = array;
 
-        Assert.Equal(bytes1, bytes2);
-        Assert.Equal(bytes1, array);
-        Assert.Equal(bytes2, array);
+        await Assert.That(bytes2).IsEqualTo(bytes1);
+        await Assert.That((Bytes)array).IsEqualTo(bytes1);
+        await Assert.That((Bytes)array).IsEqualTo(bytes2);
 
         // Changing the source array should not change the Bytes instances
         array[0] = 0;
 
-        Assert.Equal(bytes1, bytes2);
-        Assert.NotEqual(bytes1, array);
-        Assert.NotEqual(bytes2, array);
+        await Assert.That(bytes2).IsEqualTo(bytes1);
+        await Assert.That((Bytes)array).IsNotEqualTo(bytes1);
+        await Assert.That((Bytes)array).IsNotEqualTo(bytes2);
     }
 
     [Test]
-    public void BytesShouldBeComparable()
+    public async Task BytesShouldBeComparable()
     {
         byte[] array123 = [1, 2, 3];
         byte[] array124 = [1, 2, 4];
@@ -75,22 +75,22 @@ public class BytesTests
         Bytes bytesInt124 = 124;
         Bytes bytesInt1234 = 1234;
 
-        Assert.Equal(new Bytes(array123), new Bytes(array123));
+        await Assert.That(new Bytes(array123)).IsEqualTo(new Bytes(array123));
 
-        Assert.True(bytesArray123 == bytesArray123b);
-        Assert.True(bytesArray123 <= bytesArray123b);
-        Assert.True(bytesArray123 >= bytesArray123b);
-        Assert.True(bytesArray123 < bytesArray124);
-        Assert.True(bytesArray124 > bytesArray123);
+        await Assert.That(bytesArray123 == bytesArray123b).IsTrue();
+        await Assert.That(bytesArray123 <= bytesArray123b).IsTrue();
+        await Assert.That(bytesArray123 >= bytesArray123b).IsTrue();
+        await Assert.That(bytesArray123 < bytesArray124).IsTrue();
+        await Assert.That(bytesArray124 > bytesArray123).IsTrue();
 
         // Arrays should be compared sequentially
-        Assert.True(bytesArray124 > bytesArray1234);
-        Assert.True(bytesArray123 > bytesArray0123);
-        Assert.True(bytesArray124 > bytesArray0123);
+        await Assert.That(bytesArray124 > bytesArray1234).IsTrue();
+        await Assert.That(bytesArray123 > bytesArray0123).IsTrue();
+        await Assert.That(bytesArray124 > bytesArray0123).IsTrue();
     }
 
     [Test]
-    public void BytesShouldRespectSourceLength()
+    public async Task BytesShouldRespectSourceLength()
     {
         for (var i = 0; i < 1000000; i++)
         {
@@ -98,13 +98,13 @@ public class BytesTests
             byte[] source = new byte[length];
             Random.Shared.NextBytes(source);
             Bytes b = source;
-            Assert.Equal(length, b.Length);
+            await Assert.That(b.Length).IsEqualTo(length);
         }
 
         for (var i = 0; i < 1000000; i++)
         {
             Bytes b = Random.Shared.NextInt64();
-            Assert.Equal(sizeof(long), b.Length);
+            await Assert.That(b.Length).IsEqualTo(sizeof(long));
         }
     }
 }

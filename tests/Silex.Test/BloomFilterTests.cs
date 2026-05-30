@@ -11,7 +11,7 @@ public class BloomFilterTests
     [Arguments(1_000, 0.10)]
     [Arguments(10_000, 0.01)]
     [Arguments(10_000, 0.10)]
-    public void ShouldApproximateProbability(int n, double p)
+    public async Task ShouldApproximateProbability(int n, double p)
     {
         // n: distinct values
         // p: tolerable false positive rate 
@@ -25,7 +25,7 @@ public class BloomFilterTests
 
         var bloom = new BloomFilter(n, p);
 
-        Span<byte> buffer = stackalloc byte[sizeof(int) / sizeof(byte)];
+        var buffer = new byte[sizeof(int) / sizeof(byte)];
 
         foreach (int element in elements)
         {
@@ -68,16 +68,16 @@ public class BloomFilterTests
         Console.WriteLine($"Is not in set: {negative} ({fnRate * 100}%)");
 
         // A bloom filter should not return false negatives
-        Assert.Equal(0, falseNegative);
+        await Assert.That(falseNegative).IsEqualTo(0);
 
         // Ensure the resulting rate is within 20% of the expected probability
-        Assert.True((fpRate - p) / p < 0.20);
+        await Assert.That((fpRate - p) / p < 0.20).IsTrue();
     }
 
     [Test]
-    public void BloomFilterShouldNotReturnFalsePositive()
+    public async Task BloomFilterShouldNotReturnFalsePositive()
     {
-        Span<byte> buffer = stackalloc byte[sizeof(int) / sizeof(byte)];
+        var buffer = new byte[sizeof(int) / sizeof(byte)];
         var bloom = new BloomFilter(1000, 0.1);
         
         BinaryPrimitives.WriteInt32LittleEndian(buffer, 123);
@@ -89,9 +89,9 @@ public class BloomFilterTests
         var result = bloom.Probe(buffer);
 
         BinaryPrimitives.WriteInt32LittleEndian(buffer, 111);
-        Assert.False(bloom.Probe(buffer));
+        await Assert.That(bloom.Probe(buffer)).IsFalse();
 
         BinaryPrimitives.WriteInt32LittleEndian(buffer, 222);
-        Assert.False(bloom.Probe(buffer));
+        await Assert.That(bloom.Probe(buffer)).IsFalse();
     }
 }

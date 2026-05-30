@@ -5,7 +5,7 @@ using Silex.Collections;
 public class MemTableTests
 {
     [Test]
-    public void SortedDictionaryShouldReturnRange()
+    public async Task SortedDictionaryShouldReturnRange()
     {
         // SortedDictionary doesn't provide a way to enumerate a range of values (as of .NET 9) so
         // we use a custom extension method to access the private SortedSet which allows it
@@ -19,27 +19,27 @@ public class MemTableTests
         }
 
         var items = dic.Enumerate(51, 51, true, false);
-        Assert.Equivalent(new int[] { 60, 70, 80, 90 }, items.Select(x => x.Key));
+        await Assert.That(items.Select(x => x.Key)).IsEquivalentTo(new int[] { 60, 70, 80, 90 });
 
         items = dic.Enumerate(51, 51, false, true);
-        Assert.Equivalent(new int[] { 0, 10, 20, 30, 50 }, items.Select(x => x.Key));
+        await Assert.That(items.Select(x => x.Key)).IsEquivalentTo(new int[] { 0, 10, 20, 30, 40, 50 });
 
         items = dic.Enumerate(0, 0, true, true);
-        Assert.Equivalent(new int[] { 0 }, items.Select(x => x.Key));
+        await Assert.That(items.Select(x => x.Key)).IsEquivalentTo(new int[] { 0 });
 
         items = dic.Enumerate(0, 0, false, false);
-        Assert.Equivalent(Array.Empty<int>(), items.Select(x => x.Key));
+        await Assert.That(items.Select(x => x.Key)).IsEquivalentTo(new int[] { 0, 10, 20, 30, 40, 50, 60, 70, 80, 90 });
 
         items = dic.Enumerate(20, 20, false, false);
-        Assert.Equivalent(Array.Empty<int>(), items.Select(x => x.Key));
+        await Assert.That(items.Select(x => x.Key)).IsEquivalentTo(new int[] { 0, 10, 20, 30, 40, 50, 60, 70, 80, 90 });
 
         items = dic.Enumerate(20, 20, true, true);
-        Assert.Equivalent(new int[] { 20 }, items.Select(x => x.Key));
+        await Assert.That(items.Select(x => x.Key)).IsEquivalentTo(new int[] { 20 });
 
         items = dic.Enumerate(25, 65, true, true);
-        Assert.Equivalent(new int[] { 30, 40, 50 }, items.Select(x => x.Key));
+        await Assert.That(items.Select(x => x.Key)).IsEquivalentTo(new int[] { 30, 40, 50, 60 });
 
         items = dic.Enumerate(-1, 100, true, true);
-        Assert.Equivalent(new int[] { 0, 10, 20, 30, 40, 50, 60, 70, 80, 90 }, items.Select(x => x.Key));
+        await Assert.That(items.Select(x => x.Key)).IsEquivalentTo(new int[] { 0, 10, 20, 30, 40, 50, 60, 70, 80, 90 });
     }
 }
