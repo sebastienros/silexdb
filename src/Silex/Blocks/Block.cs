@@ -12,24 +12,24 @@ public class Block<TKey, TValue> : IDisposable
     private readonly IMemoryOwner<byte>? _memoryOwner;
     private bool _disposed;
 
-    public Block(IBlockEncoder<TKey, TValue> encoder, IMemoryOwner<byte> blockData, int length, IReadOnlyList<ushort> offsets)
+    public Block(IBlockEncoder<TKey, TValue> encoder, IMemoryOwner<byte> blockData, int length, int count)
     {
         _encoder = encoder;
         _memoryOwner = blockData;
         Memory = _memoryOwner.Memory[..length];
-        Offsets = offsets;
+        Offsets = new BlockOffsets(Memory, length - (count + 1) * sizeof(ushort), count);
     }
 
-    public Block(IBlockEncoder<TKey, TValue> encoder, ReadOnlyMemory<byte> blockData, int length, IReadOnlyList<ushort> offsets)
+    public Block(IBlockEncoder<TKey, TValue> encoder, ReadOnlyMemory<byte> blockData, int length, int count)
     {
         _encoder = encoder;
         _memoryOwner = null;
         Memory = blockData[..length];
-        Offsets = offsets;
+        Offsets = new BlockOffsets(Memory, length - (count + 1) * sizeof(ushort), count);
     }
 
     public ReadOnlyMemory<byte> Memory { get; }
-    public IReadOnlyList<ushort> Offsets { get; }
+    public BlockOffsets Offsets { get; }
 
     /// <summary>
     /// Returns a descriptor of a key/value in a block.

@@ -1,6 +1,7 @@
 using Silex.Buffers;
 using Silex.Serialization;
 using System.Buffers;
+using System.Buffers.Binary;
 
 namespace Silex.Blocks;
 
@@ -65,43 +66,27 @@ public class DefaultBlockEncoder<TKey, TValue> : IBlockEncoder<TKey, TValue>
 
     public Block<TKey, TValue> Decode(ReadOnlyMemory<byte> buffer)
     {
-        var offsets = ReadOffsets(buffer, buffer.Length);
+        var count = ReadEntryCount(buffer, buffer.Length);
 
         var memoryOwner = MemoryPool<byte>.Shared.Rent(buffer.Length);
         buffer.CopyTo(memoryOwner.Memory);
 
-        return new Block<TKey, TValue>(this, memoryOwner, buffer.Length, offsets);
+        return new Block<TKey, TValue>(this, memoryOwner, buffer.Length, count);
     }
 
     public Block<TKey, TValue> Decode(IMemoryOwner<byte> owner, int length)
     {
         // The block bytes were already read into the owned buffer, so build the block over it directly
-        // instead of renting a second buffer and copying. Only the offset section is scanned here.
-        var offsets = ReadOffsets(owner.Memory, length);
+        // instead of renting a second buffer and copying. The offset section is read in place by the block.
+        var count = ReadEntryCount(owner.Memory, length);
 
-        return new Block<TKey, TValue>(this, owner, length, offsets);
+        return new Block<TKey, TValue>(this, owner, length, count);
     }
 
-    private static ushort[] ReadOffsets(ReadOnlyMemory<byte> buffer, int length)
+    private static int ReadEntryCount(ReadOnlyMemory<byte> buffer, int length)
     {
-        var binaryReader = new EncoderBinaryReader(buffer, 0);
-
-        // Read the last two bytes
-        binaryReader.Seek(length - 2);
-        var totalEntries = binaryReader.ReadUInt16();
-
-        // Read the offsets position
-        var offsetPosition = length - (totalEntries + 1) * 2;
-        binaryReader.Seek(offsetPosition);
-
-        var offsets = new ushort[totalEntries];
-
-        for (var i = 0; i < totalEntries; i++)
-        {
-            offsets[i] = binaryReader.ReadUInt16();
-        }
-
-        return offsets;
+        // The total number of entries is stored as the trailing ushort of the block.
+        return BinaryPrimitives.ReadUInt16LittleEndian(buffer.Span.Slice(length - sizeof(ushort), sizeof(ushort)));
     }
 
     public RecordLocation<TKey> DecodeEntry(ReadOnlyMemory<byte> data, int offset)
@@ -188,7 +173,7 @@ public class DefaultBlockEncoder<TKey, TValue> : IBlockEncoder<TKey, TValue>
 
         writer.Flush();
            
-        return new Block<TKey, TValue>(this, memory, (int)buffer.Length, offsets);
+        return new Block<TKey, TValue>(this, memory, (int)buffer.Length, offsets.Count);
     }
 
     public int EstimateSize(int encodedKeyLength, TValue value)
