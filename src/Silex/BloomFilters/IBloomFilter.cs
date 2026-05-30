@@ -4,7 +4,7 @@ public interface IBloomFilter
 {
     void Add(ReadOnlySpan<byte> value);
     bool Probe(ReadOnlySpan<byte> item);
-    Span<byte> GetBytes();
+    ReadOnlySpan<byte> GetBytes();
 
     int K { get; }
 }

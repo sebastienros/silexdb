@@ -950,7 +950,7 @@ public class StorageTests
 
         public bool Probe(ReadOnlySpan<byte> item) => true;
 
-        public Span<byte> GetBytes() => inner.GetBytes();
+        public ReadOnlySpan<byte> GetBytes() => inner.GetBytes();
     }
 
     [Test]

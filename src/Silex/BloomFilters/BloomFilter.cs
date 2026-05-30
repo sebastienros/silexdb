@@ -1,5 +1,4 @@
-﻿using System.Collections;
-using System.IO.Hashing;
+﻿using System.IO.Hashing;
 
 namespace Silex.BloomFilters;
 
@@ -9,36 +8,41 @@ namespace Silex.BloomFilters;
 /// </summary>
 public class BloomFilter : IBloomFilter
 {
-    private readonly int _k = 5; // Number of hashing iterations
-    private readonly int _m = 2048; // Size of the bloom filter in bits
+    private readonly int _k; // Number of hashing iterations
+    private readonly int _m; // Size of the bloom filter in bits
 
-    private readonly BitArray _bits;
+    // The bits are stored LSB-first per byte (bit i lives in _bytes[i >> 3] at mask 1 << (i & 7)).
+    // This matches the legacy BitArray byte layout so persisted filters remain readable.
+    private readonly byte[] _bytes;
 
     public BloomFilter(int length, double p)
     {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(length);
+
+        if (p is <= 0 or >= 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(p), p, "The false positive probability must be in the range (0, 1).");
+        }
+
         var n = length;
         _m = (int)CalculateM(n, p);
 
-        // Round to a multiple of 8 (bytes) because BitArray will load these
+        // Round up to a multiple of 8 (bytes) since the filter is stored as a byte array.
         _m = (int)Math.Ceiling((double)_m / 8) * 8;
 
-        _k = CalculateK(n, _m);
-        _bits = new BitArray(_m);
+        // Clamp to at least one hash function; CalculateK can return 0 for degenerate ratios.
+        _k = Math.Max(1, CalculateK(n, _m));
+        _bytes = new byte[_m / 8];
     }
 
     public BloomFilter(byte[] span, int k)
     {
-        _bits = new BitArray(span);
-        _m = _bits.Length;
+        _bytes = span;
+        _m = _bytes.Length * 8;
         _k = k;
     }
 
-    public Span<byte> GetBytes()
-    {
-        var bytes = new byte[(int)Math.Ceiling((double)_bits.Count / 8)];
-        _bits.CopyTo(bytes, 0);
-        return bytes;
-    }
+    public ReadOnlySpan<byte> GetBytes() => _bytes;
 
     public int K => _k;
 
@@ -48,9 +52,11 @@ public class BloomFilter : IBloomFilter
 
         Span<int> positions = stackalloc int[_k];
         ComputeHashPositions(item, positions);
+
+        // Not thread-safe for concurrent writers: Bloom filters are built single-threaded.
         foreach (var b in positions)
         {
-            _bits[b] = true;
+            _bytes[b >> 3] |= (byte)(1 << (b & 7));
         }
     }
 
@@ -63,7 +69,7 @@ public class BloomFilter : IBloomFilter
         ComputeHashPositions(item, positions);
         foreach (var b in positions)
         {
-            if (!_bits[b]) return false;
+            if ((_bytes[b >> 3] & (1 << (b & 7))) == 0) return false;
         }
 
         return true;
@@ -71,20 +77,22 @@ public class BloomFilter : IBloomFilter
 
     private void ComputeHashPositions(ReadOnlySpan<byte> item, Span<int> positions)
     {
-        // Read-only bloom filter?
-        if (_k == 0) return;
+        // A single 128-bit hash pass yields both base hashes used for double hashing.
+        var hash128 = XxHash128.HashToUInt128(item);
+        var a = (ulong)hash128;
+        var delta = (ulong)(hash128 >> 64);
 
-        var hash1 = XxHash3.HashToUInt64(item);
-        var hash2 = XxHash64.HashToUInt64(item);
-
-        ulong hash = hash1;
+        var m = (ulong)_m;
 
         for (var i = 0; i < _k; i++)
         {
-            if (i != 0) hash += hash2;
-            
-            var bit_pos = (int)(hash % (ulong)_m);
-            positions[i] = bit_pos;
+            // Lemire multiply-shift reduction maps the hash uniformly into [0, _m) without a division.
+            positions[i] = (int)Math.BigMul(a, m, out _);
+
+            // Enhanced double hashing (Dillinger & Manolios): the quadratic delta breaks up
+            // degenerate strides that plain h1 + i*h2 produces when h2 shares a factor with _m.
+            a += delta;
+            delta += (ulong)i;
         }
     }
 
@@ -94,7 +102,7 @@ public class BloomFilter : IBloomFilter
 
         for (var i = 0; i < _m; i++)
         {
-            result[i] = _bits[i] ? '1' : '0';
+            result[i] = (_bytes[i >> 3] & (1 << (i & 7))) != 0 ? '1' : '0';
         }
 
         return String.Concat($"m: {_m}, k: {_k} bloom: ", new string(result));
