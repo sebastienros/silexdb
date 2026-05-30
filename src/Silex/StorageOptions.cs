@@ -238,4 +238,25 @@ public class StorageOptions
     /// </summary>
     /// <value>The default value is <c>2 MiB</c>.</value>
     public long TargetSstSizeBytes { get; set; } = 2 * 1024 * 1024;
+
+    /// <summary>
+    /// Gets or sets the maximum degree of parallelism used when a single leveled compaction merges its
+    /// inputs. When greater than <c>1</c> and there is enough data to warrant it, the merge is split into
+    /// independent key-range sub-compactions that run concurrently (RocksDB calls these "subcompactions"),
+    /// each producing its own size-bounded, non-overlapping output SSTs. A value of <c>1</c> runs the merge
+    /// single-threaded. Only the <see cref="Silex.CompactionStrategy.Leveled"/> strategy uses this; tiered
+    /// compaction always merges single-threaded.
+    /// </summary>
+    /// <value>The default value is <see cref="System.Environment.ProcessorCount"/>.</value>
+    public int MaxCompactionParallelism { get; set; } = Environment.ProcessorCount;
+
+    /// <summary>
+    /// Gets or sets the maximum degree of parallelism used on the read/load path: SSTs are loaded
+    /// concurrently when a store is opened, and once a store accumulates many overlapping L0 SSTs a point
+    /// lookup probes them concurrently instead of one-by-one. A value of <c>1</c> keeps both paths
+    /// sequential. Parallel point-lookup probing only engages past an internal L0 count threshold, so a
+    /// store with a small, well-compacted L0 still uses the cheaper newest-first short-circuit.
+    /// </summary>
+    /// <value>The default value is <see cref="System.Environment.ProcessorCount"/>.</value>
+    public int MaxReadParallelism { get; set; } = Environment.ProcessorCount;
 }

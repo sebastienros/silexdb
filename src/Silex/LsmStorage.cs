@@ -75,58 +75,72 @@ public static class LsmStorage
         // its WAL must still be replayed rather than discarded.
         HashSet<long> committedSstIds;
 
+        var loadParallelism = Math.Max(1, options.MaxReadParallelism);
+
+        // Loads the given SST files concurrently (bounded by MaxReadParallelism) into a position-indexed
+        // array, preserving the requested order. On any failure every already-loaded table is disposed so a
+        // failed open never leaks file handles.
+        async Task<SsTable<TKey, TValue>[]> LoadManyAsync((string filename, long id)[] items)
+        {
+            var loaded = new SsTable<TKey, TValue>[items.Length];
+
+            try
+            {
+                await Parallel.ForEachAsync(
+                    Enumerable.Range(0, items.Length),
+                    new ParallelOptions { MaxDegreeOfParallelism = loadParallelism, CancellationToken = cancellationToken },
+                    async (index, ct) =>
+                    {
+                        var (filename, id) = items[index];
+                        var blockBuilder = new BlockBuilder<TKey, TValue>(options.BlockEncoderFactory.Create<TKey, TValue>());
+                        loaded[index] = await SsTable<TKey, TValue>.LoadSsTableAsync(filename, options.SsTableEncoderFactory.Create<TKey, TValue>(), blockBuilder, options.BloomFilterFactory, id, ct);
+                    });
+            }
+            catch
+            {
+                foreach (var table in loaded)
+                {
+                    table?.Dispose();
+                }
+
+                throw;
+            }
+
+            return loaded;
+        }
+
         if (manifest != null)
         {
             var fileById = sstFiles.ToDictionary(x => x.id!.Value, x => x.filename);
             committedSstIds = new HashSet<long>();
 
-            async Task<SsTable<TKey, TValue>?> LoadByIdAsync(long id)
+            // Resolves a level's manifest ids to on-disk files, preserving order. Fail open: an id whose
+            // file is missing is skipped (the store loses that SST's data but stays usable). The surviving
+            // ids are loaded in parallel and recorded as committed.
+            async Task<List<SsTable<TKey, TValue>>> LoadLevelAsync(IEnumerable<long> ids)
             {
-                // Fail open: a manifest entry whose file is missing is skipped rather than aborting the
-                // whole open. The store loses that SST's data but remains usable.
-                if (!fileById.TryGetValue(id, out var filename))
+                var items = ids
+                    .Where(id => fileById.ContainsKey(id))
+                    .Select(id => (filename: fileById[id], id))
+                    .ToArray();
+
+                var tables = await LoadManyAsync(items);
+
+                foreach (var (_, id) in items)
                 {
-                    return null;
+                    committedSstIds.Add(id);
                 }
 
-                var blockBuilder = new BlockBuilder<TKey, TValue>(options.BlockEncoderFactory.Create<TKey, TValue>());
-                var table = await SsTable<TKey, TValue>.LoadSsTableAsync(filename, options.SsTableEncoderFactory.Create<TKey, TValue>(), blockBuilder, options.BloomFilterFactory, id, cancellationToken);
-                committedSstIds.Add(id);
-
-                return table;
+                return tables.ToList();
             }
 
-            var level0 = new List<SsTable<TKey, TValue>>();
-
-            foreach (var id in manifest.L0)
-            {
-                var table = await LoadByIdAsync(id);
-
-                if (table != null)
-                {
-                    level0.Add(table);
-                }
-            }
-
-            storageInner._state.LevelZeroTables = level0;
+            storageInner._state.LevelZeroTables = await LoadLevelAsync(manifest.L0);
 
             var levels = new List<List<SsTable<TKey, TValue>>>();
 
             foreach (var levelIds in manifest.Levels)
             {
-                var level = new List<SsTable<TKey, TValue>>();
-
-                foreach (var id in levelIds)
-                {
-                    var table = await LoadByIdAsync(id);
-
-                    if (table != null)
-                    {
-                        level.Add(table);
-                    }
-                }
-
-                levels.Add(level);
+                levels.Add(await LoadLevelAsync(levelIds));
             }
 
             storageInner._state.LeveledSsTables = levels;
@@ -147,19 +161,12 @@ public static class LsmStorage
         }
         else
         {
-            var ssTables = new List<SsTable<TKey, TValue>>();
-            committedSstIds = new HashSet<long>();
+            // Load every "{id}.sst" (already ordered by id, which encodes L0 recency) in parallel.
+            var items = sstFiles.Select(x => (x.filename, id: x.id!.Value)).ToArray();
+            var ssTables = await LoadManyAsync(items);
 
-            // TODO: [PERF] Can be parallelized
-            foreach (var (filename, id) in sstFiles)
-            {
-                var blockBuilder = new BlockBuilder<TKey, TValue>(options.BlockEncoderFactory.Create<TKey, TValue>());
-                var ssTable = await SsTable<TKey, TValue>.LoadSsTableAsync(filename, options.SsTableEncoderFactory.Create<TKey, TValue>(), blockBuilder, options.BloomFilterFactory, id!.Value, cancellationToken);
-                ssTables.Add(ssTable);
-                committedSstIds.Add(id!.Value);
-            }
-
-            storageInner._state.LevelZeroTables = ssTables;
+            storageInner._state.LevelZeroTables = ssTables.ToList();
+            committedSstIds = new HashSet<long>(items.Select(x => x.id));
         }
 
         // Recover memtables that hadn't been flushed when the previous process exited. Memtables are

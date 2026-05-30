@@ -56,6 +56,15 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     private readonly int _levelSizeMultiplier;
     private readonly int _maxLevels;
     private readonly long _targetSstSizeBytes;
+    private readonly int _maxCompactionParallelism;
+    private readonly int _maxReadParallelism;
+    private readonly IBlockEncoderFactory _blockEncoderFactory;
+    private readonly ISsTableEncoderFactory _ssTableEncoderFactory;
+
+    // Below this many overlapping L0 SSTs a point lookup probes them sequentially newest-first (the
+    // short-circuit is optimal when the key lives in a recent table). Past it, and when read parallelism is
+    // enabled, the probes run concurrently and the newest matching table wins.
+    private const int ParallelL0ProbeThreshold = 8;
 
     public string StoragePath { get; }
 
@@ -81,6 +90,10 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         _levelSizeMultiplier = options.LevelSizeMultiplier;
         _maxLevels = options.MaxLevels;
         _targetSstSizeBytes = Math.Max(1, options.TargetSstSizeBytes);
+        _maxCompactionParallelism = Math.Max(1, options.MaxCompactionParallelism);
+        _maxReadParallelism = Math.Max(1, options.MaxReadParallelism);
+        _blockEncoderFactory = options.BlockEncoderFactory;
+        _ssTableEncoderFactory = options.SsTableEncoderFactory;
         _state = new StorageState<TKey, TValue>() { CurrentMemTable = CreateCurrentMemTable(IdGenerator.GetNextId()) };
         _blockEncoder = options.BlockEncoderFactory.Create<TKey, TValue>();
         _ssTableEncoder = options.SsTableEncoderFactory.Create<TKey, TValue>();
@@ -168,17 +181,41 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
             // referenced from a stale pre-lock snapshot could already be disposed. While the read lock
             // is held no writer runs, so the list and its tables are stable for the duration.
             var l0 = _state.LevelZeroTables;
-            
-            // TODO: this can be parallelized, multiple table could return the value, but the one 
-            // from the most recent table would be used.
 
-            for (var i = l0.Count - 1; i >= 0; i--)
+            // Probe L0 newest-first. When many overlapping L0 SSTs have accumulated and read parallelism is
+            // enabled, probe them concurrently instead: every table is checked, then the newest (highest
+            // index) one that holds the key wins, preserving recency/shadowing exactly as the sequential
+            // short-circuit would.
+            if (_maxReadParallelism > 1 && l0.Count >= ParallelL0ProbeThreshold)
             {
-                var (found, resolved) = await TryReadFromTableAsync(l0[i], key, keyMemory, cancellationToken);
+                var probes = new (bool found, TValue resolved)[l0.Count];
 
-                if (found)
+                await Parallel.ForEachAsync(
+                    Enumerable.Range(0, l0.Count),
+                    new ParallelOptions { MaxDegreeOfParallelism = _maxReadParallelism, CancellationToken = cancellationToken },
+                    async (index, ct) =>
+                    {
+                        probes[index] = await TryReadFromTableAsync(l0[index], key, keyMemory, ct);
+                    });
+
+                for (var i = l0.Count - 1; i >= 0; i--)
                 {
-                    return resolved;
+                    if (probes[i].found)
+                    {
+                        return probes[i].resolved;
+                    }
+                }
+            }
+            else
+            {
+                for (var i = l0.Count - 1; i >= 0; i--)
+                {
+                    var (found, resolved) = await TryReadFromTableAsync(l0[i], key, keyMemory, cancellationToken);
+
+                    if (found)
+                    {
+                        return resolved;
+                    }
                 }
             }
 
@@ -988,12 +1025,121 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
 
     /// <summary>
     /// Merges the <paramref name="inputs"/> (listed newest-first so the most recent value per key wins) into
-    /// a sequence of size-bounded, key-ascending, non-overlapping output SSTs: a new output file is rolled
-    /// over once the current one reaches <see cref="_targetSstSizeBytes"/>. Returns an empty list when every
+    /// a sequence of size-bounded, key-ascending, non-overlapping output SSTs. When
+    /// <see cref="_maxCompactionParallelism"/> is greater than <c>1</c> and there is enough data, the
+    /// combined key range is partitioned into disjoint sub-ranges that are merged concurrently
+    /// (subcompactions); their outputs are concatenated in key order. Returns an empty list when every
     /// entry is a dropped tombstone. On failure all partially built outputs are disposed and deleted so no
     /// file handles or orphan files leak.
     /// </summary>
     private async Task<List<SsTable<TKey, TValue>>> MergeIntoSplitSsTablesAsync(List<SsTable<TKey, TValue>> inputs, bool dropTombstones, CancellationToken cancellationToken)
+    {
+        var dop = _maxCompactionParallelism;
+
+        // Decide how many parallel sub-compactions to run. Each partition should still produce roughly
+        // target-sized files, so cap the count by the total input size, and never ask for more partitions
+        // than there are distinct split boundaries available.
+        var boundaries = dop <= 1 ? new List<TKey>() : ComputeSubcompactionBoundaries(inputs);
+
+        long totalBytes = 0;
+
+        foreach (var input in inputs)
+        {
+            totalBytes += input.Size;
+        }
+
+        var maxBySize = (int)Math.Max(1, Math.Min(int.MaxValue, totalBytes / _targetSstSizeBytes));
+        var partitionCount = Math.Min(dop, Math.Min(maxBySize, boundaries.Count + 1));
+
+        if (partitionCount <= 1)
+        {
+            // Single partition: behaves exactly like the original sequential split merge.
+            var blockEncoder = _blockEncoderFactory.Create<TKey, TValue>();
+            var tableEncoder = _ssTableEncoderFactory.Create<TKey, TValue>();
+
+            return await MergeRangeIntoSplitSsTablesAsync(inputs, dropTombstones, blockEncoder, tableEncoder, hasLower: false, default!, hasUpper: false, default!, cancellationToken);
+        }
+
+        // Pick partitionCount - 1 evenly-spaced split keys. Partition j covers [split[j-1], split[j]):
+        // the boundary key is the inclusive lower bound of the upper partition and the exclusive upper
+        // bound of the lower one, so every key lands in exactly one partition.
+        var splits = new TKey[partitionCount - 1];
+
+        for (var j = 1; j < partitionCount; j++)
+        {
+            var index = (int)((long)j * boundaries.Count / partitionCount);
+            index = Math.Min(boundaries.Count - 1, Math.Max(j - 1, index));
+            splits[j - 1] = boundaries[index];
+        }
+
+        var results = new List<SsTable<TKey, TValue>>?[partitionCount];
+
+        try
+        {
+            await Parallel.ForEachAsync(
+                Enumerable.Range(0, partitionCount),
+                new ParallelOptions { MaxDegreeOfParallelism = dop, CancellationToken = cancellationToken },
+                async (partition, ct) =>
+                {
+                    var hasLower = partition > 0;
+                    var lower = hasLower ? splits[partition - 1] : default!;
+                    var hasUpper = partition < partitionCount - 1;
+                    var upper = hasUpper ? splits[partition] : default!;
+
+                    // Fresh encoder instances per partition: the shared encoder instances on the engine are
+                    // not contractually thread-safe, and parallel builders would otherwise call into the
+                    // same instance concurrently.
+                    var blockEncoder = _blockEncoderFactory.Create<TKey, TValue>();
+                    var tableEncoder = _ssTableEncoderFactory.Create<TKey, TValue>();
+
+                    // Publish only after the whole partition succeeds, so the outer cleanup never double-frees
+                    // a partially built partition (that one cleans up after itself before throwing).
+                    results[partition] = await MergeRangeIntoSplitSsTablesAsync(inputs, dropTombstones, blockEncoder, tableEncoder, hasLower, lower, hasUpper, upper, ct);
+                });
+        }
+        catch
+        {
+            foreach (var result in results)
+            {
+                if (result == null)
+                {
+                    continue;
+                }
+
+                foreach (var output in result)
+                {
+                    output.Dispose();
+                    TryDeleteSstFile(output.Filename);
+                }
+            }
+
+            throw;
+        }
+
+        // Concatenate partition outputs in key order. Sub-ranges are disjoint and each partition's outputs
+        // are internally non-overlapping, so the result is globally sorted and non-overlapping.
+        var outputs = new List<SsTable<TKey, TValue>>();
+
+        foreach (var result in results)
+        {
+            if (result != null)
+            {
+                outputs.AddRange(result);
+            }
+        }
+
+        return outputs;
+    }
+
+    /// <summary>
+    /// Merges the <paramref name="inputs"/> restricted to the half-open key range
+    /// <c>[lower, upper)</c> (either bound optional) into size-bounded, key-ascending, non-overlapping
+    /// output SSTs, rolling over to a new file once the current one reaches <see cref="_targetSstSizeBytes"/>.
+    /// Uses the supplied <paramref name="blockEncoder"/>/<paramref name="tableEncoder"/> so each caller (in
+    /// particular each parallel sub-compaction) owns its encoder instances. On failure every partially built
+    /// output is disposed and deleted, then the exception is rethrown.
+    /// </summary>
+    private async Task<List<SsTable<TKey, TValue>>> MergeRangeIntoSplitSsTablesAsync(List<SsTable<TKey, TValue>> inputs, bool dropTombstones, IBlockEncoder<TKey, TValue> blockEncoder, ISsTableEncoder<TKey, TValue> tableEncoder, bool hasLower, TKey lower, bool hasUpper, TKey upper, CancellationToken cancellationToken)
     {
         var outputs = new List<SsTable<TKey, TValue>>();
 
@@ -1015,8 +1161,17 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
 
             var merge = new MergeIterator<TKey, TValue>(iterators);
 
-            await foreach (var entry in merge.EnumerateAsync(cancellationToken))
+            // Seek every input to the lower bound (skips earlier blocks); the merge stays ascending so the
+            // upper bound is enforced with a single break below.
+            var entries = hasLower ? merge.EnumerateAsync(lower, cancellationToken) : merge.EnumerateAsync(cancellationToken);
+
+            await foreach (var entry in entries)
             {
+                if (hasUpper && _keyComparer.Compare(entry.Key, upper) >= 0)
+                {
+                    break;
+                }
+
                 if (dropTombstones && _valueSerializer.IsTombstoneValue(entry.Value))
                 {
                     continue;
@@ -1025,7 +1180,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
                 if (builder == null)
                 {
                     builderPath = GetSstPath(IdGenerator.GetNextId());
-                    builder = _ssTableBuilderFactory.CreateSsTableBuilder(builderPath, _ssTableEncoder, _blockEncoder, _bloomFilterFactory, estimatedCount);
+                    builder = _ssTableBuilderFactory.CreateSsTableBuilder(builderPath, tableEncoder, blockEncoder, _bloomFilterFactory, estimatedCount);
                 }
 
                 await builder.AddAsync(entry.Key, entry.Value);
@@ -1073,6 +1228,45 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
 
             throw;
         }
+    }
+
+    /// <summary>
+    /// Computes candidate split keys for partitioning a leveled merge into parallel sub-compactions: every
+    /// input block's first key, sorted ascending and de-duplicated, with the global minimum dropped (a split
+    /// equal to the range start would make an empty first partition). The returned keys are strictly greater
+    /// than the combined range start, so any prefix of them yields strictly increasing partition bounds.
+    /// </summary>
+    private List<TKey> ComputeSubcompactionBoundaries(List<SsTable<TKey, TValue>> inputs)
+    {
+        var candidates = new List<TKey>();
+
+        foreach (var input in inputs)
+        {
+            foreach (var metadata in input.BlockMetadata)
+            {
+                candidates.Add(metadata.FirstKey);
+            }
+        }
+
+        candidates.Sort(_keyComparer);
+
+        var distinct = new List<TKey>(candidates.Count);
+
+        foreach (var key in candidates)
+        {
+            if (distinct.Count == 0 || _keyComparer.Compare(distinct[distinct.Count - 1], key) != 0)
+            {
+                distinct.Add(key);
+            }
+        }
+
+        // Drop the smallest distinct key (the combined range start) so all boundaries are usable splits.
+        if (distinct.Count > 0)
+        {
+            distinct.RemoveAt(0);
+        }
+
+        return distinct;
     }
 
     /// <summary>

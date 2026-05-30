@@ -337,8 +337,33 @@ matters in benchmarks, replace it with a custom LRU. Low priority otherwise.
 ### Multi-threading background work
 Single writer means background operations (notably compaction) should parallelize across CPUs, and
 must not block MemTable writes. The snapshot + per-level `AsyncReaderWriterLock` design already
-supports building new SSTs off-lock and swapping them in under a short write-lock. Blocked on
-compaction existing first.
+supports building new SSTs off-lock and swapping them in under a short write-lock.
+
+**Done — parallel leveled subcompactions + parallel read path.** Two options on `StorageOptions`:
+- `MaxCompactionParallelism` (default `Environment.ProcessorCount`): degree of parallelism for leveled
+  subcompactions. The merged output is partitioned into disjoint key ranges (split keys chosen from
+  input block `FirstKey`s, evenly spaced, capped by `totalBytes / TargetSstSizeBytes` and the number of
+  distinct boundaries). Each partition runs under `Parallel.ForEachAsync` with its *own* iterators and
+  *fresh* block/SST encoder instances (the shared engine encoders are not contractually thread-safe).
+  Per-partition outputs publish only on success; any failure disposes+deletes all published outputs and
+  rethrows. Concatenating partition results in key order yields a sorted, non-overlapping run (validated
+  by `Debug.Assert(IsSortedNonOverlapping)`). Safe because SST reads use offset-based
+  `RandomAccess.ReadAsync` (concurrent reads of an immutable SST are fine), `IdGenerator` is
+  `Interlocked`, and the manifest stores level lists in key order (non-monotonic ids from parallel
+  builds recover fine). **Leveled only** — tiered keeps its single-sorted-run-per-tier + id-recency
+  model, which splitting would break, so it stays single-threaded.
+- `MaxReadParallelism` (default `Environment.ProcessorCount`): parallelizes (a) SST loading on
+  `OpenAsync` (both manifest and non-manifest branches load into a position-indexed array, disposing
+  already-loaded tables on failure) and (b) the L0 point-lookup probe in `GetAsync` — engaged only when
+  `l0.Count >= 8` (a backlogged L0, e.g. under tiered/None). All L0 tables are probed concurrently, then
+  the newest (highest-index) table reporting a hit wins, preserving recency/shadowing and tombstone
+  semantics exactly as the sequential newest-first short-circuit would. Small L0 keeps the sequential
+  short-circuit (optimal when the key sits in a recent table).
+
+Bug fixed along the way: `SsTableIterator.EnumerateAsync(from)` silently dropped all keys >= `from` when
+`from` landed exactly on a non-first block's `FirstKey` (it stepped back a block, saw that block end
+before `from`, and `yield break`ed). It now advances to the next block instead. This also affected range
+scans starting exactly on a block boundary.
 
 ### Lifting recently used entries
 Keep hot entries at the highest level possible and cold ones lower. The block cache already provides
@@ -356,6 +381,8 @@ write/space amplification and tombstone/ordering complexity. Speculative; defer 
 2. ~~WAL~~ **(done — crash recovery via write-ahead log)** + ~~manifest~~ **(done — leveled manifest)**.
 3. ~~Compaction~~ **(tiered + leveled done)** + ~~SST-level scan iterator so range scans include on-disk
    data~~ **(done)** + ~~leveling (needs a manifest)~~ **(done)** + ~~leveled output-splitting +
-   partial-overlap selection~~ **(done)**. Next: parallelism (build/compact off the write path across CPUs).
+   partial-overlap selection~~ **(done)** + ~~parallelism (build/compact off the write path across
+   CPUs)~~ **(done — `MaxCompactionParallelism` leveled subcompactions + `MaxReadParallelism` parallel
+   SST load and L0 probe)**.
 4. Finer sparse index.
 5. Defer: LRU block cache, entry-lifting.

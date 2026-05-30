@@ -1634,6 +1634,202 @@ public class StorageTests
         }
     }
 
+    [Fact]
+    public async Task ParallelSubcompactionProducesCompleteSortedData()
+    {
+        // With parallelism enabled and an input large enough to split across several key-range partitions,
+        // the parallel leveled subcompaction must produce sorted, non-overlapping SSTs holding every key.
+        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tempFolder);
+        var options = new StorageOptions
+        {
+            UseWriteAheadLog = false,
+            CompactionStrategy = CompactionStrategy.Leveled,
+            Level0CompactionThreshold = 1,
+            BlockSize = 128,
+            TargetSstSizeBytes = 128,
+            MaxCompactionParallelism = 8,
+        };
+        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+
+        try
+        {
+            await FlushTierAsync(storage, () =>
+            {
+                for (var k = 1; k <= 800; k++)
+                {
+                    storage.Put(k, k * 7);
+                }
+            });
+
+            Assert.True(await storage.TryLeveledCompactionAsync());
+
+            var l1 = storage._state.LeveledSsTables[0];
+            Assert.True(l1.Count > 1, $"expected L1 to be split across partitions, got {l1.Count} SST(s)");
+            for (var i = 1; i < l1.Count; i++)
+            {
+                Assert.True(l1[i - 1].LastKey < l1[i].FirstKey);
+            }
+
+            var entries = storage.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToList();
+            Assert.Equal(Enumerable.Range(1, 800), entries.Select(e => e.Key));
+            Assert.Equal(Enumerable.Range(1, 800).Select(k => k * 7), entries.Select(e => e.Value));
+            Assert.Equal(700 * 7, await storage.GetAsync(700));
+        }
+        finally
+        {
+            storage.Dispose();
+            Directory.Delete(tempFolder, true);
+        }
+    }
+
+    [Fact]
+    public async Task SequentialAndParallelCompactionProduceSameData()
+    {
+        // DOP=1 and DOP>1 must yield identical logical contents (same keys/values on a full scan).
+        static async Task<List<KeyValuePair<int, int>>> RunAsync(int dop)
+        {
+            var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+            Directory.CreateDirectory(tempFolder);
+            var options = new StorageOptions
+            {
+                UseWriteAheadLog = false,
+                CompactionStrategy = CompactionStrategy.Leveled,
+                Level0CompactionThreshold = 1,
+                BlockSize = 128,
+                TargetSstSizeBytes = 128,
+                MaxCompactionParallelism = dop,
+            };
+            var storage = new LsmStorageInner<int, int>(tempFolder, options);
+            try
+            {
+                await FlushTierAsync(storage, () =>
+                {
+                    for (var k = 1; k <= 600; k++)
+                    {
+                        storage.Put(k, k * 3);
+                    }
+                });
+                Assert.True(await storage.TryLeveledCompactionAsync());
+                return storage.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToList();
+            }
+            finally
+            {
+                storage.Dispose();
+                Directory.Delete(tempFolder, true);
+            }
+        }
+
+        var sequential = await RunAsync(1);
+        var parallel = await RunAsync(8);
+
+        Assert.Equal(sequential.Select(e => e.Key), parallel.Select(e => e.Key));
+        Assert.Equal(sequential.Select(e => e.Value), parallel.Select(e => e.Value));
+        Assert.Equal(Enumerable.Range(1, 600), parallel.Select(e => e.Key));
+    }
+
+    [Fact]
+    public async Task ParallelL0ProbeReturnsNewestValueAndHandlesTombstones()
+    {
+        // With read parallelism on and enough accumulated L0 tables to cross the probe threshold, point reads
+        // must still honor recency (newest table wins), tombstones, and absent keys.
+        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tempFolder);
+        var options = new StorageOptions
+        {
+            UseWriteAheadLog = false,
+            CompactionStrategy = CompactionStrategy.None,
+            MaxReadParallelism = 8,
+        };
+        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+
+        try
+        {
+            // 12 L0 tables (> the parallel probe threshold of 8). Key 1 is overwritten in successive tables;
+            // key 2 is later deleted; key 3 only ever exists in one table; key 99 never exists.
+            for (var t = 0; t < 12; t++)
+            {
+                var snapshot = t;
+                await FlushTierAsync(storage, () =>
+                {
+                    storage.Put(1, snapshot * 100);
+                    if (snapshot == 0)
+                    {
+                        storage.Put(3, 333);
+                    }
+                    if (snapshot == 5)
+                    {
+                        storage.Put(2, 222);
+                    }
+                    if (snapshot == 9)
+                    {
+                        storage.Delete(2);
+                    }
+                });
+            }
+
+            Assert.True(storage._state.LevelZeroTables.Count >= 8);
+            Assert.Equal(1100, await storage.GetAsync(1)); // newest write wins
+            Assert.Equal(333, await storage.GetAsync(3));
+            Assert.Equal(0, await storage.GetAsync(2)); // tombstoned -> default
+            Assert.Equal(0, await storage.GetAsync(99)); // never written -> default
+        }
+        finally
+        {
+            storage.Dispose();
+            Directory.Delete(tempFolder, true);
+        }
+    }
+
+    [Fact]
+    public async Task ParallelReopenRestoresData()
+    {
+        // OpenAsync loads SSTs in parallel when read parallelism is enabled; a reopen must restore all data.
+        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tempFolder);
+        var options = new StorageOptions
+        {
+            UseWriteAheadLog = false,
+            FlushPeriod = TimeSpan.Zero,
+            CompactionStrategy = CompactionStrategy.None,
+            MaxReadParallelism = 8,
+        };
+
+        try
+        {
+            var building = new LsmStorageInner<int, int>(tempFolder, options);
+            for (var t = 0; t < 10; t++)
+            {
+                var snapshot = t;
+                await FlushTierAsync(building, () =>
+                {
+                    for (var k = snapshot * 10 + 1; k <= snapshot * 10 + 10; k++)
+                    {
+                        building.Put(k, k * 2);
+                    }
+                });
+            }
+            building.Dispose();
+
+            var storage = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
+            try
+            {
+                for (var k = 1; k <= 100; k++)
+                {
+                    Assert.Equal(k * 2, await storage._inner.GetAsync(k));
+                }
+            }
+            finally
+            {
+                await storage.DisposeAsync();
+            }
+        }
+        finally
+        {
+            Directory.Delete(tempFolder, true);
+        }
+    }
+
     private static LsmStorageInner<int, byte[]> FillImmutableMemTables(int entries = 100, int valueSize = 10, long memTableSizeLimit = 100)
     {
         var storageOptions = new StorageOptions { MemTableSizeLimit = memTableSizeLimit, UseWriteAheadLog = false };

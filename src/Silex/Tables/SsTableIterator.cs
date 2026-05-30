@@ -54,10 +54,17 @@ internal sealed class SsTableIterator<TKey, TValue> : IStorageIterator<TKey, TVa
             yield break;
         }
 
-        // if the key is out of bound, exit
+        // The stepped-back block ends before 'from' (this happens when 'from' falls exactly on a later
+        // block's FirstKey, or in a gap between blocks): the first key >= from lives in a later block, so
+        // advance to it instead of giving up. Breaking here would silently drop every key from 'from' on.
         if (_keyComparer.Compare(_table.BlockMetadata[startBlockIndex].LastKey, from) < 0)
         {
-            yield break;
+            startBlockIndex++;
+
+            if (startBlockIndex > _table.BlockMetadata.Count - 1)
+            {
+                yield break;
+            }
         }
 
         // Iterate this block only, after the specified key
