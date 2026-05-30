@@ -135,4 +135,24 @@ public class StorageOptions
     /// The default value is <inheritdoc cref="_defaultBloomFilterFactory"/>.
     /// </value>
     public IBloomFilterFactory BloomFilterFactory { get; set; } = _defaultBloomFilterFactory;
+
+    /// <summary>
+    /// Gets or sets whether a write-ahead log is maintained for each <see cref="MemTable"/> so that
+    /// unflushed data can be recovered after a process crash when the store is reopened.
+    /// </summary>
+    /// <value>
+    /// The default value is <c>true</c>.
+    /// </value>
+    public bool UseWriteAheadLog { get; set; } = true;
+
+    /// <summary>
+    /// Gets or sets whether each write-ahead log append is flushed all the way to disk (<c>fsync</c>).
+    /// When <c>false</c> the append is only flushed to the operating system, which still survives a
+    /// process crash but not a power loss. Enabling this is slower but survives power loss.
+    /// </summary>
+    /// <remarks>This has no effect when <see cref="UseWriteAheadLog"/> is <c>false</c>.</remarks>
+    /// <value>
+    /// The default value is <c>false</c>.
+    /// </value>
+    public bool SyncWriteAheadLogToDisk { get; set; } = false;
 }

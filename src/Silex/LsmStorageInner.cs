@@ -5,6 +5,7 @@ using Silex.Buffers;
 using Silex.MemTables;
 using Silex.Serialization;
 using Silex.Tables;
+using Silex.Wal;
 using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.CompilerServices;
@@ -38,6 +39,8 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     private readonly long _memTableSizeLimit;
     private readonly IMemoryCache _blockCache;
     private readonly MemoryCacheEntryOptions _cacheEntryOptions;
+    private readonly bool _useWriteAheadLog;
+    private readonly bool _syncWriteAheadLogToDisk;
 
     public string StoragePath { get; }
 
@@ -51,7 +54,9 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     internal LsmStorageInner(string path, StorageOptions options)
     {
         StoragePath = path;
-        _state = new StorageState<TKey, TValue>() { CurrentMemTable = new MemTable<TKey, TValue>(IdGenerator.GetNextId()) };
+        _useWriteAheadLog = options.UseWriteAheadLog;
+        _syncWriteAheadLogToDisk = options.SyncWriteAheadLogToDisk;
+        _state = new StorageState<TKey, TValue>() { CurrentMemTable = CreateCurrentMemTable(IdGenerator.GetNextId()) };
         _blockEncoder = options.BlockEncoderFactory.Create<TKey, TValue>();
         _ssTableEncoder = options.SsTableEncoderFactory.Create<TKey, TValue>();
         _ssTableBuilderFactory = options.SsTableBuilderFactory;
@@ -316,11 +321,77 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
 
             memTableToFlush.Dispose();
         }
+
+        // The data is now durable in an SST and visible in L0, and the memtable (and its WAL handle)
+        // is disposed: the write-ahead log is obsolete and can be removed. If a crash happens before
+        // this point the WAL survives and is replayed on the next open; if it happens after the SST is
+        // durable but before the delete, recovery sees the matching SST and drops the stale WAL.
+        DeleteWal(memTableToFlush.Id);
     }
 
     public string GetSstPath(long id)
     {
         return Path.Combine(StoragePath, $"{id.ToString(CultureInfo.InvariantCulture)}.sst");
+    }
+
+    public string GetWalPath(long id)
+    {
+        return Path.Combine(StoragePath, $"{id.ToString(CultureInfo.InvariantCulture)}.wal");
+    }
+
+    /// <summary>
+    /// Creates a new current (writable) MemTable, attaching a write-ahead log when durability is enabled.
+    /// </summary>
+    private MemTable<TKey, TValue> CreateCurrentMemTable(long id)
+    {
+        if (!_useWriteAheadLog)
+        {
+            return new MemTable<TKey, TValue>(id);
+        }
+
+        var wal = new WriteAheadLog<TKey, TValue>(GetWalPath(id), _syncWriteAheadLogToDisk);
+        return new MemTable<TKey, TValue>(id, wal);
+    }
+
+    /// <summary>
+    /// Deletes the write-ahead log file for the specified memtable id, if any. Never throws: a stale
+    /// WAL whose SST already exists is cleaned up on the next open, so a failed delete is not fatal.
+    /// </summary>
+    private void DeleteWal(long id)
+    {
+        if (!_useWriteAheadLog)
+        {
+            return;
+        }
+
+        try
+        {
+            File.Delete(GetWalPath(id));
+        }
+        catch (IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
+    }
+
+    /// <summary>
+    /// On a clean shutdown the current MemTable is empty (any pending data was frozen and flushed):
+    /// remove its write-ahead log so that reopening the store finds nothing to replay.
+    /// </summary>
+    public void DeleteCurrentMemTableWal()
+    {
+        if (!_useWriteAheadLog)
+        {
+            return;
+        }
+
+        var id = _state.CurrentMemTable.Id;
+
+        // Close the handle before deleting (required on Windows where an open handle blocks deletion).
+        _state.CurrentMemTable.Dispose();
+        DeleteWal(id);
     }
 
     public IStorageIterator<TKey, TValue> CreateIterator()
@@ -344,7 +415,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
 
             _state = new StorageState<TKey, TValue>
             {
-                CurrentMemTable = new MemTable<TKey, TValue>(IdGenerator.GetNextId()),
+                CurrentMemTable = CreateCurrentMemTable(IdGenerator.GetNextId()),
                 ImmutableMemTables = _state.ImmutableMemTables.Enqueue(_previousMemTable),
                 LevelZeroTables = _state.LevelZeroTables,
                 LeveledSsTables = _state.LeveledSsTables

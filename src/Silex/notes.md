@@ -105,18 +105,39 @@ not in the individual collections.
 - A `PeriodicTimer` (default 50 ms; `TimeSpan.Zero` disables it) flushes immutable MemTables to L0
   once their count exceeds `MemTableMaxCount`. Uses an injectable `TimeProvider` (testable).
 
+### Durability / crash recovery (`Wal/WriteAheadLog.cs`)
+- **Write-ahead log (WAL).** Each writable MemTable owns a `WriteAheadLog<TKey,TValue>` (file
+  `{id}.wal` next to the SSTs). `MemTable.Put` journals the record **before** applying it in memory,
+  so an acknowledged write is always recoverable. Enabled by default (`UseWriteAheadLog`).
+- **Record format:** `[7-bit key length][key][7-bit value length][value]`, encoded once into a reused
+  pooled buffer via `EncoderBinaryWriter`. Tombstones are the usual zero-length value, so deletes are
+  journaled too. Each append is flushed to the OS; `SyncWriteAheadLogToDisk` additionally `fsync`s
+  per append (survives power loss, slower). Appends are serialized by the current-memtable write lock.
+- **WAL lifecycle / cleanup:** the file is deleted only once its data is durable elsewhere —
+  `ForceFlushNextImmutableMemTableAsync` deletes `{id}.wal` *after* the SST is durable and visible in
+  L0, and a clean `CloseAsync` deletes the (empty) current memtable's WAL. Deletion never happens from
+  a finalizer, so an abandoned (crashed) process leaves its WALs on disk for recovery.
+- **Recovery on `OpenAsync`:** existing `*.wal` files are captured *before* the inner is built (and
+  ids reserved via `EnsureGreaterThan` first, so a fresh WAL can't truncate a not-yet-replayed one).
+  For each WAL: if a matching `{id}.sst` was loaded the memtable was already flushed → the stale WAL is
+  deleted and skipped (idempotent crash-between-flush-and-delete); otherwise it is replayed into a
+  recovered immutable MemTable. Recovered tables are enqueued oldest-first (ids are always greater than
+  every loaded SST's id, so they correctly win over L0). A torn trailing record (crash mid-append) is
+  tolerated and stops replay.
+
 ### Resource management & disposal
 - `LsmStorage` is `IDisposable` + `IAsyncDisposable`; `CloseAsync()` == `DisposeAsync()`. Disposal is
-  idempotent (`_disposed` guard) and the only durability boundary: it stops the compacter, freezes
-  and flushes all immutable MemTables to L0, then disposes the inner.
+  idempotent (`_disposed` guard) and the only *clean* durability boundary: it stops the compacter,
+  freezes and flushes all immutable MemTables to L0, deletes the now-empty current WAL, then disposes
+  the inner.
 - **No flushing during finalization.** There is intentionally no `~LsmStorage()` /
   `~BufferedSsTableBuilder()` finalizer — persisting requires blocking disk I/O, which must never run
-  during GC. An unclosed storage is simply never flushed (acceptable: there is no WAL, so GC-timed
-  flushing was never reliable). Native file handles are still released by `LsmStorageInner`'s and
-  `FileStream`'s own finalizers, so leaving a storage unclosed leaks no OS resources and can never
-  crash the process.
-- Callers (and tests) must `CloseAsync()` before relying on data being on disk. Tests dispose
-  deterministically before deleting their temp folders so finalizers stay true no-ops.
+  during GC. An unclosed storage is not flushed during finalization; with the WAL enabled its
+  unflushed writes are instead **recovered on the next `OpenAsync`**. Native file handles are released
+  by `LsmStorageInner`'s and `FileStream`'s own finalizers, so leaving a storage unclosed leaks no OS
+  resources and can never crash the process.
+- Callers (and tests) must `CloseAsync()` before relying on data being compacted to disk. Tests
+  dispose deterministically before deleting their temp folders so finalizers stay true no-ops.
 
 ### Memory management buffers (`Buffers/`)
 - `RecyclableMemoryStream : IBufferWriter` — grows by chaining pooled blocks; buffers returned to the
@@ -133,13 +154,18 @@ not in the individual collections.
 
 ## What's left to do
 
-### Durability / crash recovery (missing)
-- **No write-ahead log (WAL).** Unflushed MemTable data is lost on crash. Data is persisted *only* by
-  explicit `CloseAsync`/`DisposeAsync` (or background flush of frozen tables) — never by GC/finalizers.
-- **No manifest.** No persisted record of which SSTs exist or which level they belong to.
-- Recovery on `OpenAsync` is partial: only `*.sst` files are loaded and all are treated as L0
+### Durability / crash recovery
+- **DONE — Write-ahead log (WAL).** Unflushed MemTable data now survives a process crash and is
+  replayed on the next `OpenAsync` (see *Durability / crash recovery (`Wal/WriteAheadLog.cs`)* above).
+- **No manifest (still deferred).** No persisted record of which SSTs exist or which level they belong
+  to. Only needed once compaction/levels exist; today's directory scan of `*.sst` (all loaded as L0)
+  plus WAL recovery is a self-consistent protocol. Revisit with compaction.
+- Recovery on `OpenAsync` is still L0-only: every `*.sst` is treated as L0
   (`// TODO: For now we only load l0 SSTs`); higher levels would be ignored once they exist.
 - SST loading on open is sequential (`// TODO: [PERF] Can be parallelized`).
+- Follow-up (with the manifest work): `fsync` the parent directory after creating an SST and after
+  deleting a WAL so the "SST exists ⇒ skip WAL" invariant also holds across power loss; and add a
+  per-record CRC to the WAL to detect (not just truncated) corruption.
 
 ### Compaction (missing — biggest gap)
 - `Compacter` only *flushes* L0; there is no real compaction. `LeveledSsTables` is declared but never
@@ -244,7 +270,8 @@ write/space amplification and tombstone/ordering complexity. Speculative; defer 
 1. ~~Serialization / value copy-in semantics.~~ **Decided: keep zero-copy** as a core principle —
    ownership-transfer / borrow contract rather than defensive copies (see *Serialization /
    value-ownership semantics*).
-2. WAL + manifest (durability & full recovery).
+2. ~~WAL~~ **(done — crash recovery via write-ahead log)** + manifest (manifest deferred until
+   compaction/levels exist).
 3. Compaction + leveling, then parallelism.
 4. Finer sparse index.
 5. Defer: LRU block cache, entry-lifting.

@@ -1,6 +1,7 @@
 ﻿using Silex.Collections;
 using Silex.Serialization;
 using Silex.Tables;
+using Silex.Wal;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
@@ -35,10 +36,12 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
     private long _size;
     private bool _disposed;
     private readonly long _id;
+    private readonly WriteAheadLog<TKey, TValue>? _wal;
 
-    public MemTable(long id)
+    public MemTable(long id, WriteAheadLog<TKey, TValue>? wal = null)
     {
         _id = id;
+        _wal = wal;
     }
 
     /// <summary>
@@ -90,6 +93,10 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
     public void Put(TKey key, TValue value)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+
+        // Journal the mutation before applying it in memory so a crash can't leave an applied write
+        // that isn't recoverable. The write lock held by the caller serializes appends.
+        _wal?.Append(key, value);
 
         // This method could be called concurrently, while the items in the store
         // and the size need to be consistent.
@@ -169,6 +176,10 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
 
         GC.SuppressFinalize(this);
         DisposeInternal();
+
+        // Close the write-ahead log handle (keeps the file). Done only on deterministic disposal, never
+        // from the finalizer: an abandoned (crashed) memtable must leave its WAL on disk for recovery.
+        _wal?.Dispose();
 
         _disposed = true;
     }

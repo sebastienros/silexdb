@@ -6,7 +6,9 @@ namespace Silex.Test;
 
 public class StorageTests
 {
-    private readonly StorageOptions _defaultStorageOptions = new();
+    // These in-memory unit tests construct LsmStorageInner directly against the shared system temp
+    // folder, so the write-ahead log is disabled to avoid littering it (and the per-append flush).
+    private readonly StorageOptions _defaultStorageOptions = new() { UseWriteAheadLog = false };
     private readonly ITestOutputHelper? _output;
 
     public StorageTests(ITestOutputHelper _)
@@ -92,7 +94,7 @@ public class StorageTests
     {
         var memTableSizeLimit = 100;
 
-        var storageOptions = new StorageOptions { MemTableSizeLimit = memTableSizeLimit };
+        var storageOptions = new StorageOptions { MemTableSizeLimit = memTableSizeLimit, UseWriteAheadLog = false };
         using var storage = new LsmStorageInner<int, byte[]>(Path.GetTempPath(), storageOptions);
 
         for (var i = 1; i <= entries; i++)
@@ -116,7 +118,7 @@ public class StorageTests
 
         var dictionary = new Dictionary<int, byte[]>();
 
-        var storageOptions = new StorageOptions { MemTableSizeLimit = memTableSizeLimit };
+        var storageOptions = new StorageOptions { MemTableSizeLimit = memTableSizeLimit, UseWriteAheadLog = false };
         using var storage = new LsmStorageInner<int, byte[]>(Path.GetTempPath(), storageOptions);
 
         for (var i = 1; i <= entries; i++)
@@ -157,7 +159,7 @@ public class StorageTests
     [Fact]
     public void ScanListsAllMemTables()
     {
-        using var storage = new LsmStorageInner<char, byte[]>(Path.GetTempPath(), new StorageOptions());
+        using var storage = new LsmStorageInner<char, byte[]>(Path.GetTempPath(), new StorageOptions { UseWriteAheadLog = false });
 
         // table1: b->del, c->4, d->5
         // table2: a->1, b->2, c->3
@@ -197,7 +199,7 @@ public class StorageTests
     {
         var maxKeysValue = 50; // Limit the number of unique ids to generate collisions
         var iterations = 50;
-        var storageOptions = new StorageOptions { MemTableSizeLimit = 100 };
+        var storageOptions = new StorageOptions { MemTableSizeLimit = 100, UseWriteAheadLog = false };
         using var storage = new LsmStorageInner<long, byte[]>(Path.GetTempPath(), storageOptions);
         var iterator = storage.CreateIterator();
 
@@ -475,7 +477,7 @@ public class StorageTests
         // The storage was never closed, so nothing was ever persisted.
         static async Task CreateUnclosedStorageAsync(string folder)
         {
-            var storage = await LsmStorage.OpenAsync<char, int>(folder, new StorageOptions());
+            var storage = await LsmStorage.OpenAsync<char, int>(folder, new StorageOptions { UseWriteAheadLog = false });
             storage.Put('a', 1);
             // Intentionally not closed/disposed: it becomes eligible for finalization on return.
         }
@@ -484,7 +486,7 @@ public class StorageTests
     [Fact]
     public async Task GetShouldReturnMostRecentImmutableMemTableValue()
     {
-        using var storage = new LsmStorageInner<int, int>(Path.GetTempPath(), new StorageOptions());
+        using var storage = new LsmStorageInner<int, int>(Path.GetTempPath(), new StorageOptions { UseWriteAheadLog = false });
 
         storage.Put(1, 100);
         storage.ForceFreezeMemTable();
@@ -500,7 +502,7 @@ public class StorageTests
     [Fact]
     public void ScanShouldReturnMostRecentImmutableMemTableValue()
     {
-        using var storage = new LsmStorageInner<int, int>(Path.GetTempPath(), new StorageOptions());
+        using var storage = new LsmStorageInner<int, int>(Path.GetTempPath(), new StorageOptions { UseWriteAheadLog = false });
 
         storage.Put(1, 100);
         storage.ForceFreezeMemTable();
@@ -517,7 +519,7 @@ public class StorageTests
     [Fact]
     public async Task GetShouldFindByteArrayKeyByContent()
     {
-        using var storage = new LsmStorageInner<byte[], int>(Path.GetTempPath(), new StorageOptions());
+        using var storage = new LsmStorageInner<byte[], int>(Path.GetTempPath(), new StorageOptions { UseWriteAheadLog = false });
 
         storage.Put([1, 2, 3], 42);
 
@@ -575,9 +577,148 @@ public class StorageTests
         Directory.Delete(tempFolder, true);
     }
 
+    [Fact]
+    public async Task WriteAheadLogRecoversUnflushedEntriesAfterCrash()
+    {
+        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        // Disable background flushing so the data stays only in the memtable + WAL (never an SST).
+        var options = new StorageOptions { FlushPeriod = TimeSpan.Zero };
+
+        await SimulateCrashAfterPutsAsync(tempFolder, options);
+
+        // Finalize the abandoned instance so its WAL handle is released (the file and its data remain).
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+
+        // Nothing was ever flushed, yet the WAL is on disk holding the unflushed writes.
+        Assert.Empty(Directory.EnumerateFiles(tempFolder, "*.sst"));
+        Assert.NotEmpty(Directory.EnumerateFiles(tempFolder, "*.wal"));
+
+        var reopened = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
+
+        for (var i = 0; i < 10; i++)
+        {
+            Assert.Equal(i + 1, await reopened.GetAsync(i));
+        }
+
+        await reopened.CloseAsync();
+        Directory.Delete(tempFolder, true);
+
+        static async Task SimulateCrashAfterPutsAsync(string folder, StorageOptions options)
+        {
+            var storage = await LsmStorage.OpenAsync<int, int>(folder, options);
+
+            for (var i = 0; i < 10; i++)
+            {
+                storage.Put(i, i + 1);
+            }
+
+            // Abandon without closing to simulate a crash: the WAL is left on disk.
+        }
+    }
+
+    [Fact]
+    public async Task WriteAheadLogRecoveryRequiresTheWalFile()
+    {
+        // Sanity check that the recovery above is genuinely driven by the WAL: with the WAL removed
+        // (and nothing flushed), the data is gone after a crash.
+        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        var options = new StorageOptions { FlushPeriod = TimeSpan.Zero };
+
+        await SimulateCrashAfterPutsAsync(tempFolder, options);
+
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+
+        foreach (var wal in Directory.EnumerateFiles(tempFolder, "*.wal"))
+        {
+            File.Delete(wal);
+        }
+
+        var reopened = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
+        Assert.Equal(0, await reopened.GetAsync(0));
+
+        await reopened.CloseAsync();
+        Directory.Delete(tempFolder, true);
+
+        static async Task SimulateCrashAfterPutsAsync(string folder, StorageOptions options)
+        {
+            var storage = await LsmStorage.OpenAsync<int, int>(folder, options);
+            storage.Put(0, 1);
+        }
+    }
+
+    [Fact]
+    public async Task WriteAheadLogRecoveryToleratesTornTrailingRecord()
+    {
+        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        var options = new StorageOptions { FlushPeriod = TimeSpan.Zero };
+
+        await SimulateCrashAfterPutsAsync(tempFolder, options);
+
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+
+        // Truncate the final byte to simulate a crash in the middle of the last append.
+        var walFile = Directory.EnumerateFiles(tempFolder, "*.wal").Single();
+        var bytes = await File.ReadAllBytesAsync(walFile);
+        await File.WriteAllBytesAsync(walFile, bytes[..^1]);
+
+        // Recovery must not throw and the earlier, intact records must still be recovered.
+        var reopened = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
+        Assert.Equal(1, await reopened.GetAsync(0));
+
+        await reopened.CloseAsync();
+        Directory.Delete(tempFolder, true);
+
+        static async Task SimulateCrashAfterPutsAsync(string folder, StorageOptions options)
+        {
+            var storage = await LsmStorage.OpenAsync<int, int>(folder, options);
+
+            for (var i = 0; i < 10; i++)
+            {
+                storage.Put(i, i + 1);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task RecoveryDeletesStaleWalWhenSstAlreadyExists()
+    {
+        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        var options = new StorageOptions { FlushPeriod = TimeSpan.Zero };
+
+        var storage = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
+        storage.Put(1, 42);
+        storage._inner.ForceFreezeMemTable();
+        await storage._inner.ForceFlushNextImmutableMemTableAsync();
+
+        var sstFile = Directory.EnumerateFiles(tempFolder, "*.sst").Single();
+        var sstId = Path.GetFileNameWithoutExtension(sstFile);
+        await storage.CloseAsync();
+
+        // Simulate a crash that wrote and durably persisted the SST but didn't get to delete the WAL.
+        // The bytes are intentionally garbage: if replayed they could fail, so recovery must skip them.
+        var staleWal = Path.Combine(tempFolder, sstId + ".wal");
+        await File.WriteAllBytesAsync(staleWal, new byte[] { 0xFF, 0xFF, 0xFF });
+
+        var reopened = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
+
+        Assert.Equal(42, await reopened.GetAsync(1));
+        // The stale WAL was deleted (and never replayed) because its SST was already loaded. The
+        // reopened store has its own fresh current-memtable WAL, so only assert the stale one is gone.
+        Assert.False(File.Exists(staleWal));
+
+        await reopened.CloseAsync();
+        Directory.Delete(tempFolder, true);
+    }
+
     private static LsmStorageInner<int, byte[]> FillImmutableMemTables(int entries = 100, int valueSize = 10, long memTableSizeLimit = 100)
     {
-        var storageOptions = new StorageOptions { MemTableSizeLimit = memTableSizeLimit };
+        var storageOptions = new StorageOptions { MemTableSizeLimit = memTableSizeLimit, UseWriteAheadLog = false };
         var storage = new LsmStorageInner<int, byte[]>(Path.GetTempPath(), storageOptions);
 
         for (var i = 1; i <= entries; i++)
