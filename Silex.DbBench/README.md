@@ -13,6 +13,39 @@ dotnet run --project Silex.DbBench -c Release -- \
   --num=1000000 --value_size=100 --key_size=16
 ```
 
+### Build once, then run `dbbench`
+
+`dotnet run` rebuilds and adds startup overhead on every invocation. For repeated
+runs, build the project once — the output binary is named **`dbbench`** — and call
+it directly:
+
+```bash
+# Build once (Release)
+dotnet build Silex.DbBench -c Release
+
+# Then run the compiled binary directly
+./Silex.DbBench/bin/Release/net8.0/dbbench --benchmarks=fillrandom,readrandom --num=1000000
+```
+
+To type just `dbbench` from anywhere, put it on your `PATH` for the session or add a
+shell alias:
+
+```bash
+# Option A: prepend the build output to PATH (current shell only)
+export PATH="$PWD/Silex.DbBench/bin/Release/net8.0:$PATH"
+dbbench --benchmarks=fillseq,readrandom --num=1000000
+
+# Option B: a persistent alias (add to ~/.zshrc or ~/.bashrc)
+alias dbbench="$PWD/Silex.DbBench/bin/Release/net8.0/dbbench"
+```
+
+For a self-contained, framework-independent binary you can copy elsewhere, publish it:
+
+```bash
+dotnet publish Silex.DbBench -c Release -o ./dist
+./dist/dbbench --benchmarks=fillseq,readrandom --num=1000000
+```
+
 Use `--help` to list every flag (full output in [All flags](#all-flags) below).
 
 ### Examples
