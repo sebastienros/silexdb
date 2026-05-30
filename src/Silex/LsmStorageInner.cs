@@ -6,6 +6,7 @@ using Silex.MemTables;
 using Silex.Serialization;
 using Silex.Tables;
 using Silex.Wal;
+using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.CompilerServices;
@@ -332,9 +333,9 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
 
         try
         {
-            _immutableMemTablesLock.EnterWriteLock();
-
             IMemTable<TKey, TValue> memTableToFlush;
+
+            _immutableMemTablesLock.EnterReadLock();
 
             try
             {
@@ -344,11 +345,13 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
                     return;
                 }
 
-                _state.ImmutableMemTables = _state.ImmutableMemTables.Dequeue(out memTableToFlush);
+                // Peek the oldest immutable MemTable without removing it. It stays queued (and therefore
+                // visible to concurrent scans) until its SST is published into L0 atomically below.
+                memTableToFlush = _state.ImmutableMemTables.Peek();
             }
             finally
             {
-                _immutableMemTablesLock.ExitWriteLock();
+                _immutableMemTablesLock.ExitReadLock();
             }
 
             var sstFilename = GetSstPath(memTableToFlush.Id);
@@ -361,6 +364,21 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
 
             try
             {
+                // Atomic, scan-visible transition: drop the MemTable from the immutable queue and publish its
+                // SST into L0 under the same level0 write lock. A scan holding the level0 read lock therefore
+                // always sees the data in exactly one place (the queued MemTable or the L0 SST), never neither.
+                _immutableMemTablesLock.EnterWriteLock();
+
+                try
+                {
+                    _state.ImmutableMemTables = _state.ImmutableMemTables.Dequeue(out var dequeued);
+                    Debug.Assert(ReferenceEquals(dequeued, memTableToFlush));
+                }
+                finally
+                {
+                    _immutableMemTablesLock.ExitWriteLock();
+                }
+
                 _state.LevelZeroTables.Add(ssTable);
             }
             finally
@@ -784,28 +802,44 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
 
     private sealed class LsmStorageIterator : IStorageIterator<TKey, TValue>
     {
-        private readonly ReaderWriterLockSlim _memTableLock;
-        private readonly StorageState<TKey, TValue> _state;
+        private readonly LsmStorageInner<TKey, TValue> _storage;
 
         public LsmStorageIterator(LsmStorageInner<TKey, TValue> storage)
         {
-            _memTableLock = storage._currentMemTableLock;
-            _state = storage._state;
+            _storage = storage;
         }
 
-        public async IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
+        public IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateAsync(CancellationToken cancellationToken = default)
         {
-            // In theory only the current MemTable needs to be synchronized,
-            // but we need to keep the mutable MemTable iterator around to compare with immutable ones.
-            // A solution to shorten the read-lock would be to copy the mutable MemTable keys. 
+            return EnumerateAsync(hasFrom: false, default!, cancellationToken);
+        }
 
-            _memTableLock.EnterReadLock();
+        /// <summary>
+        /// Returns all the values whose key is greater than or equal to <paramref name="from"/>, merging the
+        /// current MemTable, the immutable MemTables and the on-disk L0 SSTables.
+        /// </summary>
+        public IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateAsync(TKey from, CancellationToken cancellationToken = default)
+        {
+            return EnumerateAsync(hasFrom: true, from, cancellationToken);
+        }
+
+        private async IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateAsync(bool hasFrom, TKey from, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            // Hold the level0 read lock for the whole scan: it freezes the L0 tier list (no flush append or
+            // compaction swap) and, because flush only disposes a flushed immutable MemTable after its own
+            // level0 write-lock section, it also keeps the immutable MemTables we iterate alive throughout.
+            await _storage._level0Lock.EnterReadLockAsync();
 
             try
             {
-                var merge = new MergeIterator<TKey, TValue>(CreateMemTableIterators());
+                var iterators = BuildIterators(hasFrom, from, cancellationToken);
+                var merge = new MergeIterator<TKey, TValue>(iterators);
 
-                await foreach (var entry in merge.EnumerateAsync(cancellationToken))
+                var enumerable = hasFrom
+                    ? merge.EnumerateAsync(from, cancellationToken)
+                    : merge.EnumerateAsync(cancellationToken);
+
+                await foreach (var entry in enumerable)
                 {
                     if (!_valueSerializer.IsTombstoneValue(entry.Value))
                     {
@@ -815,59 +849,111 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
             }
             finally
             {
-                _memTableLock.ExitReadLock();
+                _storage._level0Lock.ExitReadLock();
             }
         }
 
         /// <summary>
-        /// Returns all the values currently stored in memory whose key is greater than or equal to <paramref name="from"/>.
+        /// Builds the merge inputs in most-recent-first order (current MemTable, then immutable MemTables
+        /// newest-first, then L0 SSTables newest-first) so the <see cref="MergeIterator{TKey, TValue}"/>
+        /// keeps the latest value on duplicate keys. The current MemTable is materialized under its
+        /// (thread-affine) lock so the rest of the scan can perform async SST I/O without holding it.
         /// </summary>
-        /// <remarks>Uses a merge iterator.</remarks>
-        public async IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateAsync(TKey from, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        private List<IStorageIterator<TKey, TValue>> BuildIterators(bool hasFrom, TKey from, CancellationToken cancellationToken)
         {
-            // In theory only the current MemTable needs to be synchronized,
-            // but we need to keep the mutable MemTable iterator around to compare with immutable ones.
-            // A solution to shorten the read-lock would be to copy the mutable MemTable keys. 
+            List<KeyValuePair<TKey, TValue>> currentSnapshot;
+            ImmutableQueue<IMemTable<TKey, TValue>> immutableMemTables;
+            List<SsTable<TKey, TValue>> levelZeroTables;
 
-            _memTableLock.EnterReadLock();
+            _storage._currentMemTableLock.EnterReadLock();
 
             try
             {
-                var merge = new MergeIterator<TKey, TValue>(CreateMemTableIterators());
+                // Read a consistent state snapshot: FreezeMemTable swaps the whole state object under this
+                // same lock, so current + immutable + L0 references are coherent here.
+                var state = _storage._state;
 
-                await foreach (var entry in merge.EnumerateAsync(from, cancellationToken))
-                {
-                    if (!_valueSerializer.IsTombstoneValue(entry.Value))
-                    {
-                        yield return entry;
-                    }
-                }
+                // Drain the current MemTable into a list while holding the lock. Its iterator is synchronous,
+                // so this completes inline without a thread switch (required for the thread-affine lock).
+                currentSnapshot = MaterializeCurrentMemTable(state.CurrentMemTable, cancellationToken);
+
+                immutableMemTables = state.ImmutableMemTables;
+                // The level0 read lock (held by the caller) keeps this list stable; copy it defensively anyway.
+                levelZeroTables = state.LevelZeroTables.ToList();
             }
             finally
             {
-                _memTableLock.ExitReadLock();
+                _storage._currentMemTableLock.ExitReadLock();
             }
-        }
 
-        /// <summary>
-        /// Builds the list of MemTable iterators in most-recent-first order so that the
-        /// <see cref="MergeIterator{TKey, TValue}"/> keeps the latest value on duplicate keys.
-        /// </summary>
-        private List<IStorageIterator<TKey, TValue>> CreateMemTableIterators()
-        {
             var iterators = new List<IStorageIterator<TKey, TValue>>
             {
-                _state.CurrentMemTable.CreateIterator()
+                new ListStorageIterator(currentSnapshot)
             };
 
-            // Immutable MemTables are enqueued oldest-first; the MergeIterator keeps the value from
-            // the iterator listed first, so add them most-recent-first to preserve precedence.
-            foreach (var memTable in _state.ImmutableMemTables.Reverse())
+            // Immutable MemTables are enqueued oldest-first; add them newest-first to preserve precedence.
+            foreach (var memTable in immutableMemTables.Reverse())
             {
                 iterators.Add(memTable.CreateIterator());
             }
 
+            // L0 SSTs are appended oldest-first; add them newest-first so a newer table wins on duplicates.
+            for (var i = levelZeroTables.Count - 1; i >= 0; i--)
+            {
+                iterators.Add(new SsTableIterator<TKey, TValue>(levelZeroTables[i]));
+            }
+
             return iterators;
+        }
+
+        private static List<KeyValuePair<TKey, TValue>> MaterializeCurrentMemTable(IMemTable<TKey, TValue> memTable, CancellationToken cancellationToken)
+        {
+            var snapshot = new List<KeyValuePair<TKey, TValue>>();
+
+            // The MemTable iterator is synchronous, so this blocking drain stays on the calling thread.
+            foreach (var entry in memTable.CreateIterator().EnumerateAsync(cancellationToken).ToBlockingEnumerable(cancellationToken))
+            {
+                snapshot.Add(entry);
+            }
+
+            return snapshot;
+        }
+    }
+
+    /// <summary>
+    /// An <see cref="IStorageIterator{TKey, TValue}"/> over an already-materialized, key-ascending list.
+    /// Used to snapshot the current MemTable so the rest of a scan can run async I/O off its lock.
+    /// </summary>
+    private sealed class ListStorageIterator : IStorageIterator<TKey, TValue>
+    {
+        private readonly List<KeyValuePair<TKey, TValue>> _entries;
+
+        public ListStorageIterator(List<KeyValuePair<TKey, TValue>> entries)
+        {
+            _entries = entries;
+        }
+
+        public async IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            await Task.CompletedTask;
+
+            foreach (var entry in _entries)
+            {
+                yield return entry;
+            }
+        }
+
+        public async IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateAsync(TKey from, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            await Task.CompletedTask;
+
+            foreach (var entry in _entries)
+            {
+                if (_keyComparer.Compare(entry.Key, from) >= 0)
+                {
+                    yield return entry;
+                }
+            }
         }
     }
 }

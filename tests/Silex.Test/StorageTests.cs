@@ -961,12 +961,214 @@ public class StorageTests
         public Span<byte> GetBytes() => inner.GetBytes();
     }
 
+    [Fact]
+    public async Task ConcurrentFlushAndScanNeverMissesCommittedData()
+    {
+        // Regression guard for the flush/scan race: while an immutable MemTable is mid-flush (dequeued from
+        // the queue but its SST not yet published), a concurrent scan must still observe its data. Flush makes
+        // that transition atomic under the level0 write lock, so every previously committed key stays visible.
+        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tempFolder);
+        var options = new StorageOptions { UseWriteAheadLog = false, FlushPeriod = TimeSpan.Zero };
+        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+
+        try
+        {
+            const int keyCount = 80;
+            var committedCount = 0;
+            using var done = new CancellationTokenSource();
+
+            var scanner = Task.Run(() =>
+            {
+                while (!done.IsCancellationRequested)
+                {
+                    // Keys are committed in ascending order, so observing N commits means keys 1..N must
+                    // all be present in a scan regardless of any in-flight flush.
+                    var expected = Volatile.Read(ref committedCount);
+                    var keys = storage.CreateIterator().EnumerateAsync().ToBlockingEnumerable()
+                        .Select(e => e.Key).ToHashSet();
+
+                    for (var k = 1; k <= expected; k++)
+                    {
+                        Assert.Contains(k, keys);
+                    }
+                }
+            });
+
+            for (var k = 1; k <= keyCount; k++)
+            {
+                storage.Put(k, k);
+                storage.ForceFreezeMemTable();
+                // Once frozen the key lives in the immutable queue and is committed: it must remain visible to
+                // scans throughout the subsequent flush, including the brief mid-flush transition window.
+                Volatile.Write(ref committedCount, k);
+                await storage.ForceFlushNextImmutableMemTableAsync();
+            }
+
+            done.Cancel();
+            await scanner;
+        }
+        finally
+        {
+            storage.Dispose();
+            Directory.Delete(tempFolder, true);
+        }
+    }
+
     private static async Task FlushTierAsync(LsmStorageInner<int, int> storage, Action write)
     {
         write();
         storage.ForceFreezeMemTable();
         await storage.ForceFlushNextImmutableMemTableAsync();
     }
+
+    [Fact]
+    public async Task FullScanIncludesFlushedSsTableData()
+    {
+        // Data flushed to L0 SSTs (with nothing left in the MemTables) must still appear in a full scan.
+        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tempFolder);
+        var options = new StorageOptions { UseWriteAheadLog = false };
+        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+
+        try
+        {
+            await FlushTierAsync(storage, () => storage.Put(1, 10));
+            await FlushTierAsync(storage, () => storage.Put(2, 20));
+            await FlushTierAsync(storage, () => storage.Put(3, 30));
+
+            var entries = storage.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToList();
+
+            Assert.Equal(new[] { 1, 2, 3 }, entries.Select(e => e.Key));
+            Assert.Equal(new[] { 10, 20, 30 }, entries.Select(e => e.Value));
+        }
+        finally
+        {
+            storage.Dispose();
+            Directory.Delete(tempFolder, true);
+        }
+    }
+
+    [Fact]
+    public async Task ScanReturnsNewestValueAcrossMemTableAndSsTable()
+    {
+        // A key written to an SST and later overwritten in the current MemTable must scan as the newer value.
+        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tempFolder);
+        var options = new StorageOptions { UseWriteAheadLog = false };
+        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+
+        try
+        {
+            await FlushTierAsync(storage, () => storage.Put(1, 10));
+            await FlushTierAsync(storage, () => storage.Put(2, 20));
+
+            // Overwrite key 1 in the live MemTable; this value is newer than the flushed one.
+            storage.Put(1, 999);
+
+            var entries = storage.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToList();
+
+            Assert.Equal(new[] { 1, 2 }, entries.Select(e => e.Key));
+            Assert.Equal(new[] { 999, 20 }, entries.Select(e => e.Value));
+        }
+        finally
+        {
+            storage.Dispose();
+            Directory.Delete(tempFolder, true);
+        }
+    }
+
+    [Fact]
+    public async Task ScanHidesKeysDeletedAfterFlush()
+    {
+        // A key present in an SST but deleted afterwards (tombstone in the MemTable) must be absent from scans.
+        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tempFolder);
+        var options = new StorageOptions { UseWriteAheadLog = false };
+        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+
+        try
+        {
+            await FlushTierAsync(storage, () => storage.Put(1, 10));
+            await FlushTierAsync(storage, () => storage.Put(2, 20));
+
+            storage.Delete(1);
+
+            var entries = storage.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToList();
+
+            Assert.Equal(new[] { 2 }, entries.Select(e => e.Key));
+            Assert.Equal(new[] { 20 }, entries.Select(e => e.Value));
+        }
+        finally
+        {
+            storage.Dispose();
+            Directory.Delete(tempFolder, true);
+        }
+    }
+
+    [Fact]
+    public async Task RangeScanIncludesSsTableData()
+    {
+        // A bounded scan (keys >= from) must include matching entries that live only in SSTs.
+        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tempFolder);
+        var options = new StorageOptions { UseWriteAheadLog = false };
+        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+
+        try
+        {
+            await FlushTierAsync(storage, () => storage.Put(1, 10));
+            await FlushTierAsync(storage, () => storage.Put(2, 20));
+            await FlushTierAsync(storage, () => storage.Put(3, 30));
+            storage.Put(4, 40);
+
+            var entries = storage.CreateIterator().EnumerateAsync(2).ToBlockingEnumerable().ToList();
+
+            Assert.Equal(new[] { 2, 3, 4 }, entries.Select(e => e.Key));
+            Assert.Equal(new[] { 20, 30, 40 }, entries.Select(e => e.Value));
+        }
+        finally
+        {
+            storage.Dispose();
+            Directory.Delete(tempFolder, true);
+        }
+    }
+
+    [Fact]
+    public async Task ScanAfterReopenIncludesSsTableData()
+    {
+        // After reopening, all live data is in SSTs (MemTables are empty), so the scan exercises the SST path.
+        var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Directory.CreateDirectory(tempFolder);
+        var options = new StorageOptions { UseWriteAheadLog = false, FlushPeriod = TimeSpan.Zero };
+
+        try
+        {
+            var storage = new LsmStorageInner<int, int>(tempFolder, options);
+            await FlushTierAsync(storage, () => storage.Put(1, 10));
+            await FlushTierAsync(storage, () => storage.Put(2, 20));
+            storage.Dispose();
+
+            var reopened = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
+
+            try
+            {
+                var entries = reopened._inner.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToList();
+
+                Assert.Equal(new[] { 1, 2 }, entries.Select(e => e.Key));
+                Assert.Equal(new[] { 10, 20 }, entries.Select(e => e.Value));
+            }
+            finally
+            {
+                reopened.Dispose();
+            }
+        }
+        finally
+        {
+            Directory.Delete(tempFolder, true);
+        }
+    }
+
 
     [Fact]
     public async Task GetReturnsDefaultForSentinelTombstoneStoredInSsTable()

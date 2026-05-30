@@ -196,9 +196,15 @@ not in the individual collections.
 - **Leveled compaction (still missing).** `LeveledSsTables` is declared but never populated, and
   `GetAsync` never reads it. Leveled needs a persisted manifest (to record which SST is at which level
   across reopen) — deferred with the manifest work below.
-- **Scans are still MemTable-only.** Range/full iteration covers MemTables (current + immutable) but not
-  on-disk SSTs, so a scan can miss already-flushed data. `GetAsync` (point reads) does read L0 SSTs.
-  Needs an SST-level merge/concat iterator wired into `LsmStorageIterator` (the next planned milestone).
+- **DONE — Scans include on-disk SST data.** Range/full iteration now merges the current MemTable, the
+  immutable MemTables and the L0 SSTs (most-recent-first), so a scan no longer misses already-flushed
+  data. The scan holds the level0 read lock for its whole duration (freezing L0 and preventing disposal
+  of the SSTs/immutable MemTables it references) and materializes the current MemTable into a list under
+  the (thread-affine) current-MemTable lock so the rest of the scan can run async SST I/O off that lock.
+  Flush was made atomic from a scanner's viewpoint: the immutable MemTable is *peeked* (not dequeued)
+  before its SST is built, then removed from the queue and published into L0 under the **same** level0
+  write lock — closing a pre-existing window where a mid-flush MemTable was visible in neither place.
+  Tombstones are filtered out of scan results via `IsTombstoneValue`.
 
 ### Serialization / value-ownership semantics
 - **Decision: zero-copy is a core principle.** The engine deliberately does **not** defensively copy
@@ -310,7 +316,7 @@ write/space amplification and tombstone/ordering complexity. Speculative; defer 
    value-ownership semantics*).
 2. ~~WAL~~ **(done — crash recovery via write-ahead log)** + manifest (manifest deferred until
    compaction/levels exist).
-3. ~~Compaction~~ **(tiered done)** + leveling (needs a manifest), then parallelism. Next: SST-level
-   scan iterator so range scans include on-disk data; then leveled compaction + minimal manifest.
+3. ~~Compaction~~ **(tiered done)** + ~~SST-level scan iterator so range scans include on-disk data~~
+   **(done)** + leveling (needs a manifest), then parallelism. Next: leveled compaction + minimal manifest.
 4. Finer sparse index.
 5. Defer: LRU block cache, entry-lifting.
