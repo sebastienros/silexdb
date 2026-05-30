@@ -124,6 +124,71 @@ public class Block<TKey, TValue> : IDisposable
         return false;
     }
 
+    /// <summary>
+    /// Like <see cref="ForEachRaw{TArg}"/> but starts at the first entry whose encoded key is greater than or
+    /// equal to <paramref name="encodedFrom"/> (a lower-bound seek). The block bytes are searched directly,
+    /// without materializing a <typeparamref name="TKey"/> per visited entry; this is correct because key
+    /// encoders are order-preserving, so a bytewise comparison of encoded keys matches the typed comparison.
+    /// When no entry in the block reaches <paramref name="encodedFrom"/> the callback is never invoked and the
+    /// method returns <c>true</c> so the caller can continue into the next block.
+    /// </summary>
+    internal bool ForEachRawFrom<TArg>(ReadOnlySpan<byte> encodedFrom, TArg arg, ReadRawEntryAction<TArg> reader, bool skipEmptyValues)
+    {
+        var memory = Memory;
+        var start = LowerBound(memory, encodedFrom);
+
+        for (var i = start; i < Offsets.Count; i++)
+        {
+            var blockReader = new EncoderBinaryReader(memory, Offsets[i]);
+            var keyLength = blockReader.Read7BitEncodedInt();
+            var key = blockReader.ReadBytesSpan(keyLength);
+            var valueLength = blockReader.Read7BitEncodedInt();
+            var value = blockReader.ReadBytesSpan(valueLength);
+
+            if (skipEmptyValues && value.IsEmpty)
+            {
+                continue;
+            }
+
+            if (!reader(arg, key, value))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Returns the index in <see cref="Offsets"/> of the first entry whose encoded key is greater than or
+    /// equal to <paramref name="encodedKey"/>, or <see cref="BlockOffsets.Count"/> when every key is smaller.
+    /// </summary>
+    private int LowerBound(ReadOnlyMemory<byte> memory, ReadOnlySpan<byte> encodedKey)
+    {
+        var start = 0;
+        var end = Offsets.Count;
+
+        while (start < end)
+        {
+            var m = start + (end - start) / 2;
+
+            var reader = new EncoderBinaryReader(memory, Offsets[m]);
+            var keyLength = reader.Read7BitEncodedInt();
+            var entryKey = reader.ReadBytesSpan(keyLength);
+
+            if (entryKey.SequenceCompareTo(encodedKey) < 0)
+            {
+                start = m + 1;
+            }
+            else
+            {
+                end = m;
+            }
+        }
+
+        return start;
+    }
+
     internal bool ForEachRaw<TArg>(TArg arg, ReadRawEntryAction<TArg> reader, bool skipEmptyValues)
     {
         var memory = Memory;

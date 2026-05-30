@@ -459,31 +459,44 @@ internal sealed class Runner
             var keyGen = new KeyGenerator(_options.KeySize);
             var rng = RngStreams.Create(_options.Seed, threadId, RngStreams.Seek);
             var toRead = 1 + _options.SeekNexts;
+            var seekState = new SeekScanState(stats);
 
             return new ThreadWorker(async op =>
             {
                 var target = keyGen.Generate(rng.NextInt64(_options.Num));
-                var read = 0;
+                seekState.Reset(target);
 
-                await foreach (var entry in db.CreateIterator().EnumerateAsync(target))
+                await db.SeekRawAsync(target, seekState, static (s, key, value) =>
                 {
-                    if (read == 0 && entry.Key.AsSpan().SequenceEqual(target))
+                    if (s.Read == 0 && key.SequenceEqual(s.Target))
                     {
-                        stats.Found++;
+                        s.Stats.Found++;
                     }
 
-                    stats.Bytes += entry.Key.Length + entry.Value.Length;
-
-                    if (++read >= toRead)
-                    {
-                        break;
-                    }
-                }
+                    s.Stats.Bytes += key.Length + value.Length;
+                    s.Read++;
+                    return true;
+                }, toRead);
 
                 stats.Ops++;
                 return true;
             });
         });
+    }
+
+    private sealed class SeekScanState(ThreadStats stats)
+    {
+        public ThreadStats Stats { get; } = stats;
+
+        public byte[] Target { get; private set; } = [];
+
+        public int Read { get; set; }
+
+        public void Reset(byte[] target)
+        {
+            Target = target;
+            Read = 0;
+        }
     }
 
     // ----- parallel scaffolding + reporting -----

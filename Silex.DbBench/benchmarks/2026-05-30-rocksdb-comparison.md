@@ -55,7 +55,19 @@ synchronous read targets. Steady-state (passes 2–3), aggregate throughput acro
 | Benchmark   | Silex                                 | RocksDB                                | Result            |
 |-------------|---------------------------------------|----------------------------------------|-------------------|
 | readseq     | 0.159 µs/op · 6.2M ops/s · 686 MB/s   | 0.041 µs/op · 24.5M ops/s · 2713 MB/s  | **RocksDB ~3.9×** |
-| seekrandom  | 7.137 µs/op · 140K ops/s · 15.5 MB/s  | 0.852 µs/op · 1.17M ops/s              | **RocksDB ~8.4×** |
+| seekrandom  | 1.352 µs/op · 739K ops/s · 81.8 MB/s  | 0.890 µs/op · 1.12M ops/s              | **RocksDB ~1.5×** |
+
+> **seekrandom — cached raw lower-bound seek (`SeekRawAsync`).** The benchmark previously drove
+> `seekrandom` through `CreateIterator().EnumerateAsync(from)`, which primed every SSTable iterator,
+> read blocks **uncached** (each `RandomAccess.ReadAsync` dispatched to the thread pool on Unix), and
+> materialized a `KeyValuePair<TKey,TValue>` per entry through 3–4 nested async-iterator state machines.
+> `SeekRawAsync` mirrors the proven `ScanRawAsync`/cached point-lookup machinery instead: when the
+> on-disk tables form one globally sorted run it binary-searches to the start table/block, does an
+> in-block lower-bound search (order-preserving encoded-key compare), and reads each block through the
+> block **cache** (`ReadBlockCachedAsync`), invoking a synchronous raw callback over leased block
+> memory with no per-entry allocation. Result: **7.137 → 1.352 µs/op (~5.3×)**, narrowing the RocksDB
+> gap from ~8.4× to ~1.5×. Falls back to the iterator path for sentinel-tombstone value types or
+> overlapping (non-sorted-run) tables.
 
 ### Writes — mixed pipeline (`fillseq,fillrandom,overwrite`, comparable rows)
 
@@ -73,8 +85,9 @@ synchronous read targets. Steady-state (passes 2–3), aggregate throughput acro
   misses; the synchronous read doesn't help here (and doesn't regress).
 - **Miss-heavy warm-page reads**: RocksDB ~2× at low concurrency (down from ~4.8× pre-sync-read),
   converging near 8 threads. Silex's remaining gap is the cache lock + miss machinery.
-- **Scans & seeks**: RocksDB still dominates (readseq ~3.9×, seekrandom ~8.4×) — the standout
-  optimization targets; each Silex scan/seek rebuilds a merge iterator across all sources.
+- **Scans & seeks**: `seekrandom` now within ~1.5× of RocksDB (was ~8.4×) after the cached raw
+  lower-bound `SeekRawAsync` fast path. `readseq` (~3.9×) remains the next scan target; its raw scan
+  is already cache-free sequential block reads, so the gap is decode + async-batch overhead.
 
 ---
 

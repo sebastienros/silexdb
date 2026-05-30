@@ -537,6 +537,197 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         return count;
     }
 
+    /// <summary>
+    /// Raw, cached, lower-bound seek: invokes <paramref name="reader"/> for up to <paramref name="maxEntries"/>
+    /// live entries whose key is greater than or equal to <paramref name="from"/>, in ascending key order.
+    /// Mirrors <see cref="ScanRawAsync{TArg}"/> but starts at <paramref name="from"/> and reads blocks through
+    /// the block cache, so a hot working set is reused across seeks instead of issuing an uncached read per call.
+    /// Returns the number of live entries delivered.
+    /// </summary>
+    public async ValueTask<long> SeekRawAsync<TArg>(TKey from, TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries = long.MaxValue, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(reader);
+        ArgumentOutOfRangeException.ThrowIfNegative(maxEntries);
+
+        if (maxEntries == 0)
+        {
+            return 0;
+        }
+
+        if (!_valueSerializer.UsesEmptyTombstone)
+        {
+            return await SeekRawFallbackAsync(from, arg, reader, maxEntries, cancellationToken);
+        }
+
+        var keyLength = _keySerializer.GetLength(from);
+        var bufferWriter = new PooledArrayBufferWriter<byte>(keyLength);
+        var writer = new EncoderBinaryWriter(bufferWriter);
+        _keySerializer.Encode(from, ref writer);
+        writer.Flush();
+        var keyMemory = bufferWriter.WrittenMemory;
+
+        try
+        {
+            await _level0Lock.EnterReadLockAsync();
+
+            try
+            {
+                if (TryGetGloballySortedSsTableRun(out var tables))
+                {
+                    var state = new RawScanState<TArg>(arg, reader, maxEntries);
+                    var startTableIndex = FindStartTableIndex(tables, from);
+
+                    for (var t = startTableIndex; t < tables.Count; t++)
+                    {
+                        var table = tables[t];
+                        var blockMetadata = table.BlockMetadata;
+
+                        var blockStart = 0;
+                        var seekInFirstBlock = false;
+
+                        if (t == startTableIndex)
+                        {
+                            blockStart = FindStartBlockIndex(blockMetadata, from);
+
+                            // The stepped-back block ends before 'from' (this happens when 'from' falls exactly on
+                            // a later block's FirstKey, or in a gap between blocks): the first key >= from lives in
+                            // a later block, so advance to it instead of giving up.
+                            if (_keyComparer.Compare(blockMetadata[blockStart].LastKey, from) < 0)
+                            {
+                                blockStart++;
+                            }
+                            else
+                            {
+                                seekInFirstBlock = true;
+                            }
+                        }
+
+                        for (var b = blockStart; b < blockMetadata.Count; b++)
+                        {
+                            cancellationToken.ThrowIfCancellationRequested();
+
+                            using var lease = await table.ReadBlockCachedAsync(blockMetadata[b].Index, _blockCache, cancellationToken);
+                            var block = lease.Block;
+
+                            if (block == null)
+                            {
+                                continue;
+                            }
+
+                            bool keepGoing;
+                            if (seekInFirstBlock && b == blockStart)
+                            {
+                                keepGoing = block.ForEachRawFrom(keyMemory.Span, state, static (s, key, value) => s.Accept(key, value), skipEmptyValues: true);
+                            }
+                            else
+                            {
+                                keepGoing = block.ForEachRaw(state, static (s, key, value) => s.Accept(key, value), skipEmptyValues: true);
+                            }
+
+                            if (!keepGoing)
+                            {
+                                return state.Count;
+                            }
+                        }
+                    }
+
+                    return state.Count;
+                }
+            }
+            finally
+            {
+                _level0Lock.ExitReadLock();
+            }
+
+            return await SeekRawFallbackAsync(from, arg, reader, maxEntries, cancellationToken);
+        }
+        finally
+        {
+            bufferWriter.Dispose();
+        }
+    }
+
+    private async ValueTask<long> SeekRawFallbackAsync<TArg>(TKey from, TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries, CancellationToken cancellationToken)
+    {
+        long count = 0;
+
+        await foreach (var entry in CreateIterator().EnumerateAsync(from, cancellationToken))
+        {
+            if (count >= maxEntries)
+            {
+                break;
+            }
+
+            count++;
+
+            if (!InvokeRawEntryReader(arg, reader, entry.Key, entry.Value))
+            {
+                break;
+            }
+        }
+
+        return count;
+    }
+
+    /// <summary>
+    /// Returns the index of the first table whose <see cref="SsTable{TKey, TValue}.LastKey"/> is greater than or
+    /// equal to <paramref name="from"/>, or <paramref name="tables"/>.Count when every table ends before it.
+    /// </summary>
+    private static int FindStartTableIndex(List<SsTable<TKey, TValue>> tables, TKey from)
+    {
+        var start = 0;
+        var end = tables.Count - 1;
+
+        while (start <= end)
+        {
+            var m = start + (end - start) / 2;
+
+            if (_keyComparer.Compare(tables[m].LastKey, from) < 0)
+            {
+                start = m + 1;
+            }
+            else
+            {
+                end = m - 1;
+            }
+        }
+
+        return start;
+    }
+
+    /// <summary>
+    /// Returns the index of the block that may contain <paramref name="from"/>: the last block whose FirstKey is
+    /// less than or equal to <paramref name="from"/>, clamped to the first block. Mirrors the seek used by
+    /// <see cref="SsTableIterator{TKey, TValue}"/>; callers must apply the stepped-back-block correction.
+    /// </summary>
+    private static int FindStartBlockIndex(IReadOnlyList<BlockMetadata<TKey>> blockMetadata, TKey from)
+    {
+        var start = 0;
+        var end = blockMetadata.Count - 1;
+
+        while (start <= end)
+        {
+            var m = start + (end - start) / 2;
+            var compare = _keyComparer.Compare(blockMetadata[m].FirstKey, from);
+
+            if (compare == 0)
+            {
+                return Math.Max(0, m - 1);
+            }
+
+            if (compare < 0)
+            {
+                start = m + 1;
+            }
+            else
+            {
+                end = m - 1;
+            }
+        }
+
+        return Math.Max(0, start - 1);
+    }
+
     private static bool InvokeRawEntryReader<TArg>(TArg arg, ReadRawEntryAction<TArg> reader, TKey key, TValue value)
     {
         if (_keySerializer.TryGetRawBytes(key, out var keyBytes) && _valueSerializer.TryGetRawBytes(value, out var valueBytes))
@@ -2127,6 +2318,21 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
 
             try
             {
+                // Fast path: when the memtables are empty and the on-disk SSTables form a single globally
+                // sorted, non-overlapping run, the data is already in final key order with exactly one version
+                // per key. We can stream directly from the relevant tables instead of building one iterator per
+                // table and priming them all through the merge heap. For a seek that reads a single entry this
+                // turns ~N block reads (one per table) into one binary search + one block read.
+                if (_storage.TryGetGloballySortedSsTableRun(out var sortedRun))
+                {
+                    await foreach (var entry in EnumerateSortedRunAsync(sortedRun, hasFrom, from, cancellationToken))
+                    {
+                        yield return entry;
+                    }
+
+                    yield break;
+                }
+
                 var iterators = BuildIterators(hasFrom, from, cancellationToken);
                 var merge = new MergeIterator<TKey, TValue>(iterators);
 
@@ -2145,6 +2351,67 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
             finally
             {
                 _storage._level0Lock.ExitReadLock();
+            }
+        }
+
+        /// <summary>
+        /// Streams a single globally sorted, non-overlapping SSTable run in key order. The run already holds
+        /// exactly one version per key, so no merge or duplicate resolution is needed — only tombstone
+        /// filtering. When <paramref name="hasFrom"/> is set, a binary search skips straight to the first table
+        /// whose range can contain <paramref name="from"/>.
+        /// </summary>
+        private async IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateSortedRunAsync(
+            List<SsTable<TKey, TValue>> tables,
+            bool hasFrom,
+            TKey from,
+            [EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            var startIndex = 0;
+
+            if (hasFrom)
+            {
+                // First table whose LastKey >= from. Tables are FirstKey-sorted and non-overlapping, so LastKey
+                // is monotonically increasing and binary search is valid. If from falls past every table's
+                // LastKey, lo lands at tables.Count and nothing is yielded.
+                var lo = 0;
+                var hi = tables.Count;
+
+                while (lo < hi)
+                {
+                    var mid = (lo + hi) >> 1;
+
+                    if (_keyComparer.Compare(tables[mid].LastKey, from) < 0)
+                    {
+                        lo = mid + 1;
+                    }
+                    else
+                    {
+                        hi = mid;
+                    }
+                }
+
+                startIndex = lo;
+            }
+
+            for (var i = startIndex; i < tables.Count; i++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var iterator = new SsTableIterator<TKey, TValue>(tables[i]);
+
+                // Only the first table needs the seek; every later table starts at its FirstKey, which is
+                // already >= from because the run is non-overlapping.
+                var enumerable = hasFrom && i == startIndex
+                    ? iterator.EnumerateAsync(from, cancellationToken)
+                    : iterator.EnumerateAsync(cancellationToken);
+
+                await foreach (var entry in enumerable)
+                {
+                    if (!_valueSerializer.IsTombstoneValue(entry.Value))
+                    {
+                        yield return entry;
+                    }
+                }
             }
         }
 

@@ -1342,6 +1342,90 @@ public class StorageTests
     }
 
     [Test]
+    public async Task SeekRawAcrossTablesHonorsLowerBoundMaxEntriesAndTombstones()
+    {
+        using var tempFolder = TempFolder.Create();
+        var options = new StorageOptions { UseWriteAheadLog = false };
+        var storage = new LsmStorageInner<byte[], byte[]>(tempFolder, options);
+
+        try
+        {
+            // Three single-key tables form one globally sorted run, exercising the cross-table seek path.
+            await FlushByteTierAsync(storage, () => storage.Put([10], [100]));
+            await FlushByteTierAsync(storage, () => storage.Put([20], [200]));
+            await FlushByteTierAsync(storage, () => storage.Put([30], [44]));
+
+            await Assert.That(await SeekRawCollectAsync(storage, [0])).IsEquivalentTo(new (byte, byte)[] { (10, 100), (20, 200), (30, 44) }, CollectionOrdering.Matching);
+            await Assert.That(await SeekRawCollectAsync(storage, [20])).IsEquivalentTo(new (byte, byte)[] { (20, 200), (30, 44) }, CollectionOrdering.Matching);
+            await Assert.That(await SeekRawCollectAsync(storage, [15])).IsEquivalentTo(new (byte, byte)[] { (20, 200), (30, 44) }, CollectionOrdering.Matching);
+            await Assert.That(await SeekRawCollectAsync(storage, [99])).IsEmpty();
+            await Assert.That(await SeekRawCollectAsync(storage, [0], maxEntries: 1)).IsEquivalentTo(new (byte, byte)[] { (10, 100) }, CollectionOrdering.Matching);
+
+            // A tombstone at the lower bound must be skipped without counting against maxEntries.
+            await FlushByteTierAsync(storage, () => storage.Delete([20]));
+
+            await Assert.That(await SeekRawCollectAsync(storage, [20], maxEntries: 1)).IsEquivalentTo(new (byte, byte)[] { (30, 44) }, CollectionOrdering.Matching);
+        }
+        finally
+        {
+            storage.Dispose();
+        }
+    }
+
+    [Test]
+    public async Task SeekRawLandsOnLowerBoundAcrossBlockBoundaries()
+    {
+        using var tempFolder = TempFolder.Create();
+        // A tiny block size forces the single flushed table into many blocks so the in-block lower-bound search,
+        // the stepped-back-block correction, and cross-block continuation are all exercised by the seek sweep.
+        var options = new StorageOptions { UseWriteAheadLog = false, BlockSize = 64 };
+        var storage = new LsmStorageInner<byte[], byte[]>(tempFolder, options);
+
+        try
+        {
+            for (byte k = 1; k <= 40; k++)
+            {
+                storage.Put([k], [(byte)(k + 100)]);
+            }
+
+            storage.ForceFreezeMemTable();
+            await storage.ForceFlushNextImmutableMemTableAsync();
+
+            for (byte from = 1; from <= 40; from++)
+            {
+                var expected = new List<(byte, byte)>();
+                for (byte k = from; k <= 40; k++)
+                {
+                    expected.Add((k, (byte)(k + 100)));
+                }
+
+                await Assert.That(await SeekRawCollectAsync(storage, [from])).IsEquivalentTo(expected, CollectionOrdering.Matching);
+            }
+
+            await Assert.That((await SeekRawCollectAsync(storage, [0])).Count).IsEqualTo(40);
+            await Assert.That(await SeekRawCollectAsync(storage, [41])).IsEmpty();
+            await Assert.That(await SeekRawCollectAsync(storage, [25], maxEntries: 3)).IsEquivalentTo(new (byte, byte)[] { (25, 125), (26, 126), (27, 127) }, CollectionOrdering.Matching);
+        }
+        finally
+        {
+            storage.Dispose();
+        }
+    }
+
+    private static async Task<List<(byte Key, byte Value)>> SeekRawCollectAsync(LsmStorageInner<byte[], byte[]> storage, byte[] from, long maxEntries = long.MaxValue)
+    {
+        var entries = new List<(byte Key, byte Value)>();
+
+        await storage.SeekRawAsync(from, entries, static (results, key, value) =>
+        {
+            results.Add((key[0], value[0]));
+            return true;
+        }, maxEntries);
+
+        return entries;
+    }
+
+    [Test]
     public async Task RawScanFallsBackForOverlappingTablesAndKeepsNewestValue()
     {
         using var tempFolder = TempFolder.Create();

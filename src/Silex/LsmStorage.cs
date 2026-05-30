@@ -287,6 +287,14 @@ public class LsmStorage<TKey, TValue> : IDisposable, IAsyncDisposable where TKey
         return _inner.ScanRawAsync(arg, reader, maxEntries, cancellationToken);
     }
 
+    /// <inheritdoc cref="LsmStorageInner{TKey, TValue}.SeekRawAsync{TArg}(TKey, TArg, ReadRawEntryAction{TArg}, long, CancellationToken)"/>
+    public ValueTask<long> SeekRawAsync<TArg>(TKey from, TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries = long.MaxValue, CancellationToken cancellationToken = default)
+    {
+        CheckDisposed();
+
+        return _inner.SeekRawAsync(from, arg, reader, maxEntries, cancellationToken);
+    }
+
     /// <inheritdoc cref="LsmStorageInner.Put(TKey, TValue)"/>
     /// <remarks>
     /// Zero-copy: ownership of <paramref name="key"/> and <paramref name="value"/> transfers to the
