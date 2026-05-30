@@ -181,6 +181,17 @@ not in the individual collections.
 - ~~Make disposal idempotent and finalizers no-ops.~~ Implemented: deterministic
   `CloseAsync`/`DisposeAsync` is the sole flush path; finalizers were removed (see
   *Resource management & disposal*).
+- ~~Fix latent correctness gaps found during review.~~ Implemented (with regression tests):
+  - Reads/scans now iterate immutable mem tables most-recent-first (`ImmutableQueue` enumerates
+    oldest-first), so the newest value for a key wins.
+  - L0 recovery loads `*.sst` sorted by parsed numeric id, preserves the id, and bumps
+    `IdGenerator` past persisted ids so recency order survives reopen.
+  - `byte[]` keys use content equality in MemTable dictionary lookups (`ByteArrayEncoder.Comparer`
+    now implements `IEqualityComparer<byte[]>`), consistent with the sorted-comparer phase.
+  - Removed a bogus 4-byte length assert in `BytesEncoder.Decode` that fired on arbitrary-length
+    `Bytes` values read from an SST under Debug.
+  - `SsTableIterator.EnumerateAsync(from)` clamps its start block index to 0 when the from-key
+    precedes the first block's first key.
 
 ---
 
