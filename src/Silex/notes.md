@@ -201,8 +201,8 @@ not in the individual collections.
 - `PooledArrayBufferWriter` — when full, rents a larger buffer and copies the previous content over.
 
 ### Tests & tooling
-- xUnit tests cover blocks, tables, MemTables, bloom filters, encoders, storage, `Bytes`, and
-  `AsyncReaderWriterLock`.
+- TUnit tests cover blocks, tables, MemTables, bloom filters, encoders, storage, `Bytes`, and
+  `AsyncReaderWriterLock`. Run with `dotnet test --solution Silex.slnx`.
 - `Silex.Benchmarks` (BenchmarkDotNet) and `Silex.Playground` (1M-entry write/flush demo).
 
 ---

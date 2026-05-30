@@ -1,0 +1,25 @@
+<Project>
+
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageVersion Include="Microsoft.IO.RecyclableMemoryStream" Version="3.0.1" />
+    <PackageVersion Include="BenchmarkDotNet" Version="0.14.0" />
+    <PackageVersion Include="System.CommandLine" Version="2.0.8" />
+    <PackageVersion Include="TUnit" Version="1.47.0" />
+  </ItemGroup>
+
+  <!-- Per-target-framework versions for the multi-targeted Silex library. -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'net8.0'">
+    <PackageVersion Include="Microsoft.Extensions.Caching.Memory" Version="8.0.1" />
+    <PackageVersion Include="System.IO.Hashing" Version="8.0.0" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
+    <PackageVersion Include="Microsoft.Extensions.Caching.Memory" Version="10.0.8" />
+    <PackageVersion Include="System.IO.Hashing" Version="10.0.8" />
+  </ItemGroup>
+
+</Project>

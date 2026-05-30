@@ -4,7 +4,7 @@ namespace Silex.Test;
 
 public class BlockTests
 {
-    [Fact]
+    [Test]
     public void ShouldEncodeBlock()
     {
         var blockBuilder = new BlockBuilder<ushort, string> (new DefaultBlockEncoder<ushort, string>());
@@ -29,7 +29,7 @@ public class BlockTests
         Assert.Equal(new byte[] { 2, 7, 0, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, block.Memory);
     }
 
-    [Fact]
+    [Test]
     public void ShouldDecodeBlock()
     {
         var raw = new byte[] { 2, 7, 0, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 };
@@ -48,7 +48,7 @@ public class BlockTests
         Assert.Equal(5, entry.Length);
     }
 
-    [Fact]
+    [Test]
     public void ShouldIterateAllEntries()
     {
         var blockBuilder = new BlockBuilder<int, string>(new DefaultBlockEncoder<int, string>());
@@ -68,7 +68,7 @@ public class BlockTests
         Assert.Equivalent(allKeys, result);
     }
 
-    [Fact]
+    [Test]
     public void ShouldIterateFromKey()
     {
         var blockBuilder = new BlockBuilder<int, string>(new DefaultBlockEncoder<int, string>());
@@ -88,7 +88,7 @@ public class BlockTests
         Assert.Equivalent(allKeys.Skip(1), result);
     }
 
-    [Fact]
+    [Test]
     public void ShouldIterateFromUnknownKey()
     {
         var blockBuilder = new BlockBuilder<int, string>(new DefaultBlockEncoder<int, string>());
@@ -108,7 +108,7 @@ public class BlockTests
         Assert.Empty(result);
     }
 
-    [Fact]
+    [Test]
     public void TryGetValueShouldReturnCorrectValues()
     {
         var blockBuilder = new BlockBuilder<int, int>(new DefaultBlockEncoder<int, int>());
@@ -131,7 +131,7 @@ public class BlockTests
         }
     }
 
-    [Fact]
+    [Test]
     public void ShouldNotAcceptEntriesWhenFull()
     {
         var blockBuilder = new BlockBuilder<int, byte[]>(new DefaultBlockEncoder<int, byte[]>());
@@ -148,7 +148,7 @@ public class BlockTests
         Assert.False(r4);
     }
 
-    [Fact]
+    [Test]
     public void NewBlocksShouldAcceptFirstEntryBiggerThanBlockSize()
     {
         var blockBuilder = new BlockBuilder<int, byte[]>(new DefaultBlockEncoder<int, byte[]>());
@@ -161,7 +161,7 @@ public class BlockTests
         Assert.False(r2);
     }
 
-    [Fact(Skip = "Requires values to be serialized in the MemTable buffer")]
+    [Test, Skip("Requires values to be serialized in the MemTable buffer")]
     public void EntryBuffersShouldBeCopied()
     {
         var blockBuilder = new BlockBuilder<int, byte[]>(new DefaultBlockEncoder<int, byte[]>());

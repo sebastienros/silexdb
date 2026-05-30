@@ -4,7 +4,7 @@ using Silex.Collections;
 
 public class MemTableTests
 {
-    [Fact]
+    [Test]
     public void SortedDictionaryShouldReturnRange()
     {
         // SortedDictionary doesn't provide a way to enumerate a range of values (as of .NET 9) so

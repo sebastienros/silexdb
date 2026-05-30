@@ -1,23 +1,16 @@
 ﻿namespace Silex.Test;
 
-using Xunit.Abstractions;
 
 public class AsyncReaderWriterLockTests
 {
     private readonly TimeSpan _timeout = TimeSpan.FromSeconds(1);
 
-    private readonly ITestOutputHelper? _output = null;
+    private readonly TextWriter? _output = null;
 
-    public AsyncReaderWriterLockTests(ITestOutputHelper _)
-    {
-        // Uncomment to debug tests
-        //_output = output;
-    }
-
-    [Theory]
-    [InlineData(1)]
-    [InlineData(3)]
-    [InlineData(10)]
+    [Test]
+    [Arguments(1)]
+    [Arguments(3)]
+    [Arguments(10)]
     public async Task ShouldHandleConcurrentConsumers(int levelOfConcurrency)
     {
         var loq = new AsyncReaderWriterLock();
@@ -70,7 +63,7 @@ public class AsyncReaderWriterLockTests
         }
     }
 
-    [Fact]
+    [Test]
     public async Task ReadersShouldExit()
     {
         var loq = new AsyncReaderWriterLock();
@@ -79,7 +72,7 @@ public class AsyncReaderWriterLockTests
         loq.ExitReadLock();
     }
 
-    [Fact]
+    [Test]
     public async Task TryEnterWriteLockShouldWork()
     {
         var loq = new AsyncReaderWriterLock();
@@ -101,7 +94,7 @@ public class AsyncReaderWriterLockTests
         Assert.True(await loq.TryEnterWriteLockAsync().AsTask().WaitAsync(_timeout));
     }
 
-    [Fact]
+    [Test]
     public async Task WriteFollowingRead()
     {
         var loq = new AsyncReaderWriterLock();
@@ -116,7 +109,7 @@ public class AsyncReaderWriterLockTests
         Assert.Equal((uint)0, loq._state.Writers);
     }
 
-    [Fact]
+    [Test]
     public async Task ReadersShouldNotBeBlocked()
     {
         var loq = new AsyncReaderWriterLock();
@@ -127,7 +120,7 @@ public class AsyncReaderWriterLockTests
         loq.ExitReadLock();
     }
 
-    [Fact]
+    [Test]
     public void WriteWriteRead()
     {
         var loq = new AsyncReaderWriterLock();
@@ -150,11 +143,11 @@ public class AsyncReaderWriterLockTests
         Assert.True(r2.IsCompleted);
     }
 
-    [Theory]
-    [InlineData(1)]
-    [InlineData(2)]
-    [InlineData(3)]
-    [InlineData(10)]
+    [Test]
+    [Arguments(1)]
+    [Arguments(2)]
+    [Arguments(3)]
+    [Arguments(10)]
     public async Task WritersShouldExit(int count)
     {
         var loq = new AsyncReaderWriterLock();
@@ -173,7 +166,7 @@ public class AsyncReaderWriterLockTests
         await Task.WhenAll(tasks);
     }
 
-    [Fact]
+    [Test]
     public async Task WritersShouldBlockWriters()
     {
         var loq = new AsyncReaderWriterLock();
@@ -193,7 +186,7 @@ public class AsyncReaderWriterLockTests
         await lock2;
     }
 
-    [Fact]
+    [Test]
     public async Task WritersShouldBlockWritersAwaited()
     {
         var loq = new AsyncReaderWriterLock();
@@ -208,7 +201,7 @@ public class AsyncReaderWriterLockTests
         loq.ExitWriteLock();
     }
 
-    [Fact]
+    [Test]
     public async Task WritersShouldBlockReaders()
     {
         var loq = new AsyncReaderWriterLock();
@@ -228,7 +221,7 @@ public class AsyncReaderWriterLockTests
         await lock2;
     }
 
-    [Fact]
+    [Test]
     public async Task ReadersShouldBlockWriter()
     {
         var loq = new AsyncReaderWriterLock();
@@ -248,7 +241,7 @@ public class AsyncReaderWriterLockTests
         await lock2;
     }
 
-    [Fact]
+    [Test]
     public void WriterShouldUnblockWriterInOrder()
     {
         var loq = new AsyncReaderWriterLock();
@@ -276,7 +269,7 @@ public class AsyncReaderWriterLockTests
         loq.ExitWriteLock();
     }
 
-    [Fact]
+    [Test]
     public void WriterShouldUnblockAllReadersInOrder()
     {
         var loq = new AsyncReaderWriterLock();
@@ -315,7 +308,7 @@ public class AsyncReaderWriterLockTests
         loq.ExitWriteLock();
     }
 
-    [Fact]
+    [Test]
     public async Task ExitReadLockThrowExceptionWhenUnexpected()
     {
         var loq = new AsyncReaderWriterLock();
@@ -325,7 +318,7 @@ public class AsyncReaderWriterLockTests
         Assert.Throws<SynchronizationLockException>(loq.ExitReadLock);
     }
 
-    [Fact]
+    [Test]
     public async Task ExitWriteLockThrowExceptionWhenUnexpected()
     {
         var loq = new AsyncReaderWriterLock();

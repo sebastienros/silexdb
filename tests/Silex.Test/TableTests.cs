@@ -8,7 +8,7 @@ namespace Silex.Test;
 
 public class TableTests
 {
-    [Fact]
+    [Test]
     public async Task ShouldCreateTable()
     {
         var tempFilename = Path.GetRandomFileName();
@@ -30,7 +30,7 @@ public class TableTests
         File.Delete(tempFilename);
     }
 
-    [Fact]
+    [Test]
     public async Task ShouldLoadExistingTable()
     {
         var tempFilename = Path.GetRandomFileName();
@@ -56,12 +56,12 @@ public class TableTests
         File.Delete(tempFilename);
     }
 
-    [Theory]
-    [InlineData(1)]
-    [InlineData(10)]
-    [InlineData(39)]
-    [InlineData(100)]
-    [InlineData(1000)]
+    [Test]
+    [Arguments(1)]
+    [Arguments(10)]
+    [Arguments(39)]
+    [Arguments(100)]
+    [Arguments(1000)]
     public async Task ShouldIterateAllEntries(int count)
     {
         var tempFilename = Path.GetRandomFileName();
@@ -91,7 +91,7 @@ public class TableTests
         File.Delete(tempFilename);
     }
 
-    [Fact]
+    [Test]
     public async Task ShouldIterateFromKey()
     {
         var tempFilename = Path.GetRandomFileName();
@@ -122,7 +122,7 @@ public class TableTests
         File.Delete(tempFilename);
     }
 
-    [Fact]
+    [Test]
     public async Task ShouldIterateFromUnknownKey()
     {
         var tempFilename = Path.GetRandomFileName();
@@ -153,7 +153,7 @@ public class TableTests
         File.Delete(tempFilename);
     }
 
-    [Fact]
+    [Test]
     public async Task ShouldIterateFromKeyBeforeFirst()
     {
         var tempFilename = Path.GetRandomFileName();
@@ -183,7 +183,7 @@ public class TableTests
         File.Delete(tempFilename);
     }
 
-    [Fact]
+    [Test]
     public async Task ShouldCacheBlocks()
     {
         var tempFilename = Path.GetRandomFileName();
@@ -208,7 +208,7 @@ public class TableTests
         File.Delete(tempFilename);
     }
 
-    [Fact]
+    [Test]
     public async Task ShouldCacheBlocksConcurrently()
     {
         var tempFilename = Path.GetRandomFileName();
@@ -246,7 +246,7 @@ public class TableTests
         File.Delete(tempFilename);
     }
 
-    [Fact]
+    [Test]
     public async Task ShouldLoadBloomFilter()
     {
         var entries = Enumerable.Range(0, 100).Select(x => new KeyValuePair<int, int>(x, x)).ToList();

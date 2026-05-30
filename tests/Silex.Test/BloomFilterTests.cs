@@ -5,12 +5,12 @@ namespace Silex.Test;
 
 public class BloomFilterTests
 {
-    [Theory]
-    [InlineData(1_000, 0.01)]
-    [InlineData(1_000, 0.05)]
-    [InlineData(1_000, 0.10)]
-    [InlineData(10_000, 0.01)]
-    [InlineData(10_000, 0.10)]
+    [Test]
+    [Arguments(1_000, 0.01)]
+    [Arguments(1_000, 0.05)]
+    [Arguments(1_000, 0.10)]
+    [Arguments(10_000, 0.01)]
+    [Arguments(10_000, 0.10)]
     public void ShouldApproximateProbability(int n, double p)
     {
         // n: distinct values
@@ -74,7 +74,7 @@ public class BloomFilterTests
         Assert.True((fpRate - p) / p < 0.20);
     }
 
-    [Fact]
+    [Test]
     public void BloomFilterShouldNotReturnFalsePositive()
     {
         Span<byte> buffer = stackalloc byte[sizeof(int) / sizeof(byte)];

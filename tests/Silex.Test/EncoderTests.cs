@@ -5,15 +5,15 @@ using Silex.Serialization;
 
 public class EncoderTests
 {
-    [Theory]
-    [InlineData(0)]
-    [InlineData(1)]
-    [InlineData(64)]
-    [InlineData(UTF8StringEncoder.StackAllocThreshold - 1)]
-    [InlineData(UTF8StringEncoder.StackAllocThreshold)]
-    [InlineData(UTF8StringEncoder.StackAllocThreshold + 1)]
-    [InlineData(500)]
-    [InlineData(64000)]
+    [Test]
+    [Arguments(0)]
+    [Arguments(1)]
+    [Arguments(64)]
+    [Arguments(UTF8StringEncoder.StackAllocThreshold - 1)]
+    [Arguments(UTF8StringEncoder.StackAllocThreshold)]
+    [Arguments(UTF8StringEncoder.StackAllocThreshold + 1)]
+    [Arguments(500)]
+    [Arguments(64000)]
     public void UTF8StringEncoderShouldEncodeAsciiStrings(int length)
     {
         var array = Random.Shared.GetItems<char>("abcdefghijklmnopqrstuvw", length);
@@ -35,15 +35,15 @@ public class EncoderTests
         Assert.Equal(value, decoded);
     }
 
-    [Theory]
-    [InlineData(0)]
-    [InlineData(1)]
-    [InlineData(64)]
-    [InlineData(UTF8StringEncoder.StackAllocThreshold - 1)]
-    [InlineData(UTF8StringEncoder.StackAllocThreshold)]
-    [InlineData(UTF8StringEncoder.StackAllocThreshold + 1)]
-    [InlineData(500)]
-    [InlineData(64000)]
+    [Test]
+    [Arguments(0)]
+    [Arguments(1)]
+    [Arguments(64)]
+    [Arguments(UTF8StringEncoder.StackAllocThreshold - 1)]
+    [Arguments(UTF8StringEncoder.StackAllocThreshold)]
+    [Arguments(UTF8StringEncoder.StackAllocThreshold + 1)]
+    [Arguments(500)]
+    [Arguments(64000)]
     public void UTF8StringEncoderShouldEncodeNonAsciiStrings(int length)
     {
         var array = Random.Shared.GetItems<char>("ちこそしいはきくにまのりもみらせたすとかなひてさんつ", length);
@@ -68,7 +68,7 @@ public class EncoderTests
         Assert.Equal(value, decoded);
     }
 
-    [Fact]
+    [Test]
     public void ByteArrayEncoderEqualityComparerShouldUseContent()
     {
         IEqualityComparer<byte[]> comparer = ((IBinaryEncoder<byte[]>)new ByteArrayEncoder()).EqualityComparer;

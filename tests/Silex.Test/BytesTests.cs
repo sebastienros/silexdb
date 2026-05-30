@@ -1,7 +1,7 @@
 ﻿namespace Silex.Test;
 public class BytesTests
 {
-    [Fact]
+    [Test]
     public void BytesShouldConvertData()
     {
         byte byteValue = byte.MaxValue;
@@ -35,7 +35,7 @@ public class BytesTests
         Assert.Equal(byteArrayValue.Length, byteArrayBytes.Length);
     }
 
-    [Fact]
+    [Test]
     public void BytesShouldCopyMemory()
     {
         byte[] array = [1, 2, 3];
@@ -55,7 +55,7 @@ public class BytesTests
         Assert.NotEqual(bytes2, array);
     }
 
-    [Fact]
+    [Test]
     public void BytesShouldBeComparable()
     {
         byte[] array123 = [1, 2, 3];
@@ -89,7 +89,7 @@ public class BytesTests
         Assert.True(bytesArray124 > bytesArray0123);
     }
 
-    [Fact]
+    [Test]
     public void BytesShouldRespectSourceLength()
     {
         for (var i = 0; i < 1000000; i++)

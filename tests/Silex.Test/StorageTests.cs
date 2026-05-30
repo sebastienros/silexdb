@@ -1,7 +1,6 @@
 using System.Buffers.Binary;
 using System.Globalization;
 using Silex.BloomFilters;
-using Xunit.Abstractions;
 
 namespace Silex.Test;
 
@@ -10,14 +9,9 @@ public class StorageTests
     // These in-memory unit tests construct LsmStorageInner directly against the shared system temp
     // folder, so the write-ahead log is disabled to avoid littering it (and the per-append flush).
     private readonly StorageOptions _defaultStorageOptions = new() { UseWriteAheadLog = false };
-    private readonly ITestOutputHelper? _output;
+    private readonly TextWriter? _output = null;
 
-    public StorageTests(ITestOutputHelper _)
-    {
-        _output = null;
-    }
-
-    [Fact]
+    [Test]
     public async Task CanPutArray()
     {
         using var storage = new LsmStorageInner<byte[], byte[]>(Path.GetTempPath(), _defaultStorageOptions);
@@ -32,7 +26,7 @@ public class StorageTests
         Assert.Equal(10, storage._state.CurrentMemTable.Size);
     }
 
-    [Fact]
+    [Test]
     public async Task GetReturnsZeroCopyBorrowFromMemTable()
     {
         // Zero-copy is a core principle: a value served from a memtable is the same instance that was
@@ -52,7 +46,7 @@ public class StorageTests
         Assert.Same(value, scanned.Value);
     }
 
-    [Fact]
+    [Test]
     public async Task PutValueIsCopied()
     {
         using var storage = new LsmStorageInner<byte[], byte[]>(Path.GetTempPath(), _defaultStorageOptions);
@@ -72,7 +66,7 @@ public class StorageTests
         Assert.Equal(16, storage._state.CurrentMemTable.Size);
     }
 
-    [Fact]
+    [Test]
     public async Task DeleteShouldStoreTombStone()
     {
         using var storage = new LsmStorageInner<byte[], byte[]>(Path.GetTempPath(), _defaultStorageOptions);
@@ -86,11 +80,11 @@ public class StorageTests
         Assert.Equal(7, storage._state.CurrentMemTable.Size);
     }
 
-    [Theory]
-    [InlineData(1, 1, 0)]
-    [InlineData(7, 10, 1)]
-    [InlineData(100, 100, 100)]
-    [InlineData(10, 500, 83)]
+    [Test]
+    [Arguments(1, 1, 0)]
+    [Arguments(7, 10, 1)]
+    [Arguments(100, 100, 100)]
+    [Arguments(10, 500, 83)]
     public void ShouldFreezeMemTablesWhenSizeIsOverLimit(int valueSize, int entries, int expectedImmutableTables)
     {
         var memTableSizeLimit = 100;
@@ -110,7 +104,7 @@ public class StorageTests
         Assert.Equal(expectedImmutableTables, storage._state.ImmutableMemTables.Count());
     }
 
-    [Fact]
+    [Test]
     public async Task GetFromImmutableMemTables()
     {
         var memTableSizeLimit = 100;
@@ -141,7 +135,7 @@ public class StorageTests
         }            
     }
 
-    [Fact]
+    [Test]
     public async Task DeletedEntriesShouldAppearAfterPuts ()
     {
         using var storage = FillImmutableMemTables();
@@ -157,7 +151,7 @@ public class StorageTests
         Assert.Equal(0, result?.Length);
     }
 
-    [Fact]
+    [Test]
     public void ScanListsAllMemTables()
     {
         using var storage = new LsmStorageInner<char, byte[]>(Path.GetTempPath(), new StorageOptions { UseWriteAheadLog = false });
@@ -191,11 +185,11 @@ public class StorageTests
         Assert.Equal((Bytes)'e', list[3].Key);
     }
 
-    [Theory]
-    [InlineData(1)]
-    [InlineData(2)]
-    [InlineData(5)]
-    [InlineData(10)]
+    [Test]
+    [Arguments(1)]
+    [Arguments(2)]
+    [Arguments(5)]
+    [Arguments(10)]
     public async Task ShouldHandleConcurrentClients(int levelOfConcurrency)
     {
         var maxKeysValue = 50; // Limit the number of unique ids to generate collisions
@@ -272,11 +266,11 @@ public class StorageTests
         }
     }
 
-    [Theory]
-    [InlineData(null)]
-    [InlineData(0)]
-    [InlineData(1)]
-    [InlineData(5)]
+    [Test]
+    [Arguments(null)]
+    [Arguments(0)]
+    [Arguments(1)]
+    [Arguments(5)]
     public void ScanWithBoundsShouldFilterResults(int? lowerBound)
     {
         var count = 10;
@@ -300,7 +294,7 @@ public class StorageTests
         Assert.Equal(expectedKeys, actualKeys);
     }
 
-    [Fact]
+    [Test]
     public async Task OpenAsyncShouldCreateFolder()
     {
         var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
@@ -313,7 +307,7 @@ public class StorageTests
         Directory.Delete(tempFolder, true);
     }
 
-    [Fact]
+    [Test]
     public async Task ForceFlushShouldNotFailWithNoImmutableMemTable()
     {
         var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
@@ -334,7 +328,7 @@ public class StorageTests
         Directory.Delete(tempFolder, true);
     }
 
-    [Fact]
+    [Test]
     public async Task ForceFlushShouldFlushMemTable()
     {
         var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
@@ -352,7 +346,7 @@ public class StorageTests
         Directory.Delete(tempFolder, true);
     }
 
-    [Fact]
+    [Test]
     public async Task GetShouldReadFromFlushedSsTable()
     {
         var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
@@ -388,7 +382,7 @@ public class StorageTests
         Directory.Delete(tempFolder, true);
     }
 
-    [Fact]
+    [Test]
     public async Task CompacterShouldCreateSst()
     {
         // When the number of mem tables is higher than MemTableMaxCount it should
@@ -420,7 +414,7 @@ public class StorageTests
         Directory.Delete(tempFolder, true);
     }
 
-    [Fact]
+    [Test]
     public async Task CloseAsyncShouldFlushToDisk()
     {
         var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
@@ -434,7 +428,7 @@ public class StorageTests
         Directory.Delete(tempFolder, true);
     }
 
-    [Fact]
+    [Test]
     public async Task CloseAsyncCanBeInvokedMultipleTimes()
     {
         var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
@@ -456,7 +450,7 @@ public class StorageTests
         Directory.Delete(tempFolder, true);
     }
 
-    [Fact]
+    [Test]
     public async Task FinalizerShouldNotFlushOrCrashWhenStorageIsNotClosed()
     {
         // A storage that is never closed must not flush to disk during finalization (no WAL exists,
@@ -484,7 +478,7 @@ public class StorageTests
         }
     }
 
-    [Fact]
+    [Test]
     public async Task GetShouldReturnMostRecentImmutableMemTableValue()
     {
         using var storage = new LsmStorageInner<int, int>(Path.GetTempPath(), new StorageOptions { UseWriteAheadLog = false });
@@ -500,7 +494,7 @@ public class StorageTests
         Assert.Equal(200, await storage.GetAsync(1));
     }
 
-    [Fact]
+    [Test]
     public void ScanShouldReturnMostRecentImmutableMemTableValue()
     {
         using var storage = new LsmStorageInner<int, int>(Path.GetTempPath(), new StorageOptions { UseWriteAheadLog = false });
@@ -517,7 +511,7 @@ public class StorageTests
         Assert.Equal(200, list[0].Value);
     }
 
-    [Fact]
+    [Test]
     public async Task GetShouldFindByteArrayKeyByContent()
     {
         using var storage = new LsmStorageInner<byte[], int>(Path.GetTempPath(), new StorageOptions { UseWriteAheadLog = false });
@@ -528,7 +522,7 @@ public class StorageTests
         Assert.Equal(42, await storage.GetAsync([1, 2, 3]));
     }
 
-    [Fact]
+    [Test]
     public async Task ReopenShouldPreserveLevelZeroRecency()
     {
         var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
@@ -555,7 +549,7 @@ public class StorageTests
         Directory.Delete(tempFolder, true);
     }
 
-    [Fact]
+    [Test]
     public async Task GetShouldReadBytesValueOfArbitraryLengthFromSsTable()
     {
         var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
@@ -578,7 +572,7 @@ public class StorageTests
         Directory.Delete(tempFolder, true);
     }
 
-    [Fact]
+    [Test]
     public async Task WriteAheadLogRecoversUnflushedEntriesAfterCrash()
     {
         var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
@@ -619,7 +613,7 @@ public class StorageTests
         }
     }
 
-    [Fact]
+    [Test]
     public async Task WriteAheadLogRecoveryRequiresTheWalFile()
     {
         // Sanity check that the recovery above is genuinely driven by the WAL: with the WAL removed
@@ -651,7 +645,7 @@ public class StorageTests
         }
     }
 
-    [Fact]
+    [Test]
     public async Task WriteAheadLogRecoveryToleratesTornTrailingRecord()
     {
         var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
@@ -686,7 +680,7 @@ public class StorageTests
         }
     }
 
-    [Fact]
+    [Test]
     public async Task RecoveryDeletesStaleWalWhenSstAlreadyExists()
     {
         var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
@@ -717,7 +711,7 @@ public class StorageTests
         Directory.Delete(tempFolder, true);
     }
 
-    [Fact]
+    [Test]
     public async Task TieredCompactionMergesAllTiersUnderSpaceAmplification()
     {
         // Three equally sized single-entry tiers hit the space-amplification trigger (sum of the newer
@@ -750,7 +744,7 @@ public class StorageTests
         }
     }
 
-    [Fact]
+    [Test]
     public async Task TieredCompactionDropsTombstonesOnFullCompaction()
     {
         // A full compaction (the oldest tier participates) may drop tombstones. The delete of key 1 in a
@@ -780,7 +774,7 @@ public class StorageTests
         }
     }
 
-    [Fact]
+    [Test]
     public async Task TieredCompactionPartialMergeKeepsTombstones()
     {
         // A large oldest tier plus several tiny newest tiers avoids the space-amplification trigger and
@@ -824,7 +818,7 @@ public class StorageTests
         }
     }
 
-    [Fact]
+    [Test]
     public async Task TieredCompactionBelowThresholdIsNoOp()
     {
         // With fewer tiers than MaxCompactionTiers there is nothing to do: the call is a no-op.
@@ -851,7 +845,7 @@ public class StorageTests
         }
     }
 
-    [Fact]
+    [Test]
     public async Task TieredCompactionDisabledByStrategyIsNoOp()
     {
         var tempFolder = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
@@ -875,7 +869,7 @@ public class StorageTests
         }
     }
 
-    [Fact]
+    [Test]
     public async Task TieredCompactionRecencySurvivesReopen()
     {
         // After a full compaction the merged output gets the highest id, so reopen-by-id still resolves
@@ -903,7 +897,7 @@ public class StorageTests
         Directory.Delete(tempFolder, true);
     }
 
-    [Fact]
+    [Test]
     public async Task GetContinuesToOlderSsTableOnBloomFalsePositive()
     {
         // A newer SST whose key range straddles the target key but does not contain it must not mask an
@@ -961,7 +955,7 @@ public class StorageTests
         public Span<byte> GetBytes() => inner.GetBytes();
     }
 
-    [Fact]
+    [Test]
     public async Task ConcurrentFlushAndScanNeverMissesCommittedData()
     {
         // Regression guard for the flush/scan race: while an immutable MemTable is mid-flush (dequeued from
@@ -1022,7 +1016,7 @@ public class StorageTests
         await storage.ForceFlushNextImmutableMemTableAsync();
     }
 
-    [Fact]
+    [Test]
     public async Task FullScanIncludesFlushedSsTableData()
     {
         // Data flushed to L0 SSTs (with nothing left in the MemTables) must still appear in a full scan.
@@ -1049,7 +1043,7 @@ public class StorageTests
         }
     }
 
-    [Fact]
+    [Test]
     public async Task ScanReturnsNewestValueAcrossMemTableAndSsTable()
     {
         // A key written to an SST and later overwritten in the current MemTable must scan as the newer value.
@@ -1078,7 +1072,7 @@ public class StorageTests
         }
     }
 
-    [Fact]
+    [Test]
     public async Task ScanHidesKeysDeletedAfterFlush()
     {
         // A key present in an SST but deleted afterwards (tombstone in the MemTable) must be absent from scans.
@@ -1106,7 +1100,7 @@ public class StorageTests
         }
     }
 
-    [Fact]
+    [Test]
     public async Task RangeScanIncludesSsTableData()
     {
         // A bounded scan (keys >= from) must include matching entries that live only in SSTs.
@@ -1134,7 +1128,7 @@ public class StorageTests
         }
     }
 
-    [Fact]
+    [Test]
     public async Task ScanAfterReopenIncludesSsTableData()
     {
         // After reopening, all live data is in SSTs (MemTables are empty), so the scan exercises the SST path.
@@ -1170,7 +1164,7 @@ public class StorageTests
     }
 
 
-    [Fact]
+    [Test]
     public async Task GetReturnsDefaultForSentinelTombstoneStoredInSsTable()
     {
         // Sentinel-based encoders (here int) persist a deletion as a fixed non-empty value. Reading that
@@ -1195,7 +1189,7 @@ public class StorageTests
         }
     }
 
-    [Fact]
+    [Test]
     public async Task LeveledCompactionFlushesL0IntoL1()
     {
         // Once Level0CompactionThreshold L0 SSTs accumulate, leveled compaction merges them all into a
@@ -1241,7 +1235,7 @@ public class StorageTests
         }
     }
 
-    [Fact]
+    [Test]
     public async Task LeveledCompactionPushesOverSizedLevelDown()
     {
         // With a tiny base target every level is over budget, so after L0 flushes into L1 a second
@@ -1281,7 +1275,7 @@ public class StorageTests
         }
     }
 
-    [Fact]
+    [Test]
     public async Task LeveledCompactionDropsTombstonesAtBottomLevel()
     {
         // When the destination is the last non-empty level, a delete may be discarded entirely because no
@@ -1321,7 +1315,7 @@ public class StorageTests
         }
     }
 
-    [Fact]
+    [Test]
     public async Task LeveledCompactionKeepsTombstoneWhenLowerLevelHoldsKey()
     {
         // A tombstone must be preserved when a deeper level still holds the key it shadows, otherwise the
@@ -1362,7 +1356,7 @@ public class StorageTests
         }
     }
 
-    [Fact]
+    [Test]
     public async Task LeveledReopenRestoresLevelsViaManifest()
     {
         // The manifest persists the L0/level structure so a reopen restores the exact levels (and recency)
@@ -1417,7 +1411,7 @@ public class StorageTests
         }
     }
 
-    [Fact]
+    [Test]
     public async Task LeveledReopenDeletesOrphanSstNotInManifest()
     {
         // An SST left behind by a flush/compaction that crashed before the manifest commit is not
@@ -1463,7 +1457,7 @@ public class StorageTests
         }
     }
 
-    [Fact]
+    [Test]
     public async Task LeveledCompactionSplitsOutputIntoMultipleSsTables()
     {
         // With a small per-SST target, a level holds several size-bounded, non-overlapping runs instead of
@@ -1515,7 +1509,7 @@ public class StorageTests
         }
     }
 
-    [Fact]
+    [Test]
     public async Task LeveledCompactionRewritesOnlyOverlappingTargetSsTables()
     {
         // Partial selection: an L0 batch that overlaps only the low key range rewrites just the overlapping
@@ -1582,7 +1576,7 @@ public class StorageTests
         }
     }
 
-    [Fact]
+    [Test]
     public async Task LeveledReopenRestoresSplitLevelsViaManifest()
     {
         // A reopen restores a level made of multiple split SSTs from the manifest, with all data intact.
@@ -1634,7 +1628,7 @@ public class StorageTests
         }
     }
 
-    [Fact]
+    [Test]
     public async Task ParallelSubcompactionProducesCompleteSortedData()
     {
         // With parallelism enabled and an input large enough to split across several key-range partitions,
@@ -1683,7 +1677,7 @@ public class StorageTests
         }
     }
 
-    [Fact]
+    [Test]
     public async Task SequentialAndParallelCompactionProduceSameData()
     {
         // DOP=1 and DOP>1 must yield identical logical contents (same keys/values on a full scan).
@@ -1728,7 +1722,7 @@ public class StorageTests
         Assert.Equal(Enumerable.Range(1, 600), parallel.Select(e => e.Key));
     }
 
-    [Fact]
+    [Test]
     public async Task ParallelL0ProbeReturnsNewestValueAndHandlesTombstones()
     {
         // With read parallelism on and enough accumulated L0 tables to cross the probe threshold, point reads
@@ -1781,7 +1775,7 @@ public class StorageTests
         }
     }
 
-    [Fact]
+    [Test]
     public async Task ParallelReopenRestoresData()
     {
         // OpenAsync loads SSTs in parallel when read parallelism is enabled; a reopen must restore all data.
