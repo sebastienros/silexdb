@@ -78,6 +78,11 @@ public class LsmStorage<TKey, TValue> : IDisposable, IAsyncDisposable where TKey
     }
 
     /// <inheritdoc cref="LsmStorageInner.TryGet(TKey, out TValue)"/>
+    /// <remarks>
+    /// Zero-copy: the returned key/value is a read-only borrow of engine-owned memory. Do not mutate
+    /// or dispose it. If you need an independently owned, mutable copy, copy it yourself (for example
+    /// wrap it in a <see cref="Bytes"/>).
+    /// </remarks>
     public ValueTask<TValue> GetAsync(TKey key)
     {
         CheckDisposed();
@@ -86,6 +91,11 @@ public class LsmStorage<TKey, TValue> : IDisposable, IAsyncDisposable where TKey
     }
 
     /// <inheritdoc cref="LsmStorageInner.Put(TKey, TValue)"/>
+    /// <remarks>
+    /// Zero-copy: ownership of <paramref name="key"/> and <paramref name="value"/> transfers to the
+    /// engine. Do not mutate or release them (for example return a pooled buffer) after this call; the
+    /// engine keeps and reads them until the owning memtable is flushed and disposed.
+    /// </remarks>
     public void Put(TKey key, TValue value)
     {
         CheckDisposed();

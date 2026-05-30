@@ -150,24 +150,30 @@ not in the individual collections.
   participate in range scans (today iteration covers MemTables only).
 
 ### Serialization / value-ownership semantics
-- **Done — copy-in / copy-out.** `IBinaryEncoder<T>` now has a `Copy(T)` method (default identity,
-  zero-overhead for value/immutable types; overridden by `ByteArrayEncoder` and `BytesEncoder` to
-  return an independent copy of non-empty values). `MemTable.Put` copies the value in (and copies the
-  key on insert, keeping the already-stored key on overwrite via the dictionary indexer), so the
-  engine never aliases caller-owned memory — a caller may mutate or release a pooled buffer after
-  `Put`. Reads copy out: `GetAsync` and the scan iterator return copies of memtable-owned keys/values
-  (the on-disk L0 path already returns fresh `Decode` results), so callers cannot corrupt engine
-  memory through a returned value. Empty/tombstone values are returned as-is, preserving tombstone
-  identity. `Delete` still surfaces the tombstone (empty) value through `GetAsync`, as before.
-- **Deferred — returning copies to the pool.** Engine-owned `byte[]`/`Bytes` copies are GC-reclaimed
-  rather than returned to the `ArrayPool` (a pooling-efficiency loss, not a correctness issue:
-  `MemoryOwner<byte>` has no finalizer). Activating disposal (e.g. `Bytes : IDisposable` + disposing
-  on flush/overwrite) is unsafe today because `ForceFlushNextImmutableMemTableAsync` disposes a
-  memtable outside `_immutableMemTablesLock` while a snapshot reader may still be reading it — a
-  use-after-free. This needs reference-counted memtables (release on flush + reader drop) first.
-- Still open: a block-builder-level copy so values are serialized into the SST buffer at `Add` time
-  rather than holding the `TValue` reference until `BuildBlock` (see the skipped
-  `EntryBuffersShouldBeCopied` test). Independent of the MemTable copy-in above.
+- **Decision: zero-copy is a core principle.** The engine deliberately does **not** defensively copy
+  keys/values on `Put` or `Get`/scan — no per-operation allocations. Instead correctness is governed
+  by an **ownership-transfer / borrow contract**:
+  - `Put(key, value)` *transfers ownership* of `key`/`value` to the engine. The caller must not
+    mutate or release (e.g. return a pooled buffer) the memory afterwards. The engine owns it for the
+    lifetime of the memtable.
+  - `GetAsync`/scan return a *read-only borrow* of engine-owned memory. The caller must treat the
+    result as immutable and must not dispose it.
+  - This is exactly the single-owner, pooled model that `Bytes`/`MemoryOwner<byte>` already encode; a
+    caller that needs an independent, safely-mutable copy wraps the data in `Bytes` (whose constructor
+    copies once) before handing it over.
+  - The only copy that is actually required — making the on-disk SST independent of memtable memory —
+    happens exactly once, at flush time, via the encoder's `Encode` into the SST buffer. Reads from an
+    SST likewise allocate once in `Decode`. There is no copy while data lives in a memtable.
+  - Rejected alternative: a defensive `IBinaryEncoder.Copy` with copy-in at `Put` and copy-out at
+    `Get`/scan. It made the engine safe against caller misuse but added an allocation on every write
+    and every read, which conflicts with the zero-allocation principle. Not adopted.
+- Open follow-up (separate from the contract above): a block-builder-level copy so values are
+  serialized into the SST buffer at `Add` time instead of holding the `TValue` reference until
+  `BuildBlock` (see the skipped `EntryBuffersShouldBeCopied` test).
+- Open follow-up: returning engine-owned pooled buffers to the `ArrayPool` on memtable dispose. This
+  needs reference-counted memtables first, because `ForceFlushNextImmutableMemTableAsync` disposes a
+  memtable outside `_immutableMemTablesLock` while a snapshot reader may still be borrowing it — naive
+  disposal would be a use-after-free.
 - Evaluate CBOR as a binary value format (independent of *when* the copy happens):
   https://cborbook.com/part_1/practical_introduction_to_cbor.html
 
@@ -235,8 +241,9 @@ write/space amplification and tombstone/ordering complexity. Speculative; defer 
 
 ## Suggested priority
 
-1. ~~Serialization / value copy-in semantics (correctness).~~ **Done** (copy-in/copy-out for
-   `byte[]`/`Bytes`; see *Serialization / value-ownership semantics*).
+1. ~~Serialization / value copy-in semantics.~~ **Decided: keep zero-copy** as a core principle —
+   ownership-transfer / borrow contract rather than defensive copies (see *Serialization /
+   value-ownership semantics*).
 2. WAL + manifest (durability & full recovery).
 3. Compaction + leveling, then parallelism.
 4. Finer sparse index.

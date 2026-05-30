@@ -30,6 +30,26 @@ public class StorageTests
     }
 
     [Fact]
+    public async Task GetReturnsZeroCopyBorrowFromMemTable()
+    {
+        // Zero-copy is a core principle: a value served from a memtable is the same instance that was
+        // put (a read-only borrow), not a defensive copy. This locks in that contract.
+        using var storage = new LsmStorageInner<byte[], byte[]>(Path.GetTempPath(), _defaultStorageOptions);
+
+        byte[] key = [1, 2, 3];
+        byte[] value = [4, 5, 6];
+
+        storage.Put(key, value);
+
+        var result = await storage.GetAsync(key);
+        Assert.Same(value, result);
+
+        var scanned = storage.CreateIterator().EnumerateAsync().ToBlockingEnumerable().Single();
+        Assert.Same(key, scanned.Key);
+        Assert.Same(value, scanned.Value);
+    }
+
+    [Fact]
     public async Task PutValueIsCopied()
     {
         using var storage = new LsmStorageInner<byte[], byte[]>(Path.GetTempPath(), _defaultStorageOptions);
@@ -553,98 +573,6 @@ public class StorageTests
 
         await storage.CloseAsync();
         Directory.Delete(tempFolder, true);
-    }
-
-    [Fact]
-    public async Task PutShouldCopyInValueSoCallerMutationDoesNotAffectStore()
-    {
-        using var storage = new LsmStorageInner<byte[], byte[]>(Path.GetTempPath(), _defaultStorageOptions);
-
-        byte[] key = [1, 2, 3];
-        byte[] value = [4, 5, 6];
-
-        storage.Put(key, value);
-
-        // Mutating the caller's array after Put must not change what the store holds.
-        value[0] = 99;
-
-        var result = await storage.GetAsync(key);
-        Assert.Equal(new byte[] { 4, 5, 6 }, result);
-    }
-
-    [Fact]
-    public async Task PutShouldCopyInKeySoCallerMutationDoesNotAffectLookup()
-    {
-        using var storage = new LsmStorageInner<byte[], byte[]>(Path.GetTempPath(), _defaultStorageOptions);
-
-        byte[] key = [1, 2, 3];
-        byte[] value = [4, 5, 6];
-
-        storage.Put(key, value);
-
-        // Mutating the caller's key array after Put must not move the stored entry.
-        key[0] = 99;
-
-        // The original content still resolves to the stored value.
-        var byOriginal = await storage.GetAsync([1, 2, 3]);
-        Assert.Equal(value, byOriginal);
-
-        // The mutated content does not collide with the stored entry.
-        var byMutated = await storage.GetAsync([99, 2, 3]);
-        Assert.Null(byMutated);
-    }
-
-    [Fact]
-    public async Task GetShouldCopyOutValueSoCallerMutationDoesNotAffectStore()
-    {
-        using var storage = new LsmStorageInner<byte[], byte[]>(Path.GetTempPath(), _defaultStorageOptions);
-
-        byte[] key = [1, 2, 3];
-        storage.Put(key, [4, 5, 6]);
-
-        var first = await storage.GetAsync(key);
-        Assert.Equal(new byte[] { 4, 5, 6 }, first);
-
-        // Mutating the returned array must not corrupt the engine-owned stored value.
-        first![0] = 99;
-
-        var second = await storage.GetAsync(key);
-        Assert.Equal(new byte[] { 4, 5, 6 }, second);
-    }
-
-    [Fact]
-    public async Task ScanShouldCopyOutEntriesSoCallerMutationDoesNotAffectStore()
-    {
-        using var storage = new LsmStorageInner<byte[], byte[]>(Path.GetTempPath(), _defaultStorageOptions);
-
-        byte[] key = [1, 2, 3];
-        storage.Put(key, [4, 5, 6]);
-
-        var iterator = storage.CreateIterator();
-        var first = iterator.EnumerateAsync().ToBlockingEnumerable().Single();
-
-        // Mutate both the returned key and value.
-        first.Key[0] = 99;
-        first.Value[0] = 99;
-
-        // The stored entry is untouched: still reachable by its original key with its original value.
-        var stored = await storage.GetAsync([1, 2, 3]);
-        Assert.Equal(new byte[] { 4, 5, 6 }, stored);
-    }
-
-    [Fact]
-    public async Task PutShouldCopyInBytesValueEvenWhenCallerDisposesPooledBuffer()
-    {
-        using var storage = new LsmStorageInner<int, Bytes>(Path.GetTempPath(), _defaultStorageOptions);
-
-        var value = new Bytes(new byte[] { 4, 5, 6 });
-        storage.Put(1, value);
-
-        // The caller releases its pooled buffer back to the pool; the store must hold its own copy.
-        value.Dispose();
-
-        var result = await storage.GetAsync(1);
-        Assert.Equal(new byte[] { 4, 5, 6 }, result.Span.ToArray());
     }
 
     private static LsmStorageInner<int, byte[]> FillImmutableMemTables(int entries = 100, int valueSize = 10, long memTableSizeLimit = 100)

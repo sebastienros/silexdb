@@ -17,10 +17,6 @@ public sealed class BytesEncoder : IBinaryEncoder<Bytes>
 
     public bool IsTombstoneValue(Bytes value) => value == Bytes.Empty;
 
-    // Empty values (which include the tombstone) collapse to the canonical empty Bytes; non-empty
-    // values are copied into a fresh pooled buffer so the engine never aliases caller-owned memory.
-    public Bytes Copy(Bytes value) => value.IsEmpty ? Bytes.Empty : new Bytes(value.Span);
-
     public int Encode(Bytes value, ref EncoderBinaryWriter writer)
     {
         writer.WriteRaw(value.Span);

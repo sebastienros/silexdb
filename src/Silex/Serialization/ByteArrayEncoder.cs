@@ -21,11 +21,6 @@ public sealed class ByteArrayEncoder : IBinaryEncoder<byte[]>
 
     public bool IsTombstoneValue(byte[] value) => value == Array.Empty<byte>();
 
-    // Empty arrays (including the tombstone Array.Empty<byte>()) are returned as-is to preserve the
-    // tombstone reference identity used by IsTombstoneValue and to avoid a pointless allocation.
-    // Non-empty arrays are cloned so the engine never aliases caller-owned memory.
-    public byte[] Copy(byte[] value) => value.Length == 0 ? value : (byte[])value.Clone();
-
     public int Encode(byte[] value, ref EncoderBinaryWriter writer)
     {
         writer.WriteRaw(value.AsSpan());
