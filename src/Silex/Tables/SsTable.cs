@@ -57,14 +57,7 @@ public class SsTable<TKey, TValue> : IDisposable
 
     public async Task<Block<TKey, TValue>?> ReadBlockAsync(int index, CancellationToken cancellationToken = default)
     {
-        var offset = BlockMetadata[index].Offset;
-        
-        // If there is a single block it ends at the metadata block
-        var offsetEnd = BlockMetadata.Count > index + 1
-            ? BlockMetadata[index + 1].Offset
-            : MetaBlockOffset;
-
-        var length = (int)(offsetEnd - offset);
+        var (offset, length) = GetBlockExtent(index);
 
         // Read straight into the buffer that will back the decoded block, so the block bytes are never
         // copied a second time. The owner is handed to the block on success and disposed otherwise.
@@ -98,31 +91,79 @@ public class SsTable<TKey, TValue> : IDisposable
         }
     }
 
+    /// <summary>
+    /// Synchronous block read used by the cache-miss fast path. On Unix there is no kernel async I/O for
+    /// regular files, so <see cref="RandomAccess.ReadAsync"/> dispatches every read to the thread pool; a
+    /// synchronous positioned read instead runs the <c>pread</c> inline on the calling thread, removing the
+    /// per-miss thread-pool round-trip. The file is immutable once built, so positioned reads never race.
+    /// </summary>
+    public Block<TKey, TValue>? ReadBlock(int index)
+    {
+        var (offset, length) = GetBlockExtent(index);
+
+        var owner = MemoryPool<byte>.Shared.Rent(length);
+
+        try
+        {
+            var handle = _stream.SafeFileHandle;
+            var read = 0;
+            while (read < length)
+            {
+                var n = RandomAccess.Read(handle, owner.Memory.Span.Slice(read, length - read), offset + read);
+                if (n == 0)
+                {
+                    break;
+                }
+
+                read += n;
+            }
+
+            var block = _blockBuilder.Decode(owner, length);
+            owner = null;
+            return block;
+        }
+        finally
+        {
+            owner?.Dispose();
+        }
+    }
+
+    private (long Offset, int Length) GetBlockExtent(int index)
+    {
+        var offset = BlockMetadata[index].Offset;
+
+        // If there is a single block it ends at the metadata block
+        var offsetEnd = BlockMetadata.Count > index + 1
+            ? BlockMetadata[index + 1].Offset
+            : MetaBlockOffset;
+
+        return (offset, (int)(offsetEnd - offset));
+    }
+
     internal ValueTask<BlockLease<TKey, TValue>> ReadBlockCachedAsync(int index, BlockCache<TKey, TValue> blockCache, CancellationToken cancellationToken = default)
     {
         return blockCache.GetOrLoadAsync(
             new BlockCacheKey(_id, index),
-            new BlockLoader(this, index, cancellationToken));
+            new BlockLoader(this, index));
     }
 
     /// <summary>
     /// Struct loader passed to <see cref="BlockCache{TKey, TValue}.GetOrLoadAsync"/> so the cache can populate a
-    /// miss without allocating a closure on every read (including cache hits, which never invoke it).
+    /// miss without allocating a closure on every read (including cache hits, which never invoke it). The miss
+    /// reads the block synchronously on the calling thread to avoid a per-miss thread-pool dispatch.
     /// </summary>
     private readonly struct BlockLoader : IBlockLoader<TKey, TValue>
     {
         private readonly SsTable<TKey, TValue> _table;
         private readonly int _index;
-        private readonly CancellationToken _cancellationToken;
 
-        public BlockLoader(SsTable<TKey, TValue> table, int index, CancellationToken cancellationToken)
+        public BlockLoader(SsTable<TKey, TValue> table, int index)
         {
             _table = table;
             _index = index;
-            _cancellationToken = cancellationToken;
         }
 
-        public Task<Block<TKey, TValue>?> LoadAsync() => _table.ReadBlockAsync(_index, _cancellationToken);
+        public Task<Block<TKey, TValue>?> LoadAsync() => Task.FromResult(_table.ReadBlock(_index));
     }
 
     public static async Task<SsTable<TKey, TValue>> LoadSsTableAsync(string filename, ISsTableEncoder<TKey, TValue> tableEncoder, BlockBuilder<TKey, TValue> blockBuilder, IBloomFilterFactory bloomFilterFactory, long? id = null, CancellationToken cancellationToken = default)
