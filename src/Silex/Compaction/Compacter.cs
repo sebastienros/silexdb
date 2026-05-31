@@ -31,15 +31,17 @@ internal class Compacter<TKey, TValue> : IAsyncDisposable where TKey : notnull
         _flushTask = BackgroundFlushAsync(_flushTaskCts.Token);
     }
 
-    public async Task StopBackgroundFlushAsync()
+    public async Task StopBackgroundFlushAsync(CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+
         if (_flushTask is null || _flushTaskCts is null)
         {
             return;
         }
 
         _flushTaskCts.Cancel();
-        await _flushTask;
+        await _flushTask.WaitAsync(cancellationToken);
         _flushTaskCts.Dispose();
         _flushTask = null;
         _flushTaskCts = null;
@@ -76,9 +78,9 @@ internal class Compacter<TKey, TValue> : IAsyncDisposable where TKey : notnull
 
     }
 
-    public Task CloseAsync()
+    public Task CloseAsync(CancellationToken cancellationToken = default)
     {
-        return StopBackgroundFlushAsync();
+        return StopBackgroundFlushAsync(cancellationToken);
     }
 
     public async ValueTask DisposeAsync()

@@ -178,7 +178,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         
         try
         {
-            await _level0Lock.EnterReadLockAsync();
+            await _level0Lock.EnterReadLockAsync(cancellationToken);
 
             // Read the live L0 list while holding the read lock rather than from a snapshot taken
             // earlier: compaction disposes and deletes replaced SSTs under the write lock, so a table
@@ -476,7 +476,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
             return await ScanRawFallbackAsync(arg, reader, maxEntries, cancellationToken);
         }
 
-        await _level0Lock.EnterReadLockAsync();
+        await _level0Lock.EnterReadLockAsync(cancellationToken);
 
         try
         {
@@ -568,7 +568,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
 
         try
         {
-            await _level0Lock.EnterReadLockAsync();
+            await _level0Lock.EnterReadLockAsync(cancellationToken);
 
             try
             {
@@ -894,7 +894,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
 
         try
         {
-            await _level0Lock.EnterReadLockAsync();
+            await _level0Lock.EnterReadLockAsync(cancellationToken);
 
             var l0 = _state.LevelZeroTables;
 
@@ -1191,13 +1191,13 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
 
             var sstFilename = GetSstPath(memTableToFlush.Id);
             using var builder = _ssTableBuilderFactory.CreateSsTableBuilder(sstFilename, _ssTableEncoder, _blockEncoder, _bloomFilterFactory, memTableToFlush.Count);
-            await memTableToFlush.FlushAsync(builder);
+            await memTableToFlush.FlushAsync(builder, cancellationToken);
 
             var ssTable = await builder.BuildAsync(cancellationToken);
 
             Manifest manifest;
 
-            await _level0Lock.EnterWriteLockAsync();
+            await _level0Lock.EnterWriteLockAsync(cancellationToken);
 
             try
             {
@@ -1322,7 +1322,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
             List<SsTable<TKey, TValue>> tiers;
             bool hasLeveledData;
 
-            await _level0Lock.EnterReadLockAsync();
+            await _level0Lock.EnterReadLockAsync(cancellationToken);
 
             try
             {
@@ -1392,7 +1392,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
                         continue;
                     }
 
-                    await builder.AddAsync(entry.Key, entry.Value);
+                    await builder.AddAsync(entry.Key, entry.Value, cancellationToken);
                     addedEntries++;
                 }
 
@@ -1408,7 +1408,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
             var installed = false;
             Manifest? manifest = null;
 
-            await _level0Lock.EnterWriteLockAsync();
+            await _level0Lock.EnterWriteLockAsync(cancellationToken);
 
             try
             {
@@ -1515,7 +1515,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
             List<SsTable<TKey, TValue>> level0;
             List<List<SsTable<TKey, TValue>>> levels;
 
-            await _level0Lock.EnterReadLockAsync();
+            await _level0Lock.EnterReadLockAsync(cancellationToken);
 
             try
             {
@@ -1727,7 +1727,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         // references observes consistent collections.
         Manifest manifest;
 
-        await _level0Lock.EnterWriteLockAsync();
+        await _level0Lock.EnterWriteLockAsync(cancellationToken);
 
         try
         {
@@ -1937,7 +1937,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
                     builder = _ssTableBuilderFactory.CreateSsTableBuilder(builderPath, tableEncoder, blockEncoder, _bloomFilterFactory, estimatedCount);
                 }
 
-                await builder.AddAsync(entry.Key, entry.Value);
+                await builder.AddAsync(entry.Key, entry.Value, cancellationToken);
 
                 // Roll over to a new file once the current one reaches the target size. The split happens at
                 // a key boundary, so the outputs stay non-overlapping.
@@ -2314,7 +2314,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
             // Hold the level0 read lock for the whole scan: it freezes the L0 tier list (no flush append or
             // compaction swap) and, because flush only disposes a flushed immutable MemTable after its own
             // level0 write-lock section, it also keeps the immutable MemTables we iterate alive throughout.
-            await _storage._level0Lock.EnterReadLockAsync();
+            await _storage._level0Lock.EnterReadLockAsync(cancellationToken);
 
             try
             {

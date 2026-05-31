@@ -6,15 +6,16 @@ internal sealed class WorkDispatcher<TKey, TValue> where TKey : notnull
 {
     private readonly ConcurrentDictionary<TKey, Task<TValue?>> _workers = new();
 
-    public async Task<TValue?> ScheduleAsync(TKey key, Func<TKey, Task<TValue?>> valueFactory)
+    public async Task<TValue?> ScheduleAsync(TKey key, Func<TKey, Task<TValue?>> valueFactory, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(key);
+        cancellationToken.ThrowIfCancellationRequested();
 
         while (true)
         {
             if (_workers.TryGetValue(key, out var task))
             {
-                return await task;
+                return await task.WaitAsync(cancellationToken);
             }
 
             // This is the task that we'll return to all waiters. We'll complete it when the factory is complete
@@ -26,7 +27,7 @@ internal sealed class WorkDispatcher<TKey, TValue> where TKey : notnull
                 {
                     var value = await valueFactory(key);
                     tcs.TrySetResult(value);
-                    return await tcs.Task;
+                    return value;
                 }
                 catch (Exception ex)
                 {
@@ -45,15 +46,16 @@ internal sealed class WorkDispatcher<TKey, TValue> where TKey : notnull
         }
     }
 
-    public async Task<TValue?> ScheduleAsync<TState>(TKey key, TState state, Func<TKey, TState, Task<TValue?>> valueFactory)
+    public async Task<TValue?> ScheduleAsync<TState>(TKey key, TState state, Func<TKey, TState, Task<TValue?>> valueFactory, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(key);
+        cancellationToken.ThrowIfCancellationRequested();
 
         while (true)
         {
             if (_workers.TryGetValue(key, out var task))
             {
-                return await task;
+                return await task.WaitAsync(cancellationToken);
             }
 
             // This is the task that we'll return to all waiters. We'll complete it when the factory is complete
@@ -65,7 +67,7 @@ internal sealed class WorkDispatcher<TKey, TValue> where TKey : notnull
                 {
                     var value = await valueFactory(key, state);
                     tcs.TrySetResult(value);
-                    return await tcs.Task;
+                    return value;
                 }
                 catch (Exception ex)
                 {

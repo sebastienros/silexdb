@@ -32,5 +32,5 @@ public interface IMemTable<TKey, TValue> : IDisposable where TKey : notnull
     /// Adds all entries to an SST Builder.
     /// </summary>
     /// <param name="builder">The builder.</param>
-    Task FlushAsync(ISsTableBuilder<TKey, TValue> builder);
+    Task FlushAsync(ISsTableBuilder<TKey, TValue> builder, CancellationToken cancellationToken = default);
 }

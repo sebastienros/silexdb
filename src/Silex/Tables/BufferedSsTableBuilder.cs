@@ -60,8 +60,10 @@ internal sealed class BufferedSsTableBuilder<TKey, TValue> : ISsTableBuilder<TKe
         _stream = File.Create(_tempFilename, bufferSize, options);
     }
 
-    public async Task AddAsync(TKey key, TValue value)
+    public async Task AddAsync(TKey key, TValue value, CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+
         if (_isFirstKey)
         {
             _firstKey = key;
@@ -78,7 +80,7 @@ internal sealed class BufferedSsTableBuilder<TKey, TValue> : ISsTableBuilder<TKe
         }
 
         // No, then there was not enough space in the current block for the data, start a new one
-        await FinishBlockAsync();
+        await FinishBlockAsync(cancellationToken);
 
         if (!_blockBuilder.Add(key, value))
         {
@@ -95,7 +97,7 @@ internal sealed class BufferedSsTableBuilder<TKey, TValue> : ISsTableBuilder<TKe
 
     public long EstimatedSize => _offset;
 
-    private async Task FinishBlockAsync()
+    private async Task FinishBlockAsync(CancellationToken cancellationToken)
     {
         if (!_blockBuilder.HasEntries)
         {
@@ -124,7 +126,7 @@ internal sealed class BufferedSsTableBuilder<TKey, TValue> : ISsTableBuilder<TKe
         // flush to disk
         if (_bufferWriter.FreeCapacity < block.Memory.Span.Length && _bufferWriter.WrittenCount > 0)
         {
-            await FLushBufferToDiskAsync();
+            await FLushBufferToDiskAsync(cancellationToken);
         }
 
         // If the buffer is too small, it will grow automatically, and this new size will be kept
@@ -145,7 +147,7 @@ internal sealed class BufferedSsTableBuilder<TKey, TValue> : ISsTableBuilder<TKe
     /// </summary>
     public async Task<SsTable<TKey, TValue>> BuildAsync(CancellationToken cancellationToken = default)
     {
-        await FinishBlockAsync();
+        await FinishBlockAsync(cancellationToken);
 
         if (_metadata == null || _bufferWriter == null)
         {

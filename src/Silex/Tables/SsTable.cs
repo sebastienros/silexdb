@@ -144,7 +144,8 @@ public class SsTable<TKey, TValue> : IDisposable
     {
         return blockCache.GetOrLoadAsync(
             new BlockCacheKey(_id, index),
-            new BlockLoader(this, index));
+            new BlockLoader(this, index),
+            cancellationToken);
     }
 
     /// <summary>
@@ -163,7 +164,11 @@ public class SsTable<TKey, TValue> : IDisposable
             _index = index;
         }
 
-        public Task<Block<TKey, TValue>?> LoadAsync() => Task.FromResult(_table.ReadBlock(_index));
+        public Task<Block<TKey, TValue>?> LoadAsync(CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return Task.FromResult(_table.ReadBlock(_index));
+        }
     }
 
     public static async Task<SsTable<TKey, TValue>> LoadSsTableAsync(string filename, ISsTableEncoder<TKey, TValue> tableEncoder, BlockBuilder<TKey, TValue> blockBuilder, IBloomFilterFactory bloomFilterFactory, long? id = null, CancellationToken cancellationToken = default)

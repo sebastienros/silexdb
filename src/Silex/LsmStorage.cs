@@ -248,11 +248,11 @@ public class LsmStorage<TKey, TValue> : IDisposable, IAsyncDisposable where TKey
     /// or dispose it. If you need an independently owned, mutable copy, copy it yourself (for example
     /// wrap it in a <see cref="Bytes"/>).
     /// </remarks>
-    public ValueTask<TValue> GetAsync(TKey key)
+    public ValueTask<TValue> GetAsync(TKey key, CancellationToken cancellationToken = default)
     {
         CheckDisposed();
 
-        return _inner.GetAsync(key);
+        return _inner.GetAsync(key, cancellationToken);
     }
 
     /// <inheritdoc cref="LsmStorageInner{TKey, TValue}.TryGetRawAsync(TKey, IBufferWriter{byte}, CancellationToken)"/>
@@ -338,9 +338,19 @@ public class LsmStorage<TKey, TValue> : IDisposable, IAsyncDisposable where TKey
     /// <remarks>
     /// Equivalent to <see cref="DisposeAsync()"/>. Call one or the other.
     /// </remarks>
-    public async Task CloseAsync()
+    public async Task CloseAsync(CancellationToken cancellationToken = default)
     {
-        await DisposeAsync();
+        if (_disposed)
+        {
+            return;
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+
+        GC.SuppressFinalize(this);
+        await DisposeInternalAsync(cancellationToken);
+
+        _disposed = true;
     }
 
     /// <summary>
@@ -389,15 +399,17 @@ public class LsmStorage<TKey, TValue> : IDisposable, IAsyncDisposable where TKey
         _disposed = true;
     }
 
-    public async Task DisposeInternalAsync()
+    public async Task DisposeInternalAsync(CancellationToken cancellationToken = default)
     {
-        await _compacter.CloseAsync();
+        cancellationToken.ThrowIfCancellationRequested();
+
+        await _compacter.CloseAsync(cancellationToken);
 
         _inner.ForceFreezeMemTable();
 
         while (!_inner._state.ImmutableMemTables.IsEmpty)
         {
-            await _inner.ForceFlushNextImmutableMemTableAsync();
+            await _inner.ForceFlushNextImmutableMemTableAsync(cancellationToken);
         }
 
         // The current memtable is now empty; drop its write-ahead log so a clean shutdown leaves no

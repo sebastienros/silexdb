@@ -136,15 +136,16 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
         return new MemTableIterator(this);
     }
 
-    public async Task FlushAsync(ISsTableBuilder<TKey, TValue> builder)
+    public async Task FlushAsync(ISsTableBuilder<TKey, TValue> builder, CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         EnsureSortedMap();
 
         IDictionary<TKey, TValue> store = _dic != null ? _dic : _sorted;
 
         foreach (var entry in store)
         {
-            await builder.AddAsync(entry.Key, entry.Value);
+            await builder.AddAsync(entry.Key, entry.Value, cancellationToken);
         }
     }
 

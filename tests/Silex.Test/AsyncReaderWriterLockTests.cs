@@ -309,6 +309,48 @@ public class AsyncReaderWriterLockTests
     }
 
     [Test]
+    public async Task CanceledQueuedReadShouldNotBlockWriter()
+    {
+        var loq = new AsyncReaderWriterLock();
+
+        await loq.EnterWriteLockAsync().WaitAsync(_timeout);
+
+        using var cts = new CancellationTokenSource();
+        var read = loq.EnterReadLockAsync(cts.Token);
+        await Assert.That(read.IsCompleted).IsFalse();
+
+        cts.Cancel();
+        await Assert.That(read.IsCanceled).IsTrue();
+        await Assert.That(loq._state.Readers).IsEqualTo((uint)0);
+
+        loq.ExitWriteLock();
+
+        await loq.EnterWriteLockAsync().WaitAsync(_timeout);
+        loq.ExitWriteLock();
+    }
+
+    [Test]
+    public async Task CanceledQueuedWriteShouldNotBlockReader()
+    {
+        var loq = new AsyncReaderWriterLock();
+
+        await loq.EnterReadLockAsync().WaitAsync(_timeout);
+
+        using var cts = new CancellationTokenSource();
+        var write = loq.EnterWriteLockAsync(cts.Token);
+        await Assert.That(write.IsCompleted).IsFalse();
+
+        cts.Cancel();
+        await Assert.That(write.IsCanceled).IsTrue();
+        await Assert.That(loq._state.Writers).IsEqualTo((uint)0);
+
+        loq.ExitReadLock();
+
+        await loq.EnterReadLockAsync().WaitAsync(_timeout);
+        loq.ExitReadLock();
+    }
+
+    [Test]
     public async Task ExitReadLockThrowExceptionWhenUnexpected()
     {
         var loq = new AsyncReaderWriterLock();

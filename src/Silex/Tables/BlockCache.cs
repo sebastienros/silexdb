@@ -22,9 +22,11 @@ internal sealed class BlockCache<TKey, TValue> : IDisposable
         _sizeLimit = sizeLimit;
     }
 
-    public ValueTask<BlockLease<TKey, TValue>> GetOrLoadAsync<TLoader>(BlockCacheKey key, TLoader loader)
+    public ValueTask<BlockLease<TKey, TValue>> GetOrLoadAsync<TLoader>(BlockCacheKey key, TLoader loader, CancellationToken cancellationToken = default)
         where TLoader : struct, IBlockLoader<TKey, TValue>
     {
+        cancellationToken.ThrowIfCancellationRequested();
+
         lock (_gate)
         {
             ThrowIfDisposed();
@@ -35,12 +37,13 @@ internal sealed class BlockCache<TKey, TValue> : IDisposable
             }
         }
 
-        return new ValueTask<BlockLease<TKey, TValue>>(GetOrLoadSlowAsync(key, loader));
+        return new ValueTask<BlockLease<TKey, TValue>>(GetOrLoadSlowAsync(key, loader, cancellationToken));
     }
 
-    private async Task<BlockLease<TKey, TValue>> GetOrLoadSlowAsync<TLoader>(BlockCacheKey key, TLoader loader)
+    private async Task<BlockLease<TKey, TValue>> GetOrLoadSlowAsync<TLoader>(BlockCacheKey key, TLoader loader, CancellationToken cancellationToken)
         where TLoader : struct, IBlockLoader<TKey, TValue>
     {
+        cancellationToken.ThrowIfCancellationRequested();
         PendingLoad pendingLoad;
 
         lock (_gate)
@@ -56,7 +59,7 @@ internal sealed class BlockCache<TKey, TValue> : IDisposable
             {
                 pendingLoad = new PendingLoad { Waiters = 1 };
                 _loads.Add(key, pendingLoad);
-                pendingLoad.Task = LoadAndCacheAsync(key, loader, pendingLoad);
+                pendingLoad.Task = LoadAndCacheAsync(key, loader, pendingLoad, cancellationToken);
             }
             else
             {
@@ -69,7 +72,7 @@ internal sealed class BlockCache<TKey, TValue> : IDisposable
         return entry == null ? default : new BlockLease<TKey, TValue>(this, entry);
     }
 
-    private async Task<Entry?> LoadAndCacheAsync<TLoader>(BlockCacheKey key, TLoader loader, PendingLoad pendingLoad)
+    private async Task<Entry?> LoadAndCacheAsync<TLoader>(BlockCacheKey key, TLoader loader, PendingLoad pendingLoad, CancellationToken cancellationToken)
         where TLoader : struct, IBlockLoader<TKey, TValue>
     {
         Block<TKey, TValue>? block = null;
@@ -77,7 +80,7 @@ internal sealed class BlockCache<TKey, TValue> : IDisposable
 
         try
         {
-            block = await loader.LoadAsync().ConfigureAwait(false);
+            block = await loader.LoadAsync(cancellationToken).ConfigureAwait(false);
             if (block == null)
             {
                 return null;
@@ -287,7 +290,7 @@ internal readonly record struct BlockCacheKey(long TableId, int BlockIndex);
 /// </summary>
 internal interface IBlockLoader<TKey, TValue>
 {
-    Task<Block<TKey, TValue>?> LoadAsync();
+    Task<Block<TKey, TValue>?> LoadAsync(CancellationToken cancellationToken = default);
 }
 
 internal readonly struct BlockLease<TKey, TValue> : IDisposable

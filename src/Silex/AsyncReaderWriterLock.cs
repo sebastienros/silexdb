@@ -22,8 +22,13 @@ internal class AsyncReaderWriterLock
 
     public bool IsWriteLockHeld => _state.Writers != 0;
 
-    public Task EnterReadLockAsync()
+    public Task EnterReadLockAsync(CancellationToken cancellationToken = default)
     {
+        if (cancellationToken.IsCancellationRequested)
+        {
+            return Task.FromCanceled(cancellationToken);
+        }
+
         LockCompletionSource? ticket = null;
 
         // Loop until we have managed to update the state
@@ -60,7 +65,7 @@ internal class AsyncReaderWriterLock
                 // If the swap was successful, return the result
                 if (Interlocked.CompareExchange(ref _state, state, oldState) == oldState)
                 {
-                    return ticket.TaskCompletionSource.Task;
+                    return WaitForLockAsync(ticket, cancellationToken);
                 }
             }
         }
@@ -116,8 +121,13 @@ internal class AsyncReaderWriterLock
         }
     }
 
-    public Task EnterWriteLockAsync()
+    public Task EnterWriteLockAsync(CancellationToken cancellationToken = default)
     {
+        if (cancellationToken.IsCancellationRequested)
+        {
+            return Task.FromCanceled(cancellationToken);
+        }
+
         LockCompletionSource? ticket = null;
 
         // Loop until we have managed to update the state
@@ -149,7 +159,7 @@ internal class AsyncReaderWriterLock
                 // If the swap was successful, return the result
                 if (Interlocked.CompareExchange(ref _state, state, oldState) == oldState)
                 {
-                    return ticket.TaskCompletionSource.Task;
+                    return WaitForLockAsync(ticket, cancellationToken);
                 }
             }
         }
@@ -161,8 +171,13 @@ internal class AsyncReaderWriterLock
     /// code when no other clients are active.
     /// </summary>
     /// <returns><see langword="true"/> if the lock was acquired, <see langword="false"/> otherwise.</returns>
-    public ValueTask<bool> TryEnterWriteLockAsync()
+    public ValueTask<bool> TryEnterWriteLockAsync(CancellationToken cancellationToken = default)
     {
+        if (cancellationToken.IsCancellationRequested)
+        {
+            return new ValueTask<bool>(Task.FromCanceled<bool>(cancellationToken));
+        }
+
         // Make local copy of the state. Use the local copy since
         // another thread may have changed the value;
         var oldState = _state;
@@ -181,6 +196,81 @@ internal class AsyncReaderWriterLock
         }
 
         return ValueTask.FromResult(false);
+    }
+
+    private Task WaitForLockAsync(LockCompletionSource ticket, CancellationToken cancellationToken)
+    {
+        if (!cancellationToken.CanBeCanceled || ticket.TaskCompletionSource.Task.IsCompleted)
+        {
+            return ticket.TaskCompletionSource.Task;
+        }
+
+        return WaitForLockSlowAsync(ticket, cancellationToken);
+    }
+
+    private async Task WaitForLockSlowAsync(LockCompletionSource ticket, CancellationToken cancellationToken)
+    {
+        using var registration = cancellationToken.Register(static state =>
+        {
+            var context = (CancellationRegistrationContext)state!;
+            context.Owner.CancelQueuedLock(context.Ticket, context.CancellationToken);
+        }, new CancellationRegistrationContext(this, ticket, cancellationToken));
+
+        await ticket.TaskCompletionSource.Task.ConfigureAwait(false);
+    }
+
+    private void CancelQueuedLock(LockCompletionSource ticket, CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            if (ticket.TaskCompletionSource.Task.IsCompleted)
+            {
+                return;
+            }
+
+            var oldState = _state;
+            var state = oldState.Clone();
+            state.LocksQueue = RemoveQueuedLock(state.LocksQueue, ticket, out var removed);
+
+            if (!removed)
+            {
+                return;
+            }
+
+            if (ticket.EnterLockType == EnterLockType.Read)
+            {
+                state.Readers--;
+            }
+            else if (ticket.EnterLockType == EnterLockType.Write)
+            {
+                state.Writers--;
+            }
+
+            if (Interlocked.CompareExchange(ref _state, state, oldState) == oldState)
+            {
+                ticket.TaskCompletionSource.TrySetCanceled(cancellationToken);
+                return;
+            }
+        }
+    }
+
+    private static ImmutableQueue<LockCompletionSource> RemoveQueuedLock(ImmutableQueue<LockCompletionSource> queue, LockCompletionSource ticket, out bool removed)
+    {
+        removed = false;
+        var result = ImmutableQueue<LockCompletionSource>.Empty;
+
+        foreach (var queued in queue)
+        {
+            if (!removed && ReferenceEquals(queued, ticket))
+            {
+                removed = true;
+                continue;
+            }
+
+            result = result.Enqueue(queued);
+        }
+
+        return result;
     }
 
     public void ExitWriteLock()
@@ -268,6 +358,13 @@ internal class AsyncReaderWriterLock
         public static readonly LockCompletionSource Empty = new(EnterLockType.None);
         public EnterLockType EnterLockType = enterLockType;
         public TaskCompletionSource TaskCompletionSource = new();
+    }
+
+    private sealed class CancellationRegistrationContext(AsyncReaderWriterLock owner, LockCompletionSource ticket, CancellationToken cancellationToken)
+    {
+        public AsyncReaderWriterLock Owner { get; } = owner;
+        public LockCompletionSource Ticket { get; } = ticket;
+        public CancellationToken CancellationToken { get; } = cancellationToken;
     }
 
     internal enum EnterLockType
