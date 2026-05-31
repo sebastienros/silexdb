@@ -119,9 +119,9 @@ public readonly struct Bytes : IEquatable<Bytes>, IComparable<Bytes>
         BinaryPrimitives.WriteUInt64LittleEndian(_data.Span, value);
     }
 
-    public readonly ReadOnlySpan<byte> Span => _data.Span;
+    public readonly ReadOnlySpan<byte> Span => _data == null ? default : _data.Span;
 
-    public readonly ReadOnlyMemory<byte> Memory => _data.Memory;
+    public readonly ReadOnlyMemory<byte> Memory => _data == null ? default : _data.Memory;
 
     /// <summary>
     /// Returns an empty <see cref="Bytes"/>.
@@ -140,7 +140,7 @@ public readonly struct Bytes : IEquatable<Bytes>, IComparable<Bytes>
 
     public void Dispose()
     {
-        _data.Dispose();
+        _data?.Dispose();
     }
 
     public static implicit operator Bytes(byte b) => new(b);

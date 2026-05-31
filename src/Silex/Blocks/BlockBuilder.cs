@@ -4,12 +4,12 @@ using System.Diagnostics;
 
 namespace Silex.Blocks;
 
-public class BlockBuilder<TKey, TValue> : IDisposable
+public class BlockBuilder<TKey> : IDisposable
 {
-    private static readonly IBinaryEncoder<TKey> _keySerializer = BinaryEncoderFactory<TKey>.BinarySerializer;
+    private static readonly IBinaryEncoder<TKey> _keySerializer = KeyEncoderFactory<TKey>.Encoder;
 
-    private readonly IBlockEncoder<TKey, TValue> _blockEncoder;
-    private readonly List<BlockEntry<TValue>> _blockEntries = [];
+    private readonly IBlockEncoder<TKey> _blockEncoder;
+    private readonly List<BlockEntry> _blockEntries = [];
 
     // Keys are encoded once, when they are added, and their bytes are reused both for the SST bloom
     // filter and for the final block encoding instead of being serialized a second time.
@@ -20,7 +20,7 @@ public class BlockBuilder<TKey, TValue> : IDisposable
     private int _lastKeyLength;
     private bool _disposed;
 
-    public BlockBuilder(IBlockEncoder<TKey, TValue> blockEncoder)
+    public BlockBuilder(IBlockEncoder<TKey> blockEncoder)
     {
         _blockEncoder = blockEncoder;
     }
@@ -41,7 +41,7 @@ public class BlockBuilder<TKey, TValue> : IDisposable
     /// <param name="key">The key of the entry.</param>
     /// <param name="value">The value of the entry.</param>
     /// <returns><see langword="true"/> if the value was added, <see langword="false"/> otherwise.</returns>
-    public bool Add(TKey key, TValue value)
+    public bool Add(TKey key, ValueBuffer value)
     {
         var keyLength = _keySerializer.GetLength(key);
         var size = _blockEncoder.EstimateSize(keyLength, value);
@@ -63,7 +63,7 @@ public class BlockBuilder<TKey, TValue> : IDisposable
         var actualKeyLength = _keyBuffer.WrittenCount - keyOffset;
         Debug.Assert(actualKeyLength == keyLength, $"Encoded key length {actualKeyLength} does not match the estimated length {keyLength}.");
 
-        _blockEntries.Add(new BlockEntry<TValue>(keyOffset, actualKeyLength, value));
+        _blockEntries.Add(new BlockEntry(keyOffset, actualKeyLength, value));
         _estimatedSize += size;
         _lastKeyOffset = keyOffset;
         _lastKeyLength = actualKeyLength;
@@ -80,17 +80,17 @@ public class BlockBuilder<TKey, TValue> : IDisposable
 
     public int EstimatedSize => _estimatedSize;
 
-    public Block<TKey, TValue> BuildBlock()
+    public Block<TKey> BuildBlock()
     {
         return _blockEncoder.Encode(_keyBuffer.WrittenMemory, _blockEntries);
     }
 
-    public Block<TKey, TValue> Decode(ReadOnlyMemory<byte> data)
+    public Block<TKey> Decode(ReadOnlyMemory<byte> data)
     {
         return _blockEncoder.Decode(data);
     }
 
-    public Block<TKey, TValue> Decode(System.Buffers.IMemoryOwner<byte> owner, int length)
+    public Block<TKey> Decode(System.Buffers.IMemoryOwner<byte> owner, int length)
     {
         return _blockEncoder.Decode(owner, length);
     }

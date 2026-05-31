@@ -5,7 +5,7 @@ namespace Silex.Tables;
 /// <summary>
 /// Encodes or decodes a <see cref="SsTable"/>. 
 /// </summary>
-public interface ISsTableEncoder<TKey, TValue>
+public interface ISsTableEncoder<TKey>
 {
     void EncodeMetadata(ref EncoderBinaryWriter writer, IReadOnlyList<BlockMetadata<TKey>> blockMetadata, long metadataOffset);
 

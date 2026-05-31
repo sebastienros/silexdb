@@ -83,6 +83,18 @@ public class EncoderTests
         await Assert.That(comparer.GetHashCode(b)).IsEqualTo(comparer.GetHashCode(a));
     }
 
+    [Test]
+    public async Task ByteArrayEncoderTreatsAnyEmptyArrayAsTombstone()
+    {
+        var encoder = new ByteArrayEncoder();
+
+        // The tombstone is content-based (length 0), not a specific shared instance.
+        await Assert.That(encoder.IsTombstoneValue(Array.Empty<byte>())).IsTrue();
+        await Assert.That(encoder.IsTombstoneValue(new byte[0])).IsTrue();
+        await Assert.That(encoder.IsTombstoneValue(new byte[] { 0 })).IsFalse();
+        await Assert.That(encoder.UsesEmptyTombstone).IsTrue();
+    }
+
     private static byte[] Encode<T>(IBinaryEncoder<T> encoder, T value)
     {
         var bufferWriter = new PooledArrayBufferWriter<byte>();
@@ -122,20 +134,6 @@ public class EncoderTests
     }
 
     [Test]
-    public async Task Int32EncoderIsOrderPreserving()
-    {
-        var values = new[] { int.MinValue, int.MinValue + 1, -1000000, -1, 0, 1, 2, 1000000, int.MaxValue - 1, int.MaxValue };
-        await AssertOrderPreserving(new Int32Encoder(), values);
-    }
-
-    [Test]
-    public async Task Int64EncoderIsOrderPreserving()
-    {
-        var values = new[] { long.MinValue, long.MinValue + 1, -1000000000000L, -1, 0, 1, 2, 1000000000000L, long.MaxValue - 1, long.MaxValue };
-        await AssertOrderPreserving(new Int64Encoder(), values);
-    }
-
-    [Test]
     public async Task UInt32EncoderIsOrderPreserving()
     {
         var values = new uint[] { 0, 1, 2, 255, 256, 65535, 65536, 1000000, uint.MaxValue - 1, uint.MaxValue };
@@ -143,18 +141,14 @@ public class EncoderTests
     }
 
     [Test]
-    public async Task UInt16EncoderIsOrderPreserving()
+    public async Task UInt64EncoderIsOrderPreserving()
     {
-        var values = new ushort[] { 0, 1, 2, 255, 256, 1000, 32767, 32768, ushort.MaxValue - 1, ushort.MaxValue };
-        await AssertOrderPreserving(new UInt16Serializer(), values);
-    }
-
-    [Test]
-    public async Task CharEncoderIsOrderPreserving()
-    {
-        // Includes a lone high surrogate to guard against the previous UTF-8 collision bug.
-        var values = new[] { '\u0001', 'A', 'Z', 'a', 'z', '\u00FF', '\u0100', 'ち', '\uD800', '\uFFFF' };
-        await AssertOrderPreserving(new UTF8CharEncoder(), values);
+        var values = new ulong[]
+        {
+            0, 1, 2, 255, 256, 65535, 65536, uint.MaxValue, (ulong)uint.MaxValue + 1,
+            long.MaxValue, 1UL << 63, ulong.MaxValue - 1, ulong.MaxValue
+        };
+        await AssertOrderPreserving(new UInt64Encoder(), values);
     }
 
     [Test]

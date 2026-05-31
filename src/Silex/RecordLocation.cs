@@ -9,7 +9,7 @@ namespace Silex;
 /// </summary>
 public readonly struct RecordLocation<TKey> : IComparable<RecordLocation<TKey>>
 {
-    private static readonly IComparer<TKey> _keyComparer = BinaryEncoderFactory<TKey>.BinarySerializer.Comparer;
+    private static readonly IComparer<TKey> _keyComparer = KeyEncoderFactory<TKey>.Encoder.Comparer;
 
     public TKey Key { get; init; }
     public int BlockOffset { get; init; }

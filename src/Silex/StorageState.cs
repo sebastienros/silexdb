@@ -11,7 +11,7 @@ namespace Silex;
 /// This structure is mostly immutable (minus CurrentMemTable) such that we can duplicate it
 /// to get a snapshot for read-only operation.
 /// </remarks>
-internal struct StorageState<TKey, TValue> where TKey : notnull
+internal struct StorageState<TKey> where TKey : notnull
 {
     public StorageState()
     {
@@ -20,9 +20,9 @@ internal struct StorageState<TKey, TValue> where TKey : notnull
     /// <summary>
     /// The list of immutable MemTables.
     /// </summary>
-    public ImmutableQueue<IMemTable<TKey, TValue>> ImmutableMemTables { get; set; } = [];
+    public ImmutableQueue<IMemTable<TKey>> ImmutableMemTables { get; set; } = [];
 
-    public required IMemTable<TKey, TValue> CurrentMemTable { get; set; }
+    public required IMemTable<TKey> CurrentMemTable { get; set; }
 
     /// <summary>
     /// The list of level-0 <see cref="SsTable"/>.
@@ -32,7 +32,7 @@ internal struct StorageState<TKey, TValue> where TKey : notnull
     /// They are also treated differently when iterated as tables are not ordered is relation
     /// to others in this level, so a Merge Iterator is required.
     /// </remarks>
-    public List<SsTable<TKey, TValue>> LevelZeroTables = [];
+    public List<SsTable<TKey>> LevelZeroTables = [];
 
     /// <summary>
     /// The list of <see cref="SsTable"/> for each level but 0.
@@ -41,5 +41,5 @@ internal struct StorageState<TKey, TValue> where TKey : notnull
     /// These levels are the result of compaction (either tiered or leveled).
     /// Each level has ordered tables related to each other so a Concat Iterator can be used.
     /// </remarks>
-    public List<List<SsTable<TKey, TValue>>> LeveledSsTables { get; set; } = [];
+    public List<List<SsTable<TKey>>> LeveledSsTables { get; set; } = [];
 }

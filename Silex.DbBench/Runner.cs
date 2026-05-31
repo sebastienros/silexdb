@@ -58,7 +58,7 @@ internal sealed class Runner
 
     private readonly BenchmarkOptions _options;
     private readonly string _dbPath;
-    private LsmStorage<byte[], byte[]>? _db;
+    private LsmStorage<byte[]>? _db;
     private bool _currentWalSync;
     private bool _needsReadBarrier;
 
@@ -288,7 +288,7 @@ internal sealed class Runner
     private async Task OpenAsync(bool walSync)
     {
         Directory.CreateDirectory(_dbPath);
-        _db = await LsmStorage.OpenAsync<byte[], byte[]>(_dbPath, _options.ToStorageOptions(walSync));
+        _db = await LsmStorage.OpenAsync<byte[]>(_dbPath, _options.ToStorageOptions(walSync));
         _currentWalSync = walSync;
         _needsReadBarrier = false;
     }

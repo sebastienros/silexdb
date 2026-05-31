@@ -19,9 +19,9 @@ namespace Silex.Tables;
 /// ----------------------------------------------------------------------------------------------------------------------------
 /// 
 /// </summary>
-public sealed class DefaultSsTableEncoder<TKey, TValue> : ISsTableEncoder<TKey, TValue>
+public sealed class DefaultSsTableEncoder<TKey> : ISsTableEncoder<TKey>
 {
-    private static readonly IBinaryEncoder<TKey> _keySerializer = BinaryEncoderFactory<TKey>.BinarySerializer;
+    private static readonly IBinaryEncoder<TKey> _keySerializer = KeyEncoderFactory<TKey>.Encoder;
 
     public IReadOnlyList<BlockMetadata<TKey>> DecodeMetadata(ReadOnlyMemory<byte> buffer, int offset)
     {

@@ -5,7 +5,7 @@ using Silex.Serialization;
 namespace Silex.Wal;
 
 /// <summary>
-/// Append-only write-ahead log for a single <see cref="MemTable{TKey, TValue}"/>. Every mutation is
+/// Append-only write-ahead log for a single <see cref="MemTable{TKey}"/>. Every mutation is
 /// journaled before it is applied in memory so that the unflushed contents of a memtable can be
 /// recovered after a process crash.
 /// </summary>
@@ -16,13 +16,12 @@ namespace Silex.Wal;
 /// crash; enabling <c>syncToDisk</c> additionally <c>fsync</c>s on every append to survive power loss.
 ///
 /// A single instance is only ever written from one thread at a time: appends happen while the owning
-/// <see cref="LsmStorageInner{TKey, TValue}"/> holds the current-memtable write lock, so no internal
+/// <see cref="LsmStorageInner{TKey}"/> holds the current-memtable write lock, so no internal
 /// synchronization is required.
 /// </remarks>
-internal sealed class WriteAheadLog<TKey, TValue> : IDisposable where TKey : notnull
+internal sealed class WriteAheadLog<TKey> : IDisposable where TKey : notnull
 {
-    private static readonly IBinaryEncoder<TKey> _keySerializer = BinaryEncoderFactory<TKey>.BinarySerializer;
-    private static readonly IBinaryEncoder<TValue> _valueSerializer = BinaryEncoderFactory<TValue>.BinarySerializer;
+    private static readonly IBinaryEncoder<TKey> _keySerializer = KeyEncoderFactory<TKey>.Encoder;
 
     private readonly FileStream _stream;
     private readonly bool _syncToDisk;
@@ -41,12 +40,12 @@ internal sealed class WriteAheadLog<TKey, TValue> : IDisposable where TKey : not
     /// <summary>
     /// Appends a single key/value record and flushes it so it survives a process crash.
     /// </summary>
-    public void Append(TKey key, TValue value)
+    public void Append(TKey key, ValueBuffer value)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
         var keyLength = _keySerializer.GetLength(key);
-        var valueLength = _valueSerializer.GetLength(value);
+        var valueLength = value.Length;
 
         _buffer.Clear();
 
@@ -54,7 +53,7 @@ internal sealed class WriteAheadLog<TKey, TValue> : IDisposable where TKey : not
         writer.Write7BitEncodedInt(keyLength);
         _keySerializer.Encode(key, ref writer);
         writer.Write7BitEncodedInt(valueLength);
-        _valueSerializer.Encode(value, ref writer);
+        writer.WriteRaw(value.Span);
         writer.Flush();
 
         _stream.Write(_buffer.WrittenMemory.Span);
@@ -81,7 +80,7 @@ internal sealed class WriteAheadLog<TKey, TValue> : IDisposable where TKey : not
     /// Replays the records of the log at <paramref name="path"/> into <paramref name="target"/>.
     /// A torn trailing record (from a crash in the middle of an append) is tolerated and stops replay.
     /// </summary>
-    public static void Replay(string path, IMemTable<TKey, TValue> target)
+    public static void Replay(string path, IMemTable<TKey> target)
     {
         var bytes = File.ReadAllBytes(path);
 
@@ -95,7 +94,7 @@ internal sealed class WriteAheadLog<TKey, TValue> : IDisposable where TKey : not
         while (!reader.IsEOF)
         {
             TKey key;
-            TValue value;
+            ValueBuffer value;
 
             try
             {
@@ -103,7 +102,7 @@ internal sealed class WriteAheadLog<TKey, TValue> : IDisposable where TKey : not
                 key = _keySerializer.Decode(reader.ReadBytesSpan(keyLength));
 
                 var valueLength = reader.Read7BitEncodedInt();
-                value = _valueSerializer.Decode(reader.ReadBytesSpan(valueLength));
+                value = new ValueBuffer(reader.ReadBytesSpan(valueLength).ToArray());
             }
             catch (EndOfStreamException)
             {

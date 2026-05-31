@@ -2,11 +2,11 @@
 
 namespace Silex;
 
-internal sealed class WorkDispatcher<TKey, TValue> where TKey : notnull
+internal sealed class WorkDispatcher<TKey> where TKey : notnull
 {
-    private readonly ConcurrentDictionary<TKey, Task<TValue?>> _workers = new();
+    private readonly ConcurrentDictionary<TKey, Task<ValueBuffer?>> _workers = new();
 
-    public async Task<TValue?> ScheduleAsync(TKey key, Func<TKey, Task<TValue?>> valueFactory, CancellationToken cancellationToken = default)
+    public async Task<ValueBuffer?> ScheduleAsync(TKey key, Func<TKey, Task<ValueBuffer?>> valueFactory, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(key);
         cancellationToken.ThrowIfCancellationRequested();
@@ -19,7 +19,7 @@ internal sealed class WorkDispatcher<TKey, TValue> where TKey : notnull
             }
 
             // This is the task that we'll return to all waiters. We'll complete it when the factory is complete
-            var tcs = new TaskCompletionSource<TValue?>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var tcs = new TaskCompletionSource<ValueBuffer?>(TaskCreationOptions.RunContinuationsAsynchronously);
 
             if (_workers.TryAdd(key, tcs.Task))
             {
@@ -46,7 +46,7 @@ internal sealed class WorkDispatcher<TKey, TValue> where TKey : notnull
         }
     }
 
-    public async Task<TValue?> ScheduleAsync<TState>(TKey key, TState state, Func<TKey, TState, Task<TValue?>> valueFactory, CancellationToken cancellationToken = default)
+    public async Task<ValueBuffer?> ScheduleAsync<TState>(TKey key, TState state, Func<TKey, TState, Task<ValueBuffer?>> valueFactory, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(key);
         cancellationToken.ThrowIfCancellationRequested();
@@ -59,7 +59,7 @@ internal sealed class WorkDispatcher<TKey, TValue> where TKey : notnull
             }
 
             // This is the task that we'll return to all waiters. We'll complete it when the factory is complete
-            var tcs = new TaskCompletionSource<TValue?>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var tcs = new TaskCompletionSource<ValueBuffer?>(TaskCreationOptions.RunContinuationsAsynchronously);
 
             if (_workers.TryAdd(key, tcs.Task))
             {

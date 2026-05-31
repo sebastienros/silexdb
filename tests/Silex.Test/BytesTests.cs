@@ -107,4 +107,18 @@ public class BytesTests
             await Assert.That(b.Length).IsEqualTo(sizeof(long));
         }
     }
+
+    [Test]
+    public async Task EmptyBytesAreSafeToDispose()
+    {
+        // default(Bytes) and Bytes.Empty own no pooled buffer, so disposing them must be a harmless no-op.
+        var empty = Bytes.Empty;
+        empty.Dispose();
+
+        var def = default(Bytes);
+        def.Dispose();
+
+        await Assert.That(Bytes.Empty.IsEmpty).IsTrue();
+        await Assert.That(default(Bytes).Length).IsEqualTo(0);
+    }
 }

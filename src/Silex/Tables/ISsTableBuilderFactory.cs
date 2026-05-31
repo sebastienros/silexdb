@@ -5,5 +5,5 @@ using Silex.BloomFilters;
 
 public interface ISsTableBuilderFactory
 {
-    ISsTableBuilder<TKey, TValue> CreateSsTableBuilder<TKey, TValue>(string path, ISsTableEncoder<TKey, TValue> tableEncoder, IBlockEncoder<TKey, TValue> blockEncoder, IBloomFilterFactory bloomFilterFactory, int count);
+    ISsTableBuilder<TKey> CreateSsTableBuilder<TKey>(string path, ISsTableEncoder<TKey> tableEncoder, IBlockEncoder<TKey> blockEncoder, IBloomFilterFactory bloomFilterFactory, int count);
 }

@@ -25,20 +25,19 @@ namespace Silex.MemTables;
 /// A MemTable usually has a size limit and it will be frozen to an immutable MemTable when it reaches the size limit.
 /// This logic is part of <see cref="LsmStorageInner"/>.
 /// </remarks>
-internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKey : notnull
+internal sealed class MemTable<TKey> : IMemTable<TKey> where TKey : notnull
 {
-    private static readonly IBinaryEncoder<TKey> _keySerializer = BinaryEncoderFactory<TKey>.BinarySerializer;
-    private static readonly IBinaryEncoder<TValue> _valueSerializer = BinaryEncoderFactory<TValue>.BinarySerializer;
+    private static readonly IBinaryEncoder<TKey> _keySerializer = KeyEncoderFactory<TKey>.Encoder;
 
-    private volatile Dictionary<TKey, TValue>? _dic = new(_keySerializer.EqualityComparer);
-    private volatile SortedDictionary<TKey, TValue>? _sorted;
+    private volatile Dictionary<TKey, ValueBuffer>? _dic = new(_keySerializer.EqualityComparer);
+    private volatile SortedDictionary<TKey, ValueBuffer>? _sorted;
 
     private long _size;
     private bool _disposed;
     private readonly long _id;
-    private readonly WriteAheadLog<TKey, TValue>? _wal;
+    private readonly WriteAheadLog<TKey>? _wal;
 
-    public MemTable(long id, WriteAheadLog<TKey, TValue>? wal = null)
+    public MemTable(long id, WriteAheadLog<TKey>? wal = null)
     {
         _id = id;
         _wal = wal;
@@ -63,7 +62,7 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
     }
 
     /// <inheritdocs />
-    public bool TryGet(TKey key, [MaybeNullWhen(false)] out TValue result)
+    public bool TryGet(TKey key, [MaybeNullWhen(false)] out ValueBuffer result)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
@@ -90,7 +89,7 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
     }
 
     /// <inheritdocs />
-    public void Put(TKey key, TValue value)
+    public void Put(TKey key, ValueBuffer value)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
@@ -110,7 +109,7 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
             // Retrieve the previous value to keep its size consistent.
             if (dic.Remove(key, out var previousValue))
             {
-                _size -= _valueSerializer.GetLength(previousValue) + keyLength + sizeof(int);
+                _size -= previousValue.Length + keyLength + sizeof(int);
             }
 
             dic.Add(key, value);
@@ -121,27 +120,27 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
             // Retrieve the previous value to keep its size consistent.
             if (_sorted.Remove(key, out var previousValue))
             {
-                _size -= _valueSerializer.GetLength(previousValue) + keyLength + sizeof(int);
+                _size -= previousValue.Length + keyLength + sizeof(int);
             }
 
             _sorted.Add(key, value);
         }
 
-        _size += _valueSerializer.GetLength(value) + keyLength + sizeof(int);
+        _size += value.Length + keyLength + sizeof(int);
         return;
     }
 
-    public IStorageIterator<TKey, TValue> CreateIterator()
+    public IStorageIterator<TKey, ValueBuffer> CreateIterator()
     {
         return new MemTableIterator(this);
     }
 
-    public async Task FlushAsync(ISsTableBuilder<TKey, TValue> builder, CancellationToken cancellationToken = default)
+    public async Task FlushAsync(ISsTableBuilder<TKey> builder, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         EnsureSortedMap();
 
-        IDictionary<TKey, TValue> store = _dic != null ? _dic : _sorted;
+        IDictionary<TKey, ValueBuffer> store = _dic != null ? _dic : _sorted;
 
         foreach (var entry in store)
         {
@@ -163,7 +162,7 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
 
         lock (dic)
         {
-            _sorted = new SortedDictionary<TKey, TValue>(dic, _keySerializer.Comparer);
+            _sorted = new SortedDictionary<TKey, ValueBuffer>(dic, _keySerializer.Comparer);
             _dic = null;
         }
     }
@@ -188,16 +187,9 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
     private void DisposeInternal()
     {
         var dic = _dic;
-        IDictionary<TKey, TValue> store = dic == null ? _sorted! : dic;
+        IDictionary<TKey, ValueBuffer> store = dic == null ? _sorted! : dic;
 
-        foreach (var entry in store)
-        {
-            if (entry.Value is IDisposable d)
-            {
-                d.Dispose();
-            }
-        }
-
+        // Values are garbage-collected byte arrays (see ValueBuffer); there is nothing to dispose.
         store.Clear();
     }
 
@@ -206,17 +198,17 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
         DisposeInternal();
     }
 
-    private sealed class MemTableIterator : IStorageIterator<TKey, TValue>
+    private sealed class MemTableIterator : IStorageIterator<TKey, ValueBuffer>
     {
-        private readonly MemTable<TKey, TValue> _table;
+        private readonly MemTable<TKey> _table;
         
-        public MemTableIterator(MemTable<TKey, TValue> table)
+        public MemTableIterator(MemTable<TKey> table)
         {
             _table = table;
         }
 
 #pragma warning disable CS1998 // Async method lacks 'await' operators and will run synchronously
-        public async IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
+        public async IAsyncEnumerable<KeyValuePair<TKey, ValueBuffer>> EnumerateAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
 #pragma warning restore CS1998 // Async method lacks 'await' operators and will run synchronously
         {
             _table.EnsureSortedMap();
@@ -230,7 +222,7 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
         }
 
 #pragma warning disable CS1998 // Async method lacks 'await' operators and will run synchronously
-        public async IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateAsync(TKey afterKey, [EnumeratorCancellation] CancellationToken _ = default)
+        public async IAsyncEnumerable<KeyValuePair<TKey, ValueBuffer>> EnumerateAsync(TKey afterKey, [EnumeratorCancellation] CancellationToken _ = default)
 #pragma warning restore CS1998 // Async method lacks 'await' operators and will run synchronously
         {
             _table.EnsureSortedMap();

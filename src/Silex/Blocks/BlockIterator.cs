@@ -3,15 +3,13 @@ using System.Runtime.CompilerServices;
 
 namespace Silex.Blocks;
 
-internal sealed class BlockIterator<TKey, TValue> : IStorageIterator<TKey, TValue>
+internal sealed class BlockIterator<TKey> : IStorageIterator<TKey, ValueBuffer>
 {
-    private static readonly IBinaryEncoder<TValue> _valueSerializer = BinaryEncoderFactory<TValue>.BinarySerializer;
-
-    private readonly Block<TKey, TValue> _block;
+    private readonly Block<TKey> _block;
 
     private readonly RecordLocation<TKey>[] _entries;
 
-    public BlockIterator(Block<TKey, TValue> block)
+    public BlockIterator(Block<TKey> block)
     {
         _block = block;
 
@@ -25,18 +23,18 @@ internal sealed class BlockIterator<TKey, TValue> : IStorageIterator<TKey, TValu
         _entries = entries;
     }
 
-    public async IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
+    public async IAsyncEnumerable<KeyValuePair<TKey, ValueBuffer>> EnumerateAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         await Task.Yield();
 
         foreach (var entry in _entries)
         {
-            yield return new KeyValuePair<TKey, TValue>(entry.Key, _valueSerializer.Decode(_block.GetValue(entry)));
+            yield return new KeyValuePair<TKey, ValueBuffer>(entry.Key, new ValueBuffer(_block.GetValue(entry).ToArray()));
         }
     }
 
 #pragma warning disable 1998 // async function without await
-    public async IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateAsync(TKey from, [EnumeratorCancellation] CancellationToken _ = default)
+    public async IAsyncEnumerable<KeyValuePair<TKey, ValueBuffer>> EnumerateAsync(TKey from, [EnumeratorCancellation] CancellationToken _ = default)
 #pragma warning restore 1998
     {
         var startIndex = 0;
@@ -53,7 +51,7 @@ internal sealed class BlockIterator<TKey, TValue> : IStorageIterator<TKey, TValu
         for (var i = startIndex; i < _entries.Length; i++)
         {
             var entry = _entries[i];
-            yield return new KeyValuePair<TKey, TValue>(_entries[i].Key, _valueSerializer.Decode(_block.GetValue(entry)));
+            yield return new KeyValuePair<TKey, ValueBuffer>(_entries[i].Key, new ValueBuffer(_block.GetValue(entry).ToArray()));
         }
     }
 }

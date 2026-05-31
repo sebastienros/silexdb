@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using BenchmarkDotNet.Attributes;
+using Silex;
 using Silex.Blocks;
 using Silex.Buffers;
 
@@ -8,8 +9,8 @@ namespace Silex.Benchmarks;
 /// <summary>
 /// Prototype comparing three ways to do a point lookup inside a single 4 KiB block:
 ///
-///   1. <see cref="TypedLong_Hit"/>      - the current typed path (<c>Block&lt;long,long&gt;</c>): each
-///      visited entry's key is decoded to a <see cref="long"/> (allocation-free) and compared numerically.
+///   1. <see cref="TypedLong_Hit"/>      - the current typed path (<c>Block&lt;ulong,byte[]&gt;</c>): each
+///      visited entry's key is decoded to a <see cref="ulong"/> (allocation-free) and compared numerically.
 ///   2. <see cref="BytesArray_Hit"/>     - the current byte[] path (<c>Block&lt;byte[],byte[]&gt;</c>): each
 ///      visited entry's key is decoded via <c>ToArray()</c> (one heap allocation per comparison) and
 ///      compared with <c>SequenceCompareTo</c>.
@@ -25,34 +26,34 @@ public class BlockLookupBenchmarks
 {
     private const int LookupCount = 1000;
 
-    private DefaultBlockEncoder<long, long> _typedEncoder = null!;
-    private DefaultBlockEncoder<byte[], byte[]> _bytesEncoder = null!;
-    private Block<long, long> _typedBlock = null!;
-    private Block<byte[], byte[]> _bytesBlock = null!;
+    private DefaultBlockEncoder<ulong> _typedEncoder = null!;
+    private DefaultBlockEncoder<byte[]> _bytesEncoder = null!;
+    private Block<ulong> _typedBlock = null!;
+    private Block<byte[]> _bytesBlock = null!;
 
-    private long[] _hitLongs = null!;
+    private ulong[] _hitLongs = null!;
     private byte[][] _hitBytes = null!;
-    private long[] _missLongs = null!;
+    private ulong[] _missLongs = null!;
     private byte[][] _missBytes = null!;
 
     [GlobalSetup]
     public void Setup()
     {
-        _typedEncoder = new DefaultBlockEncoder<long, long>();
-        _bytesEncoder = new DefaultBlockEncoder<byte[], byte[]>();
+        _typedEncoder = new DefaultBlockEncoder<ulong>();
+        _bytesEncoder = new DefaultBlockEncoder<byte[]>();
 
-        using var typedBuilder = new BlockBuilder<long, long>(_typedEncoder);
-        using var bytesBuilder = new BlockBuilder<byte[], byte[]>(_bytesEncoder);
+        using var typedBuilder = new BlockBuilder<ulong>(_typedEncoder);
+        using var bytesBuilder = new BlockBuilder<byte[]>(_bytesEncoder);
 
-        var keys = new List<long>();
-        var gaps = new List<long>(); // keys that are absent but lie inside the populated range
+        var keys = new List<ulong>();
+        var gaps = new List<ulong>(); // keys that are absent but lie inside the populated range
 
         var rnd = new Random(42);
-        long k = 0;
+        ulong k = 0;
 
         while (true)
         {
-            var step = 1 + rnd.Next(1, 10);
+            var step = (ulong)(1 + rnd.Next(1, 10));
 
             // Remember an in-range missing key whenever there is a gap before this key.
             if (keys.Count > 0 && step > 1)
@@ -62,14 +63,12 @@ public class BlockLookupBenchmarks
 
             k += step;
 
-            var keyBytes = new byte[8];
-            BinaryPrimitives.WriteInt64BigEndian(keyBytes, k);
-            var valueBytes = new byte[8];
-            BinaryPrimitives.WriteInt64BigEndian(valueBytes, ~k);
+            var keyBytes = ToBigEndian(k);
+            var valueBytes = ToBigEndian(~k);
 
             // Both encodings have identical on-disk sizes, so both builders fill at the same rate.
-            var okTyped = typedBuilder.Add(k, k);
-            var okBytes = bytesBuilder.Add(keyBytes, valueBytes);
+            var okTyped = typedBuilder.Add(k, new ValueBuffer(ToBigEndian(~k)));
+            var okBytes = bytesBuilder.Add(keyBytes, new ValueBuffer(valueBytes));
 
             if (!okTyped || !okBytes)
             {
@@ -89,9 +88,9 @@ public class BlockLookupBenchmarks
         }
 
         // Build LookupCount hit queries (keys that exist) and miss queries (in-range absent keys).
-        _hitLongs = new long[LookupCount];
+        _hitLongs = new ulong[LookupCount];
         _hitBytes = new byte[LookupCount][];
-        _missLongs = new long[LookupCount];
+        _missLongs = new ulong[LookupCount];
         _missBytes = new byte[LookupCount][];
 
         for (var i = 0; i < LookupCount; i++)
@@ -211,7 +210,7 @@ public class BlockLookupBenchmarks
     /// Binary search over the raw block bytes. Mirrors <c>Block&lt;TKey,TValue&gt;.TryGetValue</c> exactly,
     /// but reads each entry's key as a span and compares it directly instead of materializing a TKey.
     /// </summary>
-    private static bool SpanLookup(Block<byte[], byte[]> block, ReadOnlySpan<byte> key, out ReadOnlySpan<byte> value)
+    private static bool SpanLookup(Block<byte[]> block, ReadOnlySpan<byte> key, out ReadOnlySpan<byte> value)
     {
         var memory = block.Memory;
         var offsets = block.Offsets;
@@ -250,10 +249,10 @@ public class BlockLookupBenchmarks
         return false;
     }
 
-    private static byte[] ToBigEndian(long value)
+    private static byte[] ToBigEndian(ulong value)
     {
         var bytes = new byte[8];
-        BinaryPrimitives.WriteInt64BigEndian(bytes, value);
+        BinaryPrimitives.WriteUInt64BigEndian(bytes, value);
         return bytes;
     }
 }

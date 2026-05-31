@@ -12,7 +12,7 @@ namespace Silex;
 /// </summary>
 /// <remarks>
 /// All ids stored here are <em>filename</em> ids (parsed from <c>{id}.sst</c>), never the in-memory
-/// <see cref="Tables.SsTable{TKey, TValue}.Id"/>, which is a transient runtime value unrelated to the file.
+/// <see cref="Tables.SsTable{TKey}.Id"/>, which is a transient runtime value unrelated to the file.
 /// </remarks>
 internal sealed class Manifest
 {

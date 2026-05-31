@@ -1,7 +1,8 @@
 # Silex — Engineering Notes
 
-Silex is an LSM-tree (Log-Structured Merge-tree) key/value storage engine, generic over
-`TKey`/`TValue`, inspired by RocksDB/LevelDB and the "mini-lsm" design.
+Silex is an LSM-tree (Log-Structured Merge-tree) key/value storage engine, generic over the key type
+`TKey`, with values stored as opaque byte sequences, inspired by RocksDB/LevelDB and the "mini-lsm"
+design.
 
 ## Architecture overview
 
@@ -33,8 +34,9 @@ not in the individual collections.
 ## Implemented features
 
 ### Public API (`LsmStorage` / `LsmStorageInner`)
-- `LsmStorage.OpenAsync<TKey, TValue>(path, options)` opens/creates a store at a directory.
-- `Put(key, value)`, `Delete(key)` (synchronous, writes to the current MemTable).
+- `LsmStorage.OpenAsync<TKey>(path, options)` opens/creates a store at a directory.
+- `Put(key, value)` (overloaded on `byte[]` / `ReadOnlySpan<byte>` / `Bytes`), `Delete(key)`
+  (synchronous, writes to the current MemTable). An empty value is a tombstone.
 - `GetAsync(key)` (async; may touch disk).
 - `CreateIterator()` for full and range (`EnumerateAsync(from)`) scans.
 - `CloseAsync()` / `DisposeAsync()` flush all pending data and stop background work.
@@ -161,7 +163,7 @@ not in the individual collections.
   shared handle is safe for concurrent readers during compaction.
 
 ### Durability / crash recovery (`Wal/WriteAheadLog.cs`)
-- **Write-ahead log (WAL).** Each writable MemTable owns a `WriteAheadLog<TKey,TValue>` (file
+- **Write-ahead log (WAL).** Each writable MemTable owns a `WriteAheadLog<TKey>` (file
   `{id}.wal` next to the SSTs). `MemTable.Put` journals the record **before** applying it in memory,
   so an acknowledged write is always recoverable. Enabled by default (`UseWriteAheadLog`).
 - **Record format:** `[7-bit key length][key][7-bit value length][value]`, encoded once into a reused
@@ -265,7 +267,7 @@ not in the individual collections.
     `Get`/scan. It made the engine safe against caller misuse but added an allocation on every write
     and every read, which conflicts with the zero-allocation principle. Not adopted.
 - Rejected follow-up (consistent with the zero-copy contract above): a block-builder-level copy so
-  values are serialized into the SST buffer at `Add` time instead of holding the `TValue` reference
+  values are serialized into the SST buffer at `Add` time instead of holding the `ValueBuffer` reference
   until `BuildBlock`. This would defend against a caller mutating a value between `Put` and the
   eventual SST flush, but that is exactly the misuse the ownership-transfer contract disallows, and it
   would add a second full value copy on the flush path (encode into the value buffer, then re-copy into
@@ -381,7 +383,7 @@ write/space amplification and tombstone/ordering complexity. Speculative; defer 
 
 ### Benchmarking — `Silex.DbBench`
 A standalone console app (`Silex.DbBench/`) modelled on RocksDB's `db_bench`, for cross-engine
-comparison and for the upcoming perf work. Uses `LsmStorage<byte[], byte[]>`; keys are generated exactly
+comparison and for the upcoming perf work. Uses `LsmStorage<byte[]>` with byte-array values; keys are generated exactly
 like `db_bench`'s `GenerateKeyFromInt` (integer big-endian in the first `min(8, key_size)` bytes, rest
 padded with `'0'`, so byte order == numeric order). Command line is parsed with System.CommandLine and
 mirrors `db_bench` flag names (`--benchmarks`, `--num`, `--reads`, `--value_size`, `--key_size`,
@@ -392,7 +394,7 @@ mirrors `db_bench` flag names (`--benchmarks`, `--num`, `--reads`, `--value_size
 unsupported — iterators are forward-only). Fill benchmarks open a fresh DB (wiped unless
 `--use_existing_db`); reads reuse the prior DB. Read key streams are seeded independently of the write
 streams so found-counts reflect real coverage. Output is `db_bench`-style (`micros/op`, `ops/sec`,
-`MB/s`, optional latency percentiles). This work added a public `LsmStorage<TKey,TValue>.CreateIterator()`
+`MB/s`, optional latency percentiles). This work added a public `LsmStorage<TKey>.CreateIterator()`
 on the wrapper (previously only on the inner) to support `readseq`/`seekrandom`. Values are stored
 uncompressed and there is no write-batch API, so compare against RocksDB with compression disabled and
 `--batch_size=1` (these flags are accepted but ignored, with a warning). The solution now uses the XML

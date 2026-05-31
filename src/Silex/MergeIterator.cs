@@ -9,32 +9,32 @@ namespace Silex;
 /// listed first wins (iterators should be provided in most-recent-first order). Tombstones are not
 /// filtered out; callers that need to hide deleted entries should filter the merged stream.
 /// </summary>
-internal sealed class MergeIterator<TKey, TValue> : IStorageIterator<TKey, TValue>
+internal sealed class MergeIterator<TKey> : IStorageIterator<TKey, ValueBuffer>
 {
-    private static readonly IComparer<TKey> _keyComparer = BinaryEncoderFactory<TKey>.BinarySerializer.Comparer;
+    private static readonly IComparer<TKey> _keyComparer = KeyEncoderFactory<TKey>.Encoder.Comparer;
 
-    private readonly IEnumerable<IStorageIterator<TKey, TValue>> _iterators;
+    private readonly IEnumerable<IStorageIterator<TKey, ValueBuffer>> _iterators;
 
-    public MergeIterator(IEnumerable<IStorageIterator<TKey, TValue>> iterators)
+    public MergeIterator(IEnumerable<IStorageIterator<TKey, ValueBuffer>> iterators)
     {
         _iterators = iterators;
     }
 
-    public IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateAsync(CancellationToken cancellationToken = default)
+    public IAsyncEnumerable<KeyValuePair<TKey, ValueBuffer>> EnumerateAsync(CancellationToken cancellationToken = default)
     {
         return MergeAsync(iterator => iterator.EnumerateAsync(cancellationToken), cancellationToken);
     }
 
-    public IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateAsync(TKey from, CancellationToken cancellationToken = default)
+    public IAsyncEnumerable<KeyValuePair<TKey, ValueBuffer>> EnumerateAsync(TKey from, CancellationToken cancellationToken = default)
     {
         return MergeAsync(iterator => iterator.EnumerateAsync(from, cancellationToken), cancellationToken);
     }
 
-    private async IAsyncEnumerable<KeyValuePair<TKey, TValue>> MergeAsync(
-        Func<IStorageIterator<TKey, TValue>, IAsyncEnumerable<KeyValuePair<TKey, TValue>>> selector,
+    private async IAsyncEnumerable<KeyValuePair<TKey, ValueBuffer>> MergeAsync(
+        Func<IStorageIterator<TKey, ValueBuffer>, IAsyncEnumerable<KeyValuePair<TKey, ValueBuffer>>> selector,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        var enumerators = new List<IAsyncEnumerator<KeyValuePair<TKey, TValue>>>();
+        var enumerators = new List<IAsyncEnumerator<KeyValuePair<TKey, ValueBuffer>>>();
 
         try
         {

@@ -7,7 +7,8 @@ bound read and space amplification.
 
 ## Features
 
-- **Generic key/value store** – `LsmStorage<TKey, TValue>` works with any supported key and value type.
+- **Generic-key store** – `LsmStorage<TKey>` works with any supported key type. Values are always
+  opaque byte sequences (`byte[]`, `ReadOnlySpan<byte>`, or `Bytes`).
 - **Durable** – an optional write-ahead log (WAL) recovers unflushed data after a crash.
 - **Zero-copy reads** – values served from memory are returned as read-only borrows of engine-owned
   memory rather than defensive copies.
@@ -36,14 +37,14 @@ using Silex;
 
 var options = new StorageOptions();
 
-// Keys and values are strongly typed. The directory is created if it does not exist.
-await using var db = await LsmStorage.OpenAsync<int, string>("my-db", options);
+// The key is strongly typed; values are byte payloads. The directory is created if it does not exist.
+await using var db = await LsmStorage.OpenAsync<uint>("my-db", options);
 
-db.Put(1, "one");
-db.Put(2, "two");
+db.Put(1, "one"u8.ToArray());
+db.Put(2, "two"u8.ToArray());
 
-string value = await db.GetAsync(1);   // "one"
-string missing = await db.GetAsync(99); // null (default(TValue)) when absent
+byte[]? value = await db.GetAsync(1);   // "one" as UTF-8 bytes
+byte[]? missing = await db.GetAsync(99); // null when absent
 
 db.Delete(2);
 
@@ -51,31 +52,45 @@ db.Delete(2);
 await db.CloseAsync();
 ```
 
-`LsmStorage.OpenAsync<TKey, TValue>` reopens an existing store at the same path, replaying the WAL and
+`LsmStorage.OpenAsync<TKey>` reopens an existing store at the same path, replaying the WAL and
 loading existing SSTs, so persisted data survives process restarts.
 
-## Supported key and value types
+## Supported key types and values
 
-Silex ships with built-in binary encoders for the following types, usable as either `TKey` or `TValue`:
+Only the **key** is a generic type parameter; **values are always opaque byte sequences**. The two
+roles are deliberately different: keys must be ordered, values never are.
 
-| Type      | Notes                                                  |
-|-----------|--------------------------------------------------------|
-| `int`     | Order-preserving (sign-flipped big-endian) key bytes   |
-| `uint`    | Order-preserving (big-endian) key bytes                |
-| `ushort`  | Order-preserving (big-endian) key bytes                |
-| `long`    | Order-preserving (sign-flipped big-endian) key bytes   |
-| `char`    | Fixed 2-byte big-endian (UTF-16 code unit)             |
-| `string`  | UTF-8 encoded; keys ordered by Unicode code point      |
-| `byte[]`  | Stored as-is; an empty value is treated as a deletion  |
-| `Bytes`   | An owned, comparable byte buffer (see below)            |
+**Key types** must be encoded in an *order-preserving* form, because the engine binary-searches blocks by
+comparing raw encoded bytes. Only types with a well-defined byte ordering are allowed:
 
-Using an unsupported type throws `NotSupportedException` when the store is opened.
+| Key type | Notes                                                                       |
+|----------|-----------------------------------------------------------------------------|
+| `uint`   | Order-preserving, fixed 4-byte big-endian                                   |
+| `ulong`  | Order-preserving, fixed 8-byte big-endian                                   |
+| `string` | UTF-8 encoded; ordered by Unicode code point (ordinal, not culture-aware)   |
+| `byte[]` | Stored as-is; ordered by raw byte sequence                                  |
+| `Bytes`  | An owned, comparable byte buffer (see below); ordered by raw byte sequence  |
+
+Signed integers (`int`, `long`) and `char`/`ushort` are intentionally **not** supported as keys. Use an
+unsigned type if you need numeric ordering, or a byte buffer / string otherwise. Using an unsupported key
+type throws `NotSupportedException` the first time its encoder is resolved (when the store is opened).
+
+**Values** are not a type parameter at all — every value is just a sequence of bytes, written through
+`Put` overloads that accept a `byte[]`, a `ReadOnlySpan<byte>`, or a `Bytes`. There is no value encoder,
+no per-store value type, and no on-disk type marker for values. An **empty value** (`Length == 0`) is the
+deletion tombstone, so the entire byte range — including the all-`0xFF` value — is storable; there is no
+reserved sentinel and therefore no latent data-loss bug. To store a number as a value, encode it into a
+fixed-width `byte[]`/span yourself (for example with `BinaryPrimitives`).
 
 > **Key ordering.** Keys are encoded in an *order-preserving* form, so the engine can binary-search a
 > block by comparing raw encoded bytes on the hot read path — no per-entry key is materialized and no
-> allocation occurs. Numeric keys therefore sort by their natural numeric value (negatives before
-> non-negatives), and `string` keys sort by Unicode code point (equivalent to UTF-8 byte order), which is
-> ordinal — not culture-sensitive.
+> allocation occurs. `uint`/`ulong` keys therefore sort by their natural numeric value, and `string` keys
+> sort by Unicode code point (equivalent to UTF-8 byte order), which is ordinal — not culture-sensitive.
+
+> **On-disk format.** SST and WAL files store raw encoded key/value bytes with no embedded type marker, so
+> the type set is part of the format contract, not something recorded per store. Changing the encoders
+> (including this restriction) is a breaking on-disk change: there is no migration — open a fresh store
+> with the new types.
 
 ## Reading and writing
 
@@ -85,28 +100,47 @@ Using an unsupported type throws `NotSupportedException` when the store is opene
 db.Put(key, value);
 ```
 
-`Put` is synchronous and inserts or replaces the value for `key`. Ownership of `key` and `value`
-transfers to the engine: do not mutate or release them (for example, do not return a pooled buffer)
-after the call, because the engine keeps and reads them until the owning memtable is flushed.
+`Put` is synchronous and inserts or replaces the value for `key`. It is overloaded on the value type:
+
+| Overload                          | Allocation                          | Ownership                                                        |
+|-----------------------------------|-------------------------------------|-----------------------------------------------------------------|
+| `Put(TKey, byte[])`               | Zero-copy; the array is stored as-is| Ownership transfers to the engine; do not mutate/release it     |
+| `Put(TKey, ReadOnlySpan<byte>)`   | One `byte[]` copy of the span       | Caller keeps owning the span's backing memory                   |
+| `Put(TKey, Bytes)`                | Copies the bytes out               | Caller keeps owning (and must `Dispose`) the `Bytes`            |
+
+For `byte[]` (and any pooled `key`), ownership transfers to the engine: do not mutate or release them
+after the call (for example, do not return a pooled buffer), because the engine keeps and reads them
+until the owning memtable is flushed. The span and `Bytes` overloads copy, so the caller retains
+ownership of the source buffer.
+
+An **empty value** — `Array.Empty<byte>()`, a `default`/empty span, or `Bytes.Empty` — is treated as a
+deletion, identical to calling `Delete(key)`.
+
+To store a fixed-width number without allocating an intermediate array, reinterpret it as bytes and use
+the span overload:
+
+```csharp
+long id = 42;
+ReadOnlySpan<byte> bytes = MemoryMarshal.AsBytes(
+    MemoryMarshal.CreateReadOnlySpan(ref id, 1));
+db.Put(key, bytes);
+```
 
 ### Get
 
 ```csharp
-TValue value = await db.GetAsync(key);
+byte[]? value = await db.GetAsync(key);
 ```
 
-Returns the stored value, or `default(TValue)` (for example `null` for `string`/`byte[]`, `0` for `int`)
-when the key is absent or has been deleted. The returned key/value is a read-only borrow of
-engine-owned memory; copy it yourself (for example by wrapping it in `Bytes`) if you need an
-independently owned, mutable copy.
+Returns the stored value as a freshly allocated `byte[]`, or `null` when the key is absent or has been
+deleted. For zero-allocation reads, use the raw read overloads below.
 
 ### Raw value reads (zero-allocation)
 
 When you store byte payloads under a typed key, `GetAsync` materializes a fresh `byte[]` for every read.
 The raw read overloads avoid that copy: they look the value up by its typed key and hand you the stored
-bytes directly. They are the allocation-free path for the common "typed key, byte value" usage and work
-with any value type by exposing its encoded bytes. All three report a missing or deleted key as
-not-found (unlike `GetAsync`, which surfaces `default(TValue)`).
+bytes directly. They are the allocation-free path for reads. All three report a missing or deleted key as
+not-found (unlike `GetAsync`, which returns `null`).
 
 Write the value into an `IBufferWriter<byte>` (for example a pooled writer):
 
@@ -154,7 +188,7 @@ you need them past the callback.
 db.Delete(key);
 ```
 
-Records a tombstone for `key`. Subsequent reads return `default(TValue)`, and the space is reclaimed
+Records a tombstone for `key`. Subsequent reads return `null`, and the space is reclaimed
 during compaction.
 
 ### Range scans
@@ -165,16 +199,16 @@ on-disk levels.
 ```csharp
 using Silex;
 
-IStorageIterator<int, string> iterator = db.CreateIterator();
+IStorageIterator<uint, byte[]> iterator = db.CreateIterator();
 
 // Scan the entire key space.
-await foreach (KeyValuePair<int, string> entry in iterator.EnumerateAsync())
+await foreach (KeyValuePair<uint, byte[]> entry in iterator.EnumerateAsync())
 {
     Console.WriteLine($"{entry.Key} = {entry.Value}");
 }
 
 // Or scan from a starting key (inclusive), in ascending order.
-await foreach (KeyValuePair<int, string> entry in iterator.EnumerateAsync(from: 100))
+await foreach (KeyValuePair<uint, byte[]> entry in iterator.EnumerateAsync(from: 100))
 {
     Console.WriteLine($"{entry.Key} = {entry.Value}");
 }
@@ -192,7 +226,7 @@ await db.CloseAsync();
 // or
 await db.DisposeAsync();
 // or (via a using block)
-await using var db = await LsmStorage.OpenAsync<int, string>("my-db", options);
+await using var db = await LsmStorage.OpenAsync<uint>("my-db", options);
 ```
 
 There is no finalizer: durability is provided solely by deterministic disposal. An undisposed store
@@ -200,12 +234,32 @@ leaks no native handles, but any data still buffered in memory is not flushed.
 
 ## The `Bytes` type
 
-`Bytes` is a comparable, owned wrapper over a byte buffer. Use it when you want value semantics for
-binary keys/values, or to take an independently owned copy of a zero-copy borrow returned by a read.
+`Bytes` is a value-typed, content-comparable wrapper over a byte buffer. It is the **low-allocation
+alternative to `byte[]`**: where `byte[]` is simple and GC-allocated, `Bytes` is backed by a pooled buffer
+(`MemoryOwner<byte>` over `ArrayPool<byte>.Shared`) so that keys and values can be created and discarded on
+the hot path without producing garbage. Both are valid as keys and values; pick based on the trade-off:
+
+| Aspect      | `byte[]`                               | `Bytes`                                                |
+|-------------|----------------------------------------|--------------------------------------------------------|
+| Allocation  | Allocates on the managed heap (GC)     | Rents from `ArrayPool`; near-zero steady-state garbage |
+| Lifetime    | Reclaimed automatically by the GC      | You **must** `Dispose()` to return the buffer to the pool |
+| Comparison  | Reference type; compared by content    | Value type; compared and hashed by content             |
+| Best for    | Simplicity, occasional or borrowed data| High-throughput, allocation-sensitive workloads        |
+
+Because the buffer is pooled, **ownership matters**:
+
+- When you `Put` a `Bytes`, ownership of the buffer transfers to the engine; do not dispose or mutate it
+  afterwards.
+- A read returns a borrow valid only until the next operation; wrap it in a new `Bytes` (which copies) if
+  you need to keep it.
+- `default(Bytes)` and `Bytes.Empty` own no buffer. They are safe to use and safe to `Dispose()` (it is a
+  no-op), so empty values never need special handling.
 
 ```csharp
-var key = new Bytes(new byte[] { 1, 2, 3 });
-db.Put(key, new Bytes("hello world"u8.ToArray()));
+await using var db = await LsmStorage.OpenAsync<Bytes>("my-db", options);
+
+using var key = new Bytes(new byte[] { 1, 2, 3 });
+db.Put(key, new Bytes("hello world"u8.ToArray())); // value ownership transfers to the engine
 ```
 
 ## Configuration
@@ -258,11 +312,13 @@ dotnet run --project Silex.Playground -c Release
 
 ```csharp
 var options = new StorageOptions { MemTableSizeLimit = 1.MiB(), FlushPeriod = TimeSpan.Zero };
-await using var db = await LsmStorage.OpenAsync<int, int>("db", options);
+await using var db = await LsmStorage.OpenAsync<uint>("db", options);
 
 foreach (var x in Enumerable.Range(0, 1_000_000))
 {
-    db.Put(x, x);
+    var value = new byte[sizeof(int)];
+    BinaryPrimitives.WriteInt32BigEndian(value, x);
+    db.Put((uint)x, value);
 }
 
 await db.CloseAsync(); // flush everything to disk
@@ -352,7 +408,7 @@ leftover MemTables. `readseq` uses Silex's raw scan path for the `byte[]` benchm
 
 ## Thread-safety and lifetime notes
 
-- A single `LsmStorage<TKey, TValue>` instance is intended to be shared for concurrent reads and writes;
+- A single `LsmStorage<TKey>` instance is intended to be shared for concurrent reads and writes;
   writes are serialized internally.
 - Because reads return zero-copy borrows of engine-owned memory, do not retain a returned key/value
   beyond its immediate use unless you copy it. Treat returned data as read-only.

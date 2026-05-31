@@ -1,7 +1,7 @@
 ﻿namespace Silex.Tables;
-public interface ISsTableBuilder<TKey, TValue> : IDisposable
+public interface ISsTableBuilder<TKey> : IDisposable
 {
     long EstimatedSize { get; }
-    Task AddAsync(TKey key, TValue value, CancellationToken cancellationToken = default);
-    Task<SsTable<TKey, TValue>> BuildAsync(CancellationToken cancellationToken = default);
+    Task AddAsync(TKey key, ValueBuffer value, CancellationToken cancellationToken = default);
+    Task<SsTable<TKey>> BuildAsync(CancellationToken cancellationToken = default);
 }

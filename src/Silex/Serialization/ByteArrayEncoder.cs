@@ -27,7 +27,7 @@ public sealed class ByteArrayEncoder : IBinaryEncoder<byte[]>
 
     public byte[] GetTombstoneValue() => Array.Empty<byte>();
 
-    public bool IsTombstoneValue(byte[] value) => value == Array.Empty<byte>();
+    public bool IsTombstoneValue(byte[] value) => value.Length == 0;
 
     public int Encode(byte[] value, ref EncoderBinaryWriter writer)
     {

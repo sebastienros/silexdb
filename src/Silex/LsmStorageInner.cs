@@ -16,11 +16,10 @@ namespace Silex;
 /// <summary>
 /// The inner storage engine. It handles thread-safety for the <see cref="StorageState"/>.
 /// </summary>
-internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : notnull
+internal sealed class LsmStorageInner<TKey> : IDisposable where TKey : notnull
 {
-    private static readonly IBinaryEncoder<TValue> _valueSerializer = BinaryEncoderFactory<TValue>.BinarySerializer;
-    private static readonly IBinaryEncoder<TKey> _keySerializer= BinaryEncoderFactory<TKey>.BinarySerializer;
-    private static readonly IComparer<TKey> _keyComparer = BinaryEncoderFactory<TKey>.BinarySerializer.Comparer;
+    private static readonly IBinaryEncoder<TKey> _keySerializer= KeyEncoderFactory<TKey>.Encoder;
+    private static readonly IComparer<TKey> _keyComparer = KeyEncoderFactory<TKey>.Encoder.Comparer;
 
     // Use different locks for each type of manipulated data such that we can lock them individually.
     // For instance updating the MemTable should be synchronized, but not blocked by compaction.
@@ -34,14 +33,14 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     // in-memory install and manifest commit ordered with respect to every other structural change.
     private readonly SemaphoreSlim _maintenanceLock = new(1, 1);
 
-    internal StorageState<TKey, TValue> _state;
+    internal StorageState<TKey> _state;
     private bool _disposed;
-    private readonly IBlockEncoder<TKey, TValue> _blockEncoder;
-    private readonly ISsTableEncoder<TKey, TValue> _ssTableEncoder;
+    private readonly IBlockEncoder<TKey> _blockEncoder;
+    private readonly ISsTableEncoder<TKey> _ssTableEncoder;
     private readonly ISsTableBuilderFactory _ssTableBuilderFactory;
     private readonly IBloomFilterFactory _bloomFilterFactory;
     private readonly long _memTableSizeLimit;
-    private readonly BlockCache<TKey, TValue> _blockCache;
+    private readonly BlockCache<TKey> _blockCache;
     private readonly bool _useWriteAheadLog;
     private readonly bool _syncWriteAheadLogToDisk;
     private readonly CompactionStrategy _compactionStrategy;
@@ -92,21 +91,21 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         _maxReadParallelism = Math.Max(1, options.MaxReadParallelism);
         _blockEncoderFactory = options.BlockEncoderFactory;
         _ssTableEncoderFactory = options.SsTableEncoderFactory;
-        _state = new StorageState<TKey, TValue>() { CurrentMemTable = CreateCurrentMemTable(IdGenerator.GetNextId()) };
-        _blockEncoder = options.BlockEncoderFactory.Create<TKey, TValue>();
-        _ssTableEncoder = options.SsTableEncoderFactory.Create<TKey, TValue>();
+        _state = new StorageState<TKey>() { CurrentMemTable = CreateCurrentMemTable(IdGenerator.GetNextId()) };
+        _blockEncoder = options.BlockEncoderFactory.Create<TKey>();
+        _ssTableEncoder = options.SsTableEncoderFactory.Create<TKey>();
         _ssTableBuilderFactory = options.SsTableBuilderFactory;
         _bloomFilterFactory = options.BloomFilterFactory;
         _memTableSizeLimit = options.MemTableSizeLimit;
-        _blockCache = new BlockCache<TKey, TValue>(options.BlockCacheSizeLimit);
+        _blockCache = new BlockCache<TKey>(options.BlockCacheSizeLimit);
     }
 
     /// <summary>
     /// Gets the value associated with the specified key.
     /// </summary>
-    /// <param name="key"></param>
-    /// <returns><see cref="TValue"/> if the key was not found.</returns>
-    public async ValueTask<TValue> GetAsync(TKey key, CancellationToken cancellationToken = default)
+    /// <param name="key">The key to look up.</param>
+    /// <returns>The stored <see cref="ValueBuffer"/>, or an empty buffer when the key is absent or deleted.</returns>
+    public async ValueTask<ValueBuffer> GetAsync(TKey key, CancellationToken cancellationToken = default)
     {
         // The immutable MemTables can be accessed without lock since they are frozen (read-only),
         // and the collection won't be changed FreezeMemTable substitute the collection when it's altered.
@@ -121,8 +120,8 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         // is an immutable reference captured here to keep a coherent view with CurrentMemTable.
         _currentMemTableLock.EnterReadLock();
 
-        IMemTable<TKey, TValue> currentMemTable;
-        ImmutableQueue<IMemTable<TKey, TValue>> immutableMemTables;
+        IMemTable<TKey> currentMemTable;
+        ImmutableQueue<IMemTable<TKey>> immutableMemTables;
 
         try
         {
@@ -192,7 +191,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
             // short-circuit would.
             if (_maxReadParallelism > 1 && l0.Count >= ParallelL0ProbeThreshold)
             {
-                var probes = new (bool found, TValue resolved)[l0.Count];
+                var probes = new (bool found, ValueBuffer resolved)[l0.Count];
 
                 await Parallel.ForEachAsync(
                     Enumerable.Range(0, l0.Count),
@@ -259,20 +258,12 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     /// value is the stored value, or <c>default</c> when it is a tombstone), and <c>false</c> when the key
     /// is absent. Kept synchronous so the value span never crosses an <c>await</c> boundary.
     /// </summary>
-    private static bool TryResolveBlockValue(Block<TKey, TValue> block, ReadOnlySpan<byte> encodedKey, out TValue resolved)
+    private static bool TryResolveBlockValue(Block<TKey> block, ReadOnlySpan<byte> encodedKey, out ValueBuffer resolved)
     {
         if (block.TryGetValue(encodedKey, out var value))
         {
-            // An empty stored value is a deletion for empty-tombstone encoders (byte[]/Bytes); sentinel-based
-            // encoders (e.g. int) store a fixed non-empty value, so decode and ask the serializer.
-            if (value.IsEmpty)
-            {
-                resolved = default!;
-                return true;
-            }
-
-            var decoded = _valueSerializer.Decode(value);
-            resolved = _valueSerializer.IsTombstoneValue(decoded) ? default! : decoded;
+            // An empty stored value is a deletion (tombstone); otherwise the bytes are the value.
+            resolved = value.IsEmpty ? default! : new ValueBuffer(value.ToArray());
             return true;
         }
 
@@ -286,7 +277,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     /// <c>found = false</c> when the table cannot contain it (range/bloom miss) or a bloom false-positive
     /// turns out absent, so the caller falls through to older tables.
     /// </summary>
-    private async ValueTask<(bool found, TValue resolved)> TryReadFromTableAsync(SsTable<TKey, TValue> table, TKey key, ReadOnlyMemory<byte> keyMemory, CancellationToken cancellationToken)
+    private async ValueTask<(bool found, ValueBuffer resolved)> TryReadFromTableAsync(SsTable<TKey> table, TKey key, ReadOnlyMemory<byte> keyMemory, CancellationToken cancellationToken)
     {
         // The key could be in this table, if not go to the next one.
         if (_keyComparer.Compare(key, table.FirstKey) < 0 || _keyComparer.Compare(key, table.LastKey) > 0)
@@ -471,11 +462,6 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
             return 0;
         }
 
-        if (!_valueSerializer.UsesEmptyTombstone)
-        {
-            return await ScanRawFallbackAsync(arg, reader, maxEntries, cancellationToken);
-        }
-
         await _level0Lock.EnterReadLockAsync(cancellationToken);
 
         try
@@ -552,11 +538,6 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         if (maxEntries == 0)
         {
             return 0;
-        }
-
-        if (!_valueSerializer.UsesEmptyTombstone)
-        {
-            return await SeekRawFallbackAsync(from, arg, reader, maxEntries, cancellationToken);
         }
 
         var keyLength = _keySerializer.GetLength(from);
@@ -670,10 +651,10 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     }
 
     /// <summary>
-    /// Returns the index of the first table whose <see cref="SsTable{TKey, TValue}.LastKey"/> is greater than or
+    /// Returns the index of the first table whose <see cref="SsTable{TKey}.LastKey"/> is greater than or
     /// equal to <paramref name="from"/>, or <paramref name="tables"/>.Count when every table ends before it.
     /// </summary>
-    private static int FindStartTableIndex(List<SsTable<TKey, TValue>> tables, TKey from)
+    private static int FindStartTableIndex(List<SsTable<TKey>> tables, TKey from)
     {
         var start = 0;
         var end = tables.Count - 1;
@@ -698,7 +679,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     /// <summary>
     /// Returns the index of the block that may contain <paramref name="from"/>: the last block whose FirstKey is
     /// less than or equal to <paramref name="from"/>, clamped to the first block. Mirrors the seek used by
-    /// <see cref="SsTableIterator{TKey, TValue}"/>; callers must apply the stepped-back-block correction.
+    /// <see cref="SsTableIterator{TKey}"/>; callers must apply the stepped-back-block correction.
     /// </summary>
     private static int FindStartBlockIndex(IReadOnlyList<BlockMetadata<TKey>> blockMetadata, TKey from)
     {
@@ -728,36 +709,26 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         return Math.Max(0, start - 1);
     }
 
-    private static bool InvokeRawEntryReader<TArg>(TArg arg, ReadRawEntryAction<TArg> reader, TKey key, TValue value)
+    private static bool InvokeRawEntryReader<TArg>(TArg arg, ReadRawEntryAction<TArg> reader, TKey key, ValueBuffer value)
     {
-        if (_keySerializer.TryGetRawBytes(key, out var keyBytes) && _valueSerializer.TryGetRawBytes(value, out var valueBytes))
+        var valueBytes = value.Span;
+
+        if (_keySerializer.TryGetRawBytes(key, out var keyBytes))
         {
             return reader(arg, keyBytes, valueBytes);
         }
 
         using var keyBuffer = new PooledArrayBufferWriter<byte>(Math.Max(1, _keySerializer.GetLength(key)));
-        using var valueBuffer = new PooledArrayBufferWriter<byte>(Math.Max(1, _valueSerializer.GetLength(value)));
 
-        if (!_keySerializer.TryGetRawBytes(key, out keyBytes))
-        {
-            var keyWriter = new EncoderBinaryWriter(keyBuffer);
-            _keySerializer.Encode(key, ref keyWriter);
-            keyWriter.Flush();
-            keyBytes = keyBuffer.WrittenMemory.Span;
-        }
-
-        if (!_valueSerializer.TryGetRawBytes(value, out valueBytes))
-        {
-            var valueWriter = new EncoderBinaryWriter(valueBuffer);
-            _valueSerializer.Encode(value, ref valueWriter);
-            valueWriter.Flush();
-            valueBytes = valueBuffer.WrittenMemory.Span;
-        }
+        var keyWriter = new EncoderBinaryWriter(keyBuffer);
+        _keySerializer.Encode(key, ref keyWriter);
+        keyWriter.Flush();
+        keyBytes = keyBuffer.WrittenMemory.Span;
 
         return reader(arg, keyBytes, valueBytes);
     }
 
-    private bool TryGetGloballySortedSsTableRun(out List<SsTable<TKey, TValue>> tables)
+    private bool TryGetGloballySortedSsTableRun(out List<SsTable<TKey>> tables)
     {
         _currentMemTableLock.EnterReadLock();
 
@@ -778,7 +749,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
                 count += level.Count;
             }
 
-            tables = new List<SsTable<TKey, TValue>>(count);
+            tables = new List<SsTable<TKey>>(count);
             tables.AddRange(state.LevelZeroTables);
 
             foreach (var level in state.LeveledSsTables)
@@ -835,8 +806,8 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         // Current and immutable memtables: see GetAsync for the locking rationale.
         _currentMemTableLock.EnterReadLock();
 
-        IMemTable<TKey, TValue> currentMemTable;
-        ImmutableQueue<IMemTable<TKey, TValue>> immutableMemTables;
+        IMemTable<TKey> currentMemTable;
+        ImmutableQueue<IMemTable<TKey>> immutableMemTables;
 
         try
         {
@@ -951,7 +922,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     /// Resolves <paramref name="key"/> against a memtable, handing live value bytes to <paramref name="sink"/>.
     /// Kept synchronous so the borrowed value span never crosses an <c>await</c>.
     /// </summary>
-    private static RawLookup TryResolveMemTableRaw<TSink>(IMemTable<TKey, TValue> memTable, TKey key, TSink sink, out int length)
+    private static RawLookup TryResolveMemTableRaw<TSink>(IMemTable<TKey> memTable, TKey key, TSink sink, out int length)
         where TSink : struct, IValueByteSink
     {
         length = 0;
@@ -961,56 +932,24 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
             return RawLookup.Miss;
         }
 
-        // A present key shadows every older source, whether live or a tombstone.
-        if (_valueSerializer.IsTombstoneValue(value))
+        // A present key shadows every older source. An empty value is a tombstone, applied uniformly with
+        // the SST path so a key never flips between "found empty" and "not found" across a flush.
+        if (value.IsEmpty)
         {
             return RawLookup.Tombstone;
         }
 
-        if (_valueSerializer.TryGetRawBytes(value, out var bytes))
-        {
-            // For empty-tombstone encoders an empty byte form is a deletion, applied uniformly with the
-            // SST path so a key never flips between "found empty" and "not found" across a flush.
-            if (_valueSerializer.UsesEmptyTombstone && bytes.IsEmpty)
-            {
-                return RawLookup.Tombstone;
-            }
-
-            sink.Accept(bytes);
-            length = bytes.Length;
-            return RawLookup.Live;
-        }
-
-        // The value cannot expose its bytes directly (non-identity encoder); encode it into a pooled buffer.
-        var bufferWriter = new PooledArrayBufferWriter<byte>(Math.Max(1, _valueSerializer.GetLength(value)));
-
-        try
-        {
-            var writer = new EncoderBinaryWriter(bufferWriter);
-            _valueSerializer.Encode(value, ref writer);
-            writer.Flush();
-            var encoded = bufferWriter.WrittenMemory.Span;
-
-            if (_valueSerializer.UsesEmptyTombstone && encoded.IsEmpty)
-            {
-                return RawLookup.Tombstone;
-            }
-
-            sink.Accept(encoded);
-            length = encoded.Length;
-            return RawLookup.Live;
-        }
-        finally
-        {
-            bufferWriter.Dispose();
-        }
+        var bytes = value.Span;
+        sink.Accept(bytes);
+        length = bytes.Length;
+        return RawLookup.Live;
     }
 
     /// <summary>
     /// Probes a single SST for <paramref name="key"/> on the raw path, returning a tri-state result and the
     /// live value length. Mirrors <see cref="TryReadFromTableAsync"/> but hands value bytes to the sink.
     /// </summary>
-    private async ValueTask<(RawLookup kind, int length)> TryReadRawFromTableAsync<TSink>(SsTable<TKey, TValue> table, TKey key, ReadOnlyMemory<byte> keyMemory, TSink sink, CancellationToken cancellationToken)
+    private async ValueTask<(RawLookup kind, int length)> TryReadRawFromTableAsync<TSink>(SsTable<TKey> table, TKey key, ReadOnlyMemory<byte> keyMemory, TSink sink, CancellationToken cancellationToken)
         where TSink : struct, IValueByteSink
     {
         if (_keyComparer.Compare(key, table.FirstKey) < 0 || _keyComparer.Compare(key, table.LastKey) > 0)
@@ -1047,7 +986,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     /// Resolves <paramref name="key"/> against a single block on the raw path. Kept synchronous so the
     /// borrowed value span never crosses an <c>await</c>.
     /// </summary>
-    private static RawLookup TryResolveRawBlockValue<TSink>(Block<TKey, TValue> block, ReadOnlySpan<byte> encodedKey, TSink sink, out int length)
+    private static RawLookup TryResolveRawBlockValue<TSink>(Block<TKey> block, ReadOnlySpan<byte> encodedKey, TSink sink, out int length)
         where TSink : struct, IValueByteSink
     {
         length = 0;
@@ -1057,17 +996,9 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
             return RawLookup.Miss;
         }
 
-        // Apply the same tombstone rules as the memtable raw path so a key never changes meaning across a
-        // flush. Empty-tombstone encoders (byte[]/Bytes) treat any empty stored value as a deletion and stay
-        // zero-copy; sentinel encoders store a fixed non-empty tombstone, so decode to recognise it.
-        if (_valueSerializer.UsesEmptyTombstone)
-        {
-            if (value.IsEmpty)
-            {
-                return RawLookup.Tombstone;
-            }
-        }
-        else if (_valueSerializer.IsTombstoneValue(_valueSerializer.Decode(value)))
+        // An empty stored value is a deletion, matching the memtable raw path so a key never changes
+        // meaning across a flush.
+        if (value.IsEmpty)
         {
             return RawLookup.Tombstone;
         }
@@ -1077,7 +1008,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         return RawLookup.Live;
     }
 
-    public void Put(TKey key, TValue value)
+    public void Put(TKey key, ValueBuffer value)
     {
         _currentMemTableLock.EnterWriteLock();
 
@@ -1106,7 +1037,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
 
         try
         {
-            _state.CurrentMemTable.Put(key, _valueSerializer.GetTombstoneValue());
+            _state.CurrentMemTable.Put(key, ValueBuffer.Empty);
 
             if (_state.CurrentMemTable.Size >= _memTableSizeLimit)
             {
@@ -1168,7 +1099,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
 
         try
         {
-            IMemTable<TKey, TValue> memTableToFlush;
+            IMemTable<TKey> memTableToFlush;
 
             _immutableMemTablesLock.EnterReadLock();
 
@@ -1260,9 +1191,9 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     /// <summary>
     /// Parses the numeric <em>filename</em> id of an SST from its path. This is the id under which the file
     /// is stored on disk (and recorded in the manifest), which is distinct from the transient runtime
-    /// <see cref="SsTable{TKey, TValue}.Id"/> assigned when the in-memory table object is created.
+    /// <see cref="SsTable{TKey}.Id"/> assigned when the in-memory table object is created.
     /// </summary>
-    private static long GetSstFileId(SsTable<TKey, TValue> table)
+    private static long GetSstFileId(SsTable<TKey> table)
     {
         return long.Parse(Path.GetFileNameWithoutExtension(table.Filename), CultureInfo.InvariantCulture);
     }
@@ -1319,7 +1250,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         {
             // Snapshot the tier list while briefly holding the read lock. The maintenance lock already
             // excludes flush/compaction, so the snapshot stays valid through the merge below.
-            List<SsTable<TKey, TValue>> tiers;
+            List<SsTable<TKey>> tiers;
             bool hasLeveledData;
 
             await _level0Lock.EnterReadLockAsync(cancellationToken);
@@ -1345,7 +1276,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
 
             // The inputs are the suffix [startIndex, end). They are in ascending-id (oldest-first) order
             // because tiers are appended on flush/compaction.
-            var inputs = new List<SsTable<TKey, TValue>>(count);
+            var inputs = new List<SsTable<TKey>>(count);
 
             for (var i = startIndex; i < tiers.Count; i++)
             {
@@ -1370,24 +1301,24 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
             // rate, never correctness.
             var estimatedCount = (int)Math.Min(int.MaxValue, Math.Max(1, totalInputBytes / 24));
 
-            SsTable<TKey, TValue>? output = null;
+            SsTable<TKey>? output = null;
             var addedEntries = 0;
 
             using (var builder = _ssTableBuilderFactory.CreateSsTableBuilder(outputPath, _ssTableEncoder, _blockEncoder, _bloomFilterFactory, estimatedCount))
             {
                 // Feed iterators newest-first so the MergeIterator keeps the most recent value per key.
-                var iterators = new List<IStorageIterator<TKey, TValue>>(count);
+                var iterators = new List<IStorageIterator<TKey, ValueBuffer>>(count);
 
                 for (var i = tiers.Count - 1; i >= startIndex; i--)
                 {
-                    iterators.Add(new SsTableIterator<TKey, TValue>(tiers[i]));
+                    iterators.Add(new SsTableIterator<TKey>(tiers[i]));
                 }
 
-                var merge = new MergeIterator<TKey, TValue>(iterators);
+                var merge = new MergeIterator<TKey>(iterators);
 
                 await foreach (var entry in merge.EnumerateAsync(cancellationToken))
                 {
-                    if (dropTombstones && _valueSerializer.IsTombstoneValue(entry.Value))
+                    if (dropTombstones && entry.Value.IsEmpty)
                     {
                         continue;
                     }
@@ -1473,7 +1404,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         }
     }
 
-    private static bool SuffixMatches(List<SsTable<TKey, TValue>> live, List<SsTable<TKey, TValue>> inputs, int startIndex)
+    private static bool SuffixMatches(List<SsTable<TKey>> live, List<SsTable<TKey>> inputs, int startIndex)
     {
         for (var i = 0; i < inputs.Count; i++)
         {
@@ -1512,8 +1443,8 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         {
             // Snapshot the structure while briefly holding the read lock. The maintenance lock already
             // excludes flush/compaction, so the snapshot stays valid through the merge below.
-            List<SsTable<TKey, TValue>> level0;
-            List<List<SsTable<TKey, TValue>>> levels;
+            List<SsTable<TKey>> level0;
+            List<List<SsTable<TKey>>> levels;
 
             await _level0Lock.EnterReadLockAsync(cancellationToken);
 
@@ -1553,7 +1484,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     /// Selects the leveled source level (0-based, where index 0 is L1) with the highest size/target ratio
     /// above 1.0 that still has room to push down, or <c>-1</c> when no level is over its target.
     /// </summary>
-    private int SelectLeveledSourceLevel(List<List<SsTable<TKey, TValue>>> levels)
+    private int SelectLeveledSourceLevel(List<List<SsTable<TKey>>> levels)
     {
         var best = -1;
         var bestRatio = 1.0;
@@ -1622,16 +1553,16 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     /// output SSTs. The structure is installed under the level0 write lock, the manifest is persisted (the
     /// durable commit point), and finally the replaced input files are deleted.
     /// </summary>
-    private async Task<bool> CompactLevelAsync(int sourceLevelIndex, List<SsTable<TKey, TValue>> level0, List<List<SsTable<TKey, TValue>>> levels, CancellationToken cancellationToken)
+    private async Task<bool> CompactLevelAsync(int sourceLevelIndex, List<SsTable<TKey>> level0, List<List<SsTable<TKey>>> levels, CancellationToken cancellationToken)
     {
         // Destination level index (0-based, 0 == L1). L0 flushes into L1; level s pushes into s+1.
         var targetLevelIndex = sourceLevelIndex < 0 ? 0 : sourceLevelIndex + 1;
 
-        var targetTables = targetLevelIndex < levels.Count ? levels[targetLevelIndex] : new List<SsTable<TKey, TValue>>();
+        var targetTables = targetLevelIndex < levels.Count ? levels[targetLevelIndex] : new List<SsTable<TKey>>();
 
         // Determine the source SSTs (newest-first for the merge) and what stays behind in the source level.
-        var sourceTables = new List<SsTable<TKey, TValue>>();
-        List<SsTable<TKey, TValue>>? remainingSource = null;
+        var sourceTables = new List<SsTable<TKey>>();
+        List<SsTable<TKey>>? remainingSource = null;
         var clearLevel0 = sourceLevelIndex < 0;
 
         if (clearLevel0)
@@ -1684,7 +1615,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         }
 
         var hi = lo;
-        var overlapTargets = new List<SsTable<TKey, TValue>>();
+        var overlapTargets = new List<SsTable<TKey>>();
 
         while (hi < targetTables.Count && _keyComparer.Compare(targetTables[hi].FirstKey, rangeLast) <= 0)
         {
@@ -1699,7 +1630,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         var dropTombstones = !HasDataBelow(levels, targetLevelIndex);
 
         // Merge the source (newest) over the overlapping destination SSTs (older) into size-bounded outputs.
-        var mergeInputs = new List<SsTable<TKey, TValue>>(sourceTables.Count + overlapTargets.Count);
+        var mergeInputs = new List<SsTable<TKey>>(sourceTables.Count + overlapTargets.Count);
         mergeInputs.AddRange(sourceTables);
         mergeInputs.AddRange(overlapTargets);
 
@@ -1708,7 +1639,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         // The new destination level: kept-before ++ freshly merged outputs ++ kept-after. This stays sorted
         // and non-overlapping because the consumed targets were a contiguous run and the outputs cover only
         // keys from the source and that run (see the level0 install assert below).
-        var newTargetLevel = new List<SsTable<TKey, TValue>>(lo + outputs.Count + (targetTables.Count - hi));
+        var newTargetLevel = new List<SsTable<TKey>>(lo + outputs.Count + (targetTables.Count - hi));
 
         for (var i = 0; i < lo; i++)
         {
@@ -1745,7 +1676,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
             // Grow the leveled structure with empty runs until the destination level exists, then publish it.
             while (_state.LeveledSsTables.Count <= targetLevelIndex)
             {
-                _state.LeveledSsTables.Add(new List<SsTable<TKey, TValue>>());
+                _state.LeveledSsTables.Add(new List<SsTable<TKey>>());
             }
 
             _state.LeveledSsTables[targetLevelIndex] = newTargetLevel;
@@ -1786,7 +1717,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     /// entry is a dropped tombstone. On failure all partially built outputs are disposed and deleted so no
     /// file handles or orphan files leak.
     /// </summary>
-    private async Task<List<SsTable<TKey, TValue>>> MergeIntoSplitSsTablesAsync(List<SsTable<TKey, TValue>> inputs, bool dropTombstones, CancellationToken cancellationToken)
+    private async Task<List<SsTable<TKey>>> MergeIntoSplitSsTablesAsync(List<SsTable<TKey>> inputs, bool dropTombstones, CancellationToken cancellationToken)
     {
         var dop = _maxCompactionParallelism;
 
@@ -1808,8 +1739,8 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         if (partitionCount <= 1)
         {
             // Single partition: behaves exactly like the original sequential split merge.
-            var blockEncoder = _blockEncoderFactory.Create<TKey, TValue>();
-            var tableEncoder = _ssTableEncoderFactory.Create<TKey, TValue>();
+            var blockEncoder = _blockEncoderFactory.Create<TKey>();
+            var tableEncoder = _ssTableEncoderFactory.Create<TKey>();
 
             return await MergeRangeIntoSplitSsTablesAsync(inputs, dropTombstones, blockEncoder, tableEncoder, hasLower: false, default!, hasUpper: false, default!, cancellationToken);
         }
@@ -1826,7 +1757,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
             splits[j - 1] = boundaries[index];
         }
 
-        var results = new List<SsTable<TKey, TValue>>?[partitionCount];
+        var results = new List<SsTable<TKey>>?[partitionCount];
 
         try
         {
@@ -1843,8 +1774,8 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
                     // Fresh encoder instances per partition: the shared encoder instances on the engine are
                     // not contractually thread-safe, and parallel builders would otherwise call into the
                     // same instance concurrently.
-                    var blockEncoder = _blockEncoderFactory.Create<TKey, TValue>();
-                    var tableEncoder = _ssTableEncoderFactory.Create<TKey, TValue>();
+                    var blockEncoder = _blockEncoderFactory.Create<TKey>();
+                    var tableEncoder = _ssTableEncoderFactory.Create<TKey>();
 
                     // Publish only after the whole partition succeeds, so the outer cleanup never double-frees
                     // a partially built partition (that one cleans up after itself before throwing).
@@ -1872,7 +1803,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
 
         // Concatenate partition outputs in key order. Sub-ranges are disjoint and each partition's outputs
         // are internally non-overlapping, so the result is globally sorted and non-overlapping.
-        var outputs = new List<SsTable<TKey, TValue>>();
+        var outputs = new List<SsTable<TKey>>();
 
         foreach (var result in results)
         {
@@ -1893,27 +1824,27 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     /// particular each parallel sub-compaction) owns its encoder instances. On failure every partially built
     /// output is disposed and deleted, then the exception is rethrown.
     /// </summary>
-    private async Task<List<SsTable<TKey, TValue>>> MergeRangeIntoSplitSsTablesAsync(List<SsTable<TKey, TValue>> inputs, bool dropTombstones, IBlockEncoder<TKey, TValue> blockEncoder, ISsTableEncoder<TKey, TValue> tableEncoder, bool hasLower, TKey lower, bool hasUpper, TKey upper, CancellationToken cancellationToken)
+    private async Task<List<SsTable<TKey>>> MergeRangeIntoSplitSsTablesAsync(List<SsTable<TKey>> inputs, bool dropTombstones, IBlockEncoder<TKey> blockEncoder, ISsTableEncoder<TKey> tableEncoder, bool hasLower, TKey lower, bool hasUpper, TKey upper, CancellationToken cancellationToken)
     {
-        var outputs = new List<SsTable<TKey, TValue>>();
+        var outputs = new List<SsTable<TKey>>();
 
         // Per-output bloom sizing from the target file size; an imperfect estimate only affects the
         // false-positive rate, never correctness.
         var estimatedCount = (int)Math.Min(int.MaxValue, Math.Max(1, _targetSstSizeBytes / 24));
 
-        ISsTableBuilder<TKey, TValue>? builder = null;
+        ISsTableBuilder<TKey>? builder = null;
         string? builderPath = null;
 
         try
         {
-            var iterators = new List<IStorageIterator<TKey, TValue>>(inputs.Count);
+            var iterators = new List<IStorageIterator<TKey, ValueBuffer>>(inputs.Count);
 
             foreach (var input in inputs)
             {
-                iterators.Add(new SsTableIterator<TKey, TValue>(input));
+                iterators.Add(new SsTableIterator<TKey>(input));
             }
 
-            var merge = new MergeIterator<TKey, TValue>(iterators);
+            var merge = new MergeIterator<TKey>(iterators);
 
             // Seek every input to the lower bound (skips earlier blocks); the merge stays ascending so the
             // upper bound is enforced with a single break below.
@@ -1926,7 +1857,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
                     break;
                 }
 
-                if (dropTombstones && _valueSerializer.IsTombstoneValue(entry.Value))
+                if (dropTombstones && entry.Value.IsEmpty)
                 {
                     continue;
                 }
@@ -1990,7 +1921,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     /// equal to the range start would make an empty first partition). The returned keys are strictly greater
     /// than the combined range start, so any prefix of them yields strictly increasing partition bounds.
     /// </summary>
-    private List<TKey> ComputeSubcompactionBoundaries(List<SsTable<TKey, TValue>> inputs)
+    private List<TKey> ComputeSubcompactionBoundaries(List<SsTable<TKey>> inputs)
     {
         var candidates = new List<TKey>();
 
@@ -2027,7 +1958,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     /// Returns <see langword="true"/> when the SSTs are in ascending key order with non-overlapping ranges,
     /// the invariant every leveled level must satisfy. Used only by debug assertions.
     /// </summary>
-    private static bool IsSortedNonOverlapping(List<SsTable<TKey, TValue>> tables)
+    private static bool IsSortedNonOverlapping(List<SsTable<TKey>> tables)
     {
         for (var i = 1; i < tables.Count; i++)
         {
@@ -2044,7 +1975,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     /// Returns <see langword="true"/> when any leveled level below <paramref name="targetLevelIndex"/>
     /// still holds data, meaning tombstones must be preserved when compacting into the target level.
     /// </summary>
-    private static bool HasDataBelow(List<List<SsTable<TKey, TValue>>> levels, int targetLevelIndex)
+    private static bool HasDataBelow(List<List<SsTable<TKey>>> levels, int targetLevelIndex)
     {
         for (var i = targetLevelIndex + 1; i < levels.Count; i++)
         {
@@ -2061,7 +1992,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     /// Evaluates the tiered-compaction triggers over the tier list (oldest-first) and returns the start
     /// index of the newest suffix to merge, or <c>-1</c> when no compaction is warranted.
     /// </summary>
-    private int SelectTieredCompaction(List<SsTable<TKey, TValue>> tiers)
+    private int SelectTieredCompaction(List<SsTable<TKey>> tiers)
     {
         var n = tiers.Count;
 
@@ -2140,15 +2071,15 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     /// <summary>
     /// Creates a new current (writable) MemTable, attaching a write-ahead log when durability is enabled.
     /// </summary>
-    private MemTable<TKey, TValue> CreateCurrentMemTable(long id)
+    private MemTable<TKey> CreateCurrentMemTable(long id)
     {
         if (!_useWriteAheadLog)
         {
-            return new MemTable<TKey, TValue>(id);
+            return new MemTable<TKey>(id);
         }
 
-        var wal = new WriteAheadLog<TKey, TValue>(GetWalPath(id), _syncWriteAheadLogToDisk);
-        return new MemTable<TKey, TValue>(id, wal);
+        var wal = new WriteAheadLog<TKey>(GetWalPath(id), _syncWriteAheadLogToDisk);
+        return new MemTable<TKey>(id, wal);
     }
 
     /// <summary>
@@ -2192,7 +2123,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         DeleteWal(id);
     }
 
-    public IStorageIterator<TKey, TValue> CreateIterator()
+    public IStorageIterator<TKey, ValueBuffer> CreateIterator()
     {
         return new LsmStorageIterator(this);
     }
@@ -2232,7 +2163,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         {
             var _previousMemTable = _state.CurrentMemTable;
 
-            _state = new StorageState<TKey, TValue>
+            _state = new StorageState<TKey>
             {
                 CurrentMemTable = CreateCurrentMemTable(IdGenerator.GetNextId()),
                 ImmutableMemTables = _state.ImmutableMemTables.Enqueue(_previousMemTable),
@@ -2286,16 +2217,16 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         DisposeInternal();
     }
 
-    private sealed class LsmStorageIterator : IStorageIterator<TKey, TValue>
+    private sealed class LsmStorageIterator : IStorageIterator<TKey, ValueBuffer>
     {
-        private readonly LsmStorageInner<TKey, TValue> _storage;
+        private readonly LsmStorageInner<TKey> _storage;
 
-        public LsmStorageIterator(LsmStorageInner<TKey, TValue> storage)
+        public LsmStorageIterator(LsmStorageInner<TKey> storage)
         {
             _storage = storage;
         }
 
-        public IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateAsync(CancellationToken cancellationToken = default)
+        public IAsyncEnumerable<KeyValuePair<TKey, ValueBuffer>> EnumerateAsync(CancellationToken cancellationToken = default)
         {
             return EnumerateAsync(hasFrom: false, default!, cancellationToken);
         }
@@ -2304,12 +2235,12 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         /// Returns all the values whose key is greater than or equal to <paramref name="from"/>, merging the
         /// current MemTable, the immutable MemTables and the on-disk L0 SSTables.
         /// </summary>
-        public IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateAsync(TKey from, CancellationToken cancellationToken = default)
+        public IAsyncEnumerable<KeyValuePair<TKey, ValueBuffer>> EnumerateAsync(TKey from, CancellationToken cancellationToken = default)
         {
             return EnumerateAsync(hasFrom: true, from, cancellationToken);
         }
 
-        private async IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateAsync(bool hasFrom, TKey from, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        private async IAsyncEnumerable<KeyValuePair<TKey, ValueBuffer>> EnumerateAsync(bool hasFrom, TKey from, [EnumeratorCancellation] CancellationToken cancellationToken = default)
         {
             // Hold the level0 read lock for the whole scan: it freezes the L0 tier list (no flush append or
             // compaction swap) and, because flush only disposes a flushed immutable MemTable after its own
@@ -2334,7 +2265,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
                 }
 
                 var iterators = BuildIterators(hasFrom, from, cancellationToken);
-                var merge = new MergeIterator<TKey, TValue>(iterators);
+                var merge = new MergeIterator<TKey>(iterators);
 
                 var enumerable = hasFrom
                     ? merge.EnumerateAsync(from, cancellationToken)
@@ -2342,7 +2273,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
 
                 await foreach (var entry in enumerable)
                 {
-                    if (!_valueSerializer.IsTombstoneValue(entry.Value))
+                    if (!entry.Value.IsEmpty)
                     {
                         yield return entry;
                     }
@@ -2360,8 +2291,8 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
         /// filtering. When <paramref name="hasFrom"/> is set, a binary search skips straight to the first table
         /// whose range can contain <paramref name="from"/>.
         /// </summary>
-        private async IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateSortedRunAsync(
-            List<SsTable<TKey, TValue>> tables,
+        private async IAsyncEnumerable<KeyValuePair<TKey, ValueBuffer>> EnumerateSortedRunAsync(
+            List<SsTable<TKey>> tables,
             bool hasFrom,
             TKey from,
             [EnumeratorCancellation] CancellationToken cancellationToken)
@@ -2397,7 +2328,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                var iterator = new SsTableIterator<TKey, TValue>(tables[i]);
+                var iterator = new SsTableIterator<TKey>(tables[i]);
 
                 // Only the first table needs the seek; every later table starts at its FirstKey, which is
                 // already >= from because the run is non-overlapping.
@@ -2407,7 +2338,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
 
                 await foreach (var entry in enumerable)
                 {
-                    if (!_valueSerializer.IsTombstoneValue(entry.Value))
+                    if (!entry.Value.IsEmpty)
                     {
                         yield return entry;
                     }
@@ -2417,16 +2348,16 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
 
         /// <summary>
         /// Builds the merge inputs in most-recent-first order (current MemTable, then immutable MemTables
-        /// newest-first, then L0 SSTables newest-first) so the <see cref="MergeIterator{TKey, TValue}"/>
+        /// newest-first, then L0 SSTables newest-first) so the <see cref="MergeIterator{TKey}"/>
         /// keeps the latest value on duplicate keys. The current MemTable is materialized under its
         /// (thread-affine) lock so the rest of the scan can perform async SST I/O without holding it.
         /// </summary>
-        private List<IStorageIterator<TKey, TValue>> BuildIterators(bool hasFrom, TKey from, CancellationToken cancellationToken)
+        private List<IStorageIterator<TKey, ValueBuffer>> BuildIterators(bool hasFrom, TKey from, CancellationToken cancellationToken)
         {
-            List<KeyValuePair<TKey, TValue>> currentSnapshot;
-            ImmutableQueue<IMemTable<TKey, TValue>> immutableMemTables;
-            List<SsTable<TKey, TValue>> levelZeroTables;
-            List<List<SsTable<TKey, TValue>>> leveledTables;
+            List<KeyValuePair<TKey, ValueBuffer>> currentSnapshot;
+            ImmutableQueue<IMemTable<TKey>> immutableMemTables;
+            List<SsTable<TKey>> levelZeroTables;
+            List<List<SsTable<TKey>>> leveledTables;
 
             _storage._currentMemTableLock.EnterReadLock();
 
@@ -2450,7 +2381,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
                 _storage._currentMemTableLock.ExitReadLock();
             }
 
-            var iterators = new List<IStorageIterator<TKey, TValue>>
+            var iterators = new List<IStorageIterator<TKey, ValueBuffer>>
             {
                 new ListStorageIterator(currentSnapshot)
             };
@@ -2464,7 +2395,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
             // L0 SSTs are appended oldest-first; add them newest-first so a newer table wins on duplicates.
             for (var i = levelZeroTables.Count - 1; i >= 0; i--)
             {
-                iterators.Add(new SsTableIterator<TKey, TValue>(levelZeroTables[i]));
+                iterators.Add(new SsTableIterator<TKey>(levelZeroTables[i]));
             }
 
             // Then the compaction levels, newest-first (L1 before L2 ...). Within a level the SSTs are
@@ -2473,16 +2404,16 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
             {
                 foreach (var table in level)
                 {
-                    iterators.Add(new SsTableIterator<TKey, TValue>(table));
+                    iterators.Add(new SsTableIterator<TKey>(table));
                 }
             }
 
             return iterators;
         }
 
-        private static List<KeyValuePair<TKey, TValue>> MaterializeCurrentMemTable(IMemTable<TKey, TValue> memTable, CancellationToken cancellationToken)
+        private static List<KeyValuePair<TKey, ValueBuffer>> MaterializeCurrentMemTable(IMemTable<TKey> memTable, CancellationToken cancellationToken)
         {
-            var snapshot = new List<KeyValuePair<TKey, TValue>>();
+            var snapshot = new List<KeyValuePair<TKey, ValueBuffer>>();
 
             // The MemTable iterator is synchronous, so this blocking drain stays on the calling thread.
             foreach (var entry in memTable.CreateIterator().EnumerateAsync(cancellationToken).ToBlockingEnumerable(cancellationToken))
@@ -2498,16 +2429,16 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
     /// An <see cref="IStorageIterator{TKey, TValue}"/> over an already-materialized, key-ascending list.
     /// Used to snapshot the current MemTable so the rest of a scan can run async I/O off its lock.
     /// </summary>
-    private sealed class ListStorageIterator : IStorageIterator<TKey, TValue>
+    private sealed class ListStorageIterator : IStorageIterator<TKey, ValueBuffer>
     {
-        private readonly List<KeyValuePair<TKey, TValue>> _entries;
+        private readonly List<KeyValuePair<TKey, ValueBuffer>> _entries;
 
-        public ListStorageIterator(List<KeyValuePair<TKey, TValue>> entries)
+        public ListStorageIterator(List<KeyValuePair<TKey, ValueBuffer>> entries)
         {
             _entries = entries;
         }
 
-        public async IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
+        public async IAsyncEnumerable<KeyValuePair<TKey, ValueBuffer>> EnumerateAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
         {
             await Task.CompletedTask;
 
@@ -2517,7 +2448,7 @@ internal sealed class LsmStorageInner<TKey, TValue> : IDisposable where TKey : n
             }
         }
 
-        public async IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateAsync(TKey from, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        public async IAsyncEnumerable<KeyValuePair<TKey, ValueBuffer>> EnumerateAsync(TKey from, [EnumeratorCancellation] CancellationToken cancellationToken = default)
         {
             await Task.CompletedTask;
 

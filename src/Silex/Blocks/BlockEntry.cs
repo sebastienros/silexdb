@@ -6,4 +6,4 @@ namespace Silex.Blocks;
 /// <param name="KeyOffset">The offset of the encoded key in the shared key buffer.</param>
 /// <param name="KeyLength">The length, in bytes, of the encoded key.</param>
 /// <param name="Value">The (not yet encoded) value associated with the key.</param>
-public readonly record struct BlockEntry<TValue>(int KeyOffset, int KeyLength, TValue Value);
+public readonly record struct BlockEntry(int KeyOffset, int KeyLength, ValueBuffer Value);

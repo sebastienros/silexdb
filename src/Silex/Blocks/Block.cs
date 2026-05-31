@@ -4,15 +4,15 @@ using System.Buffers;
 
 namespace Silex.Blocks;
 
-public class Block<TKey, TValue> : IDisposable
+public class Block<TKey> : IDisposable
 {
-    private static readonly IComparer<TKey> _keyComparer = BinaryEncoderFactory<TKey>.BinarySerializer.Comparer;
+    private static readonly IComparer<TKey> _keyComparer = KeyEncoderFactory<TKey>.Encoder.Comparer;
 
-    private readonly IBlockEncoder<TKey, TValue> _encoder;
+    private readonly IBlockEncoder<TKey> _encoder;
     private readonly IMemoryOwner<byte>? _memoryOwner;
     private bool _disposed;
 
-    public Block(IBlockEncoder<TKey, TValue> encoder, IMemoryOwner<byte> blockData, int length, int count)
+    public Block(IBlockEncoder<TKey> encoder, IMemoryOwner<byte> blockData, int length, int count)
     {
         _encoder = encoder;
         _memoryOwner = blockData;
@@ -20,7 +20,7 @@ public class Block<TKey, TValue> : IDisposable
         Offsets = new BlockOffsets(Memory, length - (count + 1) * sizeof(ushort), count);
     }
 
-    public Block(IBlockEncoder<TKey, TValue> encoder, ReadOnlyMemory<byte> blockData, int length, int count)
+    public Block(IBlockEncoder<TKey> encoder, ReadOnlyMemory<byte> blockData, int length, int count)
     {
         _encoder = encoder;
         _memoryOwner = null;

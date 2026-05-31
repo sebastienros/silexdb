@@ -1,4 +1,5 @@
 ﻿using Silex;
+using System.Buffers.Binary;
 using System.Diagnostics;
 
 await Store1MillionValues();
@@ -11,12 +12,12 @@ static async Task Store1MillionValues()
     }
 
     var options = new StorageOptions { MemTableSizeLimit = 1.MiB(), FlushPeriod = TimeSpan.Zero };
-    var db = await LsmStorage.OpenAsync<int, int>("db", options);
+    var db = await LsmStorage.OpenAsync<uint>("db", options);
 
     var data = Enumerable.Range(0, 1_000_000).Select(x => Random.Shared.Next()).ToList();
 
     var sw = Stopwatch.StartNew();
-    data.ForEach(x => db.Put(x, x));
+    data.ForEach(x => db.Put((uint)x, Encode(x)));
     Console.WriteLine($"Add entries: {sw.Elapsed}");
 
     sw.Restart();
@@ -29,4 +30,12 @@ static async Task Store1MillionValues()
     {
         Console.WriteLine($"{file} ({new FileInfo(file).Length})");
     }
+
+    static byte[] Encode(int value)
+    {
+        var buffer = new byte[sizeof(int)];
+        BinaryPrimitives.WriteInt32BigEndian(buffer, value);
+        return buffer;
+    }
 }
+

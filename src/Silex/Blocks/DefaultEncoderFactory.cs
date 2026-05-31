@@ -19,5 +19,5 @@ public class DefaultBlockEncoderFactory : IBlockEncoderFactory
         _blockSize = blockSize;
     }
 
-    public IBlockEncoder<TKey, TValue> Create<TKey, TValue>() => new DefaultBlockEncoder<TKey, TValue>(_blockSize);
+    public IBlockEncoder<TKey> Create<TKey>() => new DefaultBlockEncoder<TKey>(_blockSize);
 }

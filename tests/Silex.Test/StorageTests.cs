@@ -20,13 +20,13 @@ public class StorageTests
     {
         using var tempFolder = TempFolder.Create();
 
-        using var storage = new LsmStorageInner<byte[], byte[]>(tempFolder, _defaultStorageOptions);
+        using var storage = new LsmStorageInner<byte[]>(tempFolder, _defaultStorageOptions);
 
         byte[] key = [1, 2, 3];
         byte[] value = [4, 5, 6];
 
         storage.Put(key, value);
-        var result = await storage.GetAsync(key);
+        var result = await storage.GetBytesAsync(key);
 
         await Assert.That(result).IsEqualTo(value);
         await Assert.That(storage._state.CurrentMemTable.Size).IsEqualTo(10);
@@ -39,19 +39,19 @@ public class StorageTests
         // put (a read-only borrow), not a defensive copy. This locks in that contract.
         using var tempFolder = TempFolder.Create();
 
-        using var storage = new LsmStorageInner<byte[], byte[]>(tempFolder, _defaultStorageOptions);
+        using var storage = new LsmStorageInner<byte[]>(tempFolder, _defaultStorageOptions);
 
         byte[] key = [1, 2, 3];
         byte[] value = [4, 5, 6];
 
         storage.Put(key, value);
 
-        var result = await storage.GetAsync(key);
+        var result = await storage.GetBytesAsync(key);
         await Assert.That(result).IsSameReferenceAs(value);
 
         var scanned = storage.CreateIterator().EnumerateAsync().ToBlockingEnumerable().Single();
         await Assert.That(scanned.Key).IsSameReferenceAs(key);
-        await Assert.That(scanned.Value).IsSameReferenceAs(value);
+        await Assert.That(scanned.Value.ToNullableArray()).IsSameReferenceAs(value);
     }
 
     [Test]
@@ -59,7 +59,7 @@ public class StorageTests
     {
         using var tempFolder = TempFolder.Create();
 
-        using var storage = new LsmStorageInner<byte[], byte[]>(tempFolder, _defaultStorageOptions);
+        using var storage = new LsmStorageInner<byte[]>(tempFolder, _defaultStorageOptions);
 
         byte[] key1 = [1];
         byte[] key2 = [2];
@@ -68,8 +68,8 @@ public class StorageTests
         storage.Put(key1, value);
         storage.Put(key2, value);
 
-        var result1 = await storage.GetAsync(key1);
-        var result2 = await storage.GetAsync(key2);
+        var result1 = await storage.GetBytesAsync(key1);
+        var result2 = await storage.GetBytesAsync(key2);
 
         await Assert.That(result1).IsEqualTo(value);
         await Assert.That(result2).IsEqualTo(value);
@@ -81,14 +81,14 @@ public class StorageTests
     {
         using var tempFolder = TempFolder.Create();
 
-        using var storage = new LsmStorageInner<byte[], byte[]>(tempFolder, _defaultStorageOptions);
+        using var storage = new LsmStorageInner<byte[]>(tempFolder, _defaultStorageOptions);
 
         byte[] key = [1, 2, 3];
 
         storage.Delete(key);
         var result = await storage.GetAsync(key);
 
-        await Assert.That(result?.Length == 0).IsTrue();
+        await Assert.That(result.IsEmpty).IsTrue();
         await Assert.That(storage._state.CurrentMemTable.Size).IsEqualTo(7);
     }
 
@@ -104,7 +104,7 @@ public class StorageTests
         var storageOptions = new StorageOptions { MemTableSizeLimit = memTableSizeLimit, UseWriteAheadLog = false };
         using var tempFolder = TempFolder.Create();
 
-        using var storage = new LsmStorageInner<int, byte[]>(tempFolder, storageOptions);
+        using var storage = new LsmStorageInner<uint>(tempFolder, storageOptions);
 
         for (var i = 1; i <= entries; i++)
         {
@@ -130,7 +130,7 @@ public class StorageTests
         var storageOptions = new StorageOptions { MemTableSizeLimit = memTableSizeLimit, UseWriteAheadLog = false };
         using var tempFolder = TempFolder.Create();
 
-        using var storage = new LsmStorageInner<int, byte[]>(tempFolder, storageOptions);
+        using var storage = new LsmStorageInner<uint>(tempFolder, storageOptions);
 
         for (var i = 1; i <= entries; i++)
         {
@@ -145,7 +145,7 @@ public class StorageTests
         for (var i = 1; i <= entries; i++)
         {
             var expectedValue = dictionary[i];
-            var actualValue = await storage.GetAsync(i);
+            var actualValue = await storage.GetBytesAsync(i);
 
             await Assert.That(actualValue).IsEqualTo(expectedValue);
         }
@@ -159,13 +159,13 @@ public class StorageTests
 
         int key = 10;
 
-        var result = await storage.GetAsync(key);
+        var result = await storage.GetBytesAsync(key);
         await Assert.That(result?.Length).IsEqualTo(10);
 
         storage.Delete(key);
-        result = await storage.GetAsync(key);
+        var deleted = await storage.GetAsync(key);
 
-        await Assert.That(result?.Length).IsEqualTo(0);
+        await Assert.That(deleted.IsEmpty).IsTrue();
     }
 
     [Test]
@@ -173,7 +173,7 @@ public class StorageTests
     {
         using var tempFolder = TempFolder.Create();
 
-        using var storage = new LsmStorageInner<char, byte[]>(tempFolder, new StorageOptions { UseWriteAheadLog = false });
+        using var storage = new LsmStorageInner<uint>(tempFolder, new StorageOptions { UseWriteAheadLog = false });
 
         // table1: b->del, c->4, d->5
         // table2: a->1, b->2, c->3
@@ -216,7 +216,7 @@ public class StorageTests
         var storageOptions = new StorageOptions { MemTableSizeLimit = 100, UseWriteAheadLog = false };
         using var tempFolder = TempFolder.Create();
 
-        using var storage = new LsmStorageInner<long, byte[]>(tempFolder, storageOptions);
+        using var storage = new LsmStorageInner<ulong>(tempFolder, storageOptions);
         var iterator = storage.CreateIterator();
 
         var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5)).Token;
@@ -243,18 +243,18 @@ public class StorageTests
         {
             var key = entry.Key.ToString(CultureInfo.InvariantCulture);
             var entryValue = await storage.GetAsync(entry.Key);
-            var value = entryValue.Length == 0 ? "del" : BinaryPrimitives.ReadUInt64LittleEndian(entryValue.AsSpan()).ToString(CultureInfo.InvariantCulture);
+            var value = entryValue.Length == 0 ? "del" : BinaryPrimitives.ReadUInt64LittleEndian(entryValue.Span).ToString(CultureInfo.InvariantCulture);
 
             _output?.WriteLine($"{key} -> {value}");
         }
 
         await Assert.That(allEntries.Count <= maxKeysValue).IsTrue();
 
-        async ValueTask Work(LsmStorageInner<long, byte[]> storage)
+        async ValueTask Work(LsmStorageInner<ulong> storage)
         {
             for (var i = 0; i < iterations; i++)
             {
-                var id = Random.Shared.NextInt64(maxKeysValue);
+                var id = (ulong)Random.Shared.NextInt64(maxKeysValue);
                 var value = Random.Shared.NextInt64();
                 storage.Put(id, BitConverter.GetBytes(value));
             }
@@ -262,7 +262,7 @@ public class StorageTests
             for (var i = 0; i < iterations; i++)
             {
                 var operation = Random.Shared.NextInt64(10);
-                var id = Random.Shared.NextInt64(maxKeysValue);
+                var id = (ulong)Random.Shared.NextInt64(maxKeysValue);
 
                 switch (operation)
                 {
@@ -298,11 +298,12 @@ public class StorageTests
 
         using var tempFolder = TempFolder.Create();
         using var storage = FillImmutableMemTables(tempFolder, entries: count, memTableSizeLimit: 1.KiB());
-        int lowerBytes = lowerBound == null ? -1 : lowerBound.Value;
+        // A null lower bound scans from the very first key; keys are unsigned so 0 is the natural floor.
+        uint from = lowerBound is null ? 0u : (uint)lowerBound.Value;
 
         var expectedKeys = Enumerable.Range(1, count);
 
-        var entries = storage.CreateIterator().EnumerateAsync(lowerBytes).ToBlockingEnumerable().ToList();
+        var entries = storage.CreateIterator().EnumerateAsync(from).ToBlockingEnumerable().ToList();
 
         if (lowerBound.HasValue)
         {
@@ -310,11 +311,11 @@ public class StorageTests
 
             foreach (var e in entries)
             {
-                await Assert.That(lowerBytes <= e.Key).IsTrue();
+                await Assert.That(lowerBound.Value <= e.Key).IsTrue();
             }
         }
 
-        var actualKeys = storage.CreateIterator().EnumerateAsync(lowerBytes).ToBlockingEnumerable().Select(x => x.Key).ToArray();
+        var actualKeys = storage.CreateIterator().EnumerateAsync(from).ToBlockingEnumerable().Select(x => (int)x.Key).ToArray();
 
         await Assert.That(actualKeys).IsEquivalentTo(expectedKeys, CollectionOrdering.Matching);
     }
@@ -324,7 +325,7 @@ public class StorageTests
     {
         using var tempFolder = TempFolder.Create();
 
-        var storage = await LsmStorage.OpenAsync<int, int>(tempFolder, _defaultStorageOptions);
+        var storage = await LsmStorage.OpenAsync<uint>(tempFolder, _defaultStorageOptions);
 
         await Assert.That(Directory.Exists(tempFolder)).IsTrue();
 
@@ -336,7 +337,7 @@ public class StorageTests
     {
         using var tempFolder = TempFolder.Create();
 
-        var storage = await LsmStorage.OpenAsync<char, byte[]>(tempFolder, new StorageOptions());
+        var storage = await LsmStorage.OpenAsync<uint>(tempFolder, new StorageOptions());
 
         storage.Put('e', [4]);
 
@@ -356,7 +357,7 @@ public class StorageTests
     {
         using var tempFolder = TempFolder.Create();
 
-        var storage = await LsmStorage.OpenAsync<char, byte[]>(tempFolder, new());
+        var storage = await LsmStorage.OpenAsync<uint>(tempFolder, new());
 
         storage.Put('e', [4]);
         storage._inner.ForceFreezeMemTable();
@@ -373,7 +374,7 @@ public class StorageTests
     {
         using var tempFolder = TempFolder.Create();
 
-        var storage = await LsmStorage.OpenAsync<int, int>(tempFolder, new());
+        var storage = await LsmStorage.OpenAsync<uint>(tempFolder, new());
 
         const int count = 200;
 
@@ -394,11 +395,11 @@ public class StorageTests
         // Reads must go through the bloom filter and block decoding of the SST.
         for (var i = 0; i < count; i++)
         {
-            await Assert.That(await storage.GetAsync(i)).IsEqualTo(i + 1);
+            await Assert.That(await storage.GetInt32Async(i)).IsEqualTo(i + 1);
         }
 
         // A key that was never inserted returns the default value.
-        await Assert.That(await storage.GetAsync(10000)).IsEqualTo(0);
+        await Assert.That(await storage.GetInt32Async(10000)).IsEqualTo(0);
 
         await storage.CloseAsync();
     }
@@ -419,7 +420,7 @@ public class StorageTests
             BlockCacheSizeLimit = 1,
         };
 
-        using var storage = new LsmStorageInner<byte[], byte[]>(tempFolder, options);
+        using var storage = new LsmStorageInner<byte[]>(tempFolder, options);
         var value = new byte[valueSize];
 
         for (var i = 0; i < value.Length; i++)
@@ -495,7 +496,7 @@ public class StorageTests
 
         using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { MemTableMaxCount = 2 };
-        var storage = await LsmStorage.OpenAsync<char, int>(tempFolder, options);
+        var storage = await LsmStorage.OpenAsync<uint>(tempFolder, options);
 
         storage.Put('a', 1);
         storage._inner.ForceFreezeMemTable();
@@ -522,7 +523,7 @@ public class StorageTests
     public async Task CloseAsyncShouldFlushToDisk()
     {
         using var tempFolder = TempFolder.Create();
-        var storage = await LsmStorage.OpenAsync<char, int>(tempFolder, new StorageOptions());
+        var storage = await LsmStorage.OpenAsync<uint>(tempFolder, new StorageOptions());
 
         storage.Put('a', 1);
         await storage.CloseAsync();
@@ -535,7 +536,7 @@ public class StorageTests
     public async Task CloseAsyncCanBeInvokedMultipleTimes()
     {
         using var tempFolder = TempFolder.Create();
-        var storage = await LsmStorage.OpenAsync<char, int>(tempFolder, new StorageOptions());
+        var storage = await LsmStorage.OpenAsync<uint>(tempFolder, new StorageOptions());
 
         storage.Put('a', 1);
         await storage.CloseAsync();
@@ -544,7 +545,7 @@ public class StorageTests
         await storage.CloseAsync();
         await Assert.That(Directory.EnumerateFiles(tempFolder, "*.sst")).HasSingleItem();
 
-        storage = await LsmStorage.OpenAsync<char, int>(tempFolder, new StorageOptions());
+        storage = await LsmStorage.OpenAsync<uint>(tempFolder, new StorageOptions());
         storage.Put('a', 2);
         await storage.CloseAsync();
         await Assert.That(Directory.EnumerateFiles(tempFolder, "*.sst").Count()).IsEqualTo(2);
@@ -573,7 +574,7 @@ public class StorageTests
         // The storage was never closed, so nothing was ever persisted.
         static async Task CreateUnclosedStorageAsync(string folder)
         {
-            var storage = await LsmStorage.OpenAsync<char, int>(folder, new StorageOptions { UseWriteAheadLog = false });
+            var storage = await LsmStorage.OpenAsync<uint>(folder, new StorageOptions { UseWriteAheadLog = false });
             storage.Put('a', 1);
             // Intentionally not closed/disposed: it becomes eligible for finalization on return.
         }
@@ -584,7 +585,7 @@ public class StorageTests
     {
         using var tempFolder = TempFolder.Create();
 
-        using var storage = new LsmStorageInner<int, int>(tempFolder, new StorageOptions { UseWriteAheadLog = false });
+        using var storage = new LsmStorageInner<uint>(tempFolder, new StorageOptions { UseWriteAheadLog = false });
 
         storage.Put(1, 100);
         storage.ForceFreezeMemTable();
@@ -594,7 +595,7 @@ public class StorageTests
 
         // Both immutable mem tables hold key 1; the most recently frozen value must win.
         await Assert.That(storage._state.ImmutableMemTables.Count()).IsEqualTo(2);
-        await Assert.That(await storage.GetAsync(1)).IsEqualTo(200);
+        await Assert.That(await storage.GetInt32Async(1)).IsEqualTo(200);
     }
 
     [Test]
@@ -602,7 +603,7 @@ public class StorageTests
     {
         using var tempFolder = TempFolder.Create();
 
-        using var storage = new LsmStorageInner<int, int>(tempFolder, new StorageOptions { UseWriteAheadLog = false });
+        using var storage = new LsmStorageInner<uint>(tempFolder, new StorageOptions { UseWriteAheadLog = false });
 
         storage.Put(1, 100);
         storage.ForceFreezeMemTable();
@@ -613,7 +614,7 @@ public class StorageTests
         var list = storage.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToList();
 
         await Assert.That(list).HasSingleItem();
-        await Assert.That(list[0].Value).IsEqualTo(200);
+        await Assert.That(list[0].Value.ReadInt32()).IsEqualTo(200);
     }
 
     [Test]
@@ -621,12 +622,12 @@ public class StorageTests
     {
         using var tempFolder = TempFolder.Create();
 
-        using var storage = new LsmStorageInner<byte[], int>(tempFolder, new StorageOptions { UseWriteAheadLog = false });
+        using var storage = new LsmStorageInner<byte[]>(tempFolder, new StorageOptions { UseWriteAheadLog = false });
 
         storage.Put([1, 2, 3], 42);
 
         // A different array instance with the same content must resolve to the stored value.
-        await Assert.That(await storage.GetAsync([1, 2, 3])).IsEqualTo(42);
+        await Assert.That(await storage.GetInt32Async([1, 2, 3])).IsEqualTo(42);
     }
 
     [Test]
@@ -635,7 +636,7 @@ public class StorageTests
         using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { FlushPeriod = TimeSpan.Zero };
 
-        var storage = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
+        var storage = await LsmStorage.OpenAsync<uint>(tempFolder, options);
 
         storage.Put(1, 100);
         storage._inner.ForceFreezeMemTable();
@@ -649,8 +650,8 @@ public class StorageTests
         await storage.CloseAsync();
 
         // After reopening, the SSTs must be ordered by creation so the newest value still wins.
-        var reopened = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
-        await Assert.That(await reopened.GetAsync(1)).IsEqualTo(200);
+        var reopened = await LsmStorage.OpenAsync<uint>(tempFolder, options);
+        await Assert.That(await reopened.GetInt32Async(1)).IsEqualTo(200);
 
         await reopened.CloseAsync();
     }
@@ -661,7 +662,7 @@ public class StorageTests
         using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { FlushPeriod = TimeSpan.Zero };
 
-        var storage = await LsmStorage.OpenAsync<int, Bytes>(tempFolder, options);
+        var storage = await LsmStorage.OpenAsync<uint>(tempFolder, options);
 
         // A Bytes value whose length is not 4 bytes used to trip an incorrect decode assertion.
         Bytes value = new byte[] { 1, 2, 3, 4, 5, 6, 7 };
@@ -672,7 +673,7 @@ public class StorageTests
         await Assert.That(Directory.EnumerateFiles(tempFolder, "*.sst")).HasSingleItem();
 
         var result = await storage.GetAsync(1);
-        await Assert.That(result).IsEqualTo(value);
+        await Assert.That(result).IsEquivalentTo(new byte[] { 1, 2, 3, 4, 5, 6, 7 }, CollectionOrdering.Matching);
 
         await storage.CloseAsync();
     }
@@ -695,17 +696,17 @@ public class StorageTests
         await Assert.That(Directory.EnumerateFiles(tempFolder, "*.sst")).IsEmpty();
         await Assert.That(Directory.EnumerateFiles(tempFolder, "*.wal")).IsNotEmpty();
 
-        var reopened = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
+        var reopened = await LsmStorage.OpenAsync<uint>(tempFolder, options);
 
         for (var i = 0; i < 10; i++)
         {
-            await Assert.That(await reopened.GetAsync(i)).IsEqualTo(i + 1);
+            await Assert.That(await reopened.GetInt32Async(i)).IsEqualTo(i + 1);
         }
 
         await reopened.CloseAsync();
         static async Task SimulateCrashAfterPutsAsync(string folder, StorageOptions options)
         {
-            var storage = await LsmStorage.OpenAsync<int, int>(folder, options);
+            var storage = await LsmStorage.OpenAsync<uint>(folder, options);
 
             for (var i = 0; i < 10; i++)
             {
@@ -735,13 +736,13 @@ public class StorageTests
             File.Delete(wal);
         }
 
-        var reopened = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
-        await Assert.That(await reopened.GetAsync(0)).IsEqualTo(0);
+        var reopened = await LsmStorage.OpenAsync<uint>(tempFolder, options);
+        await Assert.That(await reopened.GetInt32Async(0)).IsEqualTo(0);
 
         await reopened.CloseAsync();
         static async Task SimulateCrashAfterPutsAsync(string folder, StorageOptions options)
         {
-            var storage = await LsmStorage.OpenAsync<int, int>(folder, options);
+            var storage = await LsmStorage.OpenAsync<uint>(folder, options);
             storage.Put(0, 1);
         }
     }
@@ -764,13 +765,13 @@ public class StorageTests
         await File.WriteAllBytesAsync(walFile, bytes[..^1]);
 
         // Recovery must not throw and the earlier, intact records must still be recovered.
-        var reopened = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
-        await Assert.That(await reopened.GetAsync(0)).IsEqualTo(1);
+        var reopened = await LsmStorage.OpenAsync<uint>(tempFolder, options);
+        await Assert.That(await reopened.GetInt32Async(0)).IsEqualTo(1);
 
         await reopened.CloseAsync();
         static async Task SimulateCrashAfterPutsAsync(string folder, StorageOptions options)
         {
-            var storage = await LsmStorage.OpenAsync<int, int>(folder, options);
+            var storage = await LsmStorage.OpenAsync<uint>(folder, options);
 
             for (var i = 0; i < 10; i++)
             {
@@ -785,7 +786,7 @@ public class StorageTests
         using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { FlushPeriod = TimeSpan.Zero };
 
-        var storage = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
+        var storage = await LsmStorage.OpenAsync<uint>(tempFolder, options);
         storage.Put(1, 42);
         storage._inner.ForceFreezeMemTable();
         await storage._inner.ForceFlushNextImmutableMemTableAsync();
@@ -799,9 +800,9 @@ public class StorageTests
         var staleWal = Path.Combine(tempFolder, sstId + ".wal");
         await File.WriteAllBytesAsync(staleWal, new byte[] { 0xFF, 0xFF, 0xFF });
 
-        var reopened = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
+        var reopened = await LsmStorage.OpenAsync<uint>(tempFolder, options);
 
-        await Assert.That(await reopened.GetAsync(1)).IsEqualTo(42);
+        await Assert.That(await reopened.GetInt32Async(1)).IsEqualTo(42);
         // The stale WAL was deleted (and never replayed) because its SST was already loaded. The
         // reopened store has its own fresh current-memtable WAL, so only assert the stale one is gone.
         await Assert.That(File.Exists(staleWal)).IsFalse();
@@ -816,7 +817,7 @@ public class StorageTests
         // tiers reaches MaxSizeAmplificationPercent of the oldest), so all three merge into one SST.
         using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { UseWriteAheadLog = false, MaxCompactionTiers = 3 };
-        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+        var storage = new LsmStorageInner<uint>(tempFolder, options);
 
         try
         {
@@ -830,9 +831,9 @@ public class StorageTests
             await Assert.That(compacted).IsTrue();
             await Assert.That(storage._state.LevelZeroTables).HasSingleItem();
             await Assert.That(Directory.EnumerateFiles(tempFolder, "*.sst")).HasSingleItem();
-            await Assert.That(await storage.GetAsync(1)).IsEqualTo(10);
-            await Assert.That(await storage.GetAsync(2)).IsEqualTo(20);
-            await Assert.That(await storage.GetAsync(3)).IsEqualTo(30);
+            await Assert.That(await storage.GetInt32Async(1)).IsEqualTo(10);
+            await Assert.That(await storage.GetInt32Async(2)).IsEqualTo(20);
+            await Assert.That(await storage.GetInt32Async(3)).IsEqualTo(30);
         }
         finally
         {
@@ -845,9 +846,11 @@ public class StorageTests
     {
         // A full compaction (the oldest tier participates) may drop tombstones. The delete of key 1 in a
         // newer tier shadows its value in the oldest tier and is then discarded entirely.
+        // MaxSizeAmplificationPercent is set low so the space-amplification trigger fires deterministically
+        // and merges from the oldest tier, regardless of the (smaller) on-disk size of the tombstone tier.
         using var tempFolder = TempFolder.Create();
-        var options = new StorageOptions { UseWriteAheadLog = false, MaxCompactionTiers = 3 };
-        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+        var options = new StorageOptions { UseWriteAheadLog = false, MaxCompactionTiers = 3, MaxSizeAmplificationPercent = 1 };
+        var storage = new LsmStorageInner<uint>(tempFolder, options);
 
         try
         {
@@ -859,8 +862,8 @@ public class StorageTests
 
             await Assert.That(compacted).IsTrue();
             await Assert.That(storage._state.LevelZeroTables).HasSingleItem();
-            await Assert.That(await storage.GetAsync(1)).IsEqualTo(0);
-            await Assert.That(await storage.GetAsync(2)).IsEqualTo(200);
+            await Assert.That(await storage.GetInt32Async(1)).IsEqualTo(0);
+            await Assert.That(await storage.GetInt32Async(2)).IsEqualTo(200);
         }
         finally
         {
@@ -876,7 +879,7 @@ public class StorageTests
         // excluded, a tombstone for a key it still holds must be preserved (the key stays logically gone).
         using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { UseWriteAheadLog = false, MaxCompactionTiers = 4 };
-        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+        var storage = new LsmStorageInner<uint>(tempFolder, options);
 
         try
         {
@@ -898,11 +901,11 @@ public class StorageTests
             // The big oldest tier is untouched; the three newest tiers collapse into one.
             await Assert.That(storage._state.LevelZeroTables.Count).IsEqualTo(2);
             // The tombstone was kept, so the key the oldest tier still holds remains logically deleted.
-            await Assert.That(await storage.GetAsync(1000)).IsEqualTo(0);
+            await Assert.That(await storage.GetInt32Async(1000)).IsEqualTo(0);
             // Untouched keys from the oldest tier are still readable.
-            await Assert.That(await storage.GetAsync(1001)).IsEqualTo(1001);
-            await Assert.That(await storage.GetAsync(1)).IsEqualTo(1);
-            await Assert.That(await storage.GetAsync(3)).IsEqualTo(3);
+            await Assert.That(await storage.GetInt32Async(1001)).IsEqualTo(1001);
+            await Assert.That(await storage.GetInt32Async(1)).IsEqualTo(1);
+            await Assert.That(await storage.GetInt32Async(3)).IsEqualTo(3);
         }
         finally
         {
@@ -916,7 +919,7 @@ public class StorageTests
         // With fewer tiers than MaxCompactionTiers there is nothing to do: the call is a no-op.
         using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { UseWriteAheadLog = false, MaxCompactionTiers = 8 };
-        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+        var storage = new LsmStorageInner<uint>(tempFolder, options);
 
         try
         {
@@ -940,7 +943,7 @@ public class StorageTests
     {
         using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { UseWriteAheadLog = false, MaxCompactionTiers = 2, CompactionStrategy = CompactionStrategy.None };
-        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+        var storage = new LsmStorageInner<uint>(tempFolder, options);
 
         try
         {
@@ -965,7 +968,7 @@ public class StorageTests
         using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { FlushPeriod = TimeSpan.Zero, MaxCompactionTiers = 3 };
 
-        var storage = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
+        var storage = await LsmStorage.OpenAsync<uint>(tempFolder, options);
 
         for (var v = 1; v <= 3; v++)
         {
@@ -978,8 +981,8 @@ public class StorageTests
         await Assert.That(Directory.EnumerateFiles(tempFolder, "*.sst")).HasSingleItem();
         await storage.CloseAsync();
 
-        var reopened = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
-        await Assert.That(await reopened.GetAsync(1)).IsEqualTo(300);
+        var reopened = await LsmStorage.OpenAsync<uint>(tempFolder, options);
+        await Assert.That(await reopened.GetInt32Async(1)).IsEqualTo(300);
 
         await reopened.CloseAsync();
     }
@@ -991,7 +994,7 @@ public class StorageTests
         var tieredOptions = new StorageOptions { UseWriteAheadLog = false, FlushPeriod = TimeSpan.Zero };
 
         {
-            var storage = await LsmStorage.OpenAsync<int, int>(tempFolder, tieredOptions);
+            var storage = await LsmStorage.OpenAsync<uint>(tempFolder, tieredOptions);
             storage.Put(1, 10);
             storage._inner.ForceFreezeMemTable();
             await storage._inner.ForceFlushNextImmutableMemTableAsync();
@@ -1010,7 +1013,7 @@ public class StorageTests
             CompactionStrategy = CompactionStrategy.Leveled,
             Level0CompactionThreshold = 2,
         };
-        var reopened = await LsmStorage.OpenAsync<int, int>(tempFolder, leveledOptions);
+        var reopened = await LsmStorage.OpenAsync<uint>(tempFolder, leveledOptions);
 
         try
         {
@@ -1018,8 +1021,8 @@ public class StorageTests
             await Assert.That(await reopened._inner.TryLeveledCompactionAsync()).IsTrue();
             await Assert.That(reopened._inner._state.LevelZeroTables.Count).IsEqualTo(0);
             await Assert.That(reopened._inner._state.LeveledSsTables[0].Count).IsEqualTo(1);
-            await Assert.That(await reopened.GetAsync(1)).IsEqualTo(10);
-            await Assert.That(await reopened.GetAsync(2)).IsEqualTo(20);
+            await Assert.That(await reopened.GetInt32Async(1)).IsEqualTo(10);
+            await Assert.That(await reopened.GetInt32Async(2)).IsEqualTo(20);
         }
         finally
         {
@@ -1040,7 +1043,7 @@ public class StorageTests
         };
 
         {
-            var storage = await LsmStorage.OpenAsync<int, int>(tempFolder, leveledOptions);
+            var storage = await LsmStorage.OpenAsync<uint>(tempFolder, leveledOptions);
             storage.Put(1, 100);
             storage._inner.ForceFreezeMemTable();
             await storage._inner.ForceFlushNextImmutableMemTableAsync();
@@ -1056,7 +1059,7 @@ public class StorageTests
             CompactionStrategy = CompactionStrategy.Tiered,
             MaxCompactionTiers = 2,
         };
-        var reopened = await LsmStorage.OpenAsync<int, int>(tempFolder, tieredOptions);
+        var reopened = await LsmStorage.OpenAsync<uint>(tempFolder, tieredOptions);
 
         try
         {
@@ -1071,20 +1074,20 @@ public class StorageTests
 
             await Assert.That(await reopened._inner.TryTieredCompactionAsync()).IsTrue();
             await Assert.That(reopened._inner._state.LevelZeroTables.Count).IsEqualTo(1);
-            await Assert.That(await reopened.GetAsync(1)).IsEqualTo(0);
-            await Assert.That(await reopened.GetAsync(2)).IsEqualTo(200);
+            await Assert.That(await reopened.GetInt32Async(1)).IsEqualTo(0);
+            await Assert.That(await reopened.GetInt32Async(2)).IsEqualTo(200);
         }
         finally
         {
             await reopened.DisposeAsync();
         }
 
-        var reopenedAgain = await LsmStorage.OpenAsync<int, int>(tempFolder, tieredOptions);
+        var reopenedAgain = await LsmStorage.OpenAsync<uint>(tempFolder, tieredOptions);
 
         try
         {
-            await Assert.That(await reopenedAgain.GetAsync(1)).IsEqualTo(0);
-            await Assert.That(await reopenedAgain.GetAsync(2)).IsEqualTo(200);
+            await Assert.That(await reopenedAgain.GetInt32Async(1)).IsEqualTo(0);
+            await Assert.That(await reopenedAgain.GetInt32Async(2)).IsEqualTo(200);
         }
         finally
         {
@@ -1099,7 +1102,7 @@ public class StorageTests
         var options = new StorageOptions { UseWriteAheadLog = false, FlushPeriod = TimeSpan.Zero };
 
         {
-            var storage = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
+            var storage = await LsmStorage.OpenAsync<uint>(tempFolder, options);
             storage.Put(1, 10);
             storage._inner.ForceFreezeMemTable();
             await storage._inner.ForceFlushNextImmutableMemTableAsync();
@@ -1109,12 +1112,12 @@ public class StorageTests
         var manifestPath = Path.Combine(tempFolder, "manifest");
         File.Delete(manifestPath);
 
-        var reopened = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
+        var reopened = await LsmStorage.OpenAsync<uint>(tempFolder, options);
 
         try
         {
             await Assert.That(File.Exists(manifestPath)).IsTrue();
-            await Assert.That(await reopened.GetAsync(1)).IsEqualTo(10);
+            await Assert.That(await reopened.GetInt32Async(1)).IsEqualTo(10);
         }
         finally
         {
@@ -1134,7 +1137,7 @@ public class StorageTests
             UseWriteAheadLog = false,
             BloomFilterFactory = new AlwaysPositiveBloomFilterFactory(),
         };
-        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+        var storage = new LsmStorageInner<uint>(tempFolder, options);
 
         try
         {
@@ -1147,10 +1150,10 @@ public class StorageTests
                 storage.Put(10, 100);
             });
 
-            await Assert.That(await storage.GetAsync(5)).IsEqualTo(50);
+            await Assert.That(await storage.GetInt32Async(5)).IsEqualTo(50);
             // Keys that really are in the newer table still resolve from it.
-            await Assert.That(await storage.GetAsync(1)).IsEqualTo(10);
-            await Assert.That(await storage.GetAsync(10)).IsEqualTo(100);
+            await Assert.That(await storage.GetInt32Async(1)).IsEqualTo(10);
+            await Assert.That(await storage.GetInt32Async(10)).IsEqualTo(100);
         }
         finally
         {
@@ -1170,7 +1173,7 @@ public class StorageTests
             BlockEncoderFactory = new DefaultBlockEncoderFactory(blockSize),
             BloomFilterFactory = new AlwaysPositiveBloomFilterFactory(),
         };
-        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+        var storage = new LsmStorageInner<uint>(tempFolder, options);
 
         try
         {
@@ -1185,11 +1188,11 @@ public class StorageTests
 
             await Assert.That(storage._state.LevelZeroTables.Any(table => table.BlockMetadata.Count > 1)).IsTrue();
 
-            await Assert.That(await storage.GetAsync(1)).IsEqualTo(10);
-            await Assert.That(await storage.GetAsync(99)).IsEqualTo(990);
-            await Assert.That(await storage.GetAsync(199)).IsEqualTo(1990);
-            await Assert.That(await storage.GetAsync(20)).IsEqualTo(2000);
-            await Assert.That(await storage.GetAsync(200)).IsEqualTo(0);
+            await Assert.That(await storage.GetInt32Async(1)).IsEqualTo(10);
+            await Assert.That(await storage.GetInt32Async(99)).IsEqualTo(990);
+            await Assert.That(await storage.GetInt32Async(199)).IsEqualTo(1990);
+            await Assert.That(await storage.GetInt32Async(20)).IsEqualTo(2000);
+            await Assert.That(await storage.GetInt32Async(200)).IsEqualTo(0);
         }
         finally
         {
@@ -1227,7 +1230,7 @@ public class StorageTests
         // that transition atomic under the level0 write lock, so every previously committed key stays visible.
         using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { UseWriteAheadLog = false, FlushPeriod = TimeSpan.Zero };
-        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+        var storage = new LsmStorageInner<uint>(tempFolder, options);
 
         try
         {
@@ -1243,7 +1246,7 @@ public class StorageTests
                     // all be present in a scan regardless of any in-flight flush.
                     var expected = Volatile.Read(ref committedCount);
                     var keys = storage.CreateIterator().EnumerateAsync().ToBlockingEnumerable()
-                        .Select(e => e.Key).ToHashSet();
+                        .Select(e => (int)e.Key).ToHashSet();
 
                     for (var k = 1; k <= expected; k++)
                     {
@@ -1271,14 +1274,14 @@ public class StorageTests
         }
     }
 
-    private static async Task FlushTierAsync(LsmStorageInner<int, int> storage, Action write)
+    private static async Task FlushTierAsync(LsmStorageInner<uint> storage, Action write)
     {
         write();
         storage.ForceFreezeMemTable();
         await storage.ForceFlushNextImmutableMemTableAsync();
     }
 
-    private static async Task FlushByteTierAsync(LsmStorageInner<byte[], byte[]> storage, Action write)
+    private static async Task FlushByteTierAsync(LsmStorageInner<byte[]> storage, Action write)
     {
         write();
         storage.ForceFreezeMemTable();
@@ -1291,7 +1294,7 @@ public class StorageTests
         // Data flushed to L0 SSTs (with nothing left in the MemTables) must still appear in a full scan.
         using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { UseWriteAheadLog = false };
-        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+        var storage = new LsmStorageInner<uint>(tempFolder, options);
 
         try
         {
@@ -1301,8 +1304,8 @@ public class StorageTests
 
             var entries = storage.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToList();
 
-            await Assert.That(entries.Select(e => e.Key)).IsEquivalentTo(new[] { 1, 2, 3 }, CollectionOrdering.Matching);
-            await Assert.That(entries.Select(e => e.Value)).IsEquivalentTo(new[] { 10, 20, 30 }, CollectionOrdering.Matching);
+            await Assert.That(entries.Select(e => (int)e.Key)).IsEquivalentTo(new[] { 1, 2, 3 }, CollectionOrdering.Matching);
+            await Assert.That(entries.Select(e => e.Value.ReadInt32())).IsEquivalentTo(new[] { 10, 20, 30 }, CollectionOrdering.Matching);
         }
         finally
         {
@@ -1315,7 +1318,7 @@ public class StorageTests
     {
         using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { UseWriteAheadLog = false };
-        var storage = new LsmStorageInner<byte[], byte[]>(tempFolder, options);
+        var storage = new LsmStorageInner<byte[]>(tempFolder, options);
 
         try
         {
@@ -1346,7 +1349,7 @@ public class StorageTests
     {
         using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { UseWriteAheadLog = false };
-        var storage = new LsmStorageInner<byte[], byte[]>(tempFolder, options);
+        var storage = new LsmStorageInner<byte[]>(tempFolder, options);
 
         try
         {
@@ -1379,7 +1382,7 @@ public class StorageTests
         // A tiny block size forces the single flushed table into many blocks so the in-block lower-bound search,
         // the stepped-back-block correction, and cross-block continuation are all exercised by the seek sweep.
         var options = new StorageOptions { UseWriteAheadLog = false, BlockSize = 64 };
-        var storage = new LsmStorageInner<byte[], byte[]>(tempFolder, options);
+        var storage = new LsmStorageInner<byte[]>(tempFolder, options);
 
         try
         {
@@ -1412,7 +1415,7 @@ public class StorageTests
         }
     }
 
-    private static async Task<List<(byte Key, byte Value)>> SeekRawCollectAsync(LsmStorageInner<byte[], byte[]> storage, byte[] from, long maxEntries = long.MaxValue)
+    private static async Task<List<(byte Key, byte Value)>> SeekRawCollectAsync(LsmStorageInner<byte[]> storage, byte[] from, long maxEntries = long.MaxValue)
     {
         var entries = new List<(byte Key, byte Value)>();
 
@@ -1430,7 +1433,7 @@ public class StorageTests
     {
         using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { UseWriteAheadLog = false };
-        var storage = new LsmStorageInner<byte[], byte[]>(tempFolder, options);
+        var storage = new LsmStorageInner<byte[]>(tempFolder, options);
 
         try
         {
@@ -1460,7 +1463,7 @@ public class StorageTests
     {
         using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { UseWriteAheadLog = false, FlushPeriod = TimeSpan.Zero };
-        var storage = await LsmStorage.OpenAsync<byte[], byte[]>(tempFolder, options);
+        var storage = await LsmStorage.OpenAsync<byte[]>(tempFolder, options);
 
         try
         {
@@ -1494,7 +1497,7 @@ public class StorageTests
         // A key written to an SST and later overwritten in the current MemTable must scan as the newer value.
         using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { UseWriteAheadLog = false };
-        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+        var storage = new LsmStorageInner<uint>(tempFolder, options);
 
         try
         {
@@ -1506,8 +1509,8 @@ public class StorageTests
 
             var entries = storage.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToList();
 
-            await Assert.That(entries.Select(e => e.Key)).IsEquivalentTo(new[] { 1, 2 }, CollectionOrdering.Matching);
-            await Assert.That(entries.Select(e => e.Value)).IsEquivalentTo(new[] { 999, 20 }, CollectionOrdering.Matching);
+            await Assert.That(entries.Select(e => (int)e.Key)).IsEquivalentTo(new[] { 1, 2 }, CollectionOrdering.Matching);
+            await Assert.That(entries.Select(e => e.Value.ReadInt32())).IsEquivalentTo(new[] { 999, 20 }, CollectionOrdering.Matching);
         }
         finally
         {
@@ -1521,7 +1524,7 @@ public class StorageTests
         // A key present in an SST but deleted afterwards (tombstone in the MemTable) must be absent from scans.
         using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { UseWriteAheadLog = false };
-        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+        var storage = new LsmStorageInner<uint>(tempFolder, options);
 
         try
         {
@@ -1532,8 +1535,8 @@ public class StorageTests
 
             var entries = storage.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToList();
 
-            await Assert.That(entries.Select(e => e.Key)).IsEquivalentTo(new[] { 2 }, CollectionOrdering.Matching);
-            await Assert.That(entries.Select(e => e.Value)).IsEquivalentTo(new[] { 20 }, CollectionOrdering.Matching);
+            await Assert.That(entries.Select(e => (int)e.Key)).IsEquivalentTo(new[] { 2 }, CollectionOrdering.Matching);
+            await Assert.That(entries.Select(e => e.Value.ReadInt32())).IsEquivalentTo(new[] { 20 }, CollectionOrdering.Matching);
         }
         finally
         {
@@ -1547,7 +1550,7 @@ public class StorageTests
         // A bounded scan (keys >= from) must include matching entries that live only in SSTs.
         using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { UseWriteAheadLog = false };
-        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+        var storage = new LsmStorageInner<uint>(tempFolder, options);
 
         try
         {
@@ -1558,8 +1561,8 @@ public class StorageTests
 
             var entries = storage.CreateIterator().EnumerateAsync(2).ToBlockingEnumerable().ToList();
 
-            await Assert.That(entries.Select(e => e.Key)).IsEquivalentTo(new[] { 2, 3, 4 }, CollectionOrdering.Matching);
-            await Assert.That(entries.Select(e => e.Value)).IsEquivalentTo(new[] { 20, 30, 40 }, CollectionOrdering.Matching);
+            await Assert.That(entries.Select(e => (int)e.Key)).IsEquivalentTo(new[] { 2, 3, 4 }, CollectionOrdering.Matching);
+            await Assert.That(entries.Select(e => e.Value.ReadInt32())).IsEquivalentTo(new[] { 20, 30, 40 }, CollectionOrdering.Matching);
         }
         finally
         {
@@ -1575,19 +1578,19 @@ public class StorageTests
         var options = new StorageOptions { UseWriteAheadLog = false, FlushPeriod = TimeSpan.Zero };
 
         {
-            var storage = new LsmStorageInner<int, int>(tempFolder, options);
+            var storage = new LsmStorageInner<uint>(tempFolder, options);
             await FlushTierAsync(storage, () => storage.Put(1, 10));
             await FlushTierAsync(storage, () => storage.Put(2, 20));
             storage.Dispose();
 
-            var reopened = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
+            var reopened = await LsmStorage.OpenAsync<uint>(tempFolder, options);
 
             try
             {
                 var entries = reopened._inner.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToList();
 
-                await Assert.That(entries.Select(e => e.Key)).IsEquivalentTo(new[] { 1, 2 }, CollectionOrdering.Matching);
-                await Assert.That(entries.Select(e => e.Value)).IsEquivalentTo(new[] { 10, 20 }, CollectionOrdering.Matching);
+                await Assert.That(entries.Select(e => (int)e.Key)).IsEquivalentTo(new[] { 1, 2 }, CollectionOrdering.Matching);
+                await Assert.That(entries.Select(e => e.Value.ReadInt32())).IsEquivalentTo(new[] { 10, 20 }, CollectionOrdering.Matching);
             }
             finally
             {
@@ -1598,21 +1601,21 @@ public class StorageTests
 
 
     [Test]
-    public async Task GetReturnsDefaultForSentinelTombstoneStoredInSsTable()
+    public async Task GetReturnsDefaultForTombstoneStoredInSsTable()
     {
-        // Sentinel-based encoders (here int) persist a deletion as a fixed non-empty value. Reading that
-        // key back from an SST must resolve to the default (deleted), not the raw sentinel.
+        // A deletion persists as an empty-value tombstone in the newest SST. Reading that key back must
+        // resolve to the default (deleted), not to the older live value buried beneath it.
         using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { UseWriteAheadLog = false };
-        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+        var storage = new LsmStorageInner<uint>(tempFolder, options);
 
         try
         {
             await FlushTierAsync(storage, () => storage.Put(1, 100));
             await FlushTierAsync(storage, () => storage.Delete(1));
 
-            // The delete lives in the newest SST as a sentinel value; it must shadow the older value.
-            await Assert.That(await storage.GetAsync(1)).IsEqualTo(0);
+            // The delete lives in the newest SST as a tombstone; it must shadow the older value.
+            await Assert.That(await storage.GetInt32Async(1)).IsEqualTo(0);
         }
         finally
         {
@@ -1632,7 +1635,7 @@ public class StorageTests
             CompactionStrategy = CompactionStrategy.Leveled,
             Level0CompactionThreshold = 4,
         };
-        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+        var storage = new LsmStorageInner<uint>(tempFolder, options);
 
         try
         {
@@ -1648,15 +1651,15 @@ public class StorageTests
             await Assert.That(storage._state.LevelZeroTables).IsEmpty();
             await Assert.That(storage._state.LeveledSsTables).HasSingleItem();
             await Assert.That(storage._state.LeveledSsTables[0]).HasSingleItem();
-            await Assert.That(await storage.GetAsync(1)).IsEqualTo(10);
-            await Assert.That(await storage.GetAsync(2)).IsEqualTo(20);
-            await Assert.That(await storage.GetAsync(3)).IsEqualTo(30);
-            await Assert.That(await storage.GetAsync(4)).IsEqualTo(40);
+            await Assert.That(await storage.GetInt32Async(1)).IsEqualTo(10);
+            await Assert.That(await storage.GetInt32Async(2)).IsEqualTo(20);
+            await Assert.That(await storage.GetInt32Async(3)).IsEqualTo(30);
+            await Assert.That(await storage.GetInt32Async(4)).IsEqualTo(40);
 
             // The merged run is also visible to a full scan in key order.
             var entries = storage.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToList();
-            await Assert.That(entries.Select(e => e.Key)).IsEquivalentTo(new[] { 1, 2, 3, 4 }, CollectionOrdering.Matching);
-            await Assert.That(entries.Select(e => e.Value)).IsEquivalentTo(new[] { 10, 20, 30, 40 }, CollectionOrdering.Matching);
+            await Assert.That(entries.Select(e => (int)e.Key)).IsEquivalentTo(new[] { 1, 2, 3, 4 }, CollectionOrdering.Matching);
+            await Assert.That(entries.Select(e => e.Value.ReadInt32())).IsEquivalentTo(new[] { 10, 20, 30, 40 }, CollectionOrdering.Matching);
         }
         finally
         {
@@ -1677,7 +1680,7 @@ public class StorageTests
             Level0CompactionThreshold = 2,
             BaseLevelTargetBytes = 1,
         };
-        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+        var storage = new LsmStorageInner<uint>(tempFolder, options);
 
         try
         {
@@ -1693,8 +1696,8 @@ public class StorageTests
             await Assert.That(storage._state.LeveledSsTables[0]).IsEmpty(); // L1 now empty
             await Assert.That(storage._state.LeveledSsTables[1]).HasSingleItem(); // L2 populated
 
-            await Assert.That(await storage.GetAsync(1)).IsEqualTo(10);
-            await Assert.That(await storage.GetAsync(2)).IsEqualTo(20);
+            await Assert.That(await storage.GetInt32Async(1)).IsEqualTo(10);
+            await Assert.That(await storage.GetInt32Async(2)).IsEqualTo(20);
         }
         finally
         {
@@ -1714,7 +1717,7 @@ public class StorageTests
             CompactionStrategy = CompactionStrategy.Leveled,
             Level0CompactionThreshold = 2,
         };
-        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+        var storage = new LsmStorageInner<uint>(tempFolder, options);
 
         try
         {
@@ -1727,12 +1730,12 @@ public class StorageTests
 
             await Assert.That(await storage.TryLeveledCompactionAsync()).IsTrue();
 
-            await Assert.That(await storage.GetAsync(1)).IsEqualTo(0);
-            await Assert.That(await storage.GetAsync(2)).IsEqualTo(200);
+            await Assert.That(await storage.GetInt32Async(1)).IsEqualTo(0);
+            await Assert.That(await storage.GetInt32Async(2)).IsEqualTo(200);
 
             // The tombstone for key 1 was dropped, so only key 2 survives in L1.
             var entries = storage.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToList();
-            await Assert.That(entries.Select(e => e.Key)).IsEquivalentTo(new[] { 2 }, CollectionOrdering.Matching);
+            await Assert.That(entries.Select(e => (int)e.Key)).IsEquivalentTo(new[] { 2 }, CollectionOrdering.Matching);
         }
         finally
         {
@@ -1753,7 +1756,7 @@ public class StorageTests
             Level0CompactionThreshold = 2,
             BaseLevelTargetBytes = 1,
         };
-        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+        var storage = new LsmStorageInner<uint>(tempFolder, options);
 
         try
         {
@@ -1769,9 +1772,9 @@ public class StorageTests
             await Assert.That(await storage.TryLeveledCompactionAsync()).IsTrue(); // L0 -> L1, must keep the tombstone
 
             // The delete is preserved: key 1 reads as deleted even though L2 still physically holds 100.
-            await Assert.That(await storage.GetAsync(1)).IsEqualTo(0);
-            await Assert.That(await storage.GetAsync(2)).IsEqualTo(200);
-            await Assert.That(await storage.GetAsync(3)).IsEqualTo(300);
+            await Assert.That(await storage.GetInt32Async(1)).IsEqualTo(0);
+            await Assert.That(await storage.GetInt32Async(2)).IsEqualTo(200);
+            await Assert.That(await storage.GetInt32Async(3)).IsEqualTo(300);
         }
         finally
         {
@@ -1795,7 +1798,7 @@ public class StorageTests
         };
 
         {
-            var building = new LsmStorageInner<int, int>(tempFolder, options);
+            var building = new LsmStorageInner<uint>(tempFolder, options);
             await FlushTierAsync(building, () => building.Put(1, 10));
             await FlushTierAsync(building, () => building.Put(2, 20));
             await Assert.That(await building.TryLeveledCompactionAsync()).IsTrue(); // L0 -> L1
@@ -1807,7 +1810,7 @@ public class StorageTests
 
             await Assert.That(File.Exists(Path.Combine(tempFolder, "manifest"))).IsTrue();
 
-            var storage = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
+            var storage = await LsmStorage.OpenAsync<uint>(tempFolder, options);
 
             try
             {
@@ -1818,8 +1821,8 @@ public class StorageTests
                 await Assert.That(storage._inner._state.LevelZeroTables).IsEmpty();
 
                 var entries = storage._inner.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToList();
-                await Assert.That(entries.Select(e => e.Key)).IsEquivalentTo(new[] { 1, 2, 3, 4 }, CollectionOrdering.Matching);
-                await Assert.That(entries.Select(e => e.Value)).IsEquivalentTo(new[] { 10, 20, 30, 40 }, CollectionOrdering.Matching);
+                await Assert.That(entries.Select(e => (int)e.Key)).IsEquivalentTo(new[] { 1, 2, 3, 4 }, CollectionOrdering.Matching);
+                await Assert.That(entries.Select(e => e.Value.ReadInt32())).IsEquivalentTo(new[] { 10, 20, 30, 40 }, CollectionOrdering.Matching);
             }
             finally
             {
@@ -1843,7 +1846,7 @@ public class StorageTests
         };
 
         {
-            var building = new LsmStorageInner<int, int>(tempFolder, options);
+            var building = new LsmStorageInner<uint>(tempFolder, options);
             await FlushTierAsync(building, () => building.Put(1, 10));
             await FlushTierAsync(building, () => building.Put(2, 20));
             await Assert.That(await building.TryLeveledCompactionAsync()).IsTrue();
@@ -1853,13 +1856,13 @@ public class StorageTests
             var orphan = Path.Combine(tempFolder, "999999.sst");
             File.WriteAllText(orphan, "not a real sst");
 
-            var storage = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
+            var storage = await LsmStorage.OpenAsync<uint>(tempFolder, options);
 
             try
             {
                 await Assert.That(File.Exists(orphan)).IsFalse();
-                await Assert.That(await storage.GetAsync(1)).IsEqualTo(10);
-                await Assert.That(await storage.GetAsync(2)).IsEqualTo(20);
+                await Assert.That(await storage.GetInt32Async(1)).IsEqualTo(10);
+                await Assert.That(await storage.GetInt32Async(2)).IsEqualTo(20);
             }
             finally
             {
@@ -1882,7 +1885,7 @@ public class StorageTests
             BlockSize = 128,
             TargetSstSizeBytes = 128,
         };
-        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+        var storage = new LsmStorageInner<uint>(tempFolder, options);
 
         try
         {
@@ -1907,10 +1910,10 @@ public class StorageTests
             }
 
             // Every key is still readable and a full scan returns them all in order.
-            await Assert.That(await storage.GetAsync(250)).IsEqualTo(2500);
+            await Assert.That(await storage.GetInt32Async(250)).IsEqualTo(2500);
             var entries = storage.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToList();
-            await Assert.That(entries.Select(e => e.Key)).IsEquivalentTo(Enumerable.Range(1, 400), CollectionOrdering.Matching);
-            await Assert.That(entries.Select(e => e.Value)).IsEquivalentTo(Enumerable.Range(1, 400).Select(k => k * 10), CollectionOrdering.Matching);
+            await Assert.That(entries.Select(e => (int)e.Key)).IsEquivalentTo(Enumerable.Range(1, 400), CollectionOrdering.Matching);
+            await Assert.That(entries.Select(e => e.Value.ReadInt32())).IsEquivalentTo(Enumerable.Range(1, 400).Select(k => k * 10), CollectionOrdering.Matching);
         }
         finally
         {
@@ -1932,7 +1935,7 @@ public class StorageTests
             BlockSize = 128,
             TargetSstSizeBytes = 128,
         };
-        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+        var storage = new LsmStorageInner<uint>(tempFolder, options);
 
         try
         {
@@ -1969,13 +1972,13 @@ public class StorageTests
             await Assert.That(l1After.IsSupersetOf(untouchedBefore)).IsTrue();
 
             // Updated keys reflect the new values; everything else is unchanged.
-            await Assert.That(await storage.GetAsync(1)).IsEqualTo(1000);
-            await Assert.That(await storage.GetAsync(5)).IsEqualTo(5000);
-            await Assert.That(await storage.GetAsync(6)).IsEqualTo(6);
-            await Assert.That(await storage.GetAsync(400)).IsEqualTo(400);
+            await Assert.That(await storage.GetInt32Async(1)).IsEqualTo(1000);
+            await Assert.That(await storage.GetInt32Async(5)).IsEqualTo(5000);
+            await Assert.That(await storage.GetInt32Async(6)).IsEqualTo(6);
+            await Assert.That(await storage.GetInt32Async(400)).IsEqualTo(400);
 
             var entries = storage.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToList();
-            await Assert.That(entries.Select(e => e.Key)).IsEquivalentTo(Enumerable.Range(1, 400), CollectionOrdering.Matching);
+            await Assert.That(entries.Select(e => (int)e.Key)).IsEquivalentTo(Enumerable.Range(1, 400), CollectionOrdering.Matching);
         }
         finally
         {
@@ -1999,7 +2002,7 @@ public class StorageTests
         };
 
         {
-            var building = new LsmStorageInner<int, int>(tempFolder, options);
+            var building = new LsmStorageInner<uint>(tempFolder, options);
             await FlushTierAsync(building, () =>
             {
                 for (var k = 1; k <= 400; k++)
@@ -2012,15 +2015,15 @@ public class StorageTests
             await Assert.That(splitCount > 1).IsTrue();
             building.Dispose();
 
-            var storage = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
+            var storage = await LsmStorage.OpenAsync<uint>(tempFolder, options);
 
             try
             {
                 await Assert.That(storage._inner._state.LeveledSsTables[0].Count).IsEqualTo(splitCount);
 
                 var entries = storage._inner.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToList();
-                await Assert.That(entries.Select(e => e.Key)).IsEquivalentTo(Enumerable.Range(1, 400), CollectionOrdering.Matching);
-                await Assert.That(entries.Select(e => e.Value)).IsEquivalentTo(Enumerable.Range(1, 400).Select(k => k * 10), CollectionOrdering.Matching);
+                await Assert.That(entries.Select(e => (int)e.Key)).IsEquivalentTo(Enumerable.Range(1, 400), CollectionOrdering.Matching);
+                await Assert.That(entries.Select(e => e.Value.ReadInt32())).IsEquivalentTo(Enumerable.Range(1, 400).Select(k => k * 10), CollectionOrdering.Matching);
             }
             finally
             {
@@ -2044,7 +2047,7 @@ public class StorageTests
             TargetSstSizeBytes = 128,
             MaxCompactionParallelism = 8,
         };
-        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+        var storage = new LsmStorageInner<uint>(tempFolder, options);
 
         try
         {
@@ -2066,9 +2069,9 @@ public class StorageTests
             }
 
             var entries = storage.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToList();
-            await Assert.That(entries.Select(e => e.Key)).IsEquivalentTo(Enumerable.Range(1, 800), CollectionOrdering.Matching);
-            await Assert.That(entries.Select(e => e.Value)).IsEquivalentTo(Enumerable.Range(1, 800).Select(k => k * 7), CollectionOrdering.Matching);
-            await Assert.That(await storage.GetAsync(700)).IsEqualTo(700 * 7);
+            await Assert.That(entries.Select(e => (int)e.Key)).IsEquivalentTo(Enumerable.Range(1, 800), CollectionOrdering.Matching);
+            await Assert.That(entries.Select(e => e.Value.ReadInt32())).IsEquivalentTo(Enumerable.Range(1, 800).Select(k => k * 7), CollectionOrdering.Matching);
+            await Assert.That(await storage.GetInt32Async(700)).IsEqualTo(700 * 7);
         }
         finally
         {
@@ -2080,7 +2083,7 @@ public class StorageTests
     public async Task SequentialAndParallelCompactionProduceSameData()
     {
         // DOP=1 and DOP>1 must yield identical logical contents (same keys/values on a full scan).
-        static async Task<List<KeyValuePair<int, int>>> RunAsync(int dop)
+        static async Task<List<KeyValuePair<uint, ValueBuffer>>> RunAsync(int dop)
         {
             using var tempFolder = TempFolder.Create();
             var options = new StorageOptions
@@ -2092,7 +2095,7 @@ public class StorageTests
                 TargetSstSizeBytes = 128,
                 MaxCompactionParallelism = dop,
             };
-            var storage = new LsmStorageInner<int, int>(tempFolder, options);
+            var storage = new LsmStorageInner<uint>(tempFolder, options);
             try
             {
                 await FlushTierAsync(storage, () =>
@@ -2115,8 +2118,8 @@ public class StorageTests
         var parallel = await RunAsync(8);
 
         await Assert.That(parallel.Select(e => e.Key)).IsEquivalentTo(sequential.Select(e => e.Key), CollectionOrdering.Matching);
-        await Assert.That(parallel.Select(e => e.Value)).IsEquivalentTo(sequential.Select(e => e.Value), CollectionOrdering.Matching);
-        await Assert.That(parallel.Select(e => e.Key)).IsEquivalentTo(Enumerable.Range(1, 600), CollectionOrdering.Matching);
+        await Assert.That(parallel.Select(e => e.Value.ReadInt32())).IsEquivalentTo(sequential.Select(e => e.Value.ReadInt32()), CollectionOrdering.Matching);
+        await Assert.That(parallel.Select(e => (int)e.Key)).IsEquivalentTo(Enumerable.Range(1, 600), CollectionOrdering.Matching);
     }
 
     [Test]
@@ -2131,7 +2134,7 @@ public class StorageTests
             CompactionStrategy = CompactionStrategy.None,
             MaxReadParallelism = 8,
         };
-        var storage = new LsmStorageInner<int, int>(tempFolder, options);
+        var storage = new LsmStorageInner<uint>(tempFolder, options);
 
         try
         {
@@ -2159,10 +2162,10 @@ public class StorageTests
             }
 
             await Assert.That(storage._state.LevelZeroTables.Count >= 8).IsTrue();
-            await Assert.That(await storage.GetAsync(1)).IsEqualTo(1100); // newest write wins
-            await Assert.That(await storage.GetAsync(3)).IsEqualTo(333);
-            await Assert.That(await storage.GetAsync(2)).IsEqualTo(0); // tombstoned -> default
-            await Assert.That(await storage.GetAsync(99)).IsEqualTo(0); // never written -> default
+            await Assert.That(await storage.GetInt32Async(1)).IsEqualTo(1100); // newest write wins
+            await Assert.That(await storage.GetInt32Async(3)).IsEqualTo(333);
+            await Assert.That(await storage.GetInt32Async(2)).IsEqualTo(0); // tombstoned -> default
+            await Assert.That(await storage.GetInt32Async(99)).IsEqualTo(0); // never written -> default
         }
         finally
         {
@@ -2184,7 +2187,7 @@ public class StorageTests
         };
 
         {
-            var building = new LsmStorageInner<int, int>(tempFolder, options);
+            var building = new LsmStorageInner<uint>(tempFolder, options);
             for (var t = 0; t < 10; t++)
             {
                 var snapshot = t;
@@ -2198,12 +2201,12 @@ public class StorageTests
             }
             building.Dispose();
 
-            var storage = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
+            var storage = await LsmStorage.OpenAsync<uint>(tempFolder, options);
             try
             {
                 for (var k = 1; k <= 100; k++)
                 {
-                    await Assert.That(await storage._inner.GetAsync(k)).IsEqualTo(k * 2);
+                    await Assert.That(await storage._inner.GetInt32Async(k)).IsEqualTo(k * 2);
                 }
             }
             finally
@@ -2217,7 +2220,7 @@ public class StorageTests
     public async Task TryGetRawAsyncWritesValueFromMemTable()
     {
         using var tempFolder = TempFolder.Create();
-        using var storage = new LsmStorageInner<byte[], byte[]>(tempFolder, _defaultStorageOptions);
+        using var storage = new LsmStorageInner<byte[]>(tempFolder, _defaultStorageOptions);
 
         byte[] key = [1, 2, 3];
         byte[] value = [4, 5, 6, 7];
@@ -2234,7 +2237,7 @@ public class StorageTests
     public async Task TryGetRawAsyncReturnsFalseForMissingKey()
     {
         using var tempFolder = TempFolder.Create();
-        using var storage = new LsmStorageInner<byte[], byte[]>(tempFolder, _defaultStorageOptions);
+        using var storage = new LsmStorageInner<byte[]>(tempFolder, _defaultStorageOptions);
 
         var destination = new ArrayBufferWriter<byte>();
         var found = await storage.TryGetRawAsync([9, 9], destination);
@@ -2249,7 +2252,7 @@ public class StorageTests
         // Unlike GetAsync (which surfaces an empty array for a memtable tombstone), the raw API reports a
         // deleted key as not found.
         using var tempFolder = TempFolder.Create();
-        using var storage = new LsmStorageInner<byte[], byte[]>(tempFolder, _defaultStorageOptions);
+        using var storage = new LsmStorageInner<byte[]>(tempFolder, _defaultStorageOptions);
 
         byte[] key = [1, 2, 3];
         storage.Put(key, [4, 5, 6]);
@@ -2266,7 +2269,7 @@ public class StorageTests
     public async Task GetRawAsyncCopiesIntoDestinationAndReturnsLength()
     {
         using var tempFolder = TempFolder.Create();
-        using var storage = new LsmStorageInner<byte[], byte[]>(tempFolder, _defaultStorageOptions);
+        using var storage = new LsmStorageInner<byte[]>(tempFolder, _defaultStorageOptions);
 
         byte[] key = [1, 2, 3];
         byte[] value = [4, 5, 6, 7, 8];
@@ -2283,7 +2286,7 @@ public class StorageTests
     public async Task GetRawAsyncReturnsMinusOneForMissingKey()
     {
         using var tempFolder = TempFolder.Create();
-        using var storage = new LsmStorageInner<byte[], byte[]>(tempFolder, _defaultStorageOptions);
+        using var storage = new LsmStorageInner<byte[]>(tempFolder, _defaultStorageOptions);
 
         var length = await storage.GetRawAsync([7], new byte[8]);
 
@@ -2294,7 +2297,7 @@ public class StorageTests
     public async Task GetRawAsyncReportsLengthWithoutWritingWhenDestinationTooSmall()
     {
         using var tempFolder = TempFolder.Create();
-        using var storage = new LsmStorageInner<byte[], byte[]>(tempFolder, _defaultStorageOptions);
+        using var storage = new LsmStorageInner<byte[]>(tempFolder, _defaultStorageOptions);
 
         byte[] key = [1];
         byte[] value = [4, 5, 6, 7, 8];
@@ -2312,7 +2315,7 @@ public class StorageTests
     public async Task TryReadRawAsyncInspectsValueWithoutCopy()
     {
         using var tempFolder = TempFolder.Create();
-        using var storage = new LsmStorageInner<byte[], byte[]>(tempFolder, _defaultStorageOptions);
+        using var storage = new LsmStorageInner<byte[]>(tempFolder, _defaultStorageOptions);
 
         byte[] key = [1, 2, 3];
         byte[] value = [4, 5, 6, 7];
@@ -2333,7 +2336,7 @@ public class StorageTests
     public async Task TryReadRawAsyncReturnsFalseForMissingKey()
     {
         using var tempFolder = TempFolder.Create();
-        using var storage = new LsmStorageInner<byte[], byte[]>(tempFolder, _defaultStorageOptions);
+        using var storage = new LsmStorageInner<byte[]>(tempFolder, _defaultStorageOptions);
 
         var invoked = false;
         var found = await storage.TryReadRawAsync([5], invoked, static (_, _) => { });
@@ -2345,7 +2348,7 @@ public class StorageTests
     public async Task RawReadsResolveAgainstFlushedSsTable()
     {
         using var tempFolder = TempFolder.Create();
-        using var storage = await LsmStorage.OpenAsync<byte[], byte[]>(tempFolder, new() { UseWriteAheadLog = false });
+        using var storage = await LsmStorage.OpenAsync<byte[]>(tempFolder, new() { UseWriteAheadLog = false });
 
         byte[] liveKey = [1, 2, 3];
         byte[] liveValue = [10, 20, 30, 40];
@@ -2375,11 +2378,12 @@ public class StorageTests
     }
 
     [Test]
-    public async Task RawReadsWorkWithSentinelTombstoneEncoder()
+    public async Task RawReadsReturnStoredBytesAndSignalTombstones()
     {
-        // int uses a sentinel tombstone (not an empty value); the raw path must decode to recognise it.
+        // Numeric values persist as fixed-width little-endian bytes; the raw path returns them verbatim and
+        // signals a tombstone or a miss with a -1 length.
         using var tempFolder = TempFolder.Create();
-        using var storage = await LsmStorage.OpenAsync<int, int>(tempFolder, new() { UseWriteAheadLog = false });
+        using var storage = await LsmStorage.OpenAsync<uint>(tempFolder, new() { UseWriteAheadLog = false });
 
         storage.Put(1, 42);
         storage.Put(2, 7);
@@ -2388,8 +2392,8 @@ public class StorageTests
         var destination = new byte[8];
         var length = await storage.GetRawAsync(1, destination);
         await Assert.That(length).IsEqualTo(sizeof(int));
-        // The stored bytes are the encoder's order-preserving form, so decode through the encoder.
-        await Assert.That(new Int32Encoder().Decode(destination.AsSpan(0, length))).IsEqualTo(42);
+        // The stored bytes are the little-endian form written by the numeric Put overload.
+        await Assert.That(BinaryPrimitives.ReadInt32LittleEndian(destination.AsSpan(0, length))).IsEqualTo(42);
 
         var deletedLength = await storage.GetRawAsync(2, destination);
         await Assert.That(deletedLength).IsEqualTo(-1);
@@ -2400,10 +2404,10 @@ public class StorageTests
         await storage.CloseAsync();
     }
 
-    private static LsmStorageInner<int, byte[]> FillImmutableMemTables(string path, int entries = 100, int valueSize = 10, long memTableSizeLimit = 100)
+    private static LsmStorageInner<uint> FillImmutableMemTables(string path, int entries = 100, int valueSize = 10, long memTableSizeLimit = 100)
     {
         var storageOptions = new StorageOptions { MemTableSizeLimit = memTableSizeLimit, UseWriteAheadLog = false };
-        var storage = new LsmStorageInner<int, byte[]>(path, storageOptions);
+        var storage = new LsmStorageInner<uint>(path, storageOptions);
 
         for (var i = 1; i <= entries; i++)
         {
