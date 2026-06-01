@@ -19,11 +19,11 @@ namespace Silex.Tables;
 /// ----------------------------------------------------------------------------------------------------------------------------
 /// 
 /// </summary>
-public sealed class DefaultSsTableEncoder<TKey, TValue> : ISsTableEncoder<TKey, TValue>
+internal sealed class DefaultSsTableEncoder : ISsTableEncoder
 {
-    private static readonly IBinaryEncoder<TKey> _keySerializer = BinaryEncoderFactory<TKey>.BinarySerializer;
+    private static readonly IBinaryEncoder<ByteSlice> _keySerializer = BinaryEncoderFactory<ByteSlice>.BinarySerializer;
 
-    public IReadOnlyList<BlockMetadata<TKey>> DecodeMetadata(ReadOnlyMemory<byte> buffer, int offset)
+    public IReadOnlyList<BlockMetadata> DecodeMetadata(ReadOnlyMemory<byte> buffer, int offset)
     {
         var binaryReader = new EncoderBinaryReader(buffer, offset);
 
@@ -32,27 +32,25 @@ public sealed class DefaultSsTableEncoder<TKey, TValue> : ISsTableEncoder<TKey, 
 
         // Read each block metadata
 
-        var result = new List<BlockMetadata<TKey>>(numBlocks);
+        var result = new List<BlockMetadata>(numBlocks);
 
         for (var i = 0; i < numBlocks; i++)
         {
             var blockOffset = binaryReader.Read7BitEncodedInt();
 
             var firstKeyLen = binaryReader.Read7BitEncodedInt();
-            var firstKeyData = binaryReader.ReadBytesSpan(firstKeyLen);
-            var firstKey = _keySerializer.Decode(firstKeyData);
+            var firstKey = OwnedByteSlice.CopyFrom(binaryReader.ReadBytesSpan(firstKeyLen));
 
             var lastKeyLen = binaryReader.Read7BitEncodedInt();
-            var lastKeyData = binaryReader.ReadBytesSpan(lastKeyLen);
-            var lastKey = _keySerializer.Decode(lastKeyData);
+            var lastKey = OwnedByteSlice.CopyFrom(binaryReader.ReadBytesSpan(lastKeyLen));
 
-            result.Add(new BlockMetadata<TKey> { Index = i, Offset = blockOffset, FirstKey = firstKey, LastKey = lastKey });
+            result.Add(new BlockMetadata { Index = i, Offset = blockOffset, FirstKeyOwner = firstKey, LastKeyOwner = lastKey });
         }
 
         return result;
     }
 
-    public void EncodeMetadata(ref EncoderBinaryWriter writer, IReadOnlyList<BlockMetadata<TKey>> blockMetadata, long metadataOffset)
+    public void EncodeMetadata(ref EncoderBinaryWriter writer, IReadOnlyList<BlockMetadata> blockMetadata, long metadataOffset)
     {
         writer.Write7BitEncodedInt(blockMetadata.Count);
 
@@ -70,7 +68,7 @@ public sealed class DefaultSsTableEncoder<TKey, TValue> : ISsTableEncoder<TKey, 
         writer.WriteUInt32((uint)metadataOffset);
     }
 
-    public int EstimateMetadataSize(IReadOnlyList<BlockMetadata<TKey>> blockMetadata)
+    public int EstimateMetadataSize(IReadOnlyList<BlockMetadata> blockMetadata)
     {
         int estimate = 0;
 

@@ -12,11 +12,15 @@ public class StorageOptions
     /// <value>4KiB</value>
     private static readonly ushort _defaultBlockSize = (ushort)4.KiB();
 
+    /// <value>32KiB</value>
+    private static readonly int _defaultMemTableArenaBlockSize = (int)32.KiB();
+
     /// <value>50</value>
     private static readonly ushort _defaultMemTableMaxCount = 50;
 
     /// <value><see cref="DefaultBlockEncoderFactory"></value>
     private static readonly IBlockEncoderFactory _defaultBlockEncoderFactory = new DefaultBlockEncoderFactory();
+    private ushort _blockSize = _defaultBlockSize;
 
     /// <value><see cref="DefaultSsTableEncoderFactory"></value>
     private static readonly ISsTableEncoderFactory _defaultSsTableEncoderFactory = new DefaultSsTableEncoderFactory();
@@ -51,6 +55,18 @@ public class StorageOptions
     public long MemTableSizeLimit { get; set; } = _defaultTableSizeLimit;
 
     /// <summary>
+    /// Gets or sets the size of append-only memory blocks used by byte-oriented memtables.
+    /// </summary>
+    /// <remarks>
+    /// This is independent from <see cref="BlockSize"/>, which controls SST block encoding on flush.
+    /// Values larger than this size are stored in dedicated arena blocks.
+    /// </remarks>
+    /// <value>
+    /// The default value is <inheritdoc cref="_defaultMemTableArenaBlockSize"/>.
+    /// </value>
+    public int MemTableArenaBlockSize { get; set; } = _defaultMemTableArenaBlockSize;
+
+    /// <summary>
     /// Gets or sets the maximum number of <see cref="MemTable"> which can be kept in memory before being flushed
     /// and stored as a level-0 SST.
     /// </summary>
@@ -69,7 +85,15 @@ public class StorageOptions
     /// <value>
     /// The default value is <inheritdoc cref="_defaultBlockSize"/>.
     /// </value>
-    public ushort BlockSize { get; set; } = _defaultBlockSize;
+    public ushort BlockSize
+    {
+        get => _blockSize;
+        set
+        {
+            _blockSize = value;
+            BlockEncoderFactory = new DefaultBlockEncoderFactory(value);
+        }
+    }
 
     /// <summary>
     /// Gets or set the <see cref="IBlockEncoderFactory"> to use.
@@ -77,7 +101,7 @@ public class StorageOptions
     /// <value>
     /// The default value is <inheritdoc cref="_defaultBlockEncoderFactory"/>.
     /// </value>
-    public IBlockEncoderFactory BlockEncoderFactory { get; set; } = _defaultBlockEncoderFactory;
+    internal IBlockEncoderFactory BlockEncoderFactory { get; set; } = _defaultBlockEncoderFactory;
 
     /// <summary>
     /// Gets or set the <see cref="ISsTableEncoderFactory"> to use.
@@ -85,7 +109,7 @@ public class StorageOptions
     /// <value>
     /// The default value is <inheritdoc cref="_defaultSsTableEncoderFactory"/>.
     /// </value>
-    public ISsTableEncoderFactory SsTableEncoderFactory { get; set; } = _defaultSsTableEncoderFactory;
+    internal ISsTableEncoderFactory SsTableEncoderFactory { get; set; } = _defaultSsTableEncoderFactory;
 
     /// <summary>
     /// Gets or set the <see cref="ISsTableBuilderFactory"> to use.
@@ -93,7 +117,7 @@ public class StorageOptions
     /// <value>
     /// The default value is <inheritdoc cref="_defaultSsTableBuilderFactory"/>.
     /// </value>
-    public ISsTableBuilderFactory SsTableBuilderFactory { get; set; } = _defaultSsTableBuilderFactory;
+    internal ISsTableBuilderFactory SsTableBuilderFactory { get; set; } = _defaultSsTableBuilderFactory;
 
     /// <summary>
     /// Gets or set the delays between mem table flushes. Setting a value of <c>TimeSpan.Zero</c> disables the flush thread.

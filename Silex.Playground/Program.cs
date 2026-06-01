@@ -11,7 +11,7 @@ static async Task Store1MillionValues()
     }
 
     var options = new StorageOptions { MemTableSizeLimit = 1.MiB(), FlushPeriod = TimeSpan.Zero };
-    var db = await LsmStorage.OpenAsync<int, int>("db", options);
+    var db = await LsmStorage.OpenAsync("db", options);
 
     var data = Enumerable.Range(0, 1_000_000).Select(x => Random.Shared.Next()).ToList();
 

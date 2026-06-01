@@ -1,6 +1,8 @@
 ﻿using Silex.Blocks;
 using Silex.Compaction;
+using Silex.Buffers;
 using Silex.MemTables;
+using Silex.Serialization;
 using Silex.Tables;
 using Silex.Wal;
 using System.Buffers;
@@ -9,18 +11,188 @@ using System.Runtime.CompilerServices;
 
 namespace Silex;
 
-public static class LsmStorage
+public sealed class LsmStorage : IDisposable, IAsyncDisposable
 {
     /// <summary>
     /// Opens or create a store at the specified location.
     /// </summary>
-    /// <typeparam name="TKey">The type of keys for the store.</typeparam>
-    /// <typeparam name="TValue">The type of values of the store.</typeparam>
     /// <param name="path">The path of the store. If it doesn't exist it is created.</param>
     /// <param name="options">The storage options.</param>
     /// <param name="cancellationToken">The cancellation token.</param>
     /// <returns></returns>
-    public static async Task<LsmStorage<TKey, TValue>> OpenAsync<TKey, TValue>(string path, StorageOptions options, CancellationToken cancellationToken = default) where TKey : notnull
+    public static Task<LsmStorage> OpenAsync(string path, StorageOptions options, CancellationToken cancellationToken = default)
+    {
+        return OpenCoreAsync(path, options, cancellationToken);
+    }
+
+    internal sealed class LsmStorageTyped<TKey, TValue> : IDisposable, IAsyncDisposable where TKey : notnull
+    {
+        private static readonly IBinaryEncoder<TKey> _keyEncoder = BinaryEncoderFactory<TKey>.BinarySerializer;
+        private static readonly IBinaryEncoder<TValue> _valueEncoder = BinaryEncoderFactory<TValue>.BinarySerializer;
+
+        internal readonly LsmStorageInner _inner;
+        internal readonly Compacter _compacter;
+        private bool _disposed;
+
+        internal LsmStorageTyped(LsmStorageInner inner, Compacter compacter)
+        {
+            _inner = inner;
+            _compacter = compacter;
+        }
+
+        public async ValueTask<TValue> GetAsync(TKey key, CancellationToken cancellationToken = default)
+        {
+            CheckDisposed();
+            using var encodedKey = Encode(_keyEncoder, key);
+            using var value = await _inner.GetAsync(encodedKey.Slice, cancellationToken);
+            return value is null || value.IsEmpty ? default! : _valueEncoder.Decode(value.Span);
+        }
+
+        public async ValueTask<bool> TryGetRawAsync(TKey key, IBufferWriter<byte> destination, CancellationToken cancellationToken = default)
+        {
+            CheckDisposed();
+            using var encodedKey = Encode(_keyEncoder, key);
+            return await _inner.TryGetRawAsync(encodedKey.Slice, destination, cancellationToken);
+        }
+
+        public async ValueTask<int> GetRawAsync(TKey key, Memory<byte> destination, CancellationToken cancellationToken = default)
+        {
+            CheckDisposed();
+            using var encodedKey = Encode(_keyEncoder, key);
+            return await _inner.GetRawAsync(encodedKey.Slice, destination, cancellationToken);
+        }
+
+        public async ValueTask<bool> TryReadRawAsync<TArg>(TKey key, TArg arg, ReadValueAction<TArg> reader, CancellationToken cancellationToken = default)
+        {
+            CheckDisposed();
+            using var encodedKey = Encode(_keyEncoder, key);
+            return await _inner.TryReadRawAsync(encodedKey.Slice, arg, reader, cancellationToken);
+        }
+
+        public ValueTask<long> ScanRawAsync<TArg>(TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries = long.MaxValue, CancellationToken cancellationToken = default)
+        {
+            CheckDisposed();
+            return _inner.ScanRawAsync(arg, reader, maxEntries, cancellationToken);
+        }
+
+        public async ValueTask<long> SeekRawAsync<TArg>(TKey from, TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries = long.MaxValue, CancellationToken cancellationToken = default)
+        {
+            CheckDisposed();
+            using var encodedFrom = Encode(_keyEncoder, from);
+            return await _inner.SeekRawAsync(encodedFrom.Slice, arg, reader, maxEntries, cancellationToken);
+        }
+
+        public void Put(TKey key, TValue value)
+        {
+            CheckDisposed();
+            using var encodedKey = Encode(_keyEncoder, key);
+            using var encodedValue = Encode(_valueEncoder, value);
+            _inner.PutRaw(encodedKey.Span, encodedValue.Span);
+        }
+
+        public void Delete(TKey key)
+        {
+            CheckDisposed();
+            using var encodedKey = Encode(_keyEncoder, key);
+            _inner.DeleteRaw(encodedKey.Span);
+        }
+
+        public IStorageIterator CreateIterator()
+        {
+            CheckDisposed();
+            return _inner.CreateIterator();
+        }
+
+        public async Task CloseAsync(CancellationToken cancellationToken = default)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            GC.SuppressFinalize(this);
+            await DisposeInternalAsync(cancellationToken);
+            _disposed = true;
+        }
+
+        public async Task FlushAndCompactAsync(CancellationToken cancellationToken = default)
+        {
+            CheckDisposed();
+            await _compacter.StopBackgroundFlushAsync();
+
+            try
+            {
+                await _inner.FlushAndCompactAsync(cancellationToken);
+            }
+            finally
+            {
+                _compacter.StartBackgroundFlush();
+            }
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            GC.SuppressFinalize(this);
+            await DisposeInternalAsync();
+            _disposed = true;
+        }
+
+        public void Dispose()
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            GC.SuppressFinalize(this);
+            DisposeInternalAsync().GetAwaiter().GetResult();
+            _disposed = true;
+        }
+
+        public async Task DisposeInternalAsync(CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            await _compacter.CloseAsync(cancellationToken);
+            _inner.ForceFreezeMemTable();
+
+            while (!_inner._state.ImmutableMemTables.IsEmpty)
+            {
+                await _inner.ForceFlushNextImmutableMemTableAsync(cancellationToken);
+            }
+
+            _inner.DeleteCurrentMemTableWal();
+            _inner.Dispose();
+        }
+
+        private static OwnedByteSlice Encode<T>(IBinaryEncoder<T> encoder, T value)
+        {
+            using var bufferWriter = new PooledArrayBufferWriter<byte>(Math.Max(1, encoder.GetLength(value)));
+            var writer = new EncoderBinaryWriter(bufferWriter);
+            encoder.Encode(value, ref writer);
+            writer.Flush();
+            return OwnedByteSlice.CopyFrom(bufferWriter.WrittenMemory.Span);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void CheckDisposed()
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+        }
+    }
+
+    internal static async Task<LsmStorageTyped<TKey, TValue>> OpenAsync<TKey, TValue>(string path, StorageOptions options, CancellationToken cancellationToken = default) where TKey : notnull
+    {
+        var storage = await OpenCoreAsync(path, options, cancellationToken);
+        return new LsmStorageTyped<TKey, TValue>(storage._inner, storage._compacter);
+    }
+
+    private static async Task<LsmStorage> OpenCoreAsync(string path, StorageOptions options, CancellationToken cancellationToken = default)
     {
         if (!Directory.Exists(path))
         {
@@ -61,7 +233,7 @@ public static class LsmStorage
             IdGenerator.EnsureGreaterThan(id);
         }
 
-        var storageInner = new LsmStorageInner<TKey, TValue>(path, options);
+        var storageInner = new LsmStorageInner(path, options);
 
         // The manifest is the authoritative record of which SSTs are live and how they map to levels. It is
         // read for every strategy so changing CompactionStrategy on reopen only changes future compactions,
@@ -80,9 +252,9 @@ public static class LsmStorage
         // Loads the given SST files concurrently (bounded by MaxReadParallelism) into a position-indexed
         // array, preserving the requested order. On any failure every already-loaded table is disposed so a
         // failed open never leaks file handles.
-        async Task<SsTable<TKey, TValue>[]> LoadManyAsync((string filename, long id)[] items)
+        async Task<SsTable[]> LoadManyAsync((string filename, long id)[] items)
         {
-            var loaded = new SsTable<TKey, TValue>[items.Length];
+            var loaded = new SsTable[items.Length];
 
             try
             {
@@ -92,8 +264,8 @@ public static class LsmStorage
                     async (index, ct) =>
                     {
                         var (filename, id) = items[index];
-                        var blockBuilder = new BlockBuilder<TKey, TValue>(options.BlockEncoderFactory.Create<TKey, TValue>());
-                        loaded[index] = await SsTable<TKey, TValue>.LoadSsTableAsync(filename, options.SsTableEncoderFactory.Create<TKey, TValue>(), blockBuilder, options.BloomFilterFactory, id, ct);
+                        var blockBuilder = new BlockBuilder(options.BlockEncoderFactory.Create());
+                        loaded[index] = await SsTable.LoadSsTableAsync(filename, options.SsTableEncoderFactory.Create(), blockBuilder, options.BloomFilterFactory, id, ct);
                     });
             }
             catch
@@ -117,7 +289,7 @@ public static class LsmStorage
             // Resolves a level's manifest ids to on-disk files, preserving order. Fail open: an id whose
             // file is missing is skipped (the store loses that SST's data but stays usable). The surviving
             // ids are loaded in parallel and recorded as committed.
-            async Task<List<SsTable<TKey, TValue>>> LoadLevelAsync(IEnumerable<long> ids)
+            async Task<List<SsTable>> LoadLevelAsync(IEnumerable<long> ids)
             {
                 var items = ids
                     .Where(id => fileById.ContainsKey(id))
@@ -136,7 +308,7 @@ public static class LsmStorage
 
             storageInner._state.LevelZeroTables = await LoadLevelAsync(manifest.L0);
 
-            var levels = new List<List<SsTable<TKey, TValue>>>();
+            var levels = new List<List<SsTable>>();
 
             foreach (var levelIds in manifest.Levels)
             {
@@ -174,7 +346,7 @@ public static class LsmStorage
         // SST; enqueuing them oldest-first (reads reverse the queue) preserves recency above L0.
         if (options.UseWriteAheadLog && walFiles.Count > 0)
         {
-            var recovered = new List<IMemTable<TKey, TValue>>();
+            var recovered = new List<IMemTable>();
 
             foreach (var (filename, id) in walFiles)
             {
@@ -187,8 +359,8 @@ public static class LsmStorage
                     continue;
                 }
 
-                var memTable = new MemTable<TKey, TValue>(id!.Value);
-                WriteAheadLog<TKey, TValue>.Replay(filename, memTable);
+                var memTable = new MemTable(id!.Value, arenaBlockSize: options.MemTableArenaBlockSize);
+                WriteAheadLog.Replay(filename, memTable);
                 recovered.Add(memTable);
             }
 
@@ -202,11 +374,11 @@ public static class LsmStorage
         // older versions or by strategies that used to infer L0 from filenames.
         storageInner.BuildManifestSnapshot().Write(path);
 
-        var compacter = new Compacter<TKey, TValue>(storageInner, TimeProvider.System, options);
+        var compacter = new Compacter(storageInner, TimeProvider.System, options);
 
         compacter.StartBackgroundFlush();
 
-        return new LsmStorage<TKey, TValue>(storageInner, compacter);
+        return new LsmStorage(storageInner, compacter);
     }
 
     private static long? TryParseId(string filename)
@@ -227,117 +399,118 @@ public static class LsmStorage
         {
         }
     }
-}
 
-public class LsmStorage<TKey, TValue> : IDisposable, IAsyncDisposable where TKey : notnull
-{
-    internal readonly LsmStorageInner<TKey, TValue> _inner;
-    internal readonly Compacter<TKey, TValue> _compacter;
-
+    private readonly LsmStorageInner _inner;
+    private readonly Compacter _compacter;
     private bool _disposed;
 
-    internal LsmStorage(LsmStorageInner<TKey, TValue> inner, Compacter<TKey, TValue> compacter)
+    private LsmStorage(LsmStorageInner inner, Compacter compacter)
     {
         _inner = inner;
-        _compacter= compacter;
+        _compacter = compacter;
     }
 
-    /// <inheritdoc cref="LsmStorageInner.TryGet(TKey, out TValue)"/>
-    /// <remarks>
-    /// Zero-copy: the returned key/value is a read-only borrow of engine-owned memory. Do not mutate
-    /// or dispose it. If you need an independently owned, mutable copy, copy it yourself (for example
-    /// wrap it in a <see cref="Bytes"/>).
-    /// </remarks>
-    public ValueTask<TValue> GetAsync(TKey key, CancellationToken cancellationToken = default)
+    public void Put(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
+    {
+        CheckDisposed();
+        _inner.PutRaw(key, value);
+    }
+
+    public void Delete(ReadOnlySpan<byte> key)
+    {
+        CheckDisposed();
+        _inner.DeleteRaw(key);
+    }
+
+    public ValueTask<bool> TryGetRawAsync(ReadOnlySpan<byte> key, IBufferWriter<byte> destination, CancellationToken cancellationToken = default)
+    {
+        CheckDisposed();
+        ArgumentNullException.ThrowIfNull(destination);
+
+        var ownedKey = OwnedByteSlice.CopyFrom(key);
+        return DisposeKeyAsync(_inner.TryGetRawAsync(ownedKey.Slice, destination, cancellationToken), ownedKey);
+
+        static async ValueTask<bool> DisposeKeyAsync(ValueTask<bool> result, OwnedByteSlice ownedKey)
+        {
+            try
+            {
+                return await result;
+            }
+            finally
+            {
+                ownedKey.Dispose();
+            }
+        }
+    }
+
+    public ValueTask<int> GetRawAsync(ReadOnlySpan<byte> key, Memory<byte> destination, CancellationToken cancellationToken = default)
     {
         CheckDisposed();
 
-        return _inner.GetAsync(key, cancellationToken);
+        var ownedKey = OwnedByteSlice.CopyFrom(key);
+        return DisposeKeyAsync(_inner.GetRawAsync(ownedKey.Slice, destination, cancellationToken), ownedKey);
+
+        static async ValueTask<int> DisposeKeyAsync(ValueTask<int> result, OwnedByteSlice ownedKey)
+        {
+            try
+            {
+                return await result;
+            }
+            finally
+            {
+                ownedKey.Dispose();
+            }
+        }
     }
 
-    /// <inheritdoc cref="LsmStorageInner{TKey, TValue}.TryGetRawAsync(TKey, IBufferWriter{byte}, CancellationToken)"/>
-    public ValueTask<bool> TryGetRawAsync(TKey key, IBufferWriter<byte> destination, CancellationToken cancellationToken = default)
+    public ValueTask<bool> TryReadRawAsync<TArg>(ReadOnlySpan<byte> key, TArg arg, ReadValueAction<TArg> reader, CancellationToken cancellationToken = default)
     {
         CheckDisposed();
+        ArgumentNullException.ThrowIfNull(reader);
 
-        return _inner.TryGetRawAsync(key, destination, cancellationToken);
+        var ownedKey = OwnedByteSlice.CopyFrom(key);
+        return DisposeKeyAsync(_inner.TryReadRawAsync(ownedKey.Slice, arg, reader, cancellationToken), ownedKey);
+
+        static async ValueTask<bool> DisposeKeyAsync(ValueTask<bool> result, OwnedByteSlice ownedKey)
+        {
+            try
+            {
+                return await result;
+            }
+            finally
+            {
+                ownedKey.Dispose();
+            }
+        }
     }
 
-    /// <inheritdoc cref="LsmStorageInner{TKey, TValue}.GetRawAsync(TKey, Memory{byte}, CancellationToken)"/>
-    public ValueTask<int> GetRawAsync(TKey key, Memory<byte> destination, CancellationToken cancellationToken = default)
-    {
-        CheckDisposed();
-
-        return _inner.GetRawAsync(key, destination, cancellationToken);
-    }
-
-    /// <inheritdoc cref="LsmStorageInner{TKey, TValue}.TryReadRawAsync{TArg}(TKey, TArg, ReadValueAction{TArg}, CancellationToken)"/>
-    public ValueTask<bool> TryReadRawAsync<TArg>(TKey key, TArg arg, ReadValueAction<TArg> reader, CancellationToken cancellationToken = default)
-    {
-        CheckDisposed();
-
-        return _inner.TryReadRawAsync(key, arg, reader, cancellationToken);
-    }
-
-    /// <inheritdoc cref="LsmStorageInner{TKey, TValue}.ScanRawAsync{TArg}(TArg, ReadRawEntryAction{TArg}, long, CancellationToken)"/>
     public ValueTask<long> ScanRawAsync<TArg>(TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries = long.MaxValue, CancellationToken cancellationToken = default)
     {
         CheckDisposed();
-
         return _inner.ScanRawAsync(arg, reader, maxEntries, cancellationToken);
     }
 
-    /// <inheritdoc cref="LsmStorageInner{TKey, TValue}.SeekRawAsync{TArg}(TKey, TArg, ReadRawEntryAction{TArg}, long, CancellationToken)"/>
-    public ValueTask<long> SeekRawAsync<TArg>(TKey from, TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries = long.MaxValue, CancellationToken cancellationToken = default)
+    public ValueTask<long> SeekRawAsync<TArg>(ReadOnlySpan<byte> from, TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries = long.MaxValue, CancellationToken cancellationToken = default)
     {
         CheckDisposed();
+        ArgumentNullException.ThrowIfNull(reader);
 
-        return _inner.SeekRawAsync(from, arg, reader, maxEntries, cancellationToken);
+        var ownedFrom = OwnedByteSlice.CopyFrom(from);
+        return DisposeKeyAsync(_inner.SeekRawAsync(ownedFrom.Slice, arg, reader, maxEntries, cancellationToken), ownedFrom);
+
+        static async ValueTask<long> DisposeKeyAsync(ValueTask<long> result, OwnedByteSlice ownedFrom)
+        {
+            try
+            {
+                return await result;
+            }
+            finally
+            {
+                ownedFrom.Dispose();
+            }
+        }
     }
 
-    /// <inheritdoc cref="LsmStorageInner.Put(TKey, TValue)"/>
-    /// <remarks>
-    /// Zero-copy: ownership of <paramref name="key"/> and <paramref name="value"/> transfers to the
-    /// engine. Do not mutate or release them (for example return a pooled buffer) after this call; the
-    /// engine keeps and reads them until the owning memtable is flushed and disposed.
-    /// </remarks>
-    public void Put(TKey key, TValue value)
-    {
-        CheckDisposed();
-
-        _inner.Put(key, value);
-    }
-
-    /// <inheritdoc cref="LsmStorageInner.Delete(TKey)"/>
-    public void Delete(TKey key)
-    {
-        CheckDisposed();
-
-        _inner.Delete(key);
-    }
-
-    /// <summary>
-    /// Creates a forward iterator over the entire key space, or from a given key when one is supplied via
-    /// <see cref="IStorageIterator{TKey, TValue}.EnumerateAsync(TKey, CancellationToken)"/>. Entries are
-    /// yielded in ascending key order across every memtable and on-disk level.
-    /// </summary>
-    /// <remarks>
-    /// Zero-copy: each yielded key/value is a read-only borrow of engine-owned memory. Do not mutate or
-    /// dispose it. Copy it yourself if you need independently owned memory.
-    /// </remarks>
-    public IStorageIterator<TKey, TValue> CreateIterator()
-    {
-        CheckDisposed();
-
-        return _inner.CreateIterator();
-    }
-
-    /// <summary>
-    /// Flushes any pending data to disk and stops the compacter background threads.
-    /// </summary>
-    /// <remarks>
-    /// Equivalent to <see cref="DisposeAsync()"/>. Call one or the other.
-    /// </remarks>
     public async Task CloseAsync(CancellationToken cancellationToken = default)
     {
         if (_disposed)
@@ -353,10 +526,6 @@ public class LsmStorage<TKey, TValue> : IDisposable, IAsyncDisposable where TKey
         _disposed = true;
     }
 
-    /// <summary>
-    /// Flushes pending writes and runs compaction until the configured compaction strategy reaches a stable
-    /// state. The background compacter is paused while this explicit maintenance pass runs.
-    /// </summary>
     public async Task FlushAndCompactAsync(CancellationToken cancellationToken = default)
     {
         CheckDisposed();
@@ -399,7 +568,7 @@ public class LsmStorage<TKey, TValue> : IDisposable, IAsyncDisposable where TKey
         _disposed = true;
     }
 
-    public async Task DisposeInternalAsync(CancellationToken cancellationToken = default)
+    private async Task DisposeInternalAsync(CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
 
@@ -412,21 +581,12 @@ public class LsmStorage<TKey, TValue> : IDisposable, IAsyncDisposable where TKey
             await _inner.ForceFlushNextImmutableMemTableAsync(cancellationToken);
         }
 
-        // The current memtable is now empty; drop its write-ahead log so a clean shutdown leaves no
-        // files to replay on the next open.
         _inner.DeleteCurrentMemTableWal();
-
         _inner.Dispose();
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void CheckDisposed()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
     }
-
-    // No finalizer on purpose: persisting data requires blocking disk I/O, which must never run
-    // during finalization. Durability is provided solely by deterministic disposal
-    // (CloseAsync/DisposeAsync/Dispose). Any file handles held by the inner storage are released by
-    // its own finalizer, so an undisposed instance leaks no native resources (it just isn't flushed).
 }

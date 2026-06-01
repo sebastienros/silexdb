@@ -3,17 +3,17 @@ using System.Diagnostics.CodeAnalysis;
 
 namespace Silex.MemTables;
 
-public interface IMemTable<TKey, TValue> : IDisposable where TKey : notnull
+internal interface IMemTable : IDisposable
 {
     long Id { get; }
 
     /// <summary>
-    /// Gets the number of entries in the <see cref="IMemTable{TKey, TValue}">.
+    /// Gets the number of entries in the <see cref="IMemTable">.
     /// </summary>
     int Count { get; }
 
     /// <summary>
-    /// Gets the size of the <see cref="IMemTable{TKey, TValue}"> in bytes.
+    /// Gets the size of the <see cref="IMemTable"> in bytes.
     /// </summary>
     long Size { get; }
 
@@ -22,15 +22,15 @@ public interface IMemTable<TKey, TValue> : IDisposable where TKey : notnull
     /// </summary>
     /// <param name="key"></param>
     /// <returns><c>true</c> if the key was found, <c>false</c> otherwise.</returns>
-    bool TryGet(TKey key, [MaybeNullWhen(false)] out TValue result);
+    bool TryGet(ByteSlice key, [MaybeNullWhen(false)] out ByteSlice result);
 
-    void Put(TKey key, TValue value);
+    void Put(ByteSlice key, ByteSlice value);
 
-    IStorageIterator<TKey, TValue> CreateIterator();
+    IStorageIterator CreateIterator();
 
     /// <summary>
     /// Adds all entries to an SST Builder.
     /// </summary>
     /// <param name="builder">The builder.</param>
-    Task FlushAsync(ISsTableBuilder<TKey, TValue> builder, CancellationToken cancellationToken = default);
+    Task FlushAsync(ISsTableBuilder builder, CancellationToken cancellationToken = default);
 }

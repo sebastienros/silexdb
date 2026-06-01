@@ -77,7 +77,6 @@ internal sealed class BenchmarkOptions
             MemTableSizeLimit = Positive("--write_buffer_size", WriteBufferSize),
             MemTableMaxCount = ToUInt16("--max_write_buffer_number", MaxWriteBufferNumber),
             BlockSize = blockSize,
-            BlockEncoderFactory = new DefaultBlockEncoderFactory(blockSize),
             BlockCacheSizeLimit = NonNegative("--cache_size", CacheSize),
             BloomFilterFactory = new RocksStyleBloomFilterFactory(NonNegative("--bloom_bits", BloomBits)),
             UseWriteAheadLog = Wal,

@@ -4,23 +4,24 @@ using System.Diagnostics;
 
 namespace Silex.Blocks;
 
-public class BlockBuilder<TKey, TValue> : IDisposable
+internal sealed class BlockBuilder : IDisposable
 {
-    private static readonly IBinaryEncoder<TKey> _keySerializer = BinaryEncoderFactory<TKey>.BinarySerializer;
+    private static readonly IBinaryEncoder<ByteSlice> _keySerializer = BinaryEncoderFactory<ByteSlice>.BinarySerializer;
 
-    private readonly IBlockEncoder<TKey, TValue> _blockEncoder;
-    private readonly List<BlockEntry<TValue>> _blockEntries = [];
+    private readonly IBlockEncoder _blockEncoder;
+    private readonly List<BlockEntry> _blockEntries = [];
 
     // Keys are encoded once, when they are added, and their bytes are reused both for the SST bloom
     // filter and for the final block encoding instead of being serialized a second time.
     private readonly PooledArrayBufferWriter<byte> _keyBuffer = new();
+    private readonly PooledArrayBufferWriter<byte> _valueBuffer = new();
 
     private int _estimatedSize;
     private int _lastKeyOffset;
     private int _lastKeyLength;
     private bool _disposed;
 
-    public BlockBuilder(IBlockEncoder<TKey, TValue> blockEncoder)
+    public BlockBuilder(IBlockEncoder blockEncoder)
     {
         _blockEncoder = blockEncoder;
     }
@@ -29,6 +30,7 @@ public class BlockBuilder<TKey, TValue> : IDisposable
     {
         _blockEntries.Clear();
         _keyBuffer.Clear();
+        _valueBuffer.Clear();
         _estimatedSize = 0;
         _lastKeyOffset = 0;
         _lastKeyLength = 0;
@@ -41,10 +43,11 @@ public class BlockBuilder<TKey, TValue> : IDisposable
     /// <param name="key">The key of the entry.</param>
     /// <param name="value">The value of the entry.</param>
     /// <returns><see langword="true"/> if the value was added, <see langword="false"/> otherwise.</returns>
-    public bool Add(TKey key, TValue value)
+    public bool Add(ByteSlice key, ByteSlice value)
     {
         var keyLength = _keySerializer.GetLength(key);
-        var size = _blockEncoder.EstimateSize(keyLength, value);
+        var valueLength = value.Length;
+        var size = _blockEncoder.EstimateSize(keyLength, valueLength);
 
         // If the block already has other entries and the next value doesn't fit, refuse it.
         // The size is checked before encoding so the key buffer never needs to be rolled back.
@@ -63,7 +66,11 @@ public class BlockBuilder<TKey, TValue> : IDisposable
         var actualKeyLength = _keyBuffer.WrittenCount - keyOffset;
         Debug.Assert(actualKeyLength == keyLength, $"Encoded key length {actualKeyLength} does not match the estimated length {keyLength}.");
 
-        _blockEntries.Add(new BlockEntry<TValue>(keyOffset, actualKeyLength, value));
+        var valueOffset = _valueBuffer.WrittenCount;
+        value.Span.CopyTo(_valueBuffer.GetSpan(valueLength));
+        _valueBuffer.Advance(valueLength);
+
+        _blockEntries.Add(new BlockEntry(keyOffset, actualKeyLength, valueOffset, valueLength));
         _estimatedSize += size;
         _lastKeyOffset = keyOffset;
         _lastKeyLength = actualKeyLength;
@@ -80,17 +87,17 @@ public class BlockBuilder<TKey, TValue> : IDisposable
 
     public int EstimatedSize => _estimatedSize;
 
-    public Block<TKey, TValue> BuildBlock()
+    public Block BuildBlock()
     {
-        return _blockEncoder.Encode(_keyBuffer.WrittenMemory, _blockEntries);
+        return _blockEncoder.Encode(_keyBuffer.WrittenMemory, _valueBuffer.WrittenMemory, _blockEntries);
     }
 
-    public Block<TKey, TValue> Decode(ReadOnlyMemory<byte> data)
+    public Block Decode(ReadOnlyMemory<byte> data)
     {
         return _blockEncoder.Decode(data);
     }
 
-    public Block<TKey, TValue> Decode(System.Buffers.IMemoryOwner<byte> owner, int length)
+    public Block Decode(System.Buffers.IMemoryOwner<byte> owner, int length)
     {
         return _blockEncoder.Decode(owner, length);
     }
@@ -104,6 +111,7 @@ public class BlockBuilder<TKey, TValue> : IDisposable
 
         GC.SuppressFinalize(this);
         _keyBuffer.Dispose();
+        _valueBuffer.Dispose();
 
         _disposed = true;
     }

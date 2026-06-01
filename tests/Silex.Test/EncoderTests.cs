@@ -97,19 +97,19 @@ public class EncoderTests
     // typed comparison of the values, with no two distinct values colliding to the same bytes.
     private static async Task AssertOrderPreserving<T>(IBinaryEncoder<T> encoder, IReadOnlyList<T> values)
     {
-        var encoded = values.Select(v => (Value: v, Bytes: Encode(encoder, v))).ToList();
+        var encoded = values.Select(v => (Value: v, ByteSlice: Encode(encoder, v))).ToList();
 
         // No two distinct values may encode to the same bytes.
         for (var i = 0; i < encoded.Count; i++)
         {
             for (var j = i + 1; j < encoded.Count; j++)
             {
-                var collides = encoded[i].Bytes.AsSpan().SequenceEqual(encoded[j].Bytes);
+                var collides = encoded[i].ByteSlice.AsSpan().SequenceEqual(encoded[j].ByteSlice);
                 await Assert.That(collides).IsFalse();
             }
         }
 
-        var byBytes = encoded.OrderBy(e => e.Bytes, Comparer<byte[]>.Create((a, b) => a.AsSpan().SequenceCompareTo(b))).Select(e => e.Value).ToList();
+        var byBytes = encoded.OrderBy(e => e.ByteSlice, Comparer<byte[]>.Create((a, b) => a.AsSpan().SequenceCompareTo(b))).Select(e => e.Value).ToList();
         var byTyped = encoded.Select(e => e.Value).OrderBy(v => v, encoder.Comparer).ToList();
 
         await Assert.That(byBytes).IsEquivalentTo(byTyped, CollectionOrdering.Matching);
@@ -147,14 +147,6 @@ public class EncoderTests
     {
         var values = new ushort[] { 0, 1, 2, 255, 256, 1000, 32767, 32768, ushort.MaxValue - 1, ushort.MaxValue };
         await AssertOrderPreserving(new UInt16Serializer(), values);
-    }
-
-    [Test]
-    public async Task CharEncoderIsOrderPreserving()
-    {
-        // Includes a lone high surrogate to guard against the previous UTF-8 collision bug.
-        var values = new[] { '\u0001', 'A', 'Z', 'a', 'z', '\u00FF', '\u0100', 'ち', '\uD800', '\uFFFF' };
-        await AssertOrderPreserving(new UTF8CharEncoder(), values);
     }
 
     [Test]

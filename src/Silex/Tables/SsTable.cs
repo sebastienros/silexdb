@@ -5,17 +5,17 @@ using System.Buffers.Binary;
 
 namespace Silex.Tables;
 
-public class SsTable<TKey, TValue> : IDisposable
+internal sealed class SsTable : IDisposable
 {
     private readonly long _id;
     private readonly string _filename;
-    private readonly TKey? _firstKey;
-    private readonly TKey? _lastKey;
-    private readonly BlockBuilder<TKey, TValue> _blockBuilder;
+    private readonly ByteSlice? _firstKey;
+    private readonly ByteSlice? _lastKey;
+    private readonly BlockBuilder _blockBuilder;
     private readonly FileStream _stream;
     private bool _disposed;
 
-    public SsTable(long id, FileStream stream, string filename, IReadOnlyList<BlockMetadata<TKey>> blockMetadata, long metadataBlockOffset, BlockBuilder<TKey, TValue> blockBuilder, IBloomFilter bloomFilter)
+    public SsTable(long id, FileStream stream, string filename, IReadOnlyList<BlockMetadata> blockMetadata, long metadataBlockOffset, BlockBuilder blockBuilder, IBloomFilter bloomFilter)
     {
         _id = id;
         _filename = filename;
@@ -31,7 +31,7 @@ public class SsTable<TKey, TValue> : IDisposable
         }
     }
 
-    public IReadOnlyList<BlockMetadata<TKey>> BlockMetadata { get; } = [];
+    public IReadOnlyList<BlockMetadata> BlockMetadata { get; } = [];
 
     public long MetaBlockOffset { get; }
 
@@ -51,11 +51,11 @@ public class SsTable<TKey, TValue> : IDisposable
     /// </summary>
     public long Size => _stream.Length;
 
-    public TKey FirstKey => _firstKey!;
+    public ByteSlice FirstKey => _firstKey!;
 
-    public TKey LastKey => _lastKey!;
+    public ByteSlice LastKey => _lastKey!;
 
-    public async Task<Block<TKey, TValue>?> ReadBlockAsync(int index, CancellationToken cancellationToken = default)
+    public async Task<Block?> ReadBlockAsync(int index, CancellationToken cancellationToken = default)
     {
         var (offset, length) = GetBlockExtent(index);
 
@@ -97,7 +97,7 @@ public class SsTable<TKey, TValue> : IDisposable
     /// synchronous positioned read instead runs the <c>pread</c> inline on the calling thread, removing the
     /// per-miss thread-pool round-trip. The file is immutable once built, so positioned reads never race.
     /// </summary>
-    public Block<TKey, TValue>? ReadBlock(int index)
+    public Block? ReadBlock(int index)
     {
         var (offset, length) = GetBlockExtent(index);
 
@@ -140,7 +140,7 @@ public class SsTable<TKey, TValue> : IDisposable
         return (offset, (int)(offsetEnd - offset));
     }
 
-    internal ValueTask<BlockLease<TKey, TValue>> ReadBlockCachedAsync(int index, BlockCache<TKey, TValue> blockCache, CancellationToken cancellationToken = default)
+    internal ValueTask<BlockLease> ReadBlockCachedAsync(int index, BlockCache blockCache, CancellationToken cancellationToken = default)
     {
         return blockCache.GetOrLoadAsync(
             new BlockCacheKey(_id, index),
@@ -149,29 +149,29 @@ public class SsTable<TKey, TValue> : IDisposable
     }
 
     /// <summary>
-    /// Struct loader passed to <see cref="BlockCache{TKey, TValue}.GetOrLoadAsync"/> so the cache can populate a
+    /// Struct loader passed to <see cref="BlockCache{ByteSlice, ByteSlice}.GetOrLoadAsync"/> so the cache can populate a
     /// miss without allocating a closure on every read (including cache hits, which never invoke it). The miss
     /// reads the block synchronously on the calling thread to avoid a per-miss thread-pool dispatch.
     /// </summary>
-    private readonly struct BlockLoader : IBlockLoader<TKey, TValue>
+    private readonly struct BlockLoader : IBlockLoader
     {
-        private readonly SsTable<TKey, TValue> _table;
+        private readonly SsTable _table;
         private readonly int _index;
 
-        public BlockLoader(SsTable<TKey, TValue> table, int index)
+        public BlockLoader(SsTable table, int index)
         {
             _table = table;
             _index = index;
         }
 
-        public Task<Block<TKey, TValue>?> LoadAsync(CancellationToken cancellationToken = default)
+        public Task<Block?> LoadAsync(CancellationToken cancellationToken = default)
         {
             cancellationToken.ThrowIfCancellationRequested();
             return Task.FromResult(_table.ReadBlock(_index));
         }
     }
 
-    public static async Task<SsTable<TKey, TValue>> LoadSsTableAsync(string filename, ISsTableEncoder<TKey, TValue> tableEncoder, BlockBuilder<TKey, TValue> blockBuilder, IBloomFilterFactory bloomFilterFactory, long? id = null, CancellationToken cancellationToken = default)
+    public static async Task<SsTable> LoadSsTableAsync(string filename, ISsTableEncoder tableEncoder, BlockBuilder blockBuilder, IBloomFilterFactory bloomFilterFactory, long? id = null, CancellationToken cancellationToken = default)
     {
         byte[] uintBuffer = ArrayPool<byte>.Shared.Rent(sizeof(uint));
 
@@ -212,7 +212,7 @@ public class SsTable<TKey, TValue> : IDisposable
 
         ArrayPool<byte>.Shared.Return(uintBuffer);
 
-        var table = new SsTable<TKey, TValue>(id ?? IdGenerator.GetNextId(), stream, filename, blockMetadata, metaBlockOffset, blockBuilder, bloomFilter);
+        var table = new SsTable(id ?? IdGenerator.GetNextId(), stream, filename, blockMetadata, metaBlockOffset, blockBuilder, bloomFilter);
 
         return table;
     }
@@ -234,6 +234,10 @@ public class SsTable<TKey, TValue> : IDisposable
     {
         _stream.Dispose();
         _blockBuilder.Dispose();
+        foreach (var metadata in BlockMetadata)
+        {
+            metadata.Dispose();
+        }
     }
 
     ~SsTable()

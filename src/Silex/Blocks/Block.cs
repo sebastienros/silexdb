@@ -4,15 +4,15 @@ using System.Buffers;
 
 namespace Silex.Blocks;
 
-public class Block<TKey, TValue> : IDisposable
+internal sealed class Block : IDisposable
 {
-    private static readonly IComparer<TKey> _keyComparer = BinaryEncoderFactory<TKey>.BinarySerializer.Comparer;
+    private static readonly IComparer<ByteSlice> _keyComparer = BinaryEncoderFactory<ByteSlice>.BinarySerializer.Comparer;
 
-    private readonly IBlockEncoder<TKey, TValue> _encoder;
+    private readonly IBlockEncoder _encoder;
     private readonly IMemoryOwner<byte>? _memoryOwner;
     private bool _disposed;
 
-    public Block(IBlockEncoder<TKey, TValue> encoder, IMemoryOwner<byte> blockData, int length, int count)
+    public Block(IBlockEncoder encoder, IMemoryOwner<byte> blockData, int length, int count)
     {
         _encoder = encoder;
         _memoryOwner = blockData;
@@ -20,7 +20,7 @@ public class Block<TKey, TValue> : IDisposable
         Offsets = new BlockOffsets(Memory, length - (count + 1) * sizeof(ushort), count);
     }
 
-    public Block(IBlockEncoder<TKey, TValue> encoder, ReadOnlyMemory<byte> blockData, int length, int count)
+    public Block(IBlockEncoder encoder, ReadOnlyMemory<byte> blockData, int length, int count)
     {
         _encoder = encoder;
         _memoryOwner = null;
@@ -36,12 +36,12 @@ public class Block<TKey, TValue> : IDisposable
     /// </summary>
     /// <param name="offset"></param>
     /// <returns></returns>
-    public RecordLocation<TKey> GetEntry(int offset)
+    public RecordLocation GetEntry(int offset)
     {
         return _encoder.DecodeEntry(Memory, offset);
     }
 
-    public ReadOnlySpan<byte> GetValue(TKey key)
+    public ReadOnlySpan<byte> GetValue(ByteSlice key)
     {
         return TryGetValue(key, out var value) ? value : default;
     }
@@ -50,7 +50,7 @@ public class Block<TKey, TValue> : IDisposable
     /// Looks up <paramref name="key"/> and reports whether it is present, distinguishing a genuine miss
     /// from a key stored with an empty value (a tombstone for empty-tombstone encoders).
     /// </summary>
-    public bool TryGetValue(TKey key, out ReadOnlySpan<byte> value)
+    public bool TryGetValue(ByteSlice key, out ReadOnlySpan<byte> value)
     {
         var start = 0;
         var end = Offsets.Count - 1;
@@ -81,7 +81,7 @@ public class Block<TKey, TValue> : IDisposable
 
     /// <summary>
     /// Looks up a key by its already-encoded bytes, doing a binary search directly over the block bytes
-    /// without materializing a <typeparamref name="TKey"/> per visited entry. This is the zero-allocation
+    /// without materializing a <typeparamref name="ByteSlice"/> per visited entry. This is the zero-allocation
     /// hot path for point lookups; it is correct because key encoders are order-preserving, so a bytewise
     /// comparison of encoded keys matches the typed key comparison. As with the typed overload, a returned
     /// empty span is a key stored with an empty value (a tombstone for empty-tombstone encoders).
@@ -127,7 +127,7 @@ public class Block<TKey, TValue> : IDisposable
     /// <summary>
     /// Like <see cref="ForEachRaw{TArg}"/> but starts at the first entry whose encoded key is greater than or
     /// equal to <paramref name="encodedFrom"/> (a lower-bound seek). The block bytes are searched directly,
-    /// without materializing a <typeparamref name="TKey"/> per visited entry; this is correct because key
+    /// without materializing a <typeparamref name="ByteSlice"/> per visited entry; this is correct because key
     /// encoders are order-preserving, so a bytewise comparison of encoded keys matches the typed comparison.
     /// When no entry in the block reaches <paramref name="encodedFrom"/> the callback is never invoked and the
     /// method returns <c>true</c> so the caller can continue into the next block.
@@ -217,9 +217,14 @@ public class Block<TKey, TValue> : IDisposable
 
     /// <param name="entry"></param>
     /// <returns></returns>
-    public ReadOnlySpan<byte> GetValue(RecordLocation<TKey> entry)
+    public ReadOnlySpan<byte> GetValue(RecordLocation entry)
     {
         return _encoder.DecodeValue(Memory, entry.BlockOffset, entry.Length).Span;
+    }
+
+    public ReadOnlyMemory<byte> GetValueMemory(RecordLocation entry)
+    {
+        return _encoder.DecodeValue(Memory, entry.BlockOffset, entry.Length);
     }
 
     public void Dispose()

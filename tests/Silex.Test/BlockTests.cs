@@ -5,10 +5,12 @@ namespace Silex.Test;
 
 public class BlockTests
 {
+    private static int DecodeInt32(ByteSlice value) => new Silex.Serialization.Int32Encoder().Decode(value.Span);
+
     [Test]
     public async Task ShouldEncodeBlock()
     {
-        var blockBuilder = new BlockBuilder<ushort, string> (new DefaultBlockEncoder<ushort, string>());
+        var blockBuilder = new BlockBuilder (new DefaultBlockEncoder());
 
         ushort key = 7;
         var value = "hello";
@@ -34,9 +36,9 @@ public class BlockTests
     public async Task ShouldDecodeBlock()
     {
         var raw = new byte[] { 2, 0, 7, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 };
-        var key = new Bytes((ushort)7);
+        var key = ByteSliceTestExtensions.Slice((ushort)7);
 
-        var encoder = new DefaultBlockEncoder<ushort, byte[]>();
+        var encoder = new DefaultBlockEncoder();
 
         using var block = encoder.Decode(raw);
 
@@ -44,7 +46,7 @@ public class BlockTests
         
         await Assert.That(block.Offsets).HasSingleItem();
         await Assert.That((int)block.Offsets[0]).IsEqualTo(0);
-        await Assert.That(new Bytes(entry.Key)).IsEqualTo(key);
+        await Assert.That(entry.Key).IsEqualTo(key);
         await Assert.That((int)entry.BlockOffset).IsEqualTo(4);
         await Assert.That((int)entry.Length).IsEqualTo(5);
     }
@@ -52,7 +54,7 @@ public class BlockTests
     [Test]
     public async Task ShouldIterateAllEntries()
     {
-        var blockBuilder = new BlockBuilder<int, string>(new DefaultBlockEncoder<int, string>());
+        var blockBuilder = new BlockBuilder(new DefaultBlockEncoder());
 
         var value = "hello";
         var allKeys = new int[] { 1, 3, 5, 6, 7 };
@@ -62,9 +64,9 @@ public class BlockTests
         }
 
         var block = blockBuilder.BuildBlock();
-        var iterator = new BlockIterator<int, string>(block);
+        var iterator = new BlockIterator(block);
 
-        var result = iterator.EnumerateAsync().ToBlockingEnumerable().Select(x => x.Key).ToArray();
+        var result = iterator.EnumerateAsync().ToBlockingEnumerable().Select(x => DecodeInt32(x.Key)).ToArray();
 
         await Assert.That(result).IsEquivalentTo(allKeys);
     }
@@ -72,7 +74,7 @@ public class BlockTests
     [Test]
     public async Task ShouldIterateFromKey()
     {
-        var blockBuilder = new BlockBuilder<int, string>(new DefaultBlockEncoder<int, string>());
+        var blockBuilder = new BlockBuilder(new DefaultBlockEncoder());
 
         var value = "hello";
         var allKeys = new int[] { 1, 3, 5, 6, 7 };
@@ -82,9 +84,9 @@ public class BlockTests
         }
 
         var block = blockBuilder.BuildBlock();
-        var iterator = new BlockIterator<int, string>(block);
+        var iterator = new BlockIterator(block);
 
-        var result = iterator.EnumerateAsync(2).ToBlockingEnumerable().Select(x => x.Key).ToArray();
+        var result = iterator.EnumerateAsync(2).ToBlockingEnumerable().Select(x => DecodeInt32(x.Key)).ToArray();
 
         await Assert.That(result).IsEquivalentTo(allKeys.Skip(1));
     }
@@ -92,7 +94,7 @@ public class BlockTests
     [Test]
     public async Task ShouldIterateFromUnknownKey()
     {
-        var blockBuilder = new BlockBuilder<int, string>(new DefaultBlockEncoder<int, string>());
+        var blockBuilder = new BlockBuilder(new DefaultBlockEncoder());
 
         var value = "hello";
         var allKeys = new int[] { 1, 3, 5, 6, 7 };
@@ -102,9 +104,9 @@ public class BlockTests
         }
 
         var block = blockBuilder.BuildBlock();
-        var iterator = new BlockIterator<int, string>(block);
+        var iterator = new BlockIterator(block);
 
-        var result = iterator.EnumerateAsync(8).ToBlockingEnumerable().Select(x => x.Key).ToArray();
+        var result = iterator.EnumerateAsync(8).ToBlockingEnumerable().Select(x => DecodeInt32(x.Key)).ToArray();
 
         await Assert.That(result).IsEmpty();
     }
@@ -112,7 +114,7 @@ public class BlockTests
     [Test]
     public async Task TryGetValueShouldReturnCorrectValues()
     {
-        var blockBuilder = new BlockBuilder<int, int>(new DefaultBlockEncoder<int, int>());
+        var blockBuilder = new BlockBuilder(new DefaultBlockEncoder());
 
         var allKeys = new int[] { 1, 3, 5, 6, 7 };
         foreach (var i in allKeys)
@@ -136,7 +138,7 @@ public class BlockTests
     [Test]
     public async Task TryGetValueByEncodedKeyShouldMatchTypedLookup()
     {
-        var blockBuilder = new BlockBuilder<int, int>(new DefaultBlockEncoder<int, int>());
+        var blockBuilder = new BlockBuilder(new DefaultBlockEncoder());
 
         var allKeys = new int[] { -7, -1, 0, 1, 3, 5, 6, 7 };
         foreach (var i in allKeys)
@@ -177,7 +179,7 @@ public class BlockTests
     [Test]
     public async Task ShouldNotAcceptEntriesWhenFull()
     {
-        var blockBuilder = new BlockBuilder<int, byte[]>(new DefaultBlockEncoder<int, byte[]>());
+        var blockBuilder = new BlockBuilder(new DefaultBlockEncoder());
 
         var value = new byte[1024];
         var r1 = blockBuilder.Add(1, value);
@@ -194,7 +196,7 @@ public class BlockTests
     [Test]
     public async Task NewBlocksShouldAcceptFirstEntryBiggerThanBlockSize()
     {
-        var blockBuilder = new BlockBuilder<int, byte[]>(new DefaultBlockEncoder<int, byte[]>());
+        var blockBuilder = new BlockBuilder(new DefaultBlockEncoder());
 
         var value = new byte[8.KiB()];
         var r1 = blockBuilder.Add(1, value);

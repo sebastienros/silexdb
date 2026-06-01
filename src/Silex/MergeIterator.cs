@@ -4,37 +4,37 @@ using System.Runtime.CompilerServices;
 namespace Silex;
 
 /// <summary>
-/// Merges multiple <see cref="IStorageIterator{TKey, TValue}"/> into a single ascending stream of
+/// Merges multiple <see cref="IStorageIterator{ByteSlice, ByteSlice}"/> into a single ascending stream of
 /// key/value pairs. When the same key is present in several iterators, the value from the iterator
 /// listed first wins (iterators should be provided in most-recent-first order). Tombstones are not
 /// filtered out; callers that need to hide deleted entries should filter the merged stream.
 /// </summary>
-internal sealed class MergeIterator<TKey, TValue> : IStorageIterator<TKey, TValue>
+internal sealed class MergeIterator : IStorageIterator
 {
-    private static readonly IComparer<TKey> _keyComparer = BinaryEncoderFactory<TKey>.BinarySerializer.Comparer;
+    private static readonly IComparer<ByteSlice> _keyComparer = BinaryEncoderFactory<ByteSlice>.BinarySerializer.Comparer;
 
-    private readonly IEnumerable<IStorageIterator<TKey, TValue>> _iterators;
+    private readonly IEnumerable<IStorageIterator> _iterators;
 
-    public MergeIterator(IEnumerable<IStorageIterator<TKey, TValue>> iterators)
+    public MergeIterator(IEnumerable<IStorageIterator> iterators)
     {
         _iterators = iterators;
     }
 
-    public IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateAsync(CancellationToken cancellationToken = default)
+    public IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateAsync(CancellationToken cancellationToken = default)
     {
         return MergeAsync(iterator => iterator.EnumerateAsync(cancellationToken), cancellationToken);
     }
 
-    public IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateAsync(TKey from, CancellationToken cancellationToken = default)
+    public IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateAsync(ByteSlice from, CancellationToken cancellationToken = default)
     {
         return MergeAsync(iterator => iterator.EnumerateAsync(from, cancellationToken), cancellationToken);
     }
 
-    private async IAsyncEnumerable<KeyValuePair<TKey, TValue>> MergeAsync(
-        Func<IStorageIterator<TKey, TValue>, IAsyncEnumerable<KeyValuePair<TKey, TValue>>> selector,
+    private async IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> MergeAsync(
+        Func<IStorageIterator, IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>>> selector,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        var enumerators = new List<IAsyncEnumerator<KeyValuePair<TKey, TValue>>>();
+        var enumerators = new List<IAsyncEnumerator<KeyValuePair<ByteSlice, ByteSlice>>>();
 
         try
         {
@@ -77,36 +77,41 @@ internal sealed class MergeIterator<TKey, TValue> : IStorageIterator<TKey, TValu
                     var enumerator = enumerators[i];
                     var current = enumerator.Current;
 
-                    switch (_keyComparer.Compare(smallest.Key, current.Key))
+                    if (_keyComparer.Compare(smallest.Key, current.Key) > 0)
                     {
-                        // Discard the entry since there is the same key from a more recent iterator
-                        case 0:
-                            if (!await enumerator.MoveNextAsync())
-                            {
-                                await enumerator.DisposeAsync();
-                                enumerators.RemoveAt(i);
-                                i--;
-                            }
-                            break;
-
-                        case > 0:
-                            smallestIndex = i;
-                            smallest = current;
-                            break;
-
-                        default:
-                            break;
+                        smallestIndex = i;
+                        smallest = current;
                     }
                 }
 
-                // Consume the smallest element
+                for (var i = enumerators.Count - 1; i >= 0; i--)
+                {
+                    if (i == smallestIndex || _keyComparer.Compare(smallest.Key, enumerators[i].Current.Key) != 0)
+                    {
+                        continue;
+                    }
+
+                    // Discard older duplicates before yielding the winner. The winner itself is advanced
+                    // only after the caller has consumed it, so borrowed block slices stay valid.
+                    if (!await enumerators[i].MoveNextAsync())
+                    {
+                        await enumerators[i].DisposeAsync();
+                        enumerators.RemoveAt(i);
+
+                        if (i < smallestIndex)
+                        {
+                            smallestIndex--;
+                        }
+                    }
+                }
+
+                yield return smallest;
+
                 if (!await enumerators[smallestIndex].MoveNextAsync())
                 {
                     await enumerators[smallestIndex].DisposeAsync();
                     enumerators.RemoveAt(smallestIndex);
                 }
-
-                yield return smallest;
             }
         }
         finally

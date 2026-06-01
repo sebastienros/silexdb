@@ -7,7 +7,7 @@ namespace Silex;
 /// <param name="arg">The caller-supplied state passed to the scan call.</param>
 /// <param name="encodedKey">
 /// A read-only span over the entry's on-disk encoded key bytes. For identity encoders such as
-/// <see cref="byte"/>[] and <see cref="Bytes"/>, this is the original key byte sequence.
+/// <see cref="byte"/>[] and <see cref="ByteSlice"/>, this is the original key byte sequence.
 /// </param>
 /// <param name="value">
 /// A read-only span over engine-owned value memory. It is only valid for the duration of the callback:

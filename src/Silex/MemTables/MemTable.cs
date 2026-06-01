@@ -10,7 +10,7 @@ namespace Silex.MemTables;
 
 /// <summary>
 /// An instance of <see cref="MemTable"/> contains a sorted list of key value pairs of bytes to be stored.
-/// The default collection is a dictionary, and mutates to a custom implementation of <see cref="SortedDictionary{TKey, TValue}"/> once
+/// The default collection is a dictionary, and mutates to a custom implementation of <see cref="SortedDictionary{ByteSlice, ByteSlice}"/> once
 /// the table is enumerated. We use a custom implementation in order to add Enumerate(from, to) without needing to 
 /// clone the keys collection.
 /// </summary>
@@ -25,23 +25,24 @@ namespace Silex.MemTables;
 /// A MemTable usually has a size limit and it will be frozen to an immutable MemTable when it reaches the size limit.
 /// This logic is part of <see cref="LsmStorageInner"/>.
 /// </remarks>
-internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKey : notnull
+internal sealed class MemTable : IMemTable, IRawBytesMemTable
 {
-    private static readonly IBinaryEncoder<TKey> _keySerializer = BinaryEncoderFactory<TKey>.BinarySerializer;
-    private static readonly IBinaryEncoder<TValue> _valueSerializer = BinaryEncoderFactory<TValue>.BinarySerializer;
+    private static readonly IBinaryEncoder<ByteSlice> _keySerializer = BinaryEncoderFactory<ByteSlice>.BinarySerializer;
 
-    private volatile Dictionary<TKey, TValue>? _dic = new(_keySerializer.EqualityComparer);
-    private volatile SortedDictionary<TKey, TValue>? _sorted;
+    private volatile Dictionary<ByteSlice, ByteSlice>? _dic = new(_keySerializer.EqualityComparer);
+    private volatile SortedDictionary<ByteSlice, ByteSlice>? _sorted;
 
     private long _size;
     private bool _disposed;
     private readonly long _id;
-    private readonly WriteAheadLog<TKey, TValue>? _wal;
+    private readonly WriteAheadLog? _wal;
+    private readonly MemTableArena? _arena;
 
-    public MemTable(long id, WriteAheadLog<TKey, TValue>? wal = null)
+    public MemTable(long id, WriteAheadLog? wal = null, int arenaBlockSize = 32 * 1024)
     {
         _id = id;
         _wal = wal;
+        _arena = new MemTableArena(arenaBlockSize);
     }
 
     /// <summary>
@@ -63,7 +64,7 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
     }
 
     /// <inheritdocs />
-    public bool TryGet(TKey key, [MaybeNullWhen(false)] out TValue result)
+    public bool TryGet(ByteSlice key, [MaybeNullWhen(false)] out ByteSlice result)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
@@ -90,58 +91,58 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
     }
 
     /// <inheritdocs />
-    public void Put(TKey key, TValue value)
+    public void Put(ByteSlice key, ByteSlice value)
+    {
+        PutRaw(key.Span, value.Span);
+    }
+
+    public void PutRaw(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
-        // Journal the mutation before applying it in memory so a crash can't leave an applied write
-        // that isn't recoverable. The write lock held by the caller serializes appends.
-        _wal?.Append(key, value);
+        var arena = _arena ?? throw new ObjectDisposedException(nameof(MemTable));
 
-        // This method could be called concurrently, while the items in the store
-        // and the size need to be consistent.
-        // This also needs to handle when the same key is updated concurrently
+        _wal?.AppendRaw(key, value);
 
-        var keyLength = _keySerializer.GetLength(key);
+        var ownedKey = arena.Copy(key);
+        var ownedValue = arena.Copy(value);
 
         var dic = _dic;
         if (dic != null)
         {
-            // Retrieve the previous value to keep its size consistent.
-            if (dic.Remove(key, out var previousValue))
+            if (dic.ContainsKey(ownedKey))
             {
-                _size -= _valueSerializer.GetLength(previousValue) + keyLength + sizeof(int);
+                dic.Remove(ownedKey);
             }
 
-            dic.Add(key, value);
+            dic.Add(ownedKey, ownedValue);
         }
         else
         {
             Debug.Assert(_sorted != null);
-            // Retrieve the previous value to keep its size consistent.
-            if (_sorted.Remove(key, out var previousValue))
+
+            if (_sorted.ContainsKey(ownedKey))
             {
-                _size -= _valueSerializer.GetLength(previousValue) + keyLength + sizeof(int);
+                _sorted.Remove(ownedKey);
             }
 
-            _sorted.Add(key, value);
+            _sorted.Add(ownedKey, ownedValue);
         }
 
-        _size += _valueSerializer.GetLength(value) + keyLength + sizeof(int);
-        return;
+        _size += key.Length + value.Length + sizeof(int);
     }
 
-    public IStorageIterator<TKey, TValue> CreateIterator()
+    public IStorageIterator CreateIterator()
     {
         return new MemTableIterator(this);
     }
 
-    public async Task FlushAsync(ISsTableBuilder<TKey, TValue> builder, CancellationToken cancellationToken = default)
+    public async Task FlushAsync(ISsTableBuilder builder, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         EnsureSortedMap();
 
-        IDictionary<TKey, TValue> store = _dic != null ? _dic : _sorted;
+        IDictionary<ByteSlice, ByteSlice> store = _dic != null ? _dic : _sorted;
 
         foreach (var entry in store)
         {
@@ -163,7 +164,7 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
 
         lock (dic)
         {
-            _sorted = new SortedDictionary<TKey, TValue>(dic, _keySerializer.Comparer);
+            _sorted = new SortedDictionary<ByteSlice, ByteSlice>(dic, _keySerializer.Comparer);
             _dic = null;
         }
     }
@@ -188,17 +189,10 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
     private void DisposeInternal()
     {
         var dic = _dic;
-        IDictionary<TKey, TValue> store = dic == null ? _sorted! : dic;
-
-        foreach (var entry in store)
-        {
-            if (entry.Value is IDisposable d)
-            {
-                d.Dispose();
-            }
-        }
+        IDictionary<ByteSlice, ByteSlice> store = dic == null ? _sorted! : dic;
 
         store.Clear();
+        _arena?.Dispose();
     }
 
     ~MemTable()
@@ -206,17 +200,17 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
         DisposeInternal();
     }
 
-    private sealed class MemTableIterator : IStorageIterator<TKey, TValue>
+    private sealed class MemTableIterator : IStorageIterator
     {
-        private readonly MemTable<TKey, TValue> _table;
+        private readonly MemTable _table;
         
-        public MemTableIterator(MemTable<TKey, TValue> table)
+        public MemTableIterator(MemTable table)
         {
             _table = table;
         }
 
 #pragma warning disable CS1998 // Async method lacks 'await' operators and will run synchronously
-        public async IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
+        public async IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
 #pragma warning restore CS1998 // Async method lacks 'await' operators and will run synchronously
         {
             _table.EnsureSortedMap();
@@ -230,7 +224,7 @@ internal sealed class MemTable<TKey, TValue> : IMemTable<TKey, TValue> where TKe
         }
 
 #pragma warning disable CS1998 // Async method lacks 'await' operators and will run synchronously
-        public async IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateAsync(TKey afterKey, [EnumeratorCancellation] CancellationToken _ = default)
+        public async IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateAsync(ByteSlice afterKey, [EnumeratorCancellation] CancellationToken _ = default)
 #pragma warning restore CS1998 // Async method lacks 'await' operators and will run synchronously
         {
             _table.EnsureSortedMap();

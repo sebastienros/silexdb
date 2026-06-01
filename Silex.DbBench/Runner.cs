@@ -7,7 +7,7 @@ namespace Silex.DbBench;
 internal sealed class ThreadStats
 {
     public long Ops;
-    public long Bytes;
+    public long ByteSlice;
     public long Found;
     public double ElapsedMicros;
     public Histogram? Histogram;
@@ -58,7 +58,7 @@ internal sealed class Runner
 
     private readonly BenchmarkOptions _options;
     private readonly string _dbPath;
-    private LsmStorage<byte[], byte[]>? _db;
+    private LsmStorage? _db;
     private bool _currentWalSync;
     private bool _needsReadBarrier;
 
@@ -288,7 +288,7 @@ internal sealed class Runner
     private async Task OpenAsync(bool walSync)
     {
         Directory.CreateDirectory(_dbPath);
-        _db = await LsmStorage.OpenAsync<byte[], byte[]>(_dbPath, _options.ToStorageOptions(walSync));
+        _db = await LsmStorage.OpenAsync(_dbPath, _options.ToStorageOptions(walSync));
         _currentWalSync = walSync;
         _needsReadBarrier = false;
     }
@@ -318,7 +318,7 @@ internal sealed class Runner
                 var keyIndex = sequential ? start + op : rng.NextInt64(totalOps);
                 db.Put(keyGen.Generate(keyIndex), valueGen.Generate(_options.ValueSize));
                 stats.Ops++;
-                stats.Bytes += entryBytes;
+                stats.ByteSlice += entryBytes;
                 return new ValueTask<bool>(true);
             });
         });
@@ -337,7 +337,7 @@ internal sealed class Runner
             {
                 db.Delete(keyGen.Generate(rng.NextInt64(_options.Num)));
                 stats.Ops++;
-                stats.Bytes += _options.KeySize;
+                stats.ByteSlice += _options.KeySize;
                 return new ValueTask<bool>(true);
             });
         });
@@ -367,12 +367,12 @@ internal sealed class Runner
                 var length = await db.GetRawAsync(key, valueBuffer);
 
                 stats.Ops++;
-                stats.Bytes += _options.KeySize;
+                stats.ByteSlice += _options.KeySize;
 
                 if (length >= 0)
                 {
                     stats.Found++;
-                    stats.Bytes += length;
+                    stats.ByteSlice += length;
                 }
 
                 return true;
@@ -412,7 +412,7 @@ internal sealed class Runner
                 {
                     s.Stats.Ops++;
                     s.Stats.Found++;
-                    s.Stats.Bytes += key.Length + value.Length;
+                    s.Stats.ByteSlice += key.Length + value.Length;
                     return true;
                 }, _options.EffectiveReads);
 
@@ -436,7 +436,7 @@ internal sealed class Runner
         foreach (var stats in perThread)
         {
             result.TotalOps += stats.Ops;
-            result.TotalBytes += stats.Bytes;
+            result.TotalBytes += stats.ByteSlice;
             result.Found += stats.Found;
             result.SumThreadMicros += stats.ElapsedMicros;
         }
@@ -473,7 +473,7 @@ internal sealed class Runner
                         s.Stats.Found++;
                     }
 
-                    s.Stats.Bytes += key.Length + value.Length;
+                    s.Stats.ByteSlice += key.Length + value.Length;
                     s.Read++;
                     return true;
                 }, toRead);
@@ -616,7 +616,7 @@ internal sealed class Runner
         foreach (var stats in perThread)
         {
             result.TotalOps += stats.Ops;
-            result.TotalBytes += stats.Bytes;
+            result.TotalBytes += stats.ByteSlice;
             result.Found += stats.Found;
             result.SumThreadMicros += stats.ElapsedMicros;
 

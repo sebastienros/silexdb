@@ -41,10 +41,9 @@ namespace Silex.Blocks;
 /// 
 /// The footer of the block will be as above. Each of the number is stored as ushort (UInt16).
 /// </summary>
-public class DefaultBlockEncoder<TKey, TValue> : IBlockEncoder<TKey, TValue>
+internal sealed class DefaultBlockEncoder : IBlockEncoder
 {
-    private static readonly IBinaryEncoder<TKey> _keySerializer = BinaryEncoderFactory<TKey>.BinarySerializer;
-    private static readonly IBinaryEncoder<TValue> _valueSerializer = BinaryEncoderFactory<TValue>.BinarySerializer;
+    private static readonly IBinaryEncoder<ByteSlice> _keySerializer = BinaryEncoderFactory<ByteSlice>.BinarySerializer;
     private readonly ushort _blockSize;
 
     public DefaultBlockEncoder()
@@ -64,23 +63,23 @@ public class DefaultBlockEncoder<TKey, TValue> : IBlockEncoder<TKey, TValue>
 
     public ushort BlockSize => _blockSize;
 
-    public Block<TKey, TValue> Decode(ReadOnlyMemory<byte> buffer)
+    public Block Decode(ReadOnlyMemory<byte> buffer)
     {
         var count = ReadEntryCount(buffer, buffer.Length);
 
         var memoryOwner = MemoryPool<byte>.Shared.Rent(buffer.Length);
         buffer.CopyTo(memoryOwner.Memory);
 
-        return new Block<TKey, TValue>(this, memoryOwner, buffer.Length, count);
+        return new Block(this, memoryOwner, buffer.Length, count);
     }
 
-    public Block<TKey, TValue> Decode(IMemoryOwner<byte> owner, int length)
+    public Block Decode(IMemoryOwner<byte> owner, int length)
     {
         // The block bytes were already read into the owned buffer, so build the block over it directly
         // instead of renting a second buffer and copying. The offset section is read in place by the block.
         var count = ReadEntryCount(owner.Memory, length);
 
-        return new Block<TKey, TValue>(this, owner, length, count);
+        return new Block(this, owner, length, count);
     }
 
     private static int ReadEntryCount(ReadOnlyMemory<byte> buffer, int length)
@@ -89,7 +88,7 @@ public class DefaultBlockEncoder<TKey, TValue> : IBlockEncoder<TKey, TValue>
         return BinaryPrimitives.ReadUInt16LittleEndian(buffer.Span.Slice(length - sizeof(ushort), sizeof(ushort)));
     }
 
-    public RecordLocation<TKey> DecodeEntry(ReadOnlyMemory<byte> data, int offset)
+    public RecordLocation DecodeEntry(ReadOnlyMemory<byte> data, int offset)
     {
         var binaryReader = new EncoderBinaryReader(data, offset);
         var keyLength = binaryReader.Read7BitEncodedInt();
@@ -99,11 +98,10 @@ public class DefaultBlockEncoder<TKey, TValue> : IBlockEncoder<TKey, TValue>
             throw new InvalidOperationException("Unexpected zero-length key was stored");
         }
 
-        var keyData = binaryReader.ReadBytesSpan(keyLength);
-        var key = _keySerializer.Decode(keyData);
+        var key = ByteSlice.FromMemory(binaryReader.ReadBytesMemory(keyLength));
         var valueLength = binaryReader.Read7BitEncodedInt();
 
-        return new RecordLocation<TKey>
+        return new RecordLocation
         {
             Key = key,
             BlockOffset = binaryReader.Offset,
@@ -116,13 +114,13 @@ public class DefaultBlockEncoder<TKey, TValue> : IBlockEncoder<TKey, TValue>
         return data.Slice(offset, length);
     }
 
-    public Block<TKey, TValue> Encode(ReadOnlyMemory<byte> encodedKeys, IReadOnlyList<BlockEntry<TValue>> entries)
+    public Block Encode(ReadOnlyMemory<byte> encodedKeys, ReadOnlyMemory<byte> values, IReadOnlyList<BlockEntry> entries)
     {
         var size = 0;
 
         for (var i = 0; i < entries.Count; i++)
         {
-            size += EstimateSize(entries[i].KeyLength, entries[i].Value);
+            size += EstimateSize(entries[i].KeyLength, entries[i].ValueLength);
         }
 
         size += sizeof(ushort);
@@ -137,6 +135,7 @@ public class DefaultBlockEncoder<TKey, TValue> : IBlockEncoder<TKey, TValue>
         var offsets = new List<ushort>(entries.Count);
 
         var keysSpan = encodedKeys.Span;
+        var valuesSpan = values.Span;
 
         foreach (var entry in entries)
         {
@@ -152,8 +151,8 @@ public class DefaultBlockEncoder<TKey, TValue> : IBlockEncoder<TKey, TValue>
             // The key was already encoded when it was added to the block, so write its bytes as-is.
             writer.WriteRaw(keysSpan.Slice(entry.KeyOffset, entry.KeyLength));
 
-            writer.Write7BitEncodedInt(_valueSerializer.GetLength(entry.Value));
-            _valueSerializer.Encode(entry.Value, ref writer);
+            writer.Write7BitEncodedInt(entry.ValueLength);
+            writer.WriteRaw(valuesSpan.Slice(entry.ValueOffset, entry.ValueLength));
         }
 
         foreach (var offset in offsets)
@@ -173,15 +172,15 @@ public class DefaultBlockEncoder<TKey, TValue> : IBlockEncoder<TKey, TValue>
 
         writer.Flush();
            
-        return new Block<TKey, TValue>(this, memory, (int)buffer.Length, offsets.Count);
+        return new Block(this, memory, (int)buffer.Length, offsets.Count);
     }
 
-    public int EstimateSize(int encodedKeyLength, TValue value)
+    public int EstimateSize(int encodedKeyLength, int valueLength)
     {
         return 2 // key length
             + encodedKeyLength
             + 2 // value length
-            + _valueSerializer.GetLength(value)
+            + valueLength
             + 2 // offset
             ;
     }

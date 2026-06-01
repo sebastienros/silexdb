@@ -10,27 +10,27 @@ namespace Silex.Tables;
 /// <summary>
 /// Uses are predefined sized buffer before flushing blocks to disk. Default buffer size is 32KiB.
 /// </summary>
-public sealed class BufferedSsTableBuilderFactory : ISsTableBuilderFactory
+internal sealed class BufferedSsTableBuilderFactory : ISsTableBuilderFactory
 {
-    public ISsTableBuilder<TKey, TValue> CreateSsTableBuilder<TKey, TValue>(string path, ISsTableEncoder<TKey, TValue> tableEncoder, IBlockEncoder<TKey, TValue> blockEncoder, IBloomFilterFactory bloomFilterFactory, int count)
+    public ISsTableBuilder CreateSsTableBuilder(string path, ISsTableEncoder tableEncoder, IBlockEncoder blockEncoder, IBloomFilterFactory bloomFilterFactory, int count)
     {
-        return new BufferedSsTableBuilder<TKey, TValue>(path, tableEncoder, blockEncoder, bloomFilterFactory, count);
+        return new BufferedSsTableBuilder(path, tableEncoder, blockEncoder, bloomFilterFactory, count);
     }
 }
 
-internal sealed class BufferedSsTableBuilder<TKey, TValue> : ISsTableBuilder<TKey, TValue>
+internal sealed class BufferedSsTableBuilder : ISsTableBuilder
 {
 
     private readonly string _filename;
     private readonly string _tempFilename;
-    private readonly ISsTableEncoder<TKey, TValue> _tableEncoder;
+    private readonly ISsTableEncoder _tableEncoder;
     private long _offset;
     private bool _isFirstKey = true;
-    private TKey? _firstKey = default;
-    private TKey? _lastKey = default;
+    private OwnedByteSlice? _firstKey = default;
+    private OwnedByteSlice? _lastKey = default;
     private readonly IBloomFilter _bloomFilter;
-    private readonly BlockBuilder<TKey, TValue> _blockBuilder;
-    private List<BlockMetadata<TKey>>? _metadata;
+    private readonly BlockBuilder _blockBuilder;
+    private List<BlockMetadata>? _metadata;
     private bool _disposed;
     private bool _ownsBuiltResources = true;
     private readonly FileStream _stream;
@@ -38,7 +38,7 @@ internal sealed class BufferedSsTableBuilder<TKey, TValue> : ISsTableBuilder<TKe
     private static readonly int _flushBufferSize = (int)32.KiB();
     private readonly PooledArrayBufferWriter<byte> _bufferWriter = new(_flushBufferSize);
 
-    public BufferedSsTableBuilder(string filename, ISsTableEncoder<TKey, TValue> tableEncoder, IBlockEncoder<TKey, TValue> blockEncoder, IBloomFilterFactory bloomFilterFactory, int count)
+    public BufferedSsTableBuilder(string filename, ISsTableEncoder tableEncoder, IBlockEncoder blockEncoder, IBloomFilterFactory bloomFilterFactory, int count)
     {
         _filename = filename;
         // Write to a temporary file and atomically rename to the final ".sst" name on a successful
@@ -47,7 +47,7 @@ internal sealed class BufferedSsTableBuilder<TKey, TValue> : ISsTableBuilder<TKe
         _tempFilename = filename + ".tmp";
         _tableEncoder = tableEncoder;
         _bloomFilter = bloomFilterFactory.CreateBloomFilter(count, 0.01);
-        _blockBuilder = new BlockBuilder<TKey, TValue>(blockEncoder);
+        _blockBuilder = new BlockBuilder(blockEncoder);
 
         // Disable dotnet buffer as we are handling it
         var bufferSize = 0;
@@ -60,13 +60,13 @@ internal sealed class BufferedSsTableBuilder<TKey, TValue> : ISsTableBuilder<TKe
         _stream = File.Create(_tempFilename, bufferSize, options);
     }
 
-    public async Task AddAsync(TKey key, TValue value, CancellationToken cancellationToken = default)
+    public async Task AddAsync(ByteSlice key, ByteSlice value, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
 
         if (_isFirstKey)
         {
-            _firstKey = key;
+            _firstKey = OwnedByteSlice.CopyFrom(key.Span);
             _isFirstKey = false;
         }
 
@@ -75,7 +75,7 @@ internal sealed class BufferedSsTableBuilder<TKey, TValue> : ISsTableBuilder<TKe
         {
             // The key was encoded once by the block builder; reuse those exact bytes for the bloom filter.
             _bloomFilter.Add(_blockBuilder.LastEncodedKey);
-            _lastKey = key;
+            ReplaceLastKey(key);
             return;
         }
 
@@ -91,8 +91,8 @@ internal sealed class BufferedSsTableBuilder<TKey, TValue> : ISsTableBuilder<TKe
 
         _bloomFilter.Add(_blockBuilder.LastEncodedKey);
 
-        _firstKey = key;
-        _lastKey = key;
+        _firstKey = OwnedByteSlice.CopyFrom(key.Span);
+        ReplaceLastKey(key);
     }
 
     public long EstimatedSize => _offset;
@@ -109,12 +109,12 @@ internal sealed class BufferedSsTableBuilder<TKey, TValue> : ISsTableBuilder<TKe
 
         _metadata ??= [];
 
-        var m = new BlockMetadata<TKey>()
+        var m = new BlockMetadata()
         {
             Index = _metadata.Count,
             Offset = _offset,
-            FirstKey = _firstKey!,
-            LastKey = _lastKey!
+            FirstKeyOwner = _firstKey!,
+            LastKeyOwner = _lastKey!
         };
 
         _metadata.Add(m);
@@ -142,10 +142,16 @@ internal sealed class BufferedSsTableBuilder<TKey, TValue> : ISsTableBuilder<TKe
         return;
     }
 
+    private void ReplaceLastKey(ByteSlice key)
+    {
+        _lastKey?.Dispose();
+        _lastKey = OwnedByteSlice.CopyFrom(key.Span);
+    }
+
     /// <remarks>
     /// The returned SST has an open file handle. The result must be disposed to close the handle.
     /// </summary>
-    public async Task<SsTable<TKey, TValue>> BuildAsync(CancellationToken cancellationToken = default)
+    public async Task<SsTable> BuildAsync(CancellationToken cancellationToken = default)
     {
         await FinishBlockAsync(cancellationToken);
 
@@ -181,7 +187,7 @@ internal sealed class BufferedSsTableBuilder<TKey, TValue> : ISsTableBuilder<TKe
         // decode and locate blocks, so this builder must no longer dispose or clear them.
         _ownsBuiltResources = false;
 
-        return new SsTable<TKey, TValue>(IdGenerator.GetNextId(), File.OpenRead(_filename), _filename, _metadata, metadataOffset, _blockBuilder, _bloomFilter);
+        return new SsTable(IdGenerator.GetNextId(), File.OpenRead(_filename), _filename, _metadata, metadataOffset, _blockBuilder, _bloomFilter);
     }
 
     private async Task FLushBufferToDiskAsync(CancellationToken cancellationToken = default)
@@ -218,13 +224,25 @@ internal sealed class BufferedSsTableBuilder<TKey, TValue> : ISsTableBuilder<TKe
         // releases its OS handle through its own finalizer, so no native resource leaks even then.
         _stream?.Dispose();
         _bufferWriter?.Dispose();
+        _firstKey?.Dispose();
+        _lastKey?.Dispose();
+        _firstKey = null;
+        _lastKey = null;
 
         // After a successful build, the block builder and metadata are owned by the SsTable, so the
         // builder must not dispose the block builder nor clear the metadata list the SsTable now uses.
         if (_ownsBuiltResources)
         {
             _blockBuilder?.Dispose();
-            _metadata?.Clear();
+            if (_metadata is not null)
+            {
+                foreach (var metadata in _metadata)
+                {
+                    metadata.Dispose();
+                }
+
+                _metadata.Clear();
+            }
             _metadata = null;
 
             // The build never completed (otherwise the temp file was renamed to the final name), so

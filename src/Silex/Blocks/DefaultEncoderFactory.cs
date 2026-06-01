@@ -1,6 +1,6 @@
 namespace Silex.Blocks;
 
-public class DefaultBlockEncoderFactory : IBlockEncoderFactory
+internal sealed class DefaultBlockEncoderFactory : IBlockEncoderFactory
 {
     private readonly ushort _blockSize;
 
@@ -19,5 +19,5 @@ public class DefaultBlockEncoderFactory : IBlockEncoderFactory
         _blockSize = blockSize;
     }
 
-    public IBlockEncoder<TKey, TValue> Create<TKey, TValue>() => new DefaultBlockEncoder<TKey, TValue>(_blockSize);
+    public IBlockEncoder Create() => new DefaultBlockEncoder(_blockSize);
 }

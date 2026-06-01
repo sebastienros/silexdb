@@ -33,10 +33,12 @@ not in the individual collections.
 ## Implemented features
 
 ### Public API (`LsmStorage` / `LsmStorageInner`)
-- `LsmStorage.OpenAsync<TKey, TValue>(path, options)` opens/creates a store at a directory.
-- `Put(key, value)`, `Delete(key)` (synchronous, writes to the current MemTable).
-- `GetAsync(key)` (async; may touch disk).
-- `CreateIterator()` for full and range (`EnumerateAsync(from)`) scans.
+- `LsmStorage.OpenAsync(path, options)` opens/creates the public byte-oriented store at a directory.
+- `Put(ReadOnlySpan<byte>, ReadOnlySpan<byte>)` copies borrowed data into memtable-owned arena blocks.
+- Typed convenience overloads live in `LsmStorageTypedExtensions` and encode through the built-in
+  `IBinaryEncoder<T>` implementations before delegating to the byte API.
+- Raw get/scan/seek APIs expose borrowed encoded bytes without materializing typed values.
+- The generic `LsmStorage<TKey,TValue>` remains internal as the engine implementation surface.
 - `CloseAsync()` / `DisposeAsync()` flush all pending data and stop background work.
 - Implementation note: writes are synchronous because only background work (disk flush) and explicit
   filesystem reads are async. `Put`/`Delete` trigger a freeze when the MemTable hits the size limit.
@@ -98,10 +100,10 @@ not in the individual collections.
 
 ### Serialization (`Serialization/`)
 - Pluggable `IBinaryEncoder<T>` with a comparer, equality comparer, length, encode/decode, and
-  tombstone support. Built-in encoders: `int`, `long`, `uint`, `ushort`, `char`, UTF-8 string,
-  `byte[]`, and `Bytes`.
-- `Bytes` is a value-type wrapper that **rents a pooled copy** of the input on construction
-  (`MemoryOwner<byte>.RentCopy`), giving the engine an owned copy independent of caller memory.
+  tombstone support. Built-in public encoders include `int`, `long`, `uint`, `ulong`, `ushort`, UTF-8
+  string, and `byte[]`.
+- The byte-oriented public store uses an internal comparable byte wrapper for arena-backed memtable
+  slices and decoded SST values.
 
 ### Background flush & compaction (`Compaction/Compacter.cs`)
 - A `PeriodicTimer` (default 50 ms; `TimeSpan.Zero` disables it) drives a single background loop that
@@ -201,7 +203,7 @@ not in the individual collections.
 - `PooledArrayBufferWriter` — when full, rents a larger buffer and copies the previous content over.
 
 ### Tests & tooling
-- TUnit tests cover blocks, tables, MemTables, bloom filters, encoders, storage, `Bytes`, and
+- TUnit tests cover blocks, tables, MemTables, bloom filters, encoders, storage, `ByteSlice`, and
   `AsyncReaderWriterLock`. Run with `dotnet test --solution Silex.slnx`.
 - `Silex.Benchmarks` (BenchmarkDotNet) and `Silex.Playground` (1M-entry write/flush demo).
 
@@ -246,34 +248,15 @@ not in the individual collections.
   write lock — closing a pre-existing window where a mid-flush MemTable was visible in neither place.
   Tombstones are filtered out of scan results via `IsTombstoneValue`.
 
-### Serialization / value-ownership semantics
-- **Decision: zero-copy is a core principle.** The engine deliberately does **not** defensively copy
-  keys/values on `Put` or `Get`/scan — no per-operation allocations. Instead correctness is governed
-  by an **ownership-transfer / borrow contract**:
-  - `Put(key, value)` *transfers ownership* of `key`/`value` to the engine. The caller must not
-    mutate or release (e.g. return a pooled buffer) the memory afterwards. The engine owns it for the
-    lifetime of the memtable.
-  - `GetAsync`/scan return a *read-only borrow* of engine-owned memory. The caller must treat the
-    result as immutable and must not dispose it.
-  - This is exactly the single-owner, pooled model that `Bytes`/`MemoryOwner<byte>` already encode; a
-    caller that needs an independent, safely-mutable copy wraps the data in `Bytes` (whose constructor
-    copies once) before handing it over.
-  - The only copy that is actually required — making the on-disk SST independent of memtable memory —
-    happens exactly once, at flush time, via the encoder's `Encode` into the SST buffer. Reads from an
-    SST likewise allocate once in `Decode`. There is no copy while data lives in a memtable.
-  - Rejected alternative: a defensive `IBinaryEncoder.Copy` with copy-in at `Put` and copy-out at
-    `Get`/scan. It made the engine safe against caller misuse but added an allocation on every write
-    and every read, which conflicts with the zero-allocation principle. Not adopted.
-- Rejected follow-up (consistent with the zero-copy contract above): a block-builder-level copy so
-  values are serialized into the SST buffer at `Add` time instead of holding the `TValue` reference
-  until `BuildBlock`. This would defend against a caller mutating a value between `Put` and the
-  eventual SST flush, but that is exactly the misuse the ownership-transfer contract disallows, and it
-  would add a second full value copy on the flush path (encode into the value buffer, then re-copy into
-  the block stream). Not adopted; the corresponding `EntryBuffersShouldBeCopied` test was removed.
-- Open follow-up: returning engine-owned pooled buffers to the `ArrayPool` on memtable dispose. This
-  needs reference-counted memtables first, because `ForceFlushNextImmutableMemTableAsync` disposes a
-  memtable outside `_immutableMemTablesLock` while a snapshot reader may still be borrowing it — naive
-  disposal would be a use-after-free.
+### Serialization / value-copy semantics
+- Public byte writes have borrowed-input semantics:
+  - `Put(ReadOnlySpan<byte>, ReadOnlySpan<byte>)` copies immediately into the active memtable arena.
+  - The byte memtable stores arena-backed internal byte views whose slabs live for the memtable lifetime, and
+    raw reads/scans return short-lived borrows of engine-owned memory.
+- Open follow-up: returning arena blocks to the `ArrayPool` on memtable dispose. This needs
+  reference-counted memtables first, because `ForceFlushNextImmutableMemTableAsync` disposes a memtable
+  outside `_immutableMemTablesLock` while a snapshot reader may still be borrowing it — naive pooling
+  would be a use-after-free.
 - Evaluate CBOR as a binary value format (independent of *when* the copy happens):
   https://cborbook.com/part_1/practical_introduction_to_cbor.html
 
@@ -306,8 +289,8 @@ not in the individual collections.
     `IdGenerator` past persisted ids so recency order survives reopen.
   - `byte[]` keys use content equality in MemTable dictionary lookups (`ByteArrayEncoder.Comparer`
     now implements `IEqualityComparer<byte[]>`), consistent with the sorted-comparer phase.
-  - Removed a bogus 4-byte length assert in `BytesEncoder.Decode` that fired on arbitrary-length
-    `Bytes` values read from an SST under Debug.
+  - Removed a bogus 4-byte length assert in `ByteSliceEncoder.Decode` that fired on arbitrary-length
+    byte-slice values read from an SST under Debug.
   - `SsTableIterator.EnumerateAsync(from)` clamps its start block index to 0 when the from-key
     precedes the first block's first key.
 - ~~Tiered compaction + L0 read-path tombstone fixes.~~ Implemented (with tests):
@@ -315,14 +298,14 @@ not in the individual collections.
     loop; merges a newest suffix of L0, drops tombstones only on full compactions, atomic temp+rename
     output, oldest-first stop-on-failure input deletion, serialized by a maintenance lock (see
     *Background flush & compaction*).
-  - `GetAsync` now recognises **sentinel-based tombstones** in SSTs (e.g. `int`/`long`/`char`, whose
+  - `GetAsync` now recognises **sentinel-based tombstones** in SSTs (e.g. `int`/`long`, whose
     deletion is a fixed non-empty value): previously it returned the raw sentinel instead of the
     default for a deleted key read from an SST.
   - `GetAsync` no longer lets a **bloom-filter false positive** in a newer SST mask an older SST: a key
     that is genuinely absent from the covering block falls through to older tables (via a presence-aware
     `Block.TryGetValue`) instead of returning a premature default.
-  - `BytesEncoder.IsTombstoneValue` no longer throws on a non-empty value (it compared against
-    `Bytes.Empty`, whose `Span` dereferenced a null backing buffer); it is now an empty check.
+  - `ByteSliceEncoder.IsTombstoneValue` no longer throws on a non-empty value (it compared against
+    `ByteSlice.Empty`, whose `Span` dereferenced a null backing buffer); it is now an empty check.
 
 ---
 
@@ -392,7 +375,8 @@ mirrors `db_bench` flag names (`--benchmarks`, `--num`, `--reads`, `--value_size
 unsupported — iterators are forward-only). Fill benchmarks open a fresh DB (wiped unless
 `--use_existing_db`); reads reuse the prior DB. Read key streams are seeded independently of the write
 streams so found-counts reflect real coverage. Output is `db_bench`-style (`micros/op`, `ops/sec`,
-`MB/s`, optional latency percentiles). This work added a public `LsmStorage<TKey,TValue>.CreateIterator()`
+`MB/s`, optional latency percentiles). This work originally added a generic iterator API; the public
+surface now exposes raw byte scans instead.
 on the wrapper (previously only on the inner) to support `readseq`/`seekrandom`. Values are stored
 uncompressed and there is no write-batch API, so compare against RocksDB with compression disabled and
 `--batch_size=1` (these flags are accepted but ignored, with a warning). The solution now uses the XML
@@ -403,9 +387,8 @@ merge iterator over all memtables + SSTs; a reusable/seekable iterator handle wo
 
 ## Suggested priority
 
-1. ~~Serialization / value copy-in semantics.~~ **Decided: keep zero-copy** as a core principle —
-   ownership-transfer / borrow contract rather than defensive copies (see *Serialization /
-   value-ownership semantics*).
+1. ~~Serialization / value copy-in semantics.~~ **Decided: byte writes copy into memtable arenas** while
+   raw reads still expose short-lived engine-owned borrows (see *Serialization / value-copy semantics*).
 2. ~~WAL~~ **(done — crash recovery via write-ahead log)** + ~~manifest~~ **(done — universal manifest)**.
 3. ~~Compaction~~ **(tiered + leveled done)** + ~~SST-level scan iterator so range scans include on-disk
    data~~ **(done)** + ~~leveling (needs a manifest)~~ **(done)** + ~~leveled output-splitting +

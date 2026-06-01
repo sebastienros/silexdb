@@ -3,7 +3,7 @@
 using Silex.Blocks;
 using Silex.BloomFilters;
 
-public interface ISsTableBuilderFactory
+internal interface ISsTableBuilderFactory
 {
-    ISsTableBuilder<TKey, TValue> CreateSsTableBuilder<TKey, TValue>(string path, ISsTableEncoder<TKey, TValue> tableEncoder, IBlockEncoder<TKey, TValue> blockEncoder, IBloomFilterFactory bloomFilterFactory, int count);
+    ISsTableBuilder CreateSsTableBuilder(string path, ISsTableEncoder tableEncoder, IBlockEncoder blockEncoder, IBloomFilterFactory bloomFilterFactory, int count);
 }

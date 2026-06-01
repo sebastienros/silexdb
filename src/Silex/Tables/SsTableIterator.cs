@@ -4,18 +4,18 @@ using System.Runtime.CompilerServices;
 
 namespace Silex.Tables;
 
-internal sealed class SsTableIterator<TKey, TValue> : IStorageIterator<TKey, TValue>
+internal sealed class SsTableIterator : IStorageIterator
 {
-    private static readonly IComparer<TKey> _keyComparer = BinaryEncoderFactory<TKey>.BinarySerializer.Comparer;
+    private static readonly IComparer<ByteSlice> _keyComparer = BinaryEncoderFactory<ByteSlice>.BinarySerializer.Comparer;
 
-    private readonly SsTable<TKey, TValue> _table;
+    private readonly SsTable _table;
 
-    public SsTableIterator(SsTable<TKey, TValue> table)
+    public SsTableIterator(SsTable table)
     {
         _table = table;
     }
 
-    public async IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
+    public async IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         for (var i = 0; i < _table.BlockMetadata.Count; i++)
         {
@@ -25,7 +25,7 @@ internal sealed class SsTableIterator<TKey, TValue> : IStorageIterator<TKey, TVa
 
             if (block != null)
             {
-                var blockIterator = new BlockIterator<TKey, TValue>(block);
+                var blockIterator = new BlockIterator(block);
                 await foreach (var entry in blockIterator.EnumerateAsync(cancellationToken))
                 {
                     yield return entry;
@@ -34,7 +34,7 @@ internal sealed class SsTableIterator<TKey, TValue> : IStorageIterator<TKey, TVa
         }
     }
 
-    public async IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateAsync(TKey from, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    public async IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateAsync(ByteSlice from, [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         var startBlockIndex = FindStartBlockIndex(from);
 
@@ -64,7 +64,7 @@ internal sealed class SsTableIterator<TKey, TValue> : IStorageIterator<TKey, TVa
 
         if (block != null)
         {
-            var blockIterator = new BlockIterator<TKey, TValue>(block);
+            var blockIterator = new BlockIterator(block);
             await foreach (var entry in blockIterator.EnumerateAsync(from, cancellationToken))
             {
                 yield return entry;
@@ -81,7 +81,7 @@ internal sealed class SsTableIterator<TKey, TValue> : IStorageIterator<TKey, TVa
 
             if (block2 != null)
             {
-                var blockIterator = new BlockIterator<TKey, TValue>(block2);
+                var blockIterator = new BlockIterator(block2);
                 await foreach (var entry in blockIterator.EnumerateAsync(cancellationToken))
                 {
                     yield return entry;
@@ -92,7 +92,7 @@ internal sealed class SsTableIterator<TKey, TValue> : IStorageIterator<TKey, TVa
         yield break;
     }
 
-    private int FindStartBlockIndex(TKey from)
+    private int FindStartBlockIndex(ByteSlice from)
     {
         var start = 0;
         var end = _table.BlockMetadata.Count - 1;

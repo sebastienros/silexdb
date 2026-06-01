@@ -12,10 +12,10 @@ public static class BinaryEncoderFactory<T>
             Type t when t == typeof(int) => new Int32Encoder() as IBinaryEncoder<T>,
             Type t when t == typeof(uint) => new UInt32Encoder() as IBinaryEncoder<T>,
             Type t when t == typeof(long) => new Int64Encoder() as IBinaryEncoder<T>,
+            Type t when t == typeof(ulong) => new UInt64Encoder() as IBinaryEncoder<T>,
             Type t when t == typeof(byte[]) => new ByteArrayEncoder() as IBinaryEncoder<T>,
             Type t when t == typeof(string) => new UTF8StringEncoder() as IBinaryEncoder<T>,
-            Type t when t == typeof(char) => new UTF8CharEncoder() as IBinaryEncoder<T>,
-            Type t when t == typeof(Bytes) => new BytesEncoder() as IBinaryEncoder<T>,
+            Type t when t == typeof(ByteSlice) => new ByteSliceEncoder() as IBinaryEncoder<T>,
             _ => null
         };
 

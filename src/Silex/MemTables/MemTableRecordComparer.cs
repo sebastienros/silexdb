@@ -1,6 +1,6 @@
 ﻿namespace Silex.MemTables;
 
-using MemTableRecord = KeyValuePair<Bytes, Bytes>;
+using MemTableRecord = KeyValuePair<ByteSlice, ByteSlice>;
 
 internal class MemTableRecordComparer : EqualityComparer<MemTableRecord>, IComparer<MemTableRecord>
 {

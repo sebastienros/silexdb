@@ -1,22 +1,19 @@
-﻿using Silex.Serialization;
 using System.Runtime.CompilerServices;
 
 namespace Silex.Blocks;
 
-internal sealed class BlockIterator<TKey, TValue> : IStorageIterator<TKey, TValue>
+internal sealed class BlockIterator : IStorageIterator
 {
-    private static readonly IBinaryEncoder<TValue> _valueSerializer = BinaryEncoderFactory<TValue>.BinarySerializer;
+    private readonly Block _block;
 
-    private readonly Block<TKey, TValue> _block;
+    private readonly RecordLocation[] _entries;
 
-    private readonly RecordLocation<TKey>[] _entries;
-
-    public BlockIterator(Block<TKey, TValue> block)
+    public BlockIterator(Block block)
     {
         _block = block;
 
         var offsets = block.Offsets;
-        var entries = new RecordLocation<TKey>[offsets.Count];
+        var entries = new RecordLocation[offsets.Count];
         for (var i = 0; i < entries.Length; i++)
         {
             entries[i] = block.GetEntry(offsets[i]);
@@ -25,23 +22,23 @@ internal sealed class BlockIterator<TKey, TValue> : IStorageIterator<TKey, TValu
         _entries = entries;
     }
 
-    public async IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
+    public async IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         await Task.Yield();
 
         foreach (var entry in _entries)
         {
-            yield return new KeyValuePair<TKey, TValue>(entry.Key, _valueSerializer.Decode(_block.GetValue(entry)));
+            yield return new KeyValuePair<ByteSlice, ByteSlice>(entry.Key, ByteSlice.FromMemory(_block.GetValueMemory(entry)));
         }
     }
 
 #pragma warning disable 1998 // async function without await
-    public async IAsyncEnumerable<KeyValuePair<TKey, TValue>> EnumerateAsync(TKey from, [EnumeratorCancellation] CancellationToken _ = default)
+    public async IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateAsync(ByteSlice from, [EnumeratorCancellation] CancellationToken _ = default)
 #pragma warning restore 1998
     {
         var startIndex = 0;
 
-        var compare = Array.BinarySearch(_entries, new RecordLocation<TKey> { Key = from });
+        var compare = Array.BinarySearch(_entries, new RecordLocation { Key = from });
 
         startIndex = compare >= 0 ? compare : ~compare;
 
@@ -53,7 +50,7 @@ internal sealed class BlockIterator<TKey, TValue> : IStorageIterator<TKey, TValu
         for (var i = startIndex; i < _entries.Length; i++)
         {
             var entry = _entries[i];
-            yield return new KeyValuePair<TKey, TValue>(_entries[i].Key, _valueSerializer.Decode(_block.GetValue(entry)));
+            yield return new KeyValuePair<ByteSlice, ByteSlice>(_entries[i].Key, ByteSlice.FromMemory(_block.GetValueMemory(entry)));
         }
     }
 }

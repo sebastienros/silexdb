@@ -51,7 +51,7 @@ public static class SizeExtensions
     }
 
     /// <summary>
-    /// Bytes.
+    /// ByteSlice.
     /// </summary>
     public static long B(this int @this)
     {
