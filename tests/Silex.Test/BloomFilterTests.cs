@@ -13,85 +13,106 @@ public class BloomFilterTests
     [Arguments(10_000, 0.10)]
     public async Task ShouldApproximateProbability(int n, double p)
     {
-        // n: distinct values
-        // p: tolerable false positive rate 
-
-        var s = 1_000 * n; // Cardinality (number of values in the set)
-        var attempts = 1_000_000; // Attempts to build stats
-
-        var elements = new HashSet<int>();
-
-        while (elements.Count < n) elements.Add(Random.Shared.Next(1, s));
-
         var bloom = new BloomFilter(n, p);
+        const int sampleCount = 1_000_000;
+        var falseNegativeCount = 0;
+        var falsePositiveCount = 0;
 
-        var buffer = new byte[sizeof(int) / sizeof(byte)];
-
-        foreach (int element in elements)
         {
-            BinaryPrimitives.WriteInt32LittleEndian(buffer, element);
-            bloom.Add(buffer);
-        }
+            Span<byte> buffer = stackalloc byte[sizeof(int)];
 
-        int positive = 0;
-        int negative = 0;
-        int falsePositive = 0;
-        int falseNegative = 0;
-
-        for (var i = 0; i < attempts; i++)
-        {
-            var v = Random.Shared.Next(1, s);
-
-            BinaryPrimitives.WriteInt32LittleEndian(buffer, v);
-            var result = bloom.Probe(buffer);
-
-            if (result)
+            for (var value = 0; value < n; value++)
             {
-                positive++;
-            }
-            else
-            {
-                negative++;
+                BinaryPrimitives.WriteInt32LittleEndian(buffer, value);
+                bloom.Add(buffer);
             }
 
-            if (result && !elements.Contains(v)) falsePositive++;
-            if (!result && elements.Contains(v)) falseNegative++;
+            for (var value = 0; value < n; value++)
+            {
+                BinaryPrimitives.WriteInt32LittleEndian(buffer, value);
+                if (!bloom.Probe(buffer))
+                {
+                    falseNegativeCount++;
+                }
+            }
+
+            // Negative values are disjoint from the inserted [0, n) range.
+            for (var value = -sampleCount; value < 0; value++)
+            {
+                BinaryPrimitives.WriteInt32LittleEndian(buffer, value);
+                if (bloom.Probe(buffer))
+                {
+                    falsePositiveCount++;
+                }
+            }
         }
 
-        var pResult = positive == 0 ? 1 : (double)falsePositive / positive;
-        var nResult = negative == 0 ? 1 : (double)falseNegative / negative;
-        var fnRate = (double)negative / attempts;
-        var fpRate = (double)positive / attempts;
+        await Assert.That(falseNegativeCount).IsEqualTo(0);
 
-        Console.WriteLine($"May be set: {positive} ({fpRate * 100}%), Tolerable (p) was {p}");
-        Console.WriteLine($"False positive: {pResult} ({pResult * 100}%)");
-        Console.WriteLine($"Is not in set: {negative} ({fnRate * 100}%)");
+        var setBitCount = 0;
+        foreach (var value in bloom.GetBytes())
+        {
+            setBitCount += System.Numerics.BitOperations.PopCount(value);
+        }
 
-        // A bloom filter should not return false negatives
-        await Assert.That(falseNegative).IsEqualTo(0);
+        var bitCount = (double)bloom.GetBytes().Length * 8;
+        var occupancy = (double)setBitCount / bitCount;
+        var hashCount = (double)bloom.K * n;
+        var configuredRate = BloomFilter.CalculateP(bloom.K, (long)bitCount, n);
+        var emptyProbability = Math.Pow(1 - 1d / bitCount, hashCount);
+        var expectedOccupancy = 1 - emptyProbability;
+        var bothOccupiedProbability = 1 - 2 * emptyProbability + Math.Pow(1 - 2d / bitCount, hashCount);
+        var occupancyVariance = (bitCount * expectedOccupancy * (1 - expectedOccupancy)
+            + bitCount * (bitCount - 1) * (bothOccupiedProbability - expectedOccupancy * expectedOccupancy))
+            / (bitCount * bitCount);
+        var occupancyStandardDeviation = Math.Sqrt(Math.Max(0, occupancyVariance));
 
-        // Ensure the resulting rate is within 20% of the expected probability
-        await Assert.That((fpRate - p) / p < 0.20).IsTrue();
+        // Integer hash counts can make the theoretical rate slightly exceed the
+        // continuous optimum requested by p, but the sizing error stays below 3%.
+        await Assert.That(configuredRate).IsLessThanOrEqualTo(p * 1.03);
+        await Assert.That(Math.Abs(occupancy - expectedOccupancy))
+            .IsLessThanOrEqualTo(6 * occupancyStandardDeviation);
+
+        var expectedRate = Math.Pow(occupancy, bloom.K);
+        var standardDeviation = Math.Sqrt(expectedRate * (1 - expectedRate) / sampleCount);
+        var observedRate = (double)falsePositiveCount / sampleCount;
+
+        // The fixed sample is deterministic; the statistical bound tolerates the small
+        // model error from double hashing while detecting probe-distribution regressions.
+        await Assert.That(observedRate).IsLessThanOrEqualTo(expectedRate + 6 * standardDeviation);
     }
 
     [Test]
-    public async Task BloomFilterShouldNotReturnFalsePositive()
+    public async Task ShouldProbeAddedValuesAfterRoundTrip()
     {
-        var buffer = new byte[sizeof(int) / sizeof(byte)];
-        var bloom = new BloomFilter(1000, 0.1);
-        
-        BinaryPrimitives.WriteInt32LittleEndian(buffer, 123);
-        bloom.Add(buffer);
+        var bloom = new BloomFilter(1_000, 0.01);
 
-        BinaryPrimitives.WriteInt32LittleEndian(buffer, 456);
-        bloom.Add(buffer);
+        {
+            Span<byte> buffer = stackalloc byte[sizeof(int)];
 
-        var result = bloom.Probe(buffer);
+            for (var value = 0; value < 1_000; value++)
+            {
+                BinaryPrimitives.WriteInt32LittleEndian(buffer, value);
+                bloom.Add(buffer);
+            }
+        }
 
-        BinaryPrimitives.WriteInt32LittleEndian(buffer, 111);
-        await Assert.That(bloom.Probe(buffer)).IsFalse();
+        var restored = new BloomFilter(bloom.GetBytes().ToArray(), bloom.K);
+        var falseNegativeCount = 0;
 
-        BinaryPrimitives.WriteInt32LittleEndian(buffer, 222);
-        await Assert.That(bloom.Probe(buffer)).IsFalse();
+        {
+            Span<byte> buffer = stackalloc byte[sizeof(int)];
+
+            for (var value = 0; value < 1_000; value++)
+            {
+                BinaryPrimitives.WriteInt32LittleEndian(buffer, value);
+                if (!restored.Probe(buffer))
+                {
+                    falseNegativeCount++;
+                }
+            }
+        }
+
+        await Assert.That(falseNegativeCount).IsEqualTo(0);
     }
 }
