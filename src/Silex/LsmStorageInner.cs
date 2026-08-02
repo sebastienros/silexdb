@@ -57,6 +57,9 @@ internal sealed class LsmStorageInner : IDisposable
     private readonly long _targetSstSizeBytes;
     private readonly int _maxCompactionParallelism;
     private readonly int _maxReadParallelism;
+    private readonly SstCompression _compression;
+    private readonly int _compressionLevel;
+    private readonly double _minimumCompressionSavingsPercent;
     private readonly IBlockEncoderFactory _blockEncoderFactory;
     private readonly ISsTableEncoderFactory _ssTableEncoderFactory;
     private SsTable[]? _sortedSsTableRun;
@@ -92,6 +95,9 @@ internal sealed class LsmStorageInner : IDisposable
         _targetSstSizeBytes = Math.Max(1, options.TargetSstSizeBytes);
         _maxCompactionParallelism = Math.Max(1, options.MaxCompactionParallelism);
         _maxReadParallelism = Math.Max(1, options.MaxReadParallelism);
+        _compression = options.Compression;
+        _compressionLevel = options.CompressionLevel;
+        _minimumCompressionSavingsPercent = options.MinimumCompressionSavingsPercent;
         _blockEncoderFactory = options.BlockEncoderFactory;
         _ssTableEncoderFactory = options.SsTableEncoderFactory;
         _memTableArenaBlockSize = options.MemTableArenaBlockSize;
@@ -1279,7 +1285,15 @@ internal sealed class LsmStorageInner : IDisposable
             }
 
             var sstFilename = GetSstPath(memTableToFlush.Id);
-            using var builder = _ssTableBuilderFactory.CreateSsTableBuilder(sstFilename, _ssTableEncoder, _blockEncoder, _bloomFilterFactory, memTableToFlush.Count);
+            using var builder = _ssTableBuilderFactory.CreateSsTableBuilder(
+                sstFilename,
+                _ssTableEncoder,
+                _blockEncoder,
+                _bloomFilterFactory,
+                memTableToFlush.Count,
+                _compression,
+                _compressionLevel,
+                _minimumCompressionSavingsPercent);
             await memTableToFlush.FlushAsync(builder, cancellationToken);
 
             var ssTable = await builder.BuildAsync(cancellationToken);
@@ -1463,7 +1477,15 @@ internal sealed class LsmStorageInner : IDisposable
             SsTable? output = null;
             var addedEntries = 0;
 
-            using (var builder = _ssTableBuilderFactory.CreateSsTableBuilder(outputPath, _ssTableEncoder, _blockEncoder, _bloomFilterFactory, estimatedCount))
+            using (var builder = _ssTableBuilderFactory.CreateSsTableBuilder(
+                outputPath,
+                _ssTableEncoder,
+                _blockEncoder,
+                _bloomFilterFactory,
+                estimatedCount,
+                _compression,
+                _compressionLevel,
+                _minimumCompressionSavingsPercent))
             {
                 // Feed iterators newest-first so the MergeIterator keeps the most recent value per key.
                 var iterators = new List<IStorageIterator>(count);
@@ -2026,7 +2048,15 @@ internal sealed class LsmStorageInner : IDisposable
                 if (builder == null)
                 {
                     builderPath = GetSstPath(IdGenerator.GetNextId());
-                    builder = _ssTableBuilderFactory.CreateSsTableBuilder(builderPath, tableEncoder, blockEncoder, _bloomFilterFactory, estimatedCount);
+                    builder = _ssTableBuilderFactory.CreateSsTableBuilder(
+                        builderPath,
+                        tableEncoder,
+                        blockEncoder,
+                        _bloomFilterFactory,
+                        estimatedCount,
+                        _compression,
+                        _compressionLevel,
+                        _minimumCompressionSavingsPercent);
                 }
 
                 await builder.AddAsync(entry.Key, entry.Value, cancellationToken);

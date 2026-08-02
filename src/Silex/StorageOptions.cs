@@ -12,6 +12,10 @@ public class StorageOptions
     /// <value>4KiB</value>
     private static readonly ushort _defaultBlockSize = (ushort)4.KiB();
 
+    private const SstCompression DefaultCompression = SstCompression.Lz4;
+
+    private const double DefaultMinimumCompressionSavingsPercent = 12.5;
+
     /// <value>32KiB</value>
     private static readonly int _defaultMemTableArenaBlockSize = (int)32.KiB();
 
@@ -94,6 +98,27 @@ public class StorageOptions
             BlockEncoderFactory = new DefaultBlockEncoderFactory(value);
         }
     }
+
+    /// <summary>
+    /// Gets or sets the compression algorithm applied independently to SST data blocks.
+    /// Blocks that do not meet <see cref="MinimumCompressionSavingsPercent"/> are stored uncompressed.
+    /// </summary>
+    /// <value>The default value is <see cref="SstCompression.Lz4"/>.</value>
+    public SstCompression Compression { get; set; } = DefaultCompression;
+
+    /// <summary>
+    /// Gets or sets the codec-specific compression level. Zero selects fast LZ4 or the default
+    /// Zstandard level. LZ4 also accepts high-compression levels 3 through 12.
+    /// </summary>
+    /// <value>The default value is <c>0</c>.</value>
+    public int CompressionLevel { get; set; }
+
+    /// <summary>
+    /// Gets or sets the minimum percentage reduction required to store a compressed block.
+    /// A block that does not meet the threshold is stored uncompressed.
+    /// </summary>
+    /// <value>The default value is <c>12.5</c>.</value>
+    public double MinimumCompressionSavingsPercent { get; set; } = DefaultMinimumCompressionSavingsPercent;
 
     /// <summary>
     /// Gets or set the <see cref="IBlockEncoderFactory"> to use.

@@ -4,6 +4,7 @@ using Silex.Buffers;
 using Silex.Serialization;
 using System.Buffers;
 using System.IO;
+using System.IO.Hashing;
 
 namespace Silex.Tables;
 
@@ -12,9 +13,25 @@ namespace Silex.Tables;
 /// </summary>
 internal sealed class BufferedSsTableBuilderFactory : ISsTableBuilderFactory
 {
-    public ISsTableBuilder CreateSsTableBuilder(string path, ISsTableEncoder tableEncoder, IBlockEncoder blockEncoder, IBloomFilterFactory bloomFilterFactory, int count)
+    public ISsTableBuilder CreateSsTableBuilder(
+        string path,
+        ISsTableEncoder tableEncoder,
+        IBlockEncoder blockEncoder,
+        IBloomFilterFactory bloomFilterFactory,
+        int count,
+        SstCompression compression,
+        int compressionLevel,
+        double minimumCompressionSavingsPercent)
     {
-        return new BufferedSsTableBuilder(path, tableEncoder, blockEncoder, bloomFilterFactory, count);
+        return new BufferedSsTableBuilder(
+            path,
+            tableEncoder,
+            blockEncoder,
+            bloomFilterFactory,
+            count,
+            compression,
+            compressionLevel,
+            minimumCompressionSavingsPercent);
     }
 }
 
@@ -30,6 +47,8 @@ internal sealed class BufferedSsTableBuilder : ISsTableBuilder
     private OwnedByteSlice? _lastKey = default;
     private readonly IBloomFilter _bloomFilter;
     private readonly BlockBuilder _blockBuilder;
+    private readonly BlockCompressor _blockCompressor;
+    private readonly int _formatVersion;
     private List<BlockMetadata>? _metadata;
     private bool _disposed;
     private bool _ownsBuiltResources = true;
@@ -38,7 +57,16 @@ internal sealed class BufferedSsTableBuilder : ISsTableBuilder
     private static readonly int _flushBufferSize = (int)32.KiB();
     private readonly PooledArrayBufferWriter<byte> _bufferWriter = new(_flushBufferSize);
 
-    public BufferedSsTableBuilder(string filename, ISsTableEncoder tableEncoder, IBlockEncoder blockEncoder, IBloomFilterFactory bloomFilterFactory, int count)
+    public BufferedSsTableBuilder(
+        string filename,
+        ISsTableEncoder tableEncoder,
+        IBlockEncoder blockEncoder,
+        IBloomFilterFactory bloomFilterFactory,
+        int count,
+        SstCompression compression = SstCompression.None,
+        int compressionLevel = 0,
+        double minimumCompressionSavingsPercent = 12.5,
+        int formatVersion = SsTableFormat.CurrentVersion)
     {
         _filename = filename;
         // Write to a temporary file and atomically rename to the final ".sst" name on a successful
@@ -48,6 +76,13 @@ internal sealed class BufferedSsTableBuilder : ISsTableBuilder
         _tableEncoder = tableEncoder;
         _bloomFilter = bloomFilterFactory.CreateBloomFilter(count, 0.01);
         _blockBuilder = new BlockBuilder(blockEncoder);
+        _blockCompressor = new BlockCompressor(compression, compressionLevel, minimumCompressionSavingsPercent);
+        if (formatVersion is < SsTableFormat.LegacyVersion or > SsTableFormat.CurrentVersion
+            || (formatVersion == SsTableFormat.LegacyVersion && compression != SstCompression.None))
+        {
+            throw new ArgumentOutOfRangeException(nameof(formatVersion), formatVersion, "The requested SST format version does not support these options.");
+        }
+        _formatVersion = formatVersion;
 
         // Disable dotnet buffer as we are handling it
         var bufferSize = 0;
@@ -107,33 +142,35 @@ internal sealed class BufferedSsTableBuilder : ISsTableBuilder
         // Release the block's memory as soon as we have copied its content.
         using var block = _blockBuilder.BuildBlock();
 
-        _metadata ??= [];
-
-        var m = new BlockMetadata()
-        {
-            Index = _metadata.Count,
-            Offset = _offset,
-            FirstKeyOwner = _firstKey!,
-            LastKeyOwner = _lastKey!
-        };
-
-        _metadata.Add(m);
-
         // Write the SST content in memory as blocks are getting created.
         // Use a buffer writer as it will handle the growth of the SST buffer automatically.
 
-        // If the block is larger than the free capacity of the buffer then
-        // flush to disk
+        // Flush before compression so no span over the source or reusable compression buffer crosses
+        // the await. Compression never stores more bytes than the original block.
         if (_bufferWriter.FreeCapacity < block.Memory.Span.Length && _bufferWriter.WrittenCount > 0)
         {
             await FLushBufferToDiskAsync(cancellationToken);
         }
 
+        var storedBlock = _blockCompressor.Compress(block.Memory.Span);
+
+        _metadata ??= [];
+        _metadata.Add(new BlockMetadata()
+        {
+            Index = _metadata.Count,
+            Offset = _offset,
+            UncompressedLength = storedBlock.UncompressedLength,
+            Compression = storedBlock.Compression,
+            Checksum = XxHash32.HashToUInt32(storedBlock.Data),
+            FirstKeyOwner = _firstKey!,
+            LastKeyOwner = _lastKey!
+        });
+
         // If the buffer is too small, it will grow automatically, and this new size will be kept
         // as the new threshold until the end of the SST
-        _bufferWriter.Write(block.Memory.Span);
+        _bufferWriter.Write(storedBlock.Data);
 
-        _offset += block.Memory.Length;
+        _offset += storedBlock.Data.Length;
 
         _firstKey = default;
         _lastKey = default;
@@ -168,11 +205,15 @@ internal sealed class BufferedSsTableBuilder : ISsTableBuilder
 
         var metadataOffset = _offset;
         var binaryWriter = new EncoderBinaryWriter(_bufferWriter);
-        _tableEncoder.EncodeMetadata(ref binaryWriter, _metadata, metadataOffset);
+        _tableEncoder.EncodeMetadata(ref binaryWriter, _metadata, metadataOffset, _formatVersion);
 
         var bloomFilterOffset = _offset + binaryWriter.BytesWritten;
 
         WriteBloomFilter(ref binaryWriter, bloomFilterOffset);
+        if (_formatVersion >= 1)
+        {
+            SsTableFormat.WriteFooter(ref binaryWriter);
+        }
 
         binaryWriter.Flush();
 
@@ -235,6 +276,7 @@ internal sealed class BufferedSsTableBuilder : ISsTableBuilder
         // releases its OS handle through its own finalizer, so no native resource leaks even then.
         _stream?.Dispose();
         _bufferWriter?.Dispose();
+        _blockCompressor?.Dispose();
         _firstKey?.Dispose();
         _lastKey?.Dispose();
         _firstKey = null;

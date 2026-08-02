@@ -174,8 +174,9 @@ time. `--histogram` additionally prints avg / p50 / p95 / p99 / max latency per 
 | `--target_sst_size` | `2097152` (2 MiB) | Target size of a compacted SSTable in bytes. |
 | `--compaction_parallelism` | CPU count | Max degree of parallelism for leveled subcompactions. |
 | `--read_parallelism` | CPU count | Max degree of parallelism for SST loading and L0 probing. |
-| `--compression_type` | — | Accepted but ignored (Silex stores values uncompressed); warns. |
-| `--compression_ratio` | — | Accepted but ignored; warns. |
+| `--compression_type` | `lz4` | SST block compression: `none`, `lz4`, or `zstd`. |
+| `--compression_level` | `0` | Fast LZ4/default Zstandard, or a codec-specific level. |
+| `--compression_ratio` | `1` | Generated-value compressibility from 0 (highly compressible) to 1 (random). |
 | `--batch_size` | `1` | Accepted but ignored unless `1` (Silex has no write-batch API); warns. |
 
 `db_bench`-compatible flags use the same names so the same command line can drive both tools.
@@ -218,8 +219,11 @@ Options:
   --compaction_parallelism <compaction_parallelism>  Max degree of parallelism for leveled subcompactions. [default: 14]
   --read_parallelism <read_parallelism>              Max degree of parallelism for SST loading and L0 probing.
                                                      [default: 14]
-  --compression_type <compression_type>              Ignored: Silex stores values uncompressed.
-  --compression_ratio <compression_ratio>            Ignored: Silex stores values uncompressed.
+  --compression_type <compression_type>              SST block compression: none, lz4, or zstd. [default: lz4]
+  --compression_level <compression_level>            Codec-specific compression level. Zero selects fast LZ4 or the
+                                                     default Zstandard level. [default: 0]
+  --compression_ratio <compression_ratio>            Approximate compressibility of generated values from 0 (highly
+                                                     compressible) to 1 (random). [default: 1]
   --batch_size <batch_size>                          Ignored unless 1: Silex has no write-batch API.
   -?, -h, --help                                     Show help and usage information
   --version                                          Show version information
@@ -231,11 +235,12 @@ Options:
 
 ## Comparing against RocksDB
 
-Silex stores values **uncompressed** and has no write-batch API, so for a fair comparison run RocksDB's
-`db_bench` with compression disabled (`--compression_type=none`) and `--batch_size=1`. Keys are generated
+Silex supports `none`, `lz4`, and `zstd` compression. For a fair comparison, use the same
+`--compression_type`, `--compression_level`, and `--compression_ratio` with both tools and set
+`--batch_size=1` because Silex has no write-batch API. Keys are generated
 exactly like `db_bench`'s `GenerateKeyFromInt` (the integer is written big-endian in the first
-`min(8, key_size)` bytes, the rest padded with `'0'`). `--compression_type`, `--compression_ratio` and a
-non-1 `--batch_size` are accepted but ignored, with a warning.
+`min(8, key_size)` bytes, the rest padded with `'0'`). A non-1 `--batch_size` is accepted but ignored,
+with a warning.
 
 Recorded comparison runs (with methodology notes) live in
 [`benchmarks/`](benchmarks/) — e.g. [`2026-05-30-rocksdb-comparison.md`](benchmarks/2026-05-30-rocksdb-comparison.md).

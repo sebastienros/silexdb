@@ -59,12 +59,33 @@ internal sealed class ValueGenerator
     private readonly byte[] _data;
     private int _offset;
 
-    public ValueGenerator(int seed, int valueSize)
+    public ValueGenerator(int seed, int valueSize, double compressionRatio)
     {
         // A buffer comfortably larger than a single value so successive slices differ.
         var size = Math.Max(valueSize * 16, 1 << 20);
         _data = new byte[size];
-        new Random(seed).NextBytes(_data);
+        var random = new Random(seed);
+
+        if (compressionRatio >= 1)
+        {
+            random.NextBytes(_data);
+            return;
+        }
+
+        const int fragmentLength = 100;
+        var randomLength = Math.Max(1, (int)(fragmentLength * compressionRatio));
+        Span<byte> fragment = stackalloc byte[fragmentLength];
+
+        for (var offset = 0; offset < _data.Length; offset += fragmentLength)
+        {
+            random.NextBytes(fragment[..randomLength]);
+            for (var i = randomLength; i < fragment.Length; i++)
+            {
+                fragment[i] = fragment[i % randomLength];
+            }
+
+            fragment[..Math.Min(fragmentLength, _data.Length - offset)].CopyTo(_data.AsSpan(offset));
+        }
     }
 
     public byte[] Generate(int valueSize)

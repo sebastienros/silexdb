@@ -36,6 +36,12 @@ internal sealed class BenchmarkOptions
 
     public long CacheSize { get; set; } = 8L * 1024 * 1024;
 
+    public SstCompression Compression { get; set; } = SstCompression.Lz4;
+
+    public int CompressionLevel { get; set; }
+
+    public double CompressionRatio { get; set; } = 1;
+
     public int SeekNexts { get; set; }
 
     public CompactionStrategy Compaction { get; set; } = CompactionStrategy.Tiered;
@@ -78,6 +84,8 @@ internal sealed class BenchmarkOptions
             MemTableMaxCount = ToUInt16("--max_write_buffer_number", MaxWriteBufferNumber),
             BlockSize = blockSize,
             BlockCacheSizeLimit = NonNegative("--cache_size", CacheSize),
+            Compression = Compression,
+            CompressionLevel = CompressionLevel,
             BloomFilterFactory = new RocksStyleBloomFilterFactory(NonNegative("--bloom_bits", BloomBits)),
             UseWriteAheadLog = Wal,
             SyncWriteAheadLogToDisk = Wal && (WalSync || walSync),

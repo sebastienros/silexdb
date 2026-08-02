@@ -202,15 +202,21 @@ internal static class CommandLine
         Description = "Accepted for db_bench command compatibility; Silex runs one background compaction loop.",
     };
 
-    // Accepted-but-ignored db_bench flags, declared so they don't error out; they emit a warning instead.
-    private static readonly Option<string?> CompressionType = new("--compression_type")
+    private static readonly Option<string> CompressionType = new("--compression_type")
     {
-        Description = "Accepted for db_bench compatibility. Silex stores values uncompressed; use none for fair RocksDB runs.",
+        Description = "SST block compression: none, lz4, or zstd.",
+        DefaultValueFactory = _ => "lz4",
     };
 
-    private static readonly Option<double?> CompressionRatio = new("--compression_ratio")
+    private static readonly Option<int> CompressionLevel = new("--compression_level")
     {
-        Description = "Ignored: Silex stores values uncompressed.",
+        Description = "Codec-specific compression level. Zero selects fast LZ4 or the default Zstandard level.",
+    };
+
+    private static readonly Option<double> CompressionRatio = new("--compression_ratio")
+    {
+        Description = "Approximate compressibility of generated values from 0 (highly compressible) to 1 (random).",
+        DefaultValueFactory = _ => 1,
     };
 
     private static readonly Option<int?> BatchSize = new("--batch_size")
@@ -229,7 +235,7 @@ internal static class CommandLine
             TargetSstSize, TargetFileSizeBase,
             UniversalMaxReadAmp, UniversalMaxSizeAmplificationPercent, UniversalSizeRatio, UniversalMinMergeWidth,
             CompactionParallelism, ReadParallelism, MaxBackgroundCompactions,
-            CompressionType, CompressionRatio, BatchSize,
+            CompressionType, CompressionLevel, CompressionRatio, BatchSize,
         };
 
         root.SetAction((parseResult, _) =>
@@ -273,6 +279,9 @@ internal static class CommandLine
             BloomBits = parseResult.GetValue(BloomBits),
             BlockSize = parseResult.GetValue(BlockSize),
             CacheSize = parseResult.GetValue(CacheSize),
+            Compression = ParseCompressionType(parseResult.GetValue(CompressionType)!),
+            CompressionLevel = parseResult.GetValue(CompressionLevel),
+            CompressionRatio = ParseCompressionRatio(parseResult.GetValue(CompressionRatio)),
             SeekNexts = parseResult.GetValue(SeekNexts),
             Compaction = compactionStyle == null ? parseResult.GetValue(Compaction) : ParseCompactionStyle(compactionStyle),
             Wal = parseResult.GetValue(Wal),
@@ -289,18 +298,6 @@ internal static class CommandLine
             CompactionParallelism = Math.Max(1, parseResult.GetValue(CompactionParallelism)),
             ReadParallelism = Math.Max(1, parseResult.GetValue(ReadParallelism)),
         };
-
-        var compressionType = parseResult.GetValue(CompressionType);
-        if (compressionType != null && !compressionType.Equals("none", StringComparison.OrdinalIgnoreCase))
-        {
-            warnings.Add($"--compression_type={compressionType} ignored: Silex stores values uncompressed. Use --compression_type=none for a fair RocksDB comparison.");
-        }
-
-        var compressionRatio = parseResult.GetValue(CompressionRatio);
-        if (compressionRatio is not null && compressionRatio != 1)
-        {
-            warnings.Add("--compression_ratio ignored: Silex generates uncompressed random values. Use --compression_ratio=1 for a fair RocksDB comparison.");
-        }
 
         var maxBackgroundCompactions = parseResult.GetValue(MaxBackgroundCompactions);
         if (maxBackgroundCompactions > 1)
@@ -324,4 +321,22 @@ internal static class CommandLine
         "none" => CompactionStrategy.None,
         _ => throw new ArgumentException($"Unsupported --compaction_style='{value}'. Use 0/level, 1/universal, or none."),
     };
+
+    private static SstCompression ParseCompressionType(string value) => value.ToLowerInvariant() switch
+    {
+        "none" => SstCompression.None,
+        "lz4" => SstCompression.Lz4,
+        "zstd" or "zstandard" => SstCompression.Zstandard,
+        _ => throw new ArgumentException($"Unsupported --compression_type='{value}'. Use none, lz4, or zstd."),
+    };
+
+    private static double ParseCompressionRatio(double value)
+    {
+        if (value is < 0 or > 1)
+        {
+            throw new ArgumentOutOfRangeException("--compression_ratio", value, "--compression_ratio must be between 0 and 1.");
+        }
+
+        return value;
+    }
 }
