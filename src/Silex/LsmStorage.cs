@@ -443,6 +443,14 @@ public sealed class LsmStorage : IDisposable, IAsyncDisposable
         }
     }
 
+    public ValueTask<bool> TryGetRawAsync(byte[] key, IBufferWriter<byte> destination, CancellationToken cancellationToken = default)
+    {
+        CheckDisposed();
+        ArgumentNullException.ThrowIfNull(key);
+        ArgumentNullException.ThrowIfNull(destination);
+        return _inner.TryGetRawAsync(key.AsMemory(), destination, cancellationToken);
+    }
+
     public ValueTask<int> GetRawAsync(ReadOnlySpan<byte> key, Memory<byte> destination, CancellationToken cancellationToken = default)
     {
         CheckDisposed();
@@ -461,6 +469,13 @@ public sealed class LsmStorage : IDisposable, IAsyncDisposable
                 ownedKey.Dispose();
             }
         }
+    }
+
+    public ValueTask<int> GetRawAsync(byte[] key, Memory<byte> destination, CancellationToken cancellationToken = default)
+    {
+        CheckDisposed();
+        ArgumentNullException.ThrowIfNull(key);
+        return _inner.GetRawAsync(key.AsMemory(), destination, cancellationToken);
     }
 
     public ValueTask<bool> TryReadRawAsync<TArg>(ReadOnlySpan<byte> key, TArg arg, ReadValueAction<TArg> reader, CancellationToken cancellationToken = default)
@@ -482,6 +497,14 @@ public sealed class LsmStorage : IDisposable, IAsyncDisposable
                 ownedKey.Dispose();
             }
         }
+    }
+
+    public ValueTask<bool> TryReadRawAsync<TArg>(byte[] key, TArg arg, ReadValueAction<TArg> reader, CancellationToken cancellationToken = default)
+    {
+        CheckDisposed();
+        ArgumentNullException.ThrowIfNull(key);
+        ArgumentNullException.ThrowIfNull(reader);
+        return _inner.TryReadRawAsync(key.AsMemory(), arg, reader, cancellationToken);
     }
 
     public ValueTask<long> ScanRawAsync<TArg>(TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries = long.MaxValue, CancellationToken cancellationToken = default)
@@ -509,6 +532,14 @@ public sealed class LsmStorage : IDisposable, IAsyncDisposable
                 ownedFrom.Dispose();
             }
         }
+    }
+
+    public ValueTask<long> SeekRawAsync<TArg>(byte[] from, TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries = long.MaxValue, CancellationToken cancellationToken = default)
+    {
+        CheckDisposed();
+        ArgumentNullException.ThrowIfNull(from);
+        ArgumentNullException.ThrowIfNull(reader);
+        return _inner.SeekRawAsync(from.AsMemory(), arg, reader, maxEntries, cancellationToken);
     }
 
     public async Task CloseAsync(CancellationToken cancellationToken = default)

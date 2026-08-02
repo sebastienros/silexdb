@@ -460,10 +460,11 @@ internal sealed class Runner
             var rng = RngStreams.Create(_options.Seed, threadId, RngStreams.Seek);
             var toRead = 1 + _options.SeekNexts;
             var seekState = new SeekScanState(stats);
+            var target = new byte[_options.KeySize];
 
             return new ThreadWorker(async op =>
             {
-                var target = keyGen.Generate(rng.NextInt64(_options.Num));
+                keyGen.GenerateInto(rng.NextInt64(_options.Num), target);
                 seekState.Reset(target);
 
                 await db.SeekRawAsync(target, seekState, static (s, key, value) =>

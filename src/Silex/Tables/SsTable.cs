@@ -2,6 +2,7 @@ using Silex.Blocks;
 using Silex.BloomFilters;
 using System.Buffers;
 using System.Buffers.Binary;
+using Microsoft.Win32.SafeHandles;
 
 namespace Silex.Tables;
 
@@ -13,6 +14,7 @@ internal sealed class SsTable : IDisposable
     private readonly ByteSlice? _lastKey;
     private readonly BlockBuilder _blockBuilder;
     private readonly FileStream _stream;
+    private readonly SafeFileHandle _handle;
     private bool _disposed;
 
     public SsTable(long id, FileStream stream, string filename, IReadOnlyList<BlockMetadata> blockMetadata, long metadataBlockOffset, BlockBuilder blockBuilder, IBloomFilter bloomFilter)
@@ -20,6 +22,7 @@ internal sealed class SsTable : IDisposable
         _id = id;
         _filename = filename;
         _stream = stream;
+        _handle = stream.SafeFileHandle;
         BlockMetadata = blockMetadata;
         MetaBlockOffset = metadataBlockOffset;
         _blockBuilder = blockBuilder;
@@ -68,11 +71,10 @@ internal sealed class SsTable : IDisposable
             // Use positioned reads (RandomAccess) rather than Seek + Read so that several readers can read
             // different blocks of the same SST concurrently without racing on the shared FileStream
             // position. The file is immutable once built, so reads never conflict with writes.
-            var handle = _stream.SafeFileHandle;
             var read = 0;
             while (read < length)
             {
-                var n = await RandomAccess.ReadAsync(handle, owner.Memory.Slice(read, length - read), offset + read, cancellationToken);
+                var n = await RandomAccess.ReadAsync(_handle, owner.Memory.Slice(read, length - read), offset + read, cancellationToken);
                 if (n == 0)
                 {
                     break;
@@ -105,11 +107,10 @@ internal sealed class SsTable : IDisposable
 
         try
         {
-            var handle = _stream.SafeFileHandle;
             var read = 0;
             while (read < length)
             {
-                var n = RandomAccess.Read(handle, owner.Memory.Span.Slice(read, length - read), offset + read);
+                var n = RandomAccess.Read(_handle, owner.Memory.Span.Slice(read, length - read), offset + read);
                 if (n == 0)
                 {
                     break;
@@ -164,10 +165,10 @@ internal sealed class SsTable : IDisposable
             _index = index;
         }
 
-        public Task<Block?> LoadAsync(CancellationToken cancellationToken = default)
+        public Block? Load(CancellationToken cancellationToken = default)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            return Task.FromResult(_table.ReadBlock(_index));
+            return _table.ReadBlock(_index);
         }
     }
 
