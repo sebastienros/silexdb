@@ -55,4 +55,31 @@ internal sealed class BlockIterator : IStorageIterator
             yield return new KeyValuePair<ByteSlice, ByteSlice>(entry.Key, value);
         }
     }
+
+    public async IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateBackwardsAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        await Task.Yield();
+
+        for (var i = _entries.Length - 1; i >= 0; i--)
+        {
+            var entry = _entries[i];
+            var value = entry.IsTombstone ? ByteSlice.Tombstone : ByteSlice.FromMemory(_block.GetValueMemory(entry));
+            yield return new KeyValuePair<ByteSlice, ByteSlice>(entry.Key, value);
+        }
+    }
+
+#pragma warning disable 1998 // async function without await
+    public async IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateBackwardsAsync(ByteSlice from, [EnumeratorCancellation] CancellationToken _ = default)
+#pragma warning restore 1998
+    {
+        var compare = Array.BinarySearch(_entries, new RecordLocation { Key = from });
+        var startIndex = compare >= 0 ? compare : ~compare - 1;
+
+        for (var i = startIndex; i >= 0; i--)
+        {
+            var entry = _entries[i];
+            var value = entry.IsTombstone ? ByteSlice.Tombstone : ByteSlice.FromMemory(_block.GetValueMemory(entry));
+            yield return new KeyValuePair<ByteSlice, ByteSlice>(entry.Key, value);
+        }
+    }
 }

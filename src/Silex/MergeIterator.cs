@@ -22,16 +22,27 @@ internal sealed class MergeIterator : IStorageIterator
 
     public IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateAsync(CancellationToken cancellationToken = default)
     {
-        return MergeAsync(iterator => iterator.EnumerateAsync(cancellationToken), cancellationToken);
+        return MergeAsync(iterator => iterator.EnumerateAsync(cancellationToken), backwards: false, cancellationToken);
     }
 
     public IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateAsync(ByteSlice from, CancellationToken cancellationToken = default)
     {
-        return MergeAsync(iterator => iterator.EnumerateAsync(from, cancellationToken), cancellationToken);
+        return MergeAsync(iterator => iterator.EnumerateAsync(from, cancellationToken), backwards: false, cancellationToken);
+    }
+
+    public IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateBackwardsAsync(CancellationToken cancellationToken = default)
+    {
+        return MergeAsync(iterator => iterator.EnumerateBackwardsAsync(cancellationToken), backwards: true, cancellationToken);
+    }
+
+    public IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateBackwardsAsync(ByteSlice from, CancellationToken cancellationToken = default)
+    {
+        return MergeAsync(iterator => iterator.EnumerateBackwardsAsync(from, cancellationToken), backwards: true, cancellationToken);
     }
 
     private async IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> MergeAsync(
         Func<IStorageIterator, IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>>> selector,
+        bool backwards,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         var enumerators = new List<IAsyncEnumerator<KeyValuePair<ByteSlice, ByteSlice>>>();
@@ -68,25 +79,25 @@ internal sealed class MergeIterator : IStorageIterator
 
             while (enumerators.Count > 0)
             {
-                // Assume the smallest is the element from the first iterator
-                var smallest = enumerators[0].Current;
-                var smallestIndex = 0;
+                var selected = enumerators[0].Current;
+                var selectedIndex = 0;
 
                 for (var i = 1; i < enumerators.Count; i++)
                 {
                     var enumerator = enumerators[i];
                     var current = enumerator.Current;
 
-                    if (_keyComparer.Compare(smallest.Key, current.Key) > 0)
+                    var comparison = _keyComparer.Compare(selected.Key, current.Key);
+                    if (backwards ? comparison < 0 : comparison > 0)
                     {
-                        smallestIndex = i;
-                        smallest = current;
+                        selectedIndex = i;
+                        selected = current;
                     }
                 }
 
                 for (var i = enumerators.Count - 1; i >= 0; i--)
                 {
-                    if (i == smallestIndex || _keyComparer.Compare(smallest.Key, enumerators[i].Current.Key) != 0)
+                    if (i == selectedIndex || _keyComparer.Compare(selected.Key, enumerators[i].Current.Key) != 0)
                     {
                         continue;
                     }
@@ -98,19 +109,19 @@ internal sealed class MergeIterator : IStorageIterator
                         await enumerators[i].DisposeAsync();
                         enumerators.RemoveAt(i);
 
-                        if (i < smallestIndex)
+                        if (i < selectedIndex)
                         {
-                            smallestIndex--;
+                            selectedIndex--;
                         }
                     }
                 }
 
-                yield return smallest;
+                yield return selected;
 
-                if (!await enumerators[smallestIndex].MoveNextAsync())
+                if (!await enumerators[selectedIndex].MoveNextAsync())
                 {
-                    await enumerators[smallestIndex].DisposeAsync();
-                    enumerators.RemoveAt(smallestIndex);
+                    await enumerators[selectedIndex].DisposeAsync();
+                    enumerators.RemoveAt(selectedIndex);
                 }
             }
         }

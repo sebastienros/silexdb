@@ -260,5 +260,29 @@ internal sealed class MemTable : IMemTable, IRawBytesMemTable
                 yield return item;
             }
         }
+
+#pragma warning disable CS1998 // Async method lacks 'await' operators and will run synchronously
+        public async IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateBackwardsAsync([EnumeratorCancellation] CancellationToken _ = default)
+#pragma warning restore CS1998 // Async method lacks 'await' operators and will run synchronously
+        {
+            _table.EnsureSortedMap();
+
+            foreach (var item in _table._sorted.EnumerateBackwards(default!, default!, false, false))
+            {
+                yield return item;
+            }
+        }
+
+#pragma warning disable CS1998 // Async method lacks 'await' operators and will run synchronously
+        public async IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateBackwardsAsync(ByteSlice from, [EnumeratorCancellation] CancellationToken _ = default)
+#pragma warning restore CS1998 // Async method lacks 'await' operators and will run synchronously
+        {
+            _table.EnsureSortedMap();
+
+            foreach (var item in _table._sorted.EnumerateBackwards(default!, from, false, true))
+            {
+                yield return item;
+            }
+        }
     }
 }

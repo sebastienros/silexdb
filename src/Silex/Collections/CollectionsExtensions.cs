@@ -35,7 +35,12 @@ internal static class CollectionsExtensions
 
     internal static IEnumerable<KeyValuePair<TKey, TValue>> Enumerate<TKey, TValue>(this SortedDictionary<TKey, TValue> dic, TKey from, TKey to, bool lowerBoundActive, bool upperBoundActive) where TKey : notnull
     {
-        return InternalSortedSetTypeCache<TKey, TValue>.Enumerate(dic, from, to, lowerBoundActive, upperBoundActive);
+        return InternalSortedSetTypeCache<TKey, TValue>.Enumerate(dic, from, to, lowerBoundActive, upperBoundActive, backwards: false);
+    }
+
+    internal static IEnumerable<KeyValuePair<TKey, TValue>> EnumerateBackwards<TKey, TValue>(this SortedDictionary<TKey, TValue> dic, TKey from, TKey to, bool lowerBoundActive, bool upperBoundActive) where TKey : notnull
+    {
+        return InternalSortedSetTypeCache<TKey, TValue>.Enumerate(dic, from, to, lowerBoundActive, upperBoundActive, backwards: true);
     }
 
     /// <summary>
@@ -65,7 +70,7 @@ internal static class CollectionsExtensions
             _getSetValue = (Func<SortedDictionary<TKey, TValue>, SortedSet<KeyValuePair<TKey, TValue>>>)getterMethod.CreateDelegate(typeof(Func<SortedDictionary<TKey, TValue>, SortedSet<KeyValuePair<TKey, TValue>>>));
         }
 
-        public static IEnumerable<KeyValuePair<TKey, TValue>> Enumerate(SortedDictionary<TKey, TValue> dic, TKey from, TKey to, bool lowerBoundActive, bool upperBoundActive)
+        public static IEnumerable<KeyValuePair<TKey, TValue>> Enumerate(SortedDictionary<TKey, TValue> dic, TKey from, TKey to, bool lowerBoundActive, bool upperBoundActive, bool backwards)
         {
             var sortedSet = _getSetValue(dic);
 
@@ -86,7 +91,8 @@ internal static class CollectionsExtensions
                 return [];
             }
 
-            return sortedSet.GetViewBetween(lower, upper);
+            var view = sortedSet.GetViewBetween(lower, upper);
+            return backwards ? view.Reverse() : view;
         }
     }
 }
