@@ -65,7 +65,7 @@ public class BinaryFormatTests
         using var buffer = new PooledArrayBufferWriter<byte>();
         var writer = new EncoderBinaryWriter(buffer);
 
-        new DefaultSsTableEncoder().EncodeMetadata(ref writer, [metadata], 0x01020304);
+        new DefaultSsTableEncoder().EncodeMetadata(ref writer, [metadata], 0x01020304, SsTableFormat.LegacyVersion);
         writer.Flush();
 
         var bytes = buffer.WrittenMemory.ToArray();

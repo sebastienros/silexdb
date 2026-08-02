@@ -310,7 +310,7 @@ internal sealed class Runner
         return RunParallelAsync(name, totalOps, partitioned: true, extra, (threadId, start, count, stats) =>
         {
             var keyGen = new KeyGenerator(_options.KeySize);
-            var valueGen = new ValueGenerator(_options.Seed + threadId, _options.ValueSize);
+            var valueGen = new ValueGenerator(_options.Seed + threadId, _options.ValueSize, _options.CompressionRatio);
             var rng = RngStreams.Create(_options.Seed, threadId, RngStreams.Write);
 
             return new ThreadWorker(op =>

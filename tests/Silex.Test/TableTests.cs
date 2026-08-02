@@ -60,6 +60,146 @@ public class TableTests
     }
 
     [Test]
+    [Arguments(SstCompression.Lz4)]
+    [Arguments(SstCompression.Zstandard)]
+    public async Task ShouldCompressAndLoadBlocks(SstCompression compression)
+    {
+        using var tempFolder = TempFolder.Create();
+        var tempFilename = tempFolder.GetRandomFileName();
+        var blockEncoder = new DefaultBlockEncoder(512);
+        var value = Enumerable.Repeat((byte)0x5A, 400).ToArray();
+
+        using (var builder = new BufferedSsTableBuilder(
+            tempFilename,
+            new DefaultSsTableEncoder(),
+            blockEncoder,
+            new DefaultBloomFilterFactory(),
+            16,
+            compression))
+        {
+            for (uint i = 0; i < 16; i++)
+            {
+                await builder.AddAsync(i, value);
+            }
+
+            using var table = await builder.BuildAsync();
+            await Assert.That(table.BlockMetadata.All(x => x.Compression == compression)).IsTrue();
+            await Assert.That(table.BlockMetadata.All(x => x.UncompressedLength > 0)).IsTrue();
+        }
+
+        using var blockBuilder = new BlockBuilder(new DefaultBlockEncoder(512));
+        using var loaded = await SsTable.LoadSsTableAsync(
+            tempFilename,
+            new DefaultSsTableEncoder(),
+            blockBuilder,
+            new DefaultBloomFilterFactory());
+
+        await Assert.That(loaded.BlockMetadata.All(x => x.Compression == compression)).IsTrue();
+        var entries = new SsTableIterator(loaded).EnumerateAsync().ToBlockingEnumerable().ToArray();
+        await Assert.That(entries.Length).IsEqualTo(16);
+        await Assert.That(entries.All(x => x.Value.Span.SequenceEqual(value))).IsTrue();
+    }
+
+    [Test]
+    [Arguments(SstCompression.Lz4)]
+    [Arguments(SstCompression.Zstandard)]
+    public async Task ShouldStoreBlocksRawWhenSavingsAreInsufficient(SstCompression compression)
+    {
+        using var tempFolder = TempFolder.Create();
+        var tempFilename = tempFolder.GetRandomFileName();
+        var value = new byte[400];
+        new Random(42).NextBytes(value);
+
+        using var builder = new BufferedSsTableBuilder(
+            tempFilename,
+            new DefaultSsTableEncoder(),
+            new DefaultBlockEncoder(512),
+            new DefaultBloomFilterFactory(),
+            1,
+            compression,
+            minimumCompressionSavingsPercent: 99);
+
+        await builder.AddAsync(1u, value);
+        using var table = await builder.BuildAsync();
+
+        await Assert.That(table.BlockMetadata).HasSingleItem();
+        await Assert.That(table.BlockMetadata[0].Compression).IsEqualTo(SstCompression.None);
+        using var block = await table.ReadBlockAsync(0);
+        var found = block!.TryGetValue(ByteSliceTestExtensions.Slice(1u), out var stored);
+        var valueMatches = stored.SequenceEqual(value);
+        await Assert.That(found).IsTrue();
+        await Assert.That(valueMatches).IsTrue();
+    }
+
+    [Test]
+    public async Task ShouldLoadLegacyUncompressedTable()
+    {
+        using var tempFolder = TempFolder.Create();
+        var tempFilename = tempFolder.GetRandomFileName();
+
+        using (var builder = new BufferedSsTableBuilder(
+            tempFilename,
+            new DefaultSsTableEncoder(),
+            new DefaultBlockEncoder(),
+            new DefaultBloomFilterFactory(),
+            1,
+            formatVersion: SsTableFormat.LegacyVersion))
+        {
+            await builder.AddAsync(7, "legacy");
+            using var table = await builder.BuildAsync();
+        }
+
+        using var blockBuilder = new BlockBuilder(new DefaultBlockEncoder());
+        using var loaded = await SsTable.LoadSsTableAsync(
+            tempFilename,
+            new DefaultSsTableEncoder(),
+            blockBuilder,
+            new DefaultBloomFilterFactory());
+
+        await Assert.That(loaded.BlockMetadata[0].UncompressedLength).IsEqualTo(0);
+        using var block = await loaded.ReadBlockAsync(0);
+        await Assert.That(block!.Memory.Length > 0).IsTrue();
+    }
+
+    [Test]
+    [Arguments(SstCompression.Lz4)]
+    [Arguments(SstCompression.Zstandard)]
+    public async Task ShouldRejectCorruptedCompressedBlock(SstCompression compression)
+    {
+        using var tempFolder = TempFolder.Create();
+        var tempFilename = tempFolder.GetRandomFileName();
+
+        using (var builder = new BufferedSsTableBuilder(
+            tempFilename,
+            new DefaultSsTableEncoder(),
+            new DefaultBlockEncoder(),
+            new DefaultBloomFilterFactory(),
+            1,
+            compression))
+        {
+            await builder.AddAsync(1u, Enumerable.Repeat((byte)0x41, 1000).ToArray());
+            using var table = await builder.BuildAsync();
+            await Assert.That(table.BlockMetadata[0].Compression).IsEqualTo(compression);
+        }
+
+        var bytes = await File.ReadAllBytesAsync(tempFilename);
+        bytes[0] ^= 0xFF;
+        await File.WriteAllBytesAsync(tempFilename, bytes);
+
+        using var blockBuilder = new BlockBuilder(new DefaultBlockEncoder());
+        using var loaded = await SsTable.LoadSsTableAsync(
+            tempFilename,
+            new DefaultSsTableEncoder(),
+            blockBuilder,
+            new DefaultBloomFilterFactory());
+
+        await Assert.That(async () =>
+        {
+            using var block = await loaded.ReadBlockAsync(0);
+        }).Throws<InvalidDataException>();
+    }
+
+    [Test]
     public async Task ShouldRejectInvalidBloomMetadata()
     {
         using var tempFolder = TempFolder.Create();

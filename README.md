@@ -16,6 +16,8 @@ bound read and space amplification.
   without adding sequence checks or larger internal keys to the default store.
 - **Pluggable compaction** – choose `Tiered` (write-optimized), `Leveled` (read-optimized), or `None`.
 - **Bloom filters and a block cache** – skip SSTs that cannot contain a key and cache hot blocks.
+- **Adaptive SST compression** – LZ4 by default, optional Zstandard or none, with raw fallback for
+  blocks that do not compress enough.
 - **Multi-targeted** – builds for `net8.0` and `net10.0`.
 
 ## Requirements
@@ -257,6 +259,9 @@ is a valid starting point. The most commonly used options:
 | `MemTableArenaBlockSize`   | 32 KiB             | Append-only block size used by byte-oriented memtables.                  |
 | `MemTableMaxCount`         | 50                 | Max immutable memtables kept in memory before flushing.                  |
 | `BlockSize`                | 4 KiB              | Unit of data read from/written to disk at once.                          |
+| `Compression`              | `Lz4`              | SST data-block compression: `None`, `Lz4`, or `Zstandard`.               |
+| `CompressionLevel`         | `0`                | Fast LZ4/default Zstandard; LZ4 HC accepts levels 3–12.                  |
+| `MinimumCompressionSavingsPercent` | 12.5       | Store a block raw unless compression saves at least this percentage.     |
 | `FlushPeriod`              | 50 ms              | Interval between background flushes. `TimeSpan.Zero` disables the thread.|
 | `BlockCacheSizeLimit`      | 1 MiB              | Size of the in-memory cache of decoded blocks.                           |
 | `UseWriteAheadLog`         | `true`             | Maintain a WAL so unflushed data is recovered after a crash.             |
@@ -271,9 +276,15 @@ var options = new StorageOptions
 {
     MemTableSizeLimit = 16.MiB(),
     CompactionStrategy = CompactionStrategy.Leveled,
+    Compression = SstCompression.Zstandard,
     UseWriteAheadLog = true,
 };
 ```
+
+Compression is selected independently for every SST data block and recorded in the file, so raw, LZ4,
+and Zstandard blocks can coexist and remain readable when the database is reopened with different write
+options. The block cache stores decompressed blocks, keeping cache hits free of decompression work. Stored
+blocks are protected by an XXH32 checksum, and existing legacy uncompressed SSTs remain readable.
 
 ### Compaction strategies
 
@@ -311,9 +322,9 @@ await db.CloseAsync(); // flush everything to disk
 
 `Silex.DbBench` accepts the RocksDB-style options that affect the main LSM shape so comparisons can use
 the same strategy instead of comparing RocksDB's default leveled compaction with Silex's default tiered
-compaction. For fair runs, keep compression disabled on RocksDB (`--compression_type=none`) because Silex
-currently stores values uncompressed, use `--compression_ratio=1` so RocksDB generates fully random
-payloads like Silex, and use the same values for `--num`, `--key_size`, `--value_size`,
+compaction. It accepts `--compression_type=none|lz4|zstd`, `--compression_level`, and
+`--compression_ratio`. For fair runs, use matching compression settings and the same values for
+`--num`, `--key_size`, `--value_size`,
 `--write_buffer_size`, `--block_size`, `--bloom_bits`, `--threads`, `--seed`, and the compaction knobs.
 
 Tiered/universal comparison:

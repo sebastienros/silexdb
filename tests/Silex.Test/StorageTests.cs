@@ -2695,6 +2695,45 @@ public class StorageTests
         await storage.CloseAsync();
     }
 
+    [Test]
+    [Arguments(SstCompression.Lz4)]
+    [Arguments(SstCompression.Zstandard)]
+    public async Task CompressedTablesReopenIndependentlyOfCurrentWriteCodec(SstCompression compression)
+    {
+        using var tempFolder = TempFolder.Create();
+        var value = Enumerable.Repeat((byte)0x2A, 1000).ToArray();
+        var options = new StorageOptions
+        {
+            UseWriteAheadLog = false,
+            FlushPeriod = TimeSpan.Zero,
+            Compression = compression,
+        };
+
+        await using (var storage = await LsmStorage.OpenAsync<int, byte[]>(tempFolder, options))
+        {
+            for (var i = 0; i < 32; i++)
+            {
+                storage.Put(i, value);
+            }
+
+            storage._inner.ForceFreezeMemTable();
+            await storage._inner.ForceFlushNextImmutableMemTableAsync();
+        }
+
+        await using var reopened = await LsmStorage.OpenAsync<int, byte[]>(
+            tempFolder,
+            new StorageOptions
+            {
+                UseWriteAheadLog = false,
+                Compression = SstCompression.None,
+            });
+
+        for (var i = 0; i < 32; i++)
+        {
+            await Assert.That(await reopened.GetAsync(i)).IsEquivalentTo(value);
+        }
+    }
+
     private static LsmStorageInner FillImmutableMemTables(string path, int entries = 100, int valueSize = 10, long memTableSizeLimit = 100)
     {
         var storageOptions = new StorageOptions { MemTableSizeLimit = memTableSizeLimit, UseWriteAheadLog = false };

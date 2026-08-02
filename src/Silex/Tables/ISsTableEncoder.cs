@@ -7,9 +7,9 @@ namespace Silex.Tables;
 /// </summary>
 internal interface ISsTableEncoder
 {
-    void EncodeMetadata(ref EncoderBinaryWriter writer, IReadOnlyList<BlockMetadata> blockMetadata, long metadataOffset);
+    void EncodeMetadata(ref EncoderBinaryWriter writer, IReadOnlyList<BlockMetadata> blockMetadata, long metadataOffset, int formatVersion);
 
-    IReadOnlyList<BlockMetadata> DecodeMetadata(ReadOnlyMemory<byte> buffer, int offset);
+    IReadOnlyList<BlockMetadata> DecodeMetadata(ReadOnlyMemory<byte> buffer, int offset, int formatVersion);
 
-    int EstimateMetadataSize(IReadOnlyList<BlockMetadata> blockMetadata);
+    int EstimateMetadataSize(IReadOnlyList<BlockMetadata> blockMetadata, int formatVersion);
 }

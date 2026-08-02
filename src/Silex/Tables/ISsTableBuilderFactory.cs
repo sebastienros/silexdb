@@ -5,5 +5,13 @@ using Silex.BloomFilters;
 
 internal interface ISsTableBuilderFactory
 {
-    ISsTableBuilder CreateSsTableBuilder(string path, ISsTableEncoder tableEncoder, IBlockEncoder blockEncoder, IBloomFilterFactory bloomFilterFactory, int count);
+    ISsTableBuilder CreateSsTableBuilder(
+        string path,
+        ISsTableEncoder tableEncoder,
+        IBlockEncoder blockEncoder,
+        IBloomFilterFactory bloomFilterFactory,
+        int count,
+        SstCompression compression,
+        int compressionLevel,
+        double minimumCompressionSavingsPercent);
 }
