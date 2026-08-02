@@ -122,8 +122,8 @@ public ref struct EncoderBinaryReader
     }
 
     public ushort ReadUInt16() => BinaryPrimitives.ReadUInt16LittleEndian(ReadBytesSpan(sizeof(short)));
-    public uint ReadUInt32() => BinaryPrimitives.ReadUInt16LittleEndian(ReadBytesSpan(sizeof(uint)));
-    public ulong ReadUInt64() => BinaryPrimitives.ReadUInt16LittleEndian(ReadBytesSpan(sizeof(ulong)));
+    public uint ReadUInt32() => BinaryPrimitives.ReadUInt32LittleEndian(ReadBytesSpan(sizeof(uint)));
+    public ulong ReadUInt64() => BinaryPrimitives.ReadUInt64LittleEndian(ReadBytesSpan(sizeof(ulong)));
 
     public void Skip(int bytes)
     {
