@@ -1,3 +1,4 @@
+using System.Buffers;
 using Silex.Buffers;
 using Silex.Serialization;
 
@@ -117,45 +118,145 @@ public static class LsmStorageTypedExtensions
     public static async ValueTask<string?> GetStringAsync(this LsmStorage storage, string key, CancellationToken cancellationToken = default)
         => await GetAsync(storage, Encode(key), BinaryEncoderFactory<string>.BinarySerializer, cancellationToken);
 
-    internal static OwnedByteSlice EncodeKey(int key) => Encode(key);
-    internal static OwnedByteSlice EncodeKey(uint key) => Encode(key);
-    internal static OwnedByteSlice EncodeKey(long key) => Encode(key);
-    internal static OwnedByteSlice EncodeKey(ulong key) => Encode(key);
-    internal static OwnedByteSlice EncodeKey(string key) => Encode(key);
+    internal static OwnedByteSlice EncodeKey(int key) => EncodeOwned(BinaryEncoderFactory<int>.BinarySerializer, key);
+    internal static OwnedByteSlice EncodeKey(uint key) => EncodeOwned(BinaryEncoderFactory<uint>.BinarySerializer, key);
+    internal static OwnedByteSlice EncodeKey(long key) => EncodeOwned(BinaryEncoderFactory<long>.BinarySerializer, key);
+    internal static OwnedByteSlice EncodeKey(ulong key) => EncodeOwned(BinaryEncoderFactory<ulong>.BinarySerializer, key);
+    internal static OwnedByteSlice EncodeKey(string key) => EncodeOwned(BinaryEncoderFactory<string>.BinarySerializer, key);
 
-    internal static OwnedByteSlice EncodeValue(int value) => Encode(value);
-    internal static OwnedByteSlice EncodeValue(uint value) => Encode(value);
-    internal static OwnedByteSlice EncodeValue(long value) => Encode(value);
-    internal static OwnedByteSlice EncodeValue(ulong value) => Encode(value);
-    internal static OwnedByteSlice EncodeValue(string value) => Encode(value);
+    internal static OwnedByteSlice EncodeValue(int value) => EncodeOwned(BinaryEncoderFactory<int>.BinarySerializer, value);
+    internal static OwnedByteSlice EncodeValue(uint value) => EncodeOwned(BinaryEncoderFactory<uint>.BinarySerializer, value);
+    internal static OwnedByteSlice EncodeValue(long value) => EncodeOwned(BinaryEncoderFactory<long>.BinarySerializer, value);
+    internal static OwnedByteSlice EncodeValue(ulong value) => EncodeOwned(BinaryEncoderFactory<ulong>.BinarySerializer, value);
+    internal static OwnedByteSlice EncodeValue(string value) => EncodeOwned(BinaryEncoderFactory<string>.BinarySerializer, value);
 
     private static void PutEncodedKey<TKey>(LsmStorage storage, TKey key, ReadOnlySpan<byte> value)
     {
-        using var encodedKey = Encode(key);
-        storage.Put(encodedKey.Span, value);
+        var encoder = BinaryEncoderFactory<TKey>.BinarySerializer;
+        if (encoder.TryGetRawBytes(key, out var encodedKey))
+        {
+            storage.Put(encodedKey, value);
+            return;
+        }
+
+        var length = encoder.GetLength(key);
+        var rented = ArrayPool<byte>.Shared.Rent(Math.Max(1, length));
+        var buffer = rented.AsSpan(0, length);
+
+        try
+        {
+            EncodeInto(encoder, key, buffer);
+            storage.Put(buffer, value);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(rented);
+        }
     }
 
     private static void PutEncoded<TKey, TValue>(LsmStorage storage, TKey key, TValue value)
     {
-        using var encodedKey = Encode(key);
-        using var encodedValue = Encode(value);
-        storage.Put(encodedKey.Span, encodedValue.Span);
+        var keyEncoder = BinaryEncoderFactory<TKey>.BinarySerializer;
+        var valueEncoder = BinaryEncoderFactory<TValue>.BinarySerializer;
+
+        var hasRawKey = keyEncoder.TryGetRawBytes(key, out var encodedKey);
+        var hasRawValue = valueEncoder.TryGetRawBytes(value, out var encodedValue);
+        var keyLength = hasRawKey ? 0 : keyEncoder.GetLength(key);
+        var valueLength = hasRawValue ? 0 : valueEncoder.GetLength(value);
+
+        byte[]? rented = null;
+        Span<byte> keyBuffer = default;
+        Span<byte> valueBuffer = default;
+
+        try
+        {
+            var encodedLength = checked(keyLength + valueLength);
+            if (encodedLength != 0)
+            {
+                rented = ArrayPool<byte>.Shared.Rent(encodedLength);
+            }
+
+            if (!hasRawKey)
+            {
+                keyBuffer = rented.AsSpan(0, keyLength);
+                EncodeInto(keyEncoder, key, keyBuffer);
+                encodedKey = keyBuffer;
+            }
+
+            if (!hasRawValue)
+            {
+                valueBuffer = rented.AsSpan(keyLength, valueLength);
+                EncodeInto(valueEncoder, value, valueBuffer);
+                encodedValue = valueBuffer;
+            }
+
+            storage.Put(encodedKey, encodedValue);
+        }
+        finally
+        {
+            if (rented is not null)
+            {
+                ArrayPool<byte>.Shared.Return(rented);
+            }
+        }
     }
 
     private static void DeleteEncoded<TKey>(LsmStorage storage, TKey key)
     {
-        using var encodedKey = Encode(key);
-        storage.Delete(encodedKey.Span);
+        var encoder = BinaryEncoderFactory<TKey>.BinarySerializer;
+        if (encoder.TryGetRawBytes(key, out var encodedKey))
+        {
+            storage.Delete(encodedKey);
+            return;
+        }
+
+        var length = encoder.GetLength(key);
+        var rented = ArrayPool<byte>.Shared.Rent(Math.Max(1, length));
+        var buffer = rented.AsSpan(0, length);
+
+        try
+        {
+            EncodeInto(encoder, key, buffer);
+            storage.Delete(buffer);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(rented);
+        }
     }
 
-    private static OwnedByteSlice Encode<T>(T value)
+    internal static OwnedByteSlice EncodeOwned<T>(IBinaryEncoder<T> encoder, T value)
     {
-        var encoder = BinaryEncoderFactory<T>.BinarySerializer;
-        using var bufferWriter = new PooledArrayBufferWriter<byte>(Math.Max(1, encoder.GetLength(value)));
-        var writer = new EncoderBinaryWriter(bufferWriter);
+        if (encoder.TryGetRawBytes(value, out var rawBytes))
+        {
+            return OwnedByteSlice.CopyFrom(rawBytes);
+        }
+
+        var encoded = OwnedByteSlice.Rent(encoder.GetLength(value));
+        try
+        {
+            EncodeInto(encoder, value, encoded.WritableSpan);
+            return encoded;
+        }
+        catch
+        {
+            encoded.Dispose();
+            throw;
+        }
+    }
+
+    private static OwnedByteSlice Encode<T>(T value) =>
+        EncodeOwned(BinaryEncoderFactory<T>.BinarySerializer, value);
+
+    private static void EncodeInto<T>(IBinaryEncoder<T> encoder, T value, Span<byte> destination)
+    {
+        var writer = new EncoderBinaryWriter(destination);
         encoder.Encode(value, ref writer);
-        writer.Flush();
-        return OwnedByteSlice.CopyFrom(bufferWriter.WrittenMemory.Span);
+        if (writer.BytesWritten != destination.Length)
+        {
+            throw new InvalidOperationException(
+                $"{encoder.GetType().Name} encoded {writer.BytesWritten} bytes; expected {destination.Length}.");
+        }
     }
 
     private static async ValueTask<T> GetAsync<T>(LsmStorage storage, OwnedByteSlice key, IBinaryEncoder<T> encoder, CancellationToken cancellationToken)

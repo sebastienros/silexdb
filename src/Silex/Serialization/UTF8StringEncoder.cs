@@ -73,19 +73,28 @@ public sealed class UTF8StringEncoder : IBinaryEncoder<string>
             return written;
         }
 
-        int current = 0;
+        var current = 0;
         var remaining = span.Length;
+        var totalWritten = 0;
 
         while (remaining > 0)
-        {            
-            // Process a max number of chars of 128 / 4 which is the worst case
-            var slice = span.Slice(current, Math.Min(128 / 4, remaining));
+        {
+            var charCount = Math.Min(128 / 4, remaining);
+            if (charCount < remaining &&
+                char.IsHighSurrogate(span[current + charCount - 1]) &&
+                char.IsLowSurrogate(span[current + charCount]))
+            {
+                charCount--;
+            }
+
+            var slice = span.Slice(current, charCount);
             var written = Encoding.UTF8.GetBytes(slice, bytes);
             writer.WriteRaw(bytes.Slice(0, written));
             current += slice.Length;
             remaining -= slice.Length;
+            totalWritten += written;
         }
 
-        return current;
+        return totalWritten;
     }
 }

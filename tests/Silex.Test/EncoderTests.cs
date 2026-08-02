@@ -27,11 +27,12 @@ public class EncoderTests
 
         var _bufferWriter = new PooledArrayBufferWriter<byte>();
         var writer = new EncoderBinaryWriter(_bufferWriter);
-        encoder.Encode(value, ref writer);
+        var written = encoder.Encode(value, ref writer);
         writer.Flush();
         var memory = _bufferWriter.WrittenMemory;
         var decoded = encoder.Decode(memory.Span);
 
+        await Assert.That(written).IsEqualTo(length);
         await Assert.That(memory.Length).IsEqualTo(length);
         await Assert.That(decoded).IsEqualTo(value);
     }
@@ -61,12 +62,30 @@ public class EncoderTests
 
         var _bufferWriter = new PooledArrayBufferWriter<byte>();
         var writer = new EncoderBinaryWriter(_bufferWriter);
-        encoder.Encode(value, ref writer);
+        var written = encoder.Encode(value, ref writer);
         writer.Flush();
         var memory = _bufferWriter.WrittenMemory;
         var decoded = encoder.Decode(memory.Span);
 
+        await Assert.That(written).IsEqualTo(memory.Length);
         await Assert.That(decoded).IsEqualTo(value);
+    }
+
+    [Test]
+    public async Task UTF8StringEncoderShouldNotSplitSurrogatePairsAcrossChunks()
+    {
+        var value = new string('a', 31) + "\U0001F600" + new string('a', 70);
+        var encoder = new UTF8StringEncoder();
+        var buffer = new byte[encoder.GetLength(value)];
+        int written;
+
+        {
+            var writer = new EncoderBinaryWriter(buffer);
+            written = encoder.Encode(value, ref writer);
+        }
+
+        await Assert.That(written).IsEqualTo(buffer.Length);
+        await Assert.That(encoder.Decode(buffer)).IsEqualTo(value);
     }
 
     [Test]
@@ -81,6 +100,36 @@ public class EncoderTests
         await Assert.That(comparer.Equals(a, b)).IsTrue();
         await Assert.That(comparer.Equals(a, c)).IsFalse();
         await Assert.That(comparer.GetHashCode(b)).IsEqualTo(comparer.GetHashCode(a));
+    }
+
+    [Test]
+    public async Task FixedEncoderBinaryWriterShouldWriteIntoProvidedBuffer()
+    {
+        var buffer = new byte[sizeof(uint)];
+        int bytesWritten;
+
+        {
+            var writer = new EncoderBinaryWriter(buffer);
+            writer.WriteUInt32(0x12345678);
+            writer.Flush();
+            bytesWritten = writer.BytesWritten;
+        }
+
+        await Assert.That(bytesWritten).IsEqualTo(buffer.Length);
+        await Assert.That(buffer).IsEquivalentTo(new byte[] { 0x78, 0x56, 0x34, 0x12 });
+    }
+
+    [Test]
+    public async Task FixedEncoderBinaryWriterShouldRejectOverflow()
+    {
+        await Assert.That(WritePastEnd).Throws<InvalidOperationException>();
+
+        static void WritePastEnd()
+        {
+            Span<byte> buffer = stackalloc byte[1];
+            var writer = new EncoderBinaryWriter(buffer);
+            writer.WriteUInt16(1);
+        }
     }
 
     private static byte[] Encode<T>(IBinaryEncoder<T> encoder, T value)

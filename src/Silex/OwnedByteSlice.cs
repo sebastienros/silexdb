@@ -46,6 +46,27 @@ internal sealed class OwnedByteSlice : IDisposable
         return new OwnedByteSlice(owner, ByteSlice.CreateView(owner, 0, value.Length));
     }
 
+    internal static OwnedByteSlice Rent(int length)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(length);
+        if (length == 0)
+        {
+            return new OwnedByteSlice(null, ByteSlice.Empty);
+        }
+
+        var owner = MemoryOwner<byte>.Rent(length);
+        return new OwnedByteSlice(owner, ByteSlice.CreateView(owner, 0, length));
+    }
+
+    internal Span<byte> WritableSpan
+    {
+        get
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            return _owner is null ? Span<byte>.Empty : _owner.Memory.Span[.._slice.Length];
+        }
+    }
+
     public static OwnedByteSlice CopyFrom(ReadOnlySequence<byte> value)
     {
         if (value.IsSingleSegment)
