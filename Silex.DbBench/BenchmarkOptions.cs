@@ -50,6 +50,8 @@ internal sealed class BenchmarkOptions
 
     public bool WalSync { get; set; }
 
+    public int BatchSize { get; set; } = 1;
+
     public int Level0FileNumCompactionTrigger { get; set; } = 4;
 
     public int NumLevels { get; set; } = 7;

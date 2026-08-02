@@ -1,3 +1,5 @@
+using System.Buffers.Binary;
+using System.IO.Hashing;
 using Silex.Buffers;
 using Silex.Serialization;
 using Silex.Tables;
@@ -101,6 +103,41 @@ public class BinaryFormatTests
         key.CopyTo(expected, 2);
         expected[2 + key.Length] = 0x02;
         value.CopyTo(expected, 3 + key.Length);
+
+        await Assert.That(bytes).IsEquivalentTo(expected, CollectionOrdering.Matching);
+    }
+
+    [Test]
+    public async Task WriteAheadLogBatchUsesConcatenatedCanonicalRecords()
+    {
+        using var tempFolder = TempFolder.Create();
+        var path = tempFolder.GetRandomFileName();
+        var entries = new[]
+        {
+            WriteBatchEntry.Put(new byte[] { 1 }, new byte[] { 2, 3 }),
+            WriteBatchEntry.Delete(new byte[] { 4 }),
+            WriteBatchEntry.Put(new byte[] { 5 }, ReadOnlyMemory<byte>.Empty),
+        };
+
+        using (var log = new WriteAheadLog(path, syncToDisk: false))
+        {
+            log.AppendBatch(entries);
+        }
+
+        var bytes = await File.ReadAllBytesAsync(path);
+        var expectedWithoutChecksum = new byte[]
+        {
+            0xFF, 0xFF, 0xFF, 0xFF, 0x0F,
+            20,
+            3,
+            1, 1, 2, 2, 3,
+            1, 4, 0,
+            1, 5, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F,
+        };
+        var expected = new byte[expectedWithoutChecksum.Length + sizeof(uint)];
+        expectedWithoutChecksum.CopyTo(expected, 0);
+        var checksum = Crc32.HashToUInt32(expectedWithoutChecksum.AsSpan(6));
+        BinaryPrimitives.WriteUInt32LittleEndian(expected.AsSpan(expectedWithoutChecksum.Length), checksum);
 
         await Assert.That(bytes).IsEquivalentTo(expected, CollectionOrdering.Matching);
     }

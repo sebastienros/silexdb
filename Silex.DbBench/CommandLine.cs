@@ -219,9 +219,10 @@ internal static class CommandLine
         DefaultValueFactory = _ => 1,
     };
 
-    private static readonly Option<int?> BatchSize = new("--batch_size")
+    private static readonly Option<int> BatchSize = new("--batch_size")
     {
-        Description = "Ignored unless 1: Silex has no write-batch API.",
+        Description = "Number of writes committed in each durability-preserving WAL batch.",
+        DefaultValueFactory = _ => 1,
     };
 
     public static RootCommand BuildRootCommand(Func<BenchmarkOptions, List<string>, Task<int>> run)
@@ -286,6 +287,7 @@ internal static class CommandLine
             Compaction = compactionStyle == null ? parseResult.GetValue(Compaction) : ParseCompactionStyle(compactionStyle),
             Wal = parseResult.GetValue(Wal),
             WalSync = parseResult.GetValue(WalSync),
+            BatchSize = Positive("--batch_size", parseResult.GetValue(BatchSize)),
             Level0FileNumCompactionTrigger = parseResult.GetValue(Level0FileNumCompactionTrigger),
             NumLevels = parseResult.GetValue(NumLevels),
             MaxBytesForLevelBase = parseResult.GetValue(MaxBytesForLevelBase),
@@ -303,12 +305,6 @@ internal static class CommandLine
         if (maxBackgroundCompactions > 1)
         {
             warnings.Add("--max_background_compactions accepted for compatibility, but Silex currently runs one background compaction loop.");
-        }
-
-        var batch = parseResult.GetValue(BatchSize);
-        if (batch is not null and not 1)
-        {
-            warnings.Add("--batch_size ignored: Silex has no write-batch API; every write is an individual Put.");
         }
 
         return (options, warnings);
@@ -335,6 +331,16 @@ internal static class CommandLine
         if (value is < 0 or > 1)
         {
             throw new ArgumentOutOfRangeException("--compression_ratio", value, "--compression_ratio must be between 0 and 1.");
+        }
+
+        return value;
+    }
+
+    private static int Positive(string name, int value)
+    {
+        if (value <= 0)
+        {
+            throw new ArgumentOutOfRangeException(name, value, $"{name} must be positive.");
         }
 
         return value;
