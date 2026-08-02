@@ -83,6 +83,9 @@ internal static class ByteSliceTestExtensions
     public static IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateAsync(this BlockIterator iterator, int from, CancellationToken cancellationToken = default) => iterator.EnumerateAsync(Slice(from), cancellationToken);
     public static IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateAsync(this IStorageIterator iterator, int from, CancellationToken cancellationToken = default) => iterator.EnumerateAsync(Slice(from), cancellationToken);
     public static IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateAsync(this SsTableIterator iterator, uint from, CancellationToken cancellationToken = default) => iterator.EnumerateAsync(Slice(from), cancellationToken);
+    public static IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateBackwardsAsync(this BlockIterator iterator, int from, CancellationToken cancellationToken = default) => iterator.EnumerateBackwardsAsync(Slice(from), cancellationToken);
+    public static IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateBackwardsAsync(this IStorageIterator iterator, int from, CancellationToken cancellationToken = default) => iterator.EnumerateBackwardsAsync(Slice(from), cancellationToken);
+    public static IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateBackwardsAsync(this SsTableIterator iterator, uint from, CancellationToken cancellationToken = default) => iterator.EnumerateBackwardsAsync(Slice(from), cancellationToken);
 
     public static List<KeyValuePair<ByteSlice, ByteSlice>> SnapshotList(this IEnumerable<KeyValuePair<ByteSlice, ByteSlice>> entries)
     {

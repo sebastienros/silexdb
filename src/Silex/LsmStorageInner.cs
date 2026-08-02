@@ -2398,7 +2398,7 @@ internal sealed class LsmStorageInner : IDisposable
 
         public IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateAsync(CancellationToken cancellationToken = default)
         {
-            return EnumerateAsync(hasFrom: false, default!, cancellationToken);
+            return EnumerateAsync(hasFrom: false, default!, backwards: false, cancellationToken);
         }
 
         /// <summary>
@@ -2407,10 +2407,23 @@ internal sealed class LsmStorageInner : IDisposable
         /// </summary>
         public IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateAsync(ByteSlice from, CancellationToken cancellationToken = default)
         {
-            return EnumerateAsync(hasFrom: true, from, cancellationToken);
+            return EnumerateAsync(hasFrom: true, from, backwards: false, cancellationToken);
         }
 
-        private async IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateAsync(bool hasFrom, ByteSlice from, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        public IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateBackwardsAsync(CancellationToken cancellationToken = default)
+        {
+            return EnumerateAsync(hasFrom: false, default!, backwards: true, cancellationToken);
+        }
+
+        /// <summary>
+        /// Returns all values whose key is less than or equal to <paramref name="from"/> in descending key order.
+        /// </summary>
+        public IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateBackwardsAsync(ByteSlice from, CancellationToken cancellationToken = default)
+        {
+            return EnumerateAsync(hasFrom: true, from, backwards: true, cancellationToken);
+        }
+
+        private async IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateAsync(bool hasFrom, ByteSlice from, bool backwards, [EnumeratorCancellation] CancellationToken cancellationToken = default)
         {
             // Hold the level0 read lock for the whole scan: it freezes the L0 tier list (no flush append or
             // compaction swap) and, because flush only disposes a flushed immutable MemTable after its own
@@ -2426,7 +2439,7 @@ internal sealed class LsmStorageInner : IDisposable
                 // turns ~N block reads (one per table) into one binary search + one block read.
                 if (_storage.TryGetGloballySortedSsTableRun(out var sortedRun))
                 {
-                    await foreach (var entry in EnumerateSortedRunAsync(sortedRun, hasFrom, from, cancellationToken))
+                    await foreach (var entry in EnumerateSortedRunAsync(sortedRun, hasFrom, from, backwards, cancellationToken))
                     {
                         yield return entry;
                     }
@@ -2437,9 +2450,13 @@ internal sealed class LsmStorageInner : IDisposable
                 var iterators = BuildIterators(hasFrom, from, cancellationToken);
                 var merge = new MergeIterator(iterators);
 
-                var enumerable = hasFrom
-                    ? merge.EnumerateAsync(from, cancellationToken)
-                    : merge.EnumerateAsync(cancellationToken);
+                var enumerable = backwards
+                    ? hasFrom
+                        ? merge.EnumerateBackwardsAsync(from, cancellationToken)
+                        : merge.EnumerateBackwardsAsync(cancellationToken)
+                    : hasFrom
+                        ? merge.EnumerateAsync(from, cancellationToken)
+                        : merge.EnumerateAsync(cancellationToken);
 
                 await foreach (var entry in enumerable)
                 {
@@ -2465,8 +2482,56 @@ internal sealed class LsmStorageInner : IDisposable
             IReadOnlyList<SsTable> tables,
             bool hasFrom,
             ByteSlice from,
+            bool backwards,
             [EnumeratorCancellation] CancellationToken cancellationToken)
         {
+            if (backwards)
+            {
+                var endIndex = tables.Count - 1;
+
+                if (hasFrom)
+                {
+                    var lo = 0;
+                    var hi = tables.Count;
+
+                    while (lo < hi)
+                    {
+                        var mid = (lo + hi) >> 1;
+
+                        if (_keyComparer.Compare(tables[mid].FirstKey, from) <= 0)
+                        {
+                            lo = mid + 1;
+                        }
+                        else
+                        {
+                            hi = mid;
+                        }
+                    }
+
+                    endIndex = lo - 1;
+                }
+
+                for (var i = endIndex; i >= 0; i--)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    var iterator = new SsTableIterator(tables[i]);
+                    var enumerable = hasFrom && i == endIndex
+                        ? iterator.EnumerateBackwardsAsync(from, cancellationToken)
+                        : iterator.EnumerateBackwardsAsync(cancellationToken);
+
+                    await foreach (var entry in enumerable)
+                    {
+                        if (!entry.Value.IsTombstone)
+                        {
+                            yield return entry;
+                        }
+                    }
+                }
+
+                yield break;
+            }
+
             var startIndex = 0;
 
             if (hasFrom)
@@ -2628,6 +2693,43 @@ internal sealed class LsmStorageInner : IDisposable
                 {
                     yield return entry;
                 }
+            }
+        }
+
+        public async IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateBackwardsAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            await Task.CompletedTask;
+
+            for (var i = _entries.Count - 1; i >= 0; i--)
+            {
+                yield return _entries[i];
+            }
+        }
+
+        public async IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateBackwardsAsync(ByteSlice from, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            await Task.CompletedTask;
+
+            var lo = 0;
+            var hi = _entries.Count;
+
+            while (lo < hi)
+            {
+                var mid = (lo + hi) >> 1;
+
+                if (_keyComparer.Compare(_entries[mid].Key, from) <= 0)
+                {
+                    lo = mid + 1;
+                }
+                else
+                {
+                    hi = mid;
+                }
+            }
+
+            for (var i = lo - 1; i >= 0; i--)
+            {
+                yield return _entries[i];
             }
         }
     }

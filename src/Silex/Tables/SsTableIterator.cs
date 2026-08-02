@@ -92,6 +92,64 @@ internal sealed class SsTableIterator : IStorageIterator
         yield break;
     }
 
+    public async IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateBackwardsAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        for (var i = _table.BlockMetadata.Count - 1; i >= 0; i--)
+        {
+            var blockMetadata = _table.BlockMetadata[i];
+
+            using var block = await _table.ReadBlockAsync(blockMetadata.Index, cancellationToken);
+
+            if (block != null)
+            {
+                var blockIterator = new BlockIterator(block);
+                await foreach (var entry in blockIterator.EnumerateBackwardsAsync(cancellationToken))
+                {
+                    yield return entry;
+                }
+            }
+        }
+    }
+
+    public async IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateBackwardsAsync(ByteSlice from, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        var startBlockIndex = FindEndBlockIndex(from);
+
+        if (startBlockIndex < 0)
+        {
+            yield break;
+        }
+
+        var blockMetadata = _table.BlockMetadata[startBlockIndex];
+
+        using var block = await _table.ReadBlockAsync(blockMetadata.Index, cancellationToken);
+
+        if (block != null)
+        {
+            var blockIterator = new BlockIterator(block);
+            await foreach (var entry in blockIterator.EnumerateBackwardsAsync(from, cancellationToken))
+            {
+                yield return entry;
+            }
+        }
+
+        for (var i = startBlockIndex - 1; i >= 0; i--)
+        {
+            blockMetadata = _table.BlockMetadata[i];
+
+            using var earlierBlock = await _table.ReadBlockAsync(blockMetadata.Index, cancellationToken);
+
+            if (earlierBlock != null)
+            {
+                var blockIterator = new BlockIterator(earlierBlock);
+                await foreach (var entry in blockIterator.EnumerateBackwardsAsync(cancellationToken))
+                {
+                    yield return entry;
+                }
+            }
+        }
+    }
+
     private int FindStartBlockIndex(ByteSlice from)
     {
         var start = 0;
@@ -120,5 +178,27 @@ internal sealed class SsTableIterator : IStorageIterator
 
         // 'start' is the insertion index. Step back one block and clamp to the first block.
         return Math.Max(0, start - 1);
+    }
+
+    private int FindEndBlockIndex(ByteSlice from)
+    {
+        var start = 0;
+        var end = _table.BlockMetadata.Count;
+
+        while (start < end)
+        {
+            var m = start + (end - start) / 2;
+
+            if (_keyComparer.Compare(_table.BlockMetadata[m].FirstKey, from) <= 0)
+            {
+                start = m + 1;
+            }
+            else
+            {
+                end = m;
+            }
+        }
+
+        return start - 1;
     }
 }

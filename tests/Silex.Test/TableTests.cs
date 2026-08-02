@@ -232,6 +232,50 @@ public class TableTests
     }
 
     [Test]
+    public async Task ShouldIterateAllEntriesBackwards()
+    {
+        using var tempFolder = TempFolder.Create();
+        var tempFilename = tempFolder.GetRandomFileName();
+        using var builder = new BufferedSsTableBuilder(tempFilename, new DefaultSsTableEncoder(), new DefaultBlockEncoder(), new DefaultBloomFilterFactory(), 100);
+        var value = new byte[100.B()];
+
+        for (uint i = 0; i < 100; i++)
+        {
+            await builder.AddAsync(i, value);
+        }
+
+        using var table = await builder.BuildAsync();
+        await Assert.That(table.BlockMetadata.Count > 1).IsTrue();
+
+        var result = new SsTableIterator(table).EnumerateBackwardsAsync().ToBlockingEnumerable().Select(x => DecodeUInt32(x.Key)).ToArray();
+
+        await Assert.That(result).IsEquivalentTo(Enumerable.Range(0, 100).Reverse().Select(i => (uint)i), CollectionOrdering.Matching);
+    }
+
+    [Test]
+    [Arguments((uint)53, 54)]
+    [Arguments((uint)101, 100)]
+    [Arguments((uint)5, 6)]
+    public async Task ShouldIterateBackwardsFromKey(uint from, int expectedCount)
+    {
+        using var tempFolder = TempFolder.Create();
+        var tempFilename = tempFolder.GetRandomFileName();
+        using var builder = new BufferedSsTableBuilder(tempFilename, new DefaultSsTableEncoder(), new DefaultBlockEncoder(), new DefaultBloomFilterFactory(), 100);
+        var value = new byte[100.B()];
+
+        for (uint i = 0; i < 100; i++)
+        {
+            await builder.AddAsync(i, value);
+        }
+
+        using var table = await builder.BuildAsync();
+        var result = new SsTableIterator(table).EnumerateBackwardsAsync(from).ToBlockingEnumerable().Select(x => DecodeUInt32(x.Key)).ToArray();
+        var expected = Enumerable.Range(0, expectedCount).Reverse().Select(i => (uint)i);
+
+        await Assert.That(result).IsEquivalentTo(expected, CollectionOrdering.Matching);
+    }
+
+    [Test]
     public async Task ShouldCacheBlocks()
     {
         using var tempFolder = TempFolder.Create();

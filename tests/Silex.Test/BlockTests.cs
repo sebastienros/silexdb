@@ -145,6 +145,43 @@ public class BlockTests
     }
 
     [Test]
+    public async Task ShouldIterateAllEntriesBackwards()
+    {
+        using var blockBuilder = new BlockBuilder(new DefaultBlockEncoder());
+        var allKeys = new[] { 1, 3, 5, 6, 7 };
+
+        foreach (var key in allKeys)
+        {
+            blockBuilder.Add(key, "hello");
+        }
+
+        using var block = blockBuilder.BuildBlock();
+        var result = new BlockIterator(block).EnumerateBackwardsAsync().ToBlockingEnumerable().Select(x => DecodeInt32(x.Key)).ToArray();
+
+        await Assert.That(result).IsEquivalentTo(allKeys.AsEnumerable().Reverse(), CollectionOrdering.Matching);
+    }
+
+    [Test]
+    [Arguments(6, new[] { 6, 5, 3, 1 })]
+    [Arguments(4, new[] { 3, 1 })]
+    [Arguments(0, new int[0])]
+    [Arguments(8, new[] { 7, 6, 5, 3, 1 })]
+    public async Task ShouldIterateBackwardsFromKey(int from, int[] expected)
+    {
+        using var blockBuilder = new BlockBuilder(new DefaultBlockEncoder());
+
+        foreach (var key in new[] { 1, 3, 5, 6, 7 })
+        {
+            blockBuilder.Add(key, "hello");
+        }
+
+        using var block = blockBuilder.BuildBlock();
+        var result = new BlockIterator(block).EnumerateBackwardsAsync(from).ToBlockingEnumerable().Select(x => DecodeInt32(x.Key)).ToArray();
+
+        await Assert.That(result).IsEquivalentTo(expected, CollectionOrdering.Matching);
+    }
+
+    [Test]
     public async Task TryGetValueShouldReturnCorrectValues()
     {
         var blockBuilder = new BlockBuilder(new DefaultBlockEncoder());

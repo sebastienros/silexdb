@@ -230,6 +230,32 @@ public class StorageTests
     }
 
     [Test]
+    public async Task BackwardsScanListsAllMemTables()
+    {
+        using var tempFolder = TempFolder.Create();
+        using var storage = new LsmStorageInner(tempFolder, new StorageOptions { UseWriteAheadLog = false });
+
+        storage.Put(5, [4]);
+        storage.ForceFreezeMemTable();
+
+        storage.Put(1, [1]);
+        storage.Put(2, [2]);
+        storage.Put(3, [3]);
+        storage.ForceFreezeMemTable();
+
+        storage.Delete(2);
+        storage.Put(3, [4]);
+        storage.Put(4, [5]);
+
+        var iterator = storage.CreateIterator();
+        var all = iterator.EnumerateBackwardsAsync().ToBlockingEnumerable().SnapshotList();
+        var bounded = iterator.EnumerateBackwardsAsync(4).ToBlockingEnumerable().SnapshotList();
+
+        await Assert.That(all.Select(entry => DecodeInt32(entry.Key))).IsEquivalentTo(new[] { 5, 4, 3, 1 }, CollectionOrdering.Matching);
+        await Assert.That(bounded.Select(entry => DecodeInt32(entry.Key))).IsEquivalentTo(new[] { 4, 3, 1 }, CollectionOrdering.Matching);
+    }
+
+    [Test]
     [Arguments(1)]
     [Arguments(2)]
     [Arguments(5)]
@@ -1760,6 +1786,31 @@ public class StorageTests
     }
 
     [Test]
+    public async Task BackwardsRangeScanIncludesSsTableData()
+    {
+        using var tempFolder = TempFolder.Create();
+        var storage = new LsmStorageInner(tempFolder, new StorageOptions { UseWriteAheadLog = false });
+
+        try
+        {
+            await FlushTierAsync(storage, () => storage.Put(1, 10));
+            await FlushTierAsync(storage, () => storage.Put(2, 20));
+            await FlushTierAsync(storage, () => storage.Put(3, 30));
+            storage.Put(2, 200);
+            storage.Put(4, 40);
+
+            var entries = storage.CreateIterator().EnumerateBackwardsAsync(3).ToBlockingEnumerable().SnapshotList();
+
+            await Assert.That(entries.Select(e => DecodeInt32(e.Key))).IsEquivalentTo(new[] { 3, 2, 1 }, CollectionOrdering.Matching);
+            await Assert.That(entries.Select(e => DecodeInt32(e.Value))).IsEquivalentTo(new[] { 30, 200, 10 }, CollectionOrdering.Matching);
+        }
+        finally
+        {
+            storage.Dispose();
+        }
+    }
+
+    [Test]
     public async Task ScanAfterReopenIncludesSsTableData()
     {
         // After reopening, all live data is in SSTs (MemTables are empty), so the scan exercises the SST path.
@@ -1776,10 +1827,15 @@ public class StorageTests
 
             try
             {
-                var entries = reopened._inner.CreateIterator().EnumerateAsync().ToBlockingEnumerable().SnapshotList();
+                var iterator = reopened._inner.CreateIterator();
+                var entries = iterator.EnumerateAsync().ToBlockingEnumerable().SnapshotList();
+                var backwards = iterator.EnumerateBackwardsAsync().ToBlockingEnumerable().SnapshotList();
+                var boundedBackwards = iterator.EnumerateBackwardsAsync(1).ToBlockingEnumerable().SnapshotList();
 
                 await Assert.That(entries.Select(e => DecodeInt32(e.Key))).IsEquivalentTo(new[] { 1, 2 }, CollectionOrdering.Matching);
                 await Assert.That(entries.Select(e => DecodeInt32(e.Value))).IsEquivalentTo(new[] { 10, 20 }, CollectionOrdering.Matching);
+                await Assert.That(backwards.Select(e => DecodeInt32(e.Key))).IsEquivalentTo(new[] { 2, 1 }, CollectionOrdering.Matching);
+                await Assert.That(boundedBackwards.Select(e => DecodeInt32(e.Key))).IsEquivalentTo(new[] { 1 }, CollectionOrdering.Matching);
             }
             finally
             {
