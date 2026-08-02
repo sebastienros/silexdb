@@ -55,7 +55,7 @@ internal class Compacter : IAsyncDisposable
         {
             while (await _flushTimer.WaitForNextTickAsync(cancellationToken))
             {
-                await TriggerFlushAsync(cancellationToken);
+                await RunMaintenanceAsync(cancellationToken);
             }
         }
         catch (OperationCanceledException)
@@ -64,7 +64,7 @@ internal class Compacter : IAsyncDisposable
         }
     }
 
-    private async Task TriggerFlushAsync(CancellationToken cancellationToken)
+    internal async Task RunMaintenanceAsync(CancellationToken cancellationToken = default)
     {
         if (_storage._state.ImmutableMemTables.Count() + 1 > _memTableTableMaxCount)
         {
