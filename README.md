@@ -327,6 +327,22 @@ compaction. It accepts `--compression_type=none|lz4|zstd`, `--compression_level`
 `--num`, `--key_size`, `--value_size`,
 `--write_buffer_size`, `--block_size`, `--bloom_bits`, `--threads`, `--seed`, and the compaction knobs.
 
+Current single-thread snapshot (2026-08-02, Apple M4 Pro, median of three alternating runs):
+
+| Workload | Relative result |
+| --- | ---: |
+| Sequential, random, and overwrite writes | **Silex 1.19-1.52x faster** |
+| First random-read pass | **RocksDB 1.07x faster** |
+| Warm random reads | **Silex 1.12x faster** |
+| Sequential scans | **Silex 1.15x faster** |
+| Random seeks | **Silex 1.74x faster** |
+| WAL fsync per write | **Tie at about 4.14 ms/op** |
+
+These 200,000-entry, uncompressed runs fit in memory and measure warm-page/cache behavior rather
+than device throughput. See the
+[full comparison](Silex.DbBench/benchmarks/2026-05-30-rocksdb-comparison.md) for exact revisions,
+settings, absolute measurements, corrected concurrency methodology, and durability caveats.
+
 Tiered/universal comparison:
 
 ```bash

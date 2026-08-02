@@ -3,12 +3,105 @@
 Cross-engine comparison using RocksDB's `db_bench` ported workloads against
 `Silex.DbBench`. Captured for later reference / perf tracking.
 
-## Latest rerun setup
+## Current rerun - 2026-08-02
+
+This rerun uses Silex `63a55afce4158ec104ee9b076e447453aea75e75` and RocksDB
+`26a501b5d1e0513c90c3a54edfcf2292102a7627` (`db_bench` 11.4.0). Results are
+medians of three alternating process runs on the same Apple M4 Pro host. Both engines used:
+
+- 200,000 entries, 16-byte keys, 100-byte values, one client thread unless noted
+- WAL enabled without per-write sync for ordinary writes
+- 64 MiB write buffers, 4 KiB blocks, 10 Bloom bits/key, and universal/tiered compaction
+- compression disabled and batch size 1
+- 128 MiB block caches for the main read suite and 8 KiB for the cache-miss sweep
+
+The dataset is intentionally the same as the May baseline. It fits in RAM, so the results measure
+engine CPU, cache, and warm-page behavior rather than storage-device bandwidth. Before the RocksDB
+read phases, `flush` moved its mutable data to an SST. Silex performed its built-in
+`FlushAndCompactAsync` read barrier. The resulting read databases were nearly identical in size:
+23.4 MiB for Silex and 23.6 MiB for RocksDB. Every point read and seek found all requested keys.
+
+### Full-coverage reads, scans, seeks, and sequential writes
+
+| Benchmark | Silex | RocksDB | Result |
+| --- | ---: | ---: | --- |
+| `fillseq` | 1.141 us/op | 1.398 us/op | **Silex 1.23x** |
+| `readrandom` first | 0.751 us/op | 0.700 us/op | **RocksDB 1.07x** |
+| `readrandom` warm | 0.595 us/op | 0.665 us/op | **Silex 1.12x** |
+| `readseq` | 0.054 us/op | 0.062 us/op | **Silex 1.15x** |
+| `seekrandom` | 0.591 us/op | 1.026 us/op | **Silex 1.74x** |
+
+Unlike the May result, current Silex is ahead on sequential scans and random seeks. The first
+random-read pass remains slightly slower than RocksDB, while the warmed pass is slightly faster.
+
+### Random writes and overwrites
+
+| Benchmark | Silex | RocksDB | Result |
+| --- | ---: | ---: | --- |
+| `fillseq` | 1.155 us/op | 1.378 us/op | **Silex 1.19x** |
+| `fillrandom` | 1.226 us/op | 1.866 us/op | **Silex 1.52x** |
+| `overwrite` | 1.336 us/op | 2.037 us/op | **Silex 1.52x** |
+
+These ordinary write timings include WAL appends but not an `fsync` for every operation.
+
+### Cache-miss read concurrency over identical databases
+
+Each engine first populated and closed a 200,000-entry database with one thread. A separate
+read-only process then ran three random-read passes using the requested thread count. The table
+uses passes two and three from three process repetitions (six samples), when file pages were warm
+but the 8 KiB block cache still missed almost every lookup.
+
+| Threads | Silex | RocksDB | Result |
+| ---: | ---: | ---: | --- |
+| 1 | 574,248 ops/s | 574,799 ops/s | Tie |
+| 4 | 1,274,708 ops/s | 646,308 ops/s | **Silex 1.97x** |
+| 8 | 1,126,044 ops/s | 903,374 ops/s | **Silex 1.25x** |
+
+This replaces the older thread sweep methodology, which let RocksDB execute `num` population
+writes per thread while Silex partitioned `num` total writes. Populating with one thread ensures
+both concurrent-read tests open the same 200,000-entry database and perform the same total reads.
+
+### Fsync-per-write durability
+
+Both engines performed 10,000 single-entry writes with a WAL durability barrier before each write
+returned:
+
+| Engine | Latency | Throughput |
+| --- | ---: | ---: |
+| Silex | 4,137.5 us/op | 242 ops/s |
+| RocksDB | 4,149.2 us/op | 241 ops/s |
+
+The result is effectively a tie and is dominated by the host's durable-flush latency. RocksDB
+11.4 executes `num` operations for `fillsync`, despite still printing the historical `num/1000`
+label; Silex executes `num/1000`. The commands therefore used `--num=10000` for RocksDB and
+`--num=10000000` for Silex to make both execute exactly 10,000 durable writes.
+
+### Reproduction
+
+The main read suite used these benchmark lists with the common settings above:
+
+```bash
+# Silex (performs its read barrier before the first read)
+dbbench --benchmarks=fillseq,readrandom,readrandom,readseq,seekrandom \
+  --num=200000 --reads=200000 --cache_size=134217728 ...
+
+# RocksDB
+db_bench --benchmarks=fillseq,flush,readrandom,readrandom,readseq,seekrandom \
+  --num=200000 --reads=200000 --cache_size=134217728 ...
+```
+
+The fair concurrency sweep populated each database in a single-thread process, then reopened it
+with `--use_existing_db` for read-only passes. Raw logs are retained in the session benchmark
+artifacts under `rocksdb-rerun-2026-08-02`.
+
+---
+
+## Previous rerun setup - 2026-05-30
 
 - **Host**: macOS, Apple Silicon, 14 cores
 - **Threads**: 1 (single-threaded)
 - **Dataset**: 200,000 entries, 16-byte keys, 100-byte values (~22 MB raw)
-- **Compression**: OFF on both (fairness — Silex does not compress)
+- **Compression**: OFF on both
 - **RocksDB**: built `db_bench` from `facebook/rocksdb` `main` (v11.4.0), release
   (`make db_bench DEBUG_LEVEL=0`), linked against Homebrew gflags. Run with
   `--compression_type=none`.
@@ -19,7 +112,7 @@ Cross-engine comparison using RocksDB's `db_bench` ported workloads against
 > and a more mature WAL that this micro-benchmark does not reward. These numbers
 > favor Silex more than a larger-than-RAM workload would.
 
-## Fresh comparison — post synchronous cache-miss read fast path (2026-05-30, latest)
+## Previous comparison - post synchronous cache-miss read fast path (2026-05-30)
 
 Captured after the synchronous cache-miss read landed (`22af4a7`). Same host (macOS, Apple
 Silicon, 14 cores), 200,000 entries, 16-byte keys, 100-byte values, compression off, single
