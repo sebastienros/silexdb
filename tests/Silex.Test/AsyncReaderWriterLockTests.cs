@@ -16,6 +16,8 @@ public class AsyncReaderWriterLockTests
         var loq = new AsyncReaderWriterLock();
         var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(1)).Token;
         var ids = 0;
+        var activeReaders = 0;
+        var activeWriters = 0;
         await Parallel.ForAsync(0, levelOfConcurrency, async (i, cancellationToken) =>
         {
             await Work(loq, timeout);
@@ -36,25 +38,38 @@ public class AsyncReaderWriterLockTests
                 switch (operation)
                 {
                     case 0: // Read
-                        _output?.WriteLine($"Read({id}) r:{loq._state.Readers},w:{loq._state.Writers}");
+                        _output?.WriteLine($"Read({id}) r:{loq.ActiveReaderCount},w:{loq.IsWriteLockHeld}");
                         t = loq.EnterReadLockAsync().WaitAsync(timeout);
-                        if (t == Task.CompletedTask) _output?.WriteLine($"Go {id} r:{loq._state.Readers},w:{loq._state.Writers}"); else _output?.WriteLine($"Wait {id} r:{loq._state.Readers},w:{loq._state.Writers}");
+                        if (t == Task.CompletedTask) _output?.WriteLine($"Go {id} r:{loq.ActiveReaderCount},w:{loq.IsWriteLockHeld}"); else _output?.WriteLine($"Wait {id} r:{loq.ActiveReaderCount},w:{loq.IsWriteLockHeld}");
                         await t;
+                        Interlocked.Increment(ref activeReaders);
+                        if (Volatile.Read(ref activeWriters) != 0)
+                        {
+                            throw new InvalidOperationException("A reader and writer held the lock concurrently.");
+                        }
+
                         _output?.WriteLine($"Do({id})");
                         await Task.Delay(delay);
+                        Interlocked.Decrement(ref activeReaders);
                         loq.ExitReadLock();
-                        _output?.WriteLine($"~Read({id}) r:{loq._state.Readers},w:{loq._state.Writers}");
+                        _output?.WriteLine($"~Read({id}) r:{loq.ActiveReaderCount},w:{loq.IsWriteLockHeld}");
                         break;
 
                     case 1: // Write
-                        _output?.WriteLine($"Write({id}) r:{loq._state.Readers},w:{loq._state.Writers}");
+                        _output?.WriteLine($"Write({id}) r:{loq.ActiveReaderCount},w:{loq.IsWriteLockHeld}");
                         t = loq.EnterWriteLockAsync().WaitAsync(timeout);
-                        if (t == Task.CompletedTask) _output?.WriteLine($"Go {id} r:{loq._state.Readers},w:{loq._state.Writers}"); else _output?.WriteLine($"Wait {id} r:{loq._state.Readers},w:{loq._state.Writers}");
+                        if (t == Task.CompletedTask) _output?.WriteLine($"Go {id} r:{loq.ActiveReaderCount},w:{loq.IsWriteLockHeld}"); else _output?.WriteLine($"Wait {id} r:{loq.ActiveReaderCount},w:{loq.IsWriteLockHeld}");
                         await t;
+                        if (Interlocked.Increment(ref activeWriters) != 1 || Volatile.Read(ref activeReaders) != 0)
+                        {
+                            throw new InvalidOperationException("Multiple writers or a reader and writer held the lock concurrently.");
+                        }
+
                         _output?.WriteLine($"Do({id})");
                         await Task.Delay(delay);
+                        Interlocked.Decrement(ref activeWriters);
                         loq.ExitWriteLock();
-                        _output?.WriteLine($"~Write({id}) r:{loq._state.Readers},w:{loq._state.Writers}");
+                        _output?.WriteLine($"~Write({id}) r:{loq.ActiveReaderCount},w:{loq.IsWriteLockHeld}");
                         break;
                 }
 
@@ -92,6 +107,7 @@ public class AsyncReaderWriterLockTests
 
         loq.ExitWriteLock();
         await Assert.That(await loq.TryEnterWriteLockAsync().AsTask().WaitAsync(_timeout)).IsTrue();
+        loq.ExitWriteLock();
     }
 
     [Test]
@@ -100,13 +116,13 @@ public class AsyncReaderWriterLockTests
         var loq = new AsyncReaderWriterLock();
 
         await loq.EnterReadLockAsync().WaitAsync(_timeout);
-        await Assert.That(loq._state.Readers).IsEqualTo((uint)1);
+        await Assert.That(loq.ActiveReaderCount).IsEqualTo(1);
         loq.ExitReadLock();
-        await Assert.That(loq._state.Readers).IsEqualTo((uint)0);
+        await Assert.That(loq.ActiveReaderCount).IsEqualTo(0);
         await loq.EnterWriteLockAsync().WaitAsync(_timeout);
-        await Assert.That(loq._state.Writers).IsEqualTo((uint)1);
+        await Assert.That(loq.IsWriteLockHeld).IsTrue();
         loq.ExitWriteLock();
-        await Assert.That(loq._state.Writers).IsEqualTo((uint)0);
+        await Assert.That(loq.IsWriteLockHeld).IsFalse();
     }
 
     [Test]
@@ -121,26 +137,44 @@ public class AsyncReaderWriterLockTests
     }
 
     [Test]
+    public async Task WriterShouldWaitForAllActiveReaders()
+    {
+        var loq = new AsyncReaderWriterLock();
+
+        await loq.EnterReadLockAsync().WaitAsync(_timeout);
+        await loq.EnterReadLockAsync().WaitAsync(_timeout);
+        var writer = loq.EnterWriteLockAsync();
+
+        loq.ExitReadLock();
+        await Assert.That(writer.IsCompleted).IsFalse();
+
+        loq.ExitReadLock();
+        await writer.WaitAsync(_timeout);
+        loq.ExitWriteLock();
+    }
+
+    [Test]
     public async Task WriteWriteRead()
     {
         var loq = new AsyncReaderWriterLock();
 
-        var w3 = loq.EnterWriteLockAsync().WaitAsync(_timeout);
+        var w3 = loq.EnterWriteLockAsync();
         await Assert.That(w3.IsCompleted).IsTrue();
 
-        var w1 = loq.EnterWriteLockAsync().WaitAsync(_timeout);
+        var w1 = loq.EnterWriteLockAsync();
         await Assert.That(w1.IsCompleted).IsFalse();
 
-        var r2 = loq.EnterReadLockAsync().WaitAsync(_timeout);
+        var r2 = loq.EnterReadLockAsync();
         await Assert.That(r2.IsCompleted).IsFalse();
 
         loq.ExitWriteLock();
-        await Assert.That(w1.IsCompleted).IsTrue();
+        await w1.WaitAsync(_timeout);
         await Assert.That(r2.IsCompleted).IsFalse();
 
-        loq.ExitReadLock();
+        loq.ExitWriteLock();
         await Assert.That(w3.IsCompleted).IsTrue();
-        await Assert.That(r2.IsCompleted).IsTrue();
+        await r2.WaitAsync(_timeout);
+        loq.ExitReadLock();
     }
 
     [Test]
@@ -160,6 +194,7 @@ public class AsyncReaderWriterLockTests
 
         for (int i = 0; i < count; i++)
         {
+            await tasks[i].WaitAsync(_timeout);
             loq.ExitWriteLock();
         }
 
@@ -184,6 +219,7 @@ public class AsyncReaderWriterLockTests
         await Assert.That(lock2.IsCompletedSuccessfully).IsTrue();
 
         await lock2;
+        loq.ExitWriteLock();
     }
 
     [Test]
@@ -219,6 +255,7 @@ public class AsyncReaderWriterLockTests
         await Assert.That(lock2.IsCompletedSuccessfully).IsTrue();
 
         await lock2;
+        loq.ExitReadLock();
     }
 
     [Test]
@@ -239,6 +276,7 @@ public class AsyncReaderWriterLockTests
         await Assert.That(lock2.IsCompletedSuccessfully).IsTrue();
 
         await lock2;
+        loq.ExitWriteLock();
     }
 
     [Test]
@@ -321,7 +359,7 @@ public class AsyncReaderWriterLockTests
 
         cts.Cancel();
         await Assert.That(read.IsCanceled).IsTrue();
-        await Assert.That(loq._state.Readers).IsEqualTo((uint)0);
+        await Assert.That(loq.ActiveReaderCount).IsEqualTo(0);
 
         loq.ExitWriteLock();
 
@@ -342,12 +380,93 @@ public class AsyncReaderWriterLockTests
 
         cts.Cancel();
         await Assert.That(write.IsCanceled).IsTrue();
-        await Assert.That(loq._state.Writers).IsEqualTo((uint)0);
+        await Assert.That(loq.IsWriteLockHeld).IsFalse();
 
         loq.ExitReadLock();
 
         await loq.EnterReadLockAsync().WaitAsync(_timeout);
         loq.ExitReadLock();
+    }
+
+    [Test]
+    public async Task CancelingQueuedWriterShouldPromoteFollowingReader()
+    {
+        var loq = new AsyncReaderWriterLock();
+
+        await loq.EnterReadLockAsync().WaitAsync(_timeout);
+
+        using var cts = new CancellationTokenSource();
+        var writer = loq.EnterWriteLockAsync(cts.Token);
+        var reader = loq.EnterReadLockAsync();
+
+        cts.Cancel();
+
+        await Assert.That(writer.IsCanceled).IsTrue();
+        await reader.WaitAsync(_timeout);
+        await Assert.That(loq.ActiveReaderCount).IsEqualTo(2);
+
+        loq.ExitReadLock();
+        loq.ExitReadLock();
+    }
+
+    [Test]
+    public async Task QueuedWriterShouldNotReportWriteLockHeld()
+    {
+        var loq = new AsyncReaderWriterLock();
+
+        await loq.EnterReadLockAsync().WaitAsync(_timeout);
+        var writer = loq.EnterWriteLockAsync();
+
+        await Assert.That(loq.IsWriteLockHeld).IsFalse();
+
+        loq.ExitReadLock();
+        await writer.WaitAsync(_timeout);
+        await Assert.That(loq.IsWriteLockHeld).IsTrue();
+
+        loq.ExitWriteLock();
+        await Assert.That(loq.IsWriteLockHeld).IsFalse();
+    }
+
+    [Test]
+    public async Task QueuedReaderCannotBeExited()
+    {
+        var loq = new AsyncReaderWriterLock();
+
+        await loq.EnterWriteLockAsync().WaitAsync(_timeout);
+        var reader = loq.EnterReadLockAsync();
+
+        await Assert.That(loq.ExitReadLock).Throws<SynchronizationLockException>();
+        loq.ExitWriteLock();
+
+        await reader.WaitAsync(_timeout);
+        loq.ExitReadLock();
+    }
+
+    [Test]
+    public async Task UncontendedOperationsShouldNotAllocate()
+    {
+        var loq = new AsyncReaderWriterLock();
+
+        for (var i = 0; i < 100; i++)
+        {
+            await loq.EnterReadLockAsync();
+            loq.ExitReadLock();
+            await loq.EnterWriteLockAsync();
+            loq.ExitWriteLock();
+        }
+
+        var allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
+
+        for (var i = 0; i < 1_000; i++)
+        {
+            loq.EnterReadLockAsync().GetAwaiter().GetResult();
+            loq.ExitReadLock();
+            loq.EnterWriteLockAsync().GetAwaiter().GetResult();
+            loq.ExitWriteLock();
+        }
+
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - allocatedBefore;
+        await Assert.That(allocated).IsEqualTo(0);
     }
 
     [Test]
@@ -358,6 +477,7 @@ public class AsyncReaderWriterLockTests
         await loq.EnterWriteLockAsync().WaitAsync(_timeout);
         
         await Assert.That(loq.ExitReadLock).Throws<SynchronizationLockException>();
+        loq.ExitWriteLock();
     }
 
     [Test]
@@ -368,5 +488,6 @@ public class AsyncReaderWriterLockTests
         await loq.EnterReadLockAsync().WaitAsync(_timeout);
 
         await Assert.That(loq.ExitWriteLock).Throws<SynchronizationLockException>();
+        loq.ExitReadLock();
     }
 }
