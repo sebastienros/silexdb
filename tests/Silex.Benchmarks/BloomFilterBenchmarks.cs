@@ -5,41 +5,41 @@ using Silex.BloomFilters;
 [MemoryDiagnoser]
 public class BloomFilterBenchmarks
 {
-    private const int N = 10_000;
     private const double P = 0.01;
 
     private BloomFilter _filter = null!;
-    private byte[][] _members = null!;
-    private byte[][] _misses = null!;
+    private byte[] _members = null!;
+    private byte[] _misses = null!;
+
+    [Params(10_000, 1_000_000)]
+    public int Count { get; set; }
 
     [GlobalSetup]
     public void Setup()
     {
-        _filter = new BloomFilter(N, P);
+        _filter = new BloomFilter(Count, P);
 
-        _members = new byte[N][];
-        _misses = new byte[N][];
+        _members = new byte[Count * sizeof(int)];
+        _misses = new byte[Count * sizeof(int)];
 
-        for (var i = 0; i < N; i++)
+        for (var i = 0; i < Count; i++)
         {
-            var member = new byte[sizeof(int)];
+            var member = _members.AsSpan(i * sizeof(int), sizeof(int));
             BinaryPrimitives.WriteInt32LittleEndian(member, i);
-            _members[i] = member;
             _filter.Add(member);
 
-            var miss = new byte[sizeof(int)];
-            BinaryPrimitives.WriteInt32LittleEndian(miss, N + 1 + i);
-            _misses[i] = miss;
+            var miss = _misses.AsSpan(i * sizeof(int), sizeof(int));
+            BinaryPrimitives.WriteInt32LittleEndian(miss, Count + 1 + i);
         }
     }
 
     [Benchmark]
     public void Add()
     {
-        var filter = new BloomFilter(N, P);
-        for (var i = 0; i < N; i++)
+        var filter = new BloomFilter(Count, P);
+        for (var i = 0; i < Count; i++)
         {
-            filter.Add(_members[i]);
+            filter.Add(_members.AsSpan(i * sizeof(int), sizeof(int)));
         }
     }
 
@@ -47,9 +47,9 @@ public class BloomFilterBenchmarks
     public int ProbeHit()
     {
         var count = 0;
-        for (var i = 0; i < N; i++)
+        for (var i = 0; i < Count; i++)
         {
-            if (_filter.Probe(_members[i]))
+            if (_filter.Probe(_members.AsSpan(i * sizeof(int), sizeof(int))))
             {
                 count++;
             }
@@ -62,9 +62,9 @@ public class BloomFilterBenchmarks
     public int ProbeMiss()
     {
         var count = 0;
-        for (var i = 0; i < N; i++)
+        for (var i = 0; i < Count; i++)
         {
-            if (_filter.Probe(_misses[i]))
+            if (_filter.Probe(_misses.AsSpan(i * sizeof(int), sizeof(int))))
             {
                 count++;
             }

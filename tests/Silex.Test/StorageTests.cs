@@ -1393,11 +1393,16 @@ public class StorageTests
         public IBloomFilter CreateBloomFilter(ReadOnlySpan<byte> bytes, int k) => new AlwaysPositiveBloomFilter(_inner.CreateBloomFilter(bytes, k));
 
         public IBloomFilter CreateBloomFilterFromOwnedBytes(byte[] bytes, int k) => new AlwaysPositiveBloomFilter(_inner.CreateBloomFilterFromOwnedBytes(bytes, k));
+
+        public IBloomFilter CreateBloomFilterFromOwnedBytes(byte[] bytes, int k, int algorithmVersion)
+            => new AlwaysPositiveBloomFilter(_inner.CreateBloomFilterFromOwnedBytes(bytes, k, algorithmVersion));
     }
 
     private sealed class AlwaysPositiveBloomFilter(IBloomFilter inner) : IBloomFilter
     {
         public int K => inner.K;
+
+        public int AlgorithmVersion => inner.AlgorithmVersion;
 
         public void Add(ReadOnlySpan<byte> value) => inner.Add(value);
 

@@ -18,4 +18,10 @@ public class DefaultBloomFilterFactory : IBloomFilterFactory
         var bloomFilter = new BloomFilter(bytes, k);
         return bloomFilter;
     }
+
+    public IBloomFilter CreateBloomFilterFromOwnedBytes(byte[] bytes, int k, int algorithmVersion)
+    {
+        var bloomFilter = new BloomFilter(bytes, k, algorithmVersion);
+        return bloomFilter;
+    }
 }
