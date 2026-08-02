@@ -312,11 +312,15 @@ internal sealed class Runner
             var keyGen = new KeyGenerator(_options.KeySize);
             var valueGen = new ValueGenerator(_options.Seed + threadId, _options.ValueSize, _options.CompressionRatio);
             var rng = RngStreams.Create(_options.Seed, threadId, RngStreams.Write);
+            var key = new byte[_options.KeySize];
+            var value = new byte[_options.ValueSize];
 
             return new ThreadWorker(op =>
             {
                 var keyIndex = sequential ? start + op : rng.NextInt64(totalOps);
-                db.Put(keyGen.Generate(keyIndex), valueGen.Generate(_options.ValueSize));
+                keyGen.GenerateInto(keyIndex, key);
+                valueGen.GenerateInto(value);
+                db.Put(key, value);
                 stats.Ops++;
                 stats.ByteSlice += entryBytes;
                 return new ValueTask<bool>(true);

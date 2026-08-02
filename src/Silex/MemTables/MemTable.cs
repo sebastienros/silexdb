@@ -134,23 +134,12 @@ internal sealed class MemTable : IMemTable, IRawBytesMemTable
         var dic = _dic;
         if (dic != null)
         {
-            if (dic.ContainsKey(ownedKey))
-            {
-                dic.Remove(ownedKey);
-            }
-
-            dic.Add(ownedKey, ownedValue);
+            dic[ownedKey] = ownedValue;
         }
         else
         {
             Debug.Assert(_sorted != null);
-
-            if (_sorted.ContainsKey(ownedKey))
-            {
-                _sorted.Remove(ownedKey);
-            }
-
-            _sorted.Add(ownedKey, ownedValue);
+            _sorted[ownedKey] = ownedValue;
         }
 
         _size += key.Length + value.Length + sizeof(int);

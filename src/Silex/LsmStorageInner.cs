@@ -312,7 +312,7 @@ internal sealed class LsmStorageInner : IDisposable
             return (false, null);
         }
 
-        var blockIndex = FindMatchingBlockIndex(table.BlockMetadata, key);
+        var blockIndex = FindMatchingBlockIndex(table.BlockMetadataArray, key);
         if (blockIndex >= 0)
         {
             using var blockLease = await table.ReadBlockCachedAsync(blockIndex, _blockCache, cancellationToken);
@@ -329,58 +329,62 @@ internal sealed class LsmStorageInner : IDisposable
         return (false, null);
     }
 
-    private static int FindMatchingBlockIndex(IReadOnlyList<BlockMetadata> blockMetadata, ByteSlice key)
+    private static int FindMatchingBlockIndex(BlockMetadata[] blockMetadata, ByteSlice key)
     {
         var start = 0;
-        var end = blockMetadata.Count - 1;
+        var end = blockMetadata.Length - 1;
 
         while (start <= end)
         {
             var middle = start + (end - start) / 2;
             var metadata = blockMetadata[middle];
 
-            if (_keyComparer.Compare(key, metadata.FirstKey) < 0)
-            {
-                end = middle - 1;
-            }
-            else if (_keyComparer.Compare(key, metadata.LastKey) > 0)
+            if (_keyComparer.Compare(key, metadata.LastKey) > 0)
             {
                 start = middle + 1;
             }
             else
             {
-                return metadata.Index;
+                end = middle - 1;
             }
         }
 
-        return -1;
+        if ((uint)start >= (uint)blockMetadata.Length)
+        {
+            return -1;
+        }
+
+        var candidate = blockMetadata[start];
+        return _keyComparer.Compare(key, candidate.FirstKey) >= 0 ? candidate.Index : -1;
     }
 
-    private static int FindMatchingBlockIndex(IReadOnlyList<BlockMetadata> blockMetadata, ReadOnlySpan<byte> key)
+    private static int FindMatchingBlockIndex(BlockMetadata[] blockMetadata, ReadOnlySpan<byte> key)
     {
         var start = 0;
-        var end = blockMetadata.Count - 1;
+        var end = blockMetadata.Length - 1;
 
         while (start <= end)
         {
             var middle = start + (end - start) / 2;
             var metadata = blockMetadata[middle];
 
-            if (key.SequenceCompareTo(metadata.FirstKey.Span) < 0)
-            {
-                end = middle - 1;
-            }
-            else if (key.SequenceCompareTo(metadata.LastKey.Span) > 0)
+            if (key.SequenceCompareTo(metadata.LastKey.Span) > 0)
             {
                 start = middle + 1;
             }
             else
             {
-                return metadata.Index;
+                end = middle - 1;
             }
         }
 
-        return -1;
+        if ((uint)start >= (uint)blockMetadata.Length)
+        {
+            return -1;
+        }
+
+        var candidate = blockMetadata[start];
+        return key.SequenceCompareTo(candidate.FirstKey.Span) >= 0 ? candidate.Index : -1;
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -539,16 +543,14 @@ internal sealed class LsmStorageInner : IDisposable
 
                 foreach (var table in tables)
                 {
-                    for (var i = 0; i < table.BlockMetadata.Count; i++)
+                    var blockMetadata = table.BlockMetadataArray;
+                    using var blockReader = table.CreateSequentialBlockReader();
+
+                    for (var i = 0; i < blockMetadata.Length; i++)
                     {
                         cancellationToken.ThrowIfCancellationRequested();
 
-                        using var block = table.ReadBlock(i);
-
-                        if (block == null)
-                        {
-                            continue;
-                        }
+                        using var block = blockReader.ReadNextBlock();
 
                         if (!block.ForEachRaw(state, static (s, key, value) => s.Accept(key, value), skipTombstones: true))
                         {
@@ -624,7 +626,7 @@ internal sealed class LsmStorageInner : IDisposable
                 for (var t = startTableIndex; t < tables.Count; t++)
                 {
                     var table = tables[t];
-                    var blockMetadata = table.BlockMetadata;
+                    var blockMetadata = table.BlockMetadataArray;
 
                     var blockStart = 0;
                     var seekInFirstBlock = false;
@@ -646,7 +648,7 @@ internal sealed class LsmStorageInner : IDisposable
                         }
                     }
 
-                    for (var b = blockStart; b < blockMetadata.Count; b++)
+                    for (var b = blockStart; b < blockMetadata.Length; b++)
                     {
                         cancellationToken.ThrowIfCancellationRequested();
 
@@ -755,10 +757,10 @@ internal sealed class LsmStorageInner : IDisposable
     /// less than or equal to <paramref name="from"/>, clamped to the first block. Mirrors the seek used by
     /// <see cref="SsTableIterator{ByteSlice, ByteSlice}"/>; callers must apply the stepped-back-block correction.
     /// </summary>
-    private static int FindStartBlockIndex(IReadOnlyList<BlockMetadata> blockMetadata, ReadOnlySpan<byte> from)
+    private static int FindStartBlockIndex(BlockMetadata[] blockMetadata, ReadOnlySpan<byte> from)
     {
         var start = 0;
-        var end = blockMetadata.Count - 1;
+        var end = blockMetadata.Length - 1;
 
         while (start <= end)
         {
@@ -1081,7 +1083,7 @@ internal sealed class LsmStorageInner : IDisposable
             return (RawLookup.Miss, 0);
         }
 
-        var blockIndex = FindMatchingBlockIndex(table.BlockMetadata, keyMemory.Span);
+        var blockIndex = FindMatchingBlockIndex(table.BlockMetadataArray, keyMemory.Span);
         if (blockIndex >= 0)
         {
             using var blockLease = await table.ReadBlockCachedAsync(blockIndex, _blockCache, cancellationToken);

@@ -162,6 +162,48 @@ public class TableTests
     }
 
     [Test]
+    [Arguments(SstCompression.None)]
+    [Arguments(SstCompression.Lz4)]
+    public async Task SequentialReaderReadsEveryEntryAcrossBlocks(SstCompression compression)
+    {
+        using var tempFolder = TempFolder.Create();
+        var tempFilename = tempFolder.GetRandomFileName();
+        var blockEncoder = new DefaultBlockEncoder(128);
+        var value = Enumerable.Repeat((byte)0x5A, 32).ToArray();
+
+        using var builder = new BufferedSsTableBuilder(
+            tempFilename,
+            new DefaultSsTableEncoder(),
+            blockEncoder,
+            new DefaultBloomFilterFactory(),
+            100,
+            compression);
+
+        for (uint i = 0; i < 100; i++)
+        {
+            await builder.AddAsync(i, value);
+        }
+
+        using var table = await builder.BuildAsync();
+        await Assert.That(table.BlockMetadata.Count > 1).IsTrue();
+
+        var count = new int[1];
+        using var reader = table.CreateSequentialBlockReader();
+
+        for (var i = 0; i < table.BlockMetadata.Count; i++)
+        {
+            using var block = reader.ReadNextBlock();
+            block.ForEachRaw(count, static (state, _, _) =>
+            {
+                state[0]++;
+                return true;
+            }, skipTombstones: false);
+        }
+
+        await Assert.That(count[0]).IsEqualTo(100);
+    }
+
+    [Test]
     [Arguments(SstCompression.Lz4)]
     [Arguments(SstCompression.Zstandard)]
     public async Task ShouldRejectCorruptedCompressedBlock(SstCompression compression)
@@ -196,6 +238,45 @@ public class TableTests
         await Assert.That(async () =>
         {
             using var block = await loaded.ReadBlockAsync(0);
+        }).Throws<InvalidDataException>();
+    }
+
+    [Test]
+    [Arguments(SstCompression.Lz4)]
+    [Arguments(SstCompression.Zstandard)]
+    public async Task SequentialReaderRejectsCorruptedCompressedBlock(SstCompression compression)
+    {
+        using var tempFolder = TempFolder.Create();
+        var tempFilename = tempFolder.GetRandomFileName();
+
+        using (var builder = new BufferedSsTableBuilder(
+            tempFilename,
+            new DefaultSsTableEncoder(),
+            new DefaultBlockEncoder(),
+            new DefaultBloomFilterFactory(),
+            1,
+            compression))
+        {
+            await builder.AddAsync(1u, Enumerable.Repeat((byte)0x41, 1000).ToArray());
+            using var table = await builder.BuildAsync();
+            await Assert.That(table.BlockMetadata[0].Compression).IsEqualTo(compression);
+        }
+
+        var bytes = await File.ReadAllBytesAsync(tempFilename);
+        bytes[0] ^= 0xFF;
+        await File.WriteAllBytesAsync(tempFilename, bytes);
+
+        using var blockBuilder = new BlockBuilder(new DefaultBlockEncoder());
+        using var loaded = await SsTable.LoadSsTableAsync(
+            tempFilename,
+            new DefaultSsTableEncoder(),
+            blockBuilder,
+            new DefaultBloomFilterFactory());
+        using var reader = loaded.CreateSequentialBlockReader();
+
+        await Assert.That(() =>
+        {
+            using var block = reader.ReadNextBlock();
         }).Throws<InvalidDataException>();
     }
 
@@ -489,6 +570,122 @@ public class TableTests
     }
 
     [Test]
+    public async Task CacheLoadsIndependentMissesConcurrently()
+    {
+        using var blockCache = new BlockCache(1.MiB());
+        using var started = new CountdownEvent(2);
+        using var release = new ManualResetEventSlim();
+        var state = new CoordinatedBlockLoaderState(started, release);
+
+        var first = Task.Run(async () =>
+        {
+            using var lease = await blockCache.GetOrLoadAsync(
+                new BlockCacheKey(1, 0),
+                new CoordinatedBlockLoader(state, 1));
+            return lease.Block!.Memory.ToArray();
+        });
+        var second = Task.Run(async () =>
+        {
+            using var lease = await blockCache.GetOrLoadAsync(
+                new BlockCacheKey(2, 0),
+                new CoordinatedBlockLoader(state, 2));
+            return lease.Block!.Memory.ToArray();
+        });
+
+        var loadedConcurrently = started.Wait(TimeSpan.FromSeconds(5));
+        release.Set();
+        var blocks = await Task.WhenAll(first, second);
+
+        await Assert.That(loadedConcurrently).IsTrue();
+        await Assert.That(blocks.All(static block => block.Length > 0)).IsTrue();
+    }
+
+    [Test]
+    public async Task CacheCoalescesConcurrentMissesForSameBlock()
+    {
+        using var blockCache = new BlockCache(1.MiB());
+        using var started = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        var state = new CountingBlockLoaderState(started, release);
+
+        var first = Task.Run(async () =>
+            await blockCache.GetOrLoadAsync(new BlockCacheKey(1, 0), new CountingBlockLoader(state)));
+
+        var loadStarted = started.Wait(TimeSpan.FromSeconds(5));
+        var remaining = Enumerable.Range(0, 7)
+            .Select(_ => Task.Run(async () =>
+                await blockCache.GetOrLoadAsync(new BlockCacheKey(1, 0), new CountingBlockLoader(state))))
+            .ToArray();
+
+        await Task.Delay(100);
+        release.Set();
+
+        var leases = await Task.WhenAll(remaining.Prepend(first));
+
+        try
+        {
+            var block = leases[0].Block;
+            await Assert.That(loadStarted).IsTrue();
+            await Assert.That(state.LoadCount).IsEqualTo(1);
+            await Assert.That(leases.All(lease => ReferenceEquals(lease.Block, block))).IsTrue();
+        }
+        finally
+        {
+            foreach (var lease in leases)
+            {
+                lease.Dispose();
+            }
+        }
+    }
+
+    [Test]
+    public async Task CacheRetriesWhenLoadLeaderIsCanceled()
+    {
+        using var blockCache = new BlockCache(1.MiB());
+        using var cancellation = new CancellationTokenSource();
+        using var loadStarted = new ManualResetEventSlim();
+        using var waiterStarted = new ManualResetEventSlim();
+        var successfulLoads = new int[1];
+
+        var leader = Task.Run(async () =>
+            await blockCache.GetOrLoadAsync(
+                new BlockCacheKey(1, 0),
+                new CancelingBlockLoader(loadStarted),
+                cancellation.Token));
+
+        var leaderStarted = loadStarted.Wait(TimeSpan.FromSeconds(5));
+        var waiter = Task.Run(async () =>
+        {
+            waiterStarted.Set();
+            return await blockCache.GetOrLoadAsync(
+                new BlockCacheKey(1, 0),
+                new ImmediateBlockLoader(successfulLoads));
+        });
+
+        var waiterEntered = waiterStarted.Wait(TimeSpan.FromSeconds(5));
+        await Task.Delay(50);
+        cancellation.Cancel();
+
+        var leaderCanceled = false;
+        try
+        {
+            using var lease = await leader;
+        }
+        catch (OperationCanceledException)
+        {
+            leaderCanceled = true;
+        }
+
+        using var waiterLease = await waiter;
+
+        await Assert.That(leaderStarted).IsTrue();
+        await Assert.That(waiterEntered).IsTrue();
+        await Assert.That(leaderCanceled).IsTrue();
+        await Assert.That(waiterLease.Block).IsNotNull();
+        await Assert.That(successfulLoads[0]).IsEqualTo(1);
+    }
+
+    [Test]
     public async Task ShouldEvictBlocksWhenCacheIsFull()
     {
         using var tempFolder = TempFolder.Create();
@@ -577,6 +774,75 @@ public class TableTests
         await Assert.That(falsePositives < iterations * 0.1).IsTrue();
 
         table.Dispose();
+    }
+
+    private sealed record CoordinatedBlockLoaderState(CountdownEvent Started, ManualResetEventSlim Release);
+
+    private readonly struct CoordinatedBlockLoader(
+        CoordinatedBlockLoaderState state,
+        uint value) : IBlockLoader
+    {
+        public Block Load(CancellationToken cancellationToken = default)
+        {
+            state.Started.Signal();
+            state.Release.Wait(cancellationToken);
+
+            using var builder = new BlockBuilder(new DefaultBlockEncoder());
+            builder.Add(ByteSliceTestExtensions.Slice(value), ByteSliceTestExtensions.Slice(value));
+            return builder.BuildBlock();
+        }
+    }
+
+    private sealed class CountingBlockLoaderState(ManualResetEventSlim started, ManualResetEventSlim release)
+    {
+        private int _loadCount;
+
+        public int LoadCount => Volatile.Read(ref _loadCount);
+
+        public void LoadStarted()
+        {
+            Interlocked.Increment(ref _loadCount);
+            started.Set();
+        }
+
+        public void WaitForRelease(CancellationToken cancellationToken) => release.Wait(cancellationToken);
+    }
+
+    private readonly struct CountingBlockLoader(CountingBlockLoaderState state) : IBlockLoader
+    {
+        public Block Load(CancellationToken cancellationToken = default)
+        {
+            state.LoadStarted();
+            state.WaitForRelease(cancellationToken);
+
+            using var builder = new BlockBuilder(new DefaultBlockEncoder());
+            builder.Add(ByteSliceTestExtensions.Slice(1u), ByteSliceTestExtensions.Slice(1u));
+            return builder.BuildBlock();
+        }
+    }
+
+    private readonly struct CancelingBlockLoader(ManualResetEventSlim started) : IBlockLoader
+    {
+        public Block? Load(CancellationToken cancellationToken = default)
+        {
+            started.Set();
+            cancellationToken.WaitHandle.WaitOne();
+            cancellationToken.ThrowIfCancellationRequested();
+            return null;
+        }
+    }
+
+    private readonly struct ImmediateBlockLoader(int[] loadCount) : IBlockLoader
+    {
+        public Block Load(CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Interlocked.Increment(ref loadCount[0]);
+
+            using var builder = new BlockBuilder(new DefaultBlockEncoder());
+            builder.Add(ByteSliceTestExtensions.Slice(1u), ByteSliceTestExtensions.Slice(1u));
+            return builder.BuildBlock();
+        }
     }
 
     private async Task<SsTable> CreateAndLoadSsTableAsync(IReadOnlyList<KeyValuePair<int, int>> entries, TempFolder tempFolder)

@@ -32,7 +32,7 @@ internal sealed class DefaultSsTableEncoder : ISsTableEncoder
 
         // Read each block metadata
 
-        var result = new List<BlockMetadata>(numBlocks);
+        var result = new BlockMetadata[numBlocks];
 
         for (var i = 0; i < numBlocks; i++)
         {
@@ -59,7 +59,7 @@ internal sealed class DefaultSsTableEncoder : ISsTableEncoder
             var lastKeyLen = binaryReader.Read7BitEncodedInt();
             var lastKey = OwnedByteSlice.CopyFrom(binaryReader.ReadBytesSpan(lastKeyLen));
 
-            result.Add(new BlockMetadata
+            result[i] = new BlockMetadata
             {
                 Index = i,
                 Offset = blockOffset,
@@ -68,7 +68,7 @@ internal sealed class DefaultSsTableEncoder : ISsTableEncoder
                 Checksum = checksum,
                 FirstKeyOwner = firstKey,
                 LastKeyOwner = lastKey
-            });
+            };
         }
 
         return result;

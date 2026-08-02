@@ -99,6 +99,32 @@ public class StorageTests
     }
 
     [Test]
+    [Arguments(false)]
+    [Arguments(true)]
+    public async Task PutUpdatesExistingMemTableEntry(bool sortBeforeUpdate)
+    {
+        using var tempFolder = TempFolder.Create();
+        using var storage = new LsmStorageInner(tempFolder, _defaultStorageOptions);
+        byte[] key = [1];
+        byte[] value = [10];
+
+        storage.Put(key, value);
+
+        if (sortBeforeUpdate)
+        {
+            _ = storage.CreateIterator().EnumerateAsync().ToBlockingEnumerable().SnapshotList();
+        }
+
+        key[0] = 2;
+        value[0] = 11;
+        storage.Put([1], [20]);
+
+        await Assert.That(storage._state.CurrentMemTable.Count).IsEqualTo(1);
+        await Assert.That(ToArray(await storage.GetAsync([1]))).IsEquivalentTo(new byte[] { 20 }, CollectionOrdering.Matching);
+        await Assert.That(await storage.GetAsync([2])).IsNull();
+    }
+
+    [Test]
     public async Task DeleteShouldStoreTombStone()
     {
         using var tempFolder = TempFolder.Create();
@@ -1557,6 +1583,28 @@ public class StorageTests
         {
             storage.Dispose();
         }
+    }
+
+    [Test]
+    public async Task RawScanCanStopEarlyAndScanAgain()
+    {
+        using var tempFolder = TempFolder.Create();
+        var options = new StorageOptions { UseWriteAheadLog = false, BlockSize = 64 };
+        using var storage = new LsmStorageInner(tempFolder, options);
+
+        for (byte key = 1; key <= 40; key++)
+        {
+            storage.Put([key], [(byte)(key + 100)]);
+        }
+
+        storage.ForceFreezeMemTable();
+        await storage.ForceFlushNextImmutableMemTableAsync();
+
+        var firstScanCount = await storage.ScanRawAsync(0, static (_, _, _) => false);
+        var secondScanCount = await storage.ScanRawAsync(0, static (_, _, _) => true);
+
+        await Assert.That(firstScanCount).IsEqualTo(1);
+        await Assert.That(secondScanCount).IsEqualTo(40);
     }
 
     [Test]
