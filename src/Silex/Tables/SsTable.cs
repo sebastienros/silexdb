@@ -174,47 +174,108 @@ internal sealed class SsTable : IDisposable
     public static async Task<SsTable> LoadSsTableAsync(string filename, ISsTableEncoder tableEncoder, BlockBuilder blockBuilder, IBloomFilterFactory bloomFilterFactory, long? id = null, CancellationToken cancellationToken = default)
     {
         byte[] uintBuffer = ArrayPool<byte>.Shared.Rent(sizeof(uint));
-
         var stream = File.OpenRead(filename);
+        var success = false;
 
-        // Read the bloom filter k in the previous 8 - 4 digits
-        stream.Seek(stream.Length - 8, SeekOrigin.Begin);
-        await stream.ReadExactlyAsync(uintBuffer, 0, 4, cancellationToken);
-        var bloomFilterK = (int)BinaryPrimitives.ReadUInt32LittleEndian(uintBuffer);
+        try
+        {
+            if (stream.Length < BloomFilterPersistence.LegacyFooterLength)
+            {
+                throw new InvalidDataException("The SST is too short to contain a Bloom filter footer.");
+            }
 
-        // Read the bloom filter offset in the last four bytes
-        await stream.ReadExactlyAsync(uintBuffer, 0, 4, cancellationToken);
-        var bloomFilterOffset = BinaryPrimitives.ReadUInt32LittleEndian(uintBuffer);
+            stream.Seek(-BloomFilterPersistence.LegacyFooterLength, SeekOrigin.End);
+            await stream.ReadExactlyAsync(uintBuffer.AsMemory(0, sizeof(uint)), cancellationToken);
+            var serializedK = BinaryPrimitives.ReadUInt32LittleEndian(uintBuffer);
+            await stream.ReadExactlyAsync(uintBuffer.AsMemory(0, sizeof(uint)), cancellationToken);
+            var bloomFilterOffset = BinaryPrimitives.ReadUInt32LittleEndian(uintBuffer);
 
-        // Read the bloom filter content
-        var bloomContentLength = 4;
-        var bloomKLength = 4;
-        var bloomFilterLength = stream.Length - bloomContentLength - bloomKLength - bloomFilterOffset;
+            var footerLength = BloomFilterPersistence.LegacyFooterLength;
+            var algorithmVersion = 0;
 
-        var bloomFilterBytes = new byte[(int)bloomFilterLength];
-        stream.Seek(bloomFilterOffset, SeekOrigin.Begin);
-        await stream.ReadExactlyAsync(bloomFilterBytes, 0, (int)bloomFilterLength, cancellationToken);
-        var bloomFilter = bloomFilterFactory.CreateBloomFilterFromOwnedBytes(bloomFilterBytes, bloomFilterK);
+            if (serializedK == BloomFilterPersistence.VersionedSentinel
+                && bloomFilterOffset != stream.Length - BloomFilterPersistence.LegacyFooterLength
+                && stream.Length >= BloomFilterPersistence.VersionedFooterLength)
+            {
+                stream.Seek(-3 * sizeof(uint), SeekOrigin.End);
+                await stream.ReadExactlyAsync(uintBuffer.AsMemory(0, sizeof(uint)), cancellationToken);
+                var marker = BinaryPrimitives.ReadUInt32LittleEndian(uintBuffer);
 
-        // Read the metadata block offset in the last four bytes before the bloom filter
-        stream.Seek(bloomFilterOffset - 4, SeekOrigin.Begin);
-        await stream.ReadExactlyAsync(uintBuffer, 0, 4, cancellationToken);
-        var metaBlockOffset = BinaryPrimitives.ReadUInt32LittleEndian(uintBuffer);
+                if (BloomFilterPersistence.TryDecodeMarker(marker, out algorithmVersion))
+                {
+                    stream.Seek(-BloomFilterPersistence.VersionedFooterLength, SeekOrigin.End);
+                    await stream.ReadExactlyAsync(uintBuffer.AsMemory(0, sizeof(uint)), cancellationToken);
+                    serializedK = BinaryPrimitives.ReadUInt32LittleEndian(uintBuffer);
+                    footerLength = BloomFilterPersistence.VersionedFooterLength;
+                }
+            }
 
-        // Read the metadata block content
-        var metadataLength = bloomFilterOffset - 4 - metaBlockOffset;
+            if (serializedK > int.MaxValue)
+            {
+                throw new InvalidDataException("The SST contains an invalid Bloom filter hash count.");
+            }
 
-        var buffer = ArrayPool<byte>.Shared.Rent((int)metadataLength);
-        stream.Seek(metaBlockOffset, SeekOrigin.Begin);
-        await stream.ReadExactlyAsync(buffer, 0, (int)metadataLength, cancellationToken);
-        var blockMetadata = tableEncoder.DecodeMetadata(buffer, 0);
-        ArrayPool<byte>.Shared.Return(buffer);
+            var contentEnd = stream.Length - footerLength;
+            if (bloomFilterOffset < sizeof(uint) || bloomFilterOffset > contentEnd)
+            {
+                throw new InvalidDataException("The SST contains an invalid Bloom filter offset.");
+            }
 
-        ArrayPool<byte>.Shared.Return(uintBuffer);
+            var bloomFilterLength = contentEnd - bloomFilterOffset;
+            if (bloomFilterLength is < 0 or > int.MaxValue
+                || (bloomFilterLength == 0 && (serializedK != 0 || algorithmVersion != 0)))
+            {
+                throw new InvalidDataException("The SST contains an invalid Bloom filter length.");
+            }
 
-        var table = new SsTable(id ?? IdGenerator.GetNextId(), stream, filename, blockMetadata, metaBlockOffset, blockBuilder, bloomFilter);
+            var bloomFilterBytes = new byte[(int)bloomFilterLength];
+            stream.Seek(bloomFilterOffset, SeekOrigin.Begin);
+            await stream.ReadExactlyAsync(bloomFilterBytes, cancellationToken);
 
-        return table;
+            IBloomFilter bloomFilter;
+            try
+            {
+                bloomFilter = bloomFilterFactory.CreateBloomFilterFromOwnedBytes(bloomFilterBytes, (int)serializedK, algorithmVersion);
+            }
+            catch (ArgumentException exception)
+            {
+                throw new InvalidDataException("The SST contains invalid Bloom filter metadata.", exception);
+            }
+
+            stream.Seek(bloomFilterOffset - sizeof(uint), SeekOrigin.Begin);
+            await stream.ReadExactlyAsync(uintBuffer.AsMemory(0, sizeof(uint)), cancellationToken);
+            var metaBlockOffset = BinaryPrimitives.ReadUInt32LittleEndian(uintBuffer);
+            var metadataLength = (long)bloomFilterOffset - sizeof(uint) - metaBlockOffset;
+
+            if (metadataLength is <= 0 or > int.MaxValue)
+            {
+                throw new InvalidDataException("The SST contains an invalid metadata block.");
+            }
+
+            var buffer = ArrayPool<byte>.Shared.Rent((int)metadataLength);
+            IReadOnlyList<BlockMetadata> blockMetadata;
+            try
+            {
+                stream.Seek(metaBlockOffset, SeekOrigin.Begin);
+                await stream.ReadExactlyAsync(buffer.AsMemory(0, (int)metadataLength), cancellationToken);
+                blockMetadata = tableEncoder.DecodeMetadata(buffer.AsMemory(0, (int)metadataLength), 0);
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+            }
+
+            success = true;
+            return new SsTable(id ?? IdGenerator.GetNextId(), stream, filename, blockMetadata, metaBlockOffset, blockBuilder, bloomFilter);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(uintBuffer);
+            if (!success)
+            {
+                stream.Dispose();
+            }
+        }
     }
 
     public void Dispose()

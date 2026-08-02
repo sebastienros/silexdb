@@ -200,7 +200,18 @@ internal sealed class BufferedSsTableBuilder : ISsTableBuilder
     private void WriteBloomFilter(ref EncoderBinaryWriter writer, long bloomFilterOffset)
     {
         writer.WriteRaw(_bloomFilter.GetBytes());
-        writer.WriteUInt32((uint)_bloomFilter.K);
+
+        if (_bloomFilter.AlgorithmVersion > 0)
+        {
+            writer.WriteUInt32((uint)_bloomFilter.K);
+            writer.WriteUInt32(BloomFilterPersistence.EncodeMarker(_bloomFilter.AlgorithmVersion));
+            writer.WriteUInt32(BloomFilterPersistence.VersionedSentinel);
+        }
+        else
+        {
+            writer.WriteUInt32((uint)_bloomFilter.K);
+        }
+
         writer.WriteUInt32((uint)bloomFilterOffset);
     }
 

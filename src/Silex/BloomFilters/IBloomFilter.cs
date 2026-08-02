@@ -7,4 +7,6 @@ public interface IBloomFilter
     ReadOnlySpan<byte> GetBytes();
 
     int K { get; }
+
+    int AlgorithmVersion => 0;
 }

@@ -52,10 +52,56 @@ public class TableTests
         table = await SsTable.LoadSsTableAsync(tempFilename, new DefaultSsTableEncoder(), blockBuilder, new DefaultBloomFilterFactory());
 
         await Assert.That(table.BlockMetadata).HasSingleItem();
+        await Assert.That(table.BloomFilter.AlgorithmVersion).IsEqualTo(BloomFilter.CurrentAlgorithmVersion);
         using var block = await table.ReadBlockAsync(0);
         await Assert.That(block!.Memory).IsEquivalentTo(new byte[] { 2, 0, 7, 5, 104, 101, 108, 108, 111, 0, 0, 1, 0 }, CollectionOrdering.Matching);
 
         table.Dispose();
+    }
+
+    [Test]
+    public async Task ShouldRejectInvalidBloomMetadata()
+    {
+        using var tempFolder = TempFolder.Create();
+        var tempFilename = tempFolder.GetRandomFileName();
+
+        using (var builder = new BufferedSsTableBuilder(tempFilename, new DefaultSsTableEncoder(), new DefaultBlockEncoder(), new DefaultBloomFilterFactory(), 100))
+        {
+            await builder.AddAsync(7, "hello");
+            var table = await builder.BuildAsync();
+            table.Dispose();
+        }
+
+        var bytes = await File.ReadAllBytesAsync(tempFilename);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(bytes.Length - 16), uint.MaxValue);
+        await File.WriteAllBytesAsync(tempFilename, bytes);
+
+        using var blockBuilder = new BlockBuilder(new DefaultBlockEncoder());
+        await Assert.That(async () =>
+            await SsTable.LoadSsTableAsync(tempFilename, new DefaultSsTableEncoder(), blockBuilder, new DefaultBloomFilterFactory()))
+            .Throws<InvalidDataException>();
+    }
+
+    [Test]
+    public async Task ShouldLoadDisabledBloomFilter()
+    {
+        using var tempFolder = TempFolder.Create();
+        var tempFilename = tempFolder.GetRandomFileName();
+        var bloomFilterFactory = new DisabledBloomFilterFactory();
+
+        using (var builder = new BufferedSsTableBuilder(tempFilename, new DefaultSsTableEncoder(), new DefaultBlockEncoder(), bloomFilterFactory, 100))
+        {
+            await builder.AddAsync(7, "hello");
+            var table = await builder.BuildAsync();
+            table.Dispose();
+        }
+
+        using var blockBuilder = new BlockBuilder(new DefaultBlockEncoder());
+        var loaded = await SsTable.LoadSsTableAsync(tempFilename, new DefaultSsTableEncoder(), blockBuilder, bloomFilterFactory);
+
+        await Assert.That(loaded.BloomFilter.K).IsEqualTo(0);
+        await Assert.That(loaded.BloomFilter.Probe("anything"u8)).IsTrue();
+        loaded.Dispose();
     }
 
     [Test]
@@ -366,5 +412,31 @@ public class TableTests
         table.Dispose();
 
         return await SsTable.LoadSsTableAsync(tempFilename, ssTableEncoder, blockBuilder, new DefaultBloomFilterFactory());
+    }
+
+    private sealed class DisabledBloomFilterFactory : IBloomFilterFactory
+    {
+        public IBloomFilter CreateBloomFilter(int n, double p) => DisabledBloomFilter.Instance;
+
+        public IBloomFilter CreateBloomFilter(ReadOnlySpan<byte> bytes, int k)
+            => k == 0 ? DisabledBloomFilter.Instance : new BloomFilter(bytes.ToArray(), k);
+
+        public IBloomFilter CreateBloomFilterFromOwnedBytes(byte[] bytes, int k, int algorithmVersion)
+            => k == 0 ? DisabledBloomFilter.Instance : new BloomFilter(bytes, k, algorithmVersion);
+    }
+
+    private sealed class DisabledBloomFilter : IBloomFilter
+    {
+        public static DisabledBloomFilter Instance { get; } = new();
+
+        public int K => 0;
+
+        public void Add(ReadOnlySpan<byte> value)
+        {
+        }
+
+        public bool Probe(ReadOnlySpan<byte> item) => true;
+
+        public ReadOnlySpan<byte> GetBytes() => [];
     }
 }

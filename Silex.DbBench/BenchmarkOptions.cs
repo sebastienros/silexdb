@@ -174,6 +174,16 @@ internal sealed class BenchmarkOptions
 
             return new BloomFilter(bytes.ToArray(), k);
         }
+
+        public IBloomFilter CreateBloomFilterFromOwnedBytes(byte[] bytes, int k, int algorithmVersion)
+        {
+            if (k == 0)
+            {
+                return DisabledBloomFilter.Instance;
+            }
+
+            return new BloomFilter(bytes, k, algorithmVersion);
+        }
     }
 
     private sealed class DisabledBloomFilter : IBloomFilter
