@@ -19,15 +19,15 @@ namespace Silex.Blocks;
 /// -----------------------------------------------------------------------
 /// |                           Entry #1                            | ... |
 /// -----------------------------------------------------------------------
-/// | key_len (u16) | key (keylen) | value_len (u16) | value (varlen) | ... |
+/// | key_len (7b) | key (keylen) | value_len_code (7b) | value (varlen) | ... |
 /// -----------------------------------------------------------------------
 /// 
 /// Key length and value length are 7 bits encoded since each entry position is 
 /// recorded in the offsets sections so we don't have to calculate them.
 ///  
-/// We assume that keys will never be empty, and values can be empty.
-/// An empty value means that the corresponding key has been deleted in the view 
-/// of other parts of the system.
+/// We assume that keys will never be empty. A zero value length code is a tombstone,
+/// <see cref="RecordValueEncoding.EmptyValueLengthCode"/> is a live empty value, and every other code
+/// is the value's byte length.
 /// 
 /// At the end of each block, we will store the offsets of each entry and the total number 
 /// of entries. For example, if the first entry is at 0th position of the block, 
@@ -99,13 +99,13 @@ internal sealed class DefaultBlockEncoder : IBlockEncoder
         }
 
         var key = ByteSlice.FromMemory(binaryReader.ReadBytesMemory(keyLength));
-        var valueLength = binaryReader.Read7BitEncodedInt();
+        var valueLength = RecordValueEncoding.DecodeLength(binaryReader.Read7BitEncodedInt(), out var isTombstone);
 
         return new RecordLocation
         {
             Key = key,
             BlockOffset = binaryReader.Offset,
-            Length = valueLength
+            Length = isTombstone ? -1 : valueLength,
         };
     }
 
@@ -120,7 +120,7 @@ internal sealed class DefaultBlockEncoder : IBlockEncoder
 
         for (var i = 0; i < entries.Count; i++)
         {
-            size += EstimateSize(entries[i].KeyLength, entries[i].ValueLength);
+            size += EstimateSize(entries[i].KeyLength, entries[i].StoredValueLength, entries[i].IsTombstone);
         }
 
         size += sizeof(ushort);
@@ -151,8 +151,8 @@ internal sealed class DefaultBlockEncoder : IBlockEncoder
             // The key was already encoded when it was added to the block, so write its bytes as-is.
             writer.WriteRaw(keysSpan.Slice(entry.KeyOffset, entry.KeyLength));
 
-            writer.Write7BitEncodedInt(entry.ValueLength);
-            writer.WriteRaw(valuesSpan.Slice(entry.ValueOffset, entry.ValueLength));
+            writer.Write7BitEncodedInt(RecordValueEncoding.EncodeLength(entry.StoredValueLength, entry.IsTombstone));
+            writer.WriteRaw(valuesSpan.Slice(entry.ValueOffset, entry.StoredValueLength));
         }
 
         foreach (var offset in offsets)
@@ -175,11 +175,11 @@ internal sealed class DefaultBlockEncoder : IBlockEncoder
         return new Block(this, memory, (int)buffer.Length, offsets.Count);
     }
 
-    public int EstimateSize(int encodedKeyLength, int valueLength)
+    public int EstimateSize(int encodedKeyLength, int valueLength, bool isTombstone)
     {
         return 2 // key length
             + encodedKeyLength
-            + 2 // value length
+            + RecordValueEncoding.GetEncodedLengthSize(valueLength, isTombstone)
             + valueLength
             + 2 // offset
             ;

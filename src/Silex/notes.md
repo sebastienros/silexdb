@@ -52,7 +52,7 @@ not in the individual collections.
 - Not thread-safe on its own by design — `LsmStorageInner` owns the locking and knows when a table
   is frozen vs. concurrently read/written.
 - A MemTable is **not** a read cache; values read from SSTs are never inserted back into it.
-- `Delete` is a tombstone write (`GetTombstoneValue()`), filtered out during iteration/compaction.
+- `Delete` writes the internal `ByteSlice.Tombstone` marker, filtered out during iteration/compaction.
 
 ### Immutable MemTables
 - Held in an `ImmutableQueue`. Created by freezing the current MemTable (size-triggered or forced).
@@ -99,8 +99,8 @@ not in the individual collections.
 - Reads take a short lock to clone a `StorageState` snapshot, then work lock-free off the snapshot.
 
 ### Serialization (`Serialization/`)
-- Pluggable `IBinaryEncoder<T>` with a comparer, equality comparer, length, encode/decode, and
-  tombstone support. Built-in public encoders include `int`, `long`, `uint`, `ulong`, `ushort`, UTF-8
+- Pluggable `IBinaryEncoder<T>` with a comparer, equality comparer, length, and encode/decode operations.
+  Built-in public encoders include `int`, `long`, `uint`, `ulong`, `ushort`, UTF-8
   string, and `byte[]`.
 - The byte-oriented public store uses an internal comparable byte wrapper for arena-backed memtable
   slices and decoded SST values.
@@ -166,8 +166,8 @@ not in the individual collections.
 - **Write-ahead log (WAL).** Each writable MemTable owns a `WriteAheadLog<TKey,TValue>` (file
   `{id}.wal` next to the SSTs). `MemTable.Put` journals the record **before** applying it in memory,
   so an acknowledged write is always recoverable. Enabled by default (`UseWriteAheadLog`).
-- **Record format:** `[7-bit key length][key][7-bit value length][value]`, encoded once into a reused
-  pooled buffer via `EncoderBinaryWriter`. Tombstones are the usual zero-length value, so deletes are
+- **Record format:** `[7-bit key length][key][7-bit value length code][value]`, encoded once into a reused
+  pooled buffer via `EncoderBinaryWriter`. Tombstones use a distinct length code, so live empty values are
   journaled too. Each append is flushed to the OS; `SyncWriteAheadLogToDisk` additionally `fsync`s
   per append (survives power loss, slower). Appends are serialized by the current-memtable write lock.
 - **WAL lifecycle / cleanup:** the file is deleted only once its data is durable elsewhere —
@@ -246,7 +246,7 @@ not in the individual collections.
   Flush was made atomic from a scanner's viewpoint: the immutable MemTable is *peeked* (not dequeued)
   before its SST is built, then removed from the queue and published into L0 under the **same** level0
   write lock — closing a pre-existing window where a mid-flush MemTable was visible in neither place.
-  Tombstones are filtered out of scan results via `IsTombstoneValue`.
+  Tombstones are filtered out of scan results via the internal `ByteSlice.IsTombstone` marker.
 
 ### Serialization / value-copy semantics
 - Public byte writes have borrowed-input semantics:
@@ -298,14 +298,11 @@ not in the individual collections.
     loop; merges a newest suffix of L0, drops tombstones only on full compactions, atomic temp+rename
     output, oldest-first stop-on-failure input deletion, serialized by a maintenance lock (see
     *Background flush & compaction*).
-  - `GetAsync` now recognises **sentinel-based tombstones** in SSTs (e.g. `int`/`long`, whose
-    deletion is a fixed non-empty value): previously it returned the raw sentinel instead of the
-    default for a deleted key read from an SST.
+  - `GetAsync` recognises the SST record's explicit tombstone state instead of reserving an encoded value.
   - `GetAsync` no longer lets a **bloom-filter false positive** in a newer SST mask an older SST: a key
     that is genuinely absent from the covering block falls through to older tables (via a presence-aware
     `Block.TryGetValue`) instead of returning a premature default.
-  - `ByteSliceEncoder.IsTombstoneValue` no longer throws on a non-empty value (it compared against
-    `ByteSlice.Empty`, whose `Span` dereferenced a null backing buffer); it is now an empty check.
+  - Tombstone state is independent of value encoders, so every encoded value remains available to callers.
 
 ---
 

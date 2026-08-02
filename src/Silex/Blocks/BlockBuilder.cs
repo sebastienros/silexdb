@@ -47,7 +47,8 @@ internal sealed class BlockBuilder : IDisposable
     {
         var keyLength = _keySerializer.GetLength(key);
         var valueLength = value.Length;
-        var size = _blockEncoder.EstimateSize(keyLength, valueLength);
+        var isTombstone = value.IsTombstone;
+        var size = _blockEncoder.EstimateSize(keyLength, valueLength, isTombstone);
 
         // If the block already has other entries and the next value doesn't fit, refuse it.
         // The size is checked before encoding so the key buffer never needs to be rolled back.
@@ -70,7 +71,7 @@ internal sealed class BlockBuilder : IDisposable
         value.Span.CopyTo(_valueBuffer.GetSpan(valueLength));
         _valueBuffer.Advance(valueLength);
 
-        _blockEntries.Add(new BlockEntry(keyOffset, actualKeyLength, valueOffset, valueLength));
+        _blockEntries.Add(new BlockEntry(keyOffset, actualKeyLength, valueOffset, isTombstone ? -1 : valueLength));
         _estimatedSize += size;
         _lastKeyOffset = keyOffset;
         _lastKeyLength = actualKeyLength;

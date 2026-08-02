@@ -135,7 +135,7 @@ internal sealed class LsmStorageInner : IDisposable
             // since all other collections are immutable
             if (currentMemTable.TryGet(key, out var result))
             {
-                return result.IsEmpty ? null : OwnedByteSlice.CopyFrom(result.Span);
+                return result.IsTombstone ? null : OwnedByteSlice.CopyFrom(result.Span);
             }
         }
         finally 
@@ -158,7 +158,7 @@ internal sealed class LsmStorageInner : IDisposable
                 {
                     if (memTable.TryGet(key, out var result))
                     {
-                        return result.IsEmpty ? null : OwnedByteSlice.CopyFrom(result.Span);
+                        return result.IsTombstone ? null : OwnedByteSlice.CopyFrom(result.Span);
                     }
                 }
             }
@@ -269,11 +269,9 @@ internal sealed class LsmStorageInner : IDisposable
     /// </summary>
     private static bool TryResolveBlockValue(Block block, ReadOnlySpan<byte> encodedKey, out OwnedByteSlice? resolved)
     {
-        if (block.TryGetValue(encodedKey, out var value))
+        if (block.TryGetValue(encodedKey, out var value, out var isTombstone))
         {
-            // An empty stored value is a deletion for empty-tombstone encoders (byte[]/ByteSlice); sentinel-based
-            // encoders (e.g. int) store a fixed non-empty value, so decode and ask the serializer.
-            if (value.IsEmpty)
+            if (isTombstone)
             {
                 resolved = null;
                 return true;
@@ -465,8 +463,8 @@ internal sealed class LsmStorageInner : IDisposable
     /// </summary>
     /// <remarks>
     /// The allocation-free SST fast path is used only when the on-disk tables form a single globally
-    /// non-overlapping sorted run and the value encoder uses empty-value tombstones. Other layouts fall
-    /// back to the regular iterator to preserve duplicate-key and tombstone semantics.
+    /// non-overlapping sorted run. Other layouts fall back to the regular iterator to preserve duplicate-key
+    /// and tombstone semantics.
     /// </remarks>
     public async ValueTask<long> ScanRawAsync<TArg>(TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries = long.MaxValue, CancellationToken cancellationToken = default)
     {
@@ -476,11 +474,6 @@ internal sealed class LsmStorageInner : IDisposable
         if (maxEntries == 0)
         {
             return 0;
-        }
-
-        if (!_valueSerializer.UsesEmptyTombstone)
-        {
-            return await ScanRawFallbackAsync(arg, reader, maxEntries, cancellationToken);
         }
 
         await _level0Lock.EnterReadLockAsync(cancellationToken);
@@ -504,7 +497,7 @@ internal sealed class LsmStorageInner : IDisposable
                             continue;
                         }
 
-                        if (!block.ForEachRaw(state, static (s, key, value) => s.Accept(key, value), skipEmptyValues: true))
+                        if (!block.ForEachRaw(state, static (s, key, value) => s.Accept(key, value), skipTombstones: true))
                         {
                             return state.Count;
                         }
@@ -559,11 +552,6 @@ internal sealed class LsmStorageInner : IDisposable
         if (maxEntries == 0)
         {
             return 0;
-        }
-
-        if (!_valueSerializer.UsesEmptyTombstone)
-        {
-            return await SeekRawFallbackAsync(from, arg, reader, maxEntries, cancellationToken);
         }
 
         var keyLength = _keySerializer.GetLength(from);
@@ -624,11 +612,11 @@ internal sealed class LsmStorageInner : IDisposable
                             bool keepGoing;
                             if (seekInFirstBlock && b == blockStart)
                             {
-                                keepGoing = block.ForEachRawFrom(keyMemory.Span, state, static (s, key, value) => s.Accept(key, value), skipEmptyValues: true);
+                                keepGoing = block.ForEachRawFrom(keyMemory.Span, state, static (s, key, value) => s.Accept(key, value), skipTombstones: true);
                             }
                             else
                             {
-                                keepGoing = block.ForEachRaw(state, static (s, key, value) => s.Accept(key, value), skipEmptyValues: true);
+                                keepGoing = block.ForEachRaw(state, static (s, key, value) => s.Accept(key, value), skipTombstones: true);
                             }
 
                             if (!keepGoing)
@@ -969,20 +957,13 @@ internal sealed class LsmStorageInner : IDisposable
         }
 
         // A present key shadows every older source, whether live or a tombstone.
-        if (_valueSerializer.IsTombstoneValue(value))
+        if (value.IsTombstone)
         {
             return RawLookup.Tombstone;
         }
 
         if (_valueSerializer.TryGetRawBytes(value, out var bytes))
         {
-            // For empty-tombstone encoders an empty byte form is a deletion, applied uniformly with the
-            // SST path so a key never flips between "found empty" and "not found" across a flush.
-            if (_valueSerializer.UsesEmptyTombstone && bytes.IsEmpty)
-            {
-                return RawLookup.Tombstone;
-            }
-
             sink.Accept(bytes);
             length = bytes.Length;
             return RawLookup.Live;
@@ -997,11 +978,6 @@ internal sealed class LsmStorageInner : IDisposable
             _valueSerializer.Encode(value, ref writer);
             writer.Flush();
             var encoded = bufferWriter.WrittenMemory.Span;
-
-            if (_valueSerializer.UsesEmptyTombstone && encoded.IsEmpty)
-            {
-                return RawLookup.Tombstone;
-            }
 
             sink.Accept(encoded);
             length = encoded.Length;
@@ -1059,22 +1035,12 @@ internal sealed class LsmStorageInner : IDisposable
     {
         length = 0;
 
-        if (!block.TryGetValue(encodedKey, out var value))
+        if (!block.TryGetValue(encodedKey, out var value, out var isTombstone))
         {
             return RawLookup.Miss;
         }
 
-        // Apply the same tombstone rules as the memtable raw path so a key never changes meaning across a
-        // flush. Empty-tombstone encoders (byte[]/ByteSlice) treat any empty stored value as a deletion and stay
-        // zero-copy; sentinel encoders store a fixed non-empty tombstone, so decode to recognise it.
-        if (_valueSerializer.UsesEmptyTombstone)
-        {
-            if (value.IsEmpty)
-            {
-                return RawLookup.Tombstone;
-            }
-        }
-        else if (_valueSerializer.IsTombstoneValue(_valueSerializer.Decode(value)))
+        if (isTombstone)
         {
             return RawLookup.Tombstone;
         }
@@ -1137,7 +1103,7 @@ internal sealed class LsmStorageInner : IDisposable
 
         try
         {
-            _state.CurrentMemTable.Put(key, _valueSerializer.GetTombstoneValue());
+            _state.CurrentMemTable.Put(key, ByteSlice.Tombstone);
 
             if (_state.CurrentMemTable.Size >= _memTableSizeLimit)
             {
@@ -1152,7 +1118,21 @@ internal sealed class LsmStorageInner : IDisposable
 
     public void DeleteRaw(ReadOnlySpan<byte> key)
     {
-        PutRaw(key, ReadOnlySpan<byte>.Empty);
+        _currentMemTableLock.EnterWriteLock();
+
+        try
+        {
+            ((IRawBytesMemTable)_state.CurrentMemTable).DeleteRaw(key);
+
+            if (_state.CurrentMemTable.Size >= _memTableSizeLimit)
+            {
+                FreezeMemTable();
+            }
+        }
+        finally
+        {
+            _currentMemTableLock.ExitWriteLock();
+        }
     }
 
     /// <summary>
@@ -1423,7 +1403,7 @@ internal sealed class LsmStorageInner : IDisposable
 
                 await foreach (var entry in merge.EnumerateAsync(cancellationToken))
                 {
-                    if (dropTombstones && _valueSerializer.IsTombstoneValue(entry.Value))
+                    if (dropTombstones && entry.Value.IsTombstone)
                     {
                         continue;
                     }
@@ -1962,7 +1942,7 @@ internal sealed class LsmStorageInner : IDisposable
                     break;
                 }
 
-                if (dropTombstones && _valueSerializer.IsTombstoneValue(entry.Value))
+                if (dropTombstones && entry.Value.IsTombstone)
                 {
                     continue;
                 }
@@ -2387,7 +2367,7 @@ internal sealed class LsmStorageInner : IDisposable
 
                 await foreach (var entry in enumerable)
                 {
-                    if (!_valueSerializer.IsTombstoneValue(entry.Value))
+                    if (!entry.Value.IsTombstone)
                     {
                         yield return entry;
                     }
@@ -2452,7 +2432,7 @@ internal sealed class LsmStorageInner : IDisposable
 
                 await foreach (var entry in enumerable)
                 {
-                    if (!_valueSerializer.IsTombstoneValue(entry.Value))
+                    if (!entry.Value.IsTombstone)
                     {
                         yield return entry;
                     }

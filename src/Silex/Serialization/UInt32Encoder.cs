@@ -15,10 +15,6 @@ public sealed class UInt32Encoder : IBinaryEncoder<uint>
 
     public int GetLength(uint value) => sizeof(uint);
 
-    public uint GetTombstoneValue() => uint.MaxValue;
-
-    public bool IsTombstoneValue(uint value) => value == uint.MaxValue;
-
     public int Encode(uint value, ref EncoderBinaryWriter writer)
     {
         var length = sizeof(uint);

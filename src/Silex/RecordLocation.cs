@@ -13,7 +13,10 @@ internal readonly struct RecordLocation : IComparable<RecordLocation>
 
     public ByteSlice Key { get; init; }
     public int BlockOffset { get; init; }
+    /// <summary>The value length in bytes, or <c>-1</c> for a tombstone.</summary>
     public int Length { get; init; }
+    public bool IsTombstone => Length < 0;
+    public int StoredValueLength => IsTombstone ? 0 : Length;
     public int CompareTo(RecordLocation other)
     {
         return _keyComparer.Compare(Key, other.Key);

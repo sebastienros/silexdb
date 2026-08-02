@@ -28,7 +28,8 @@ internal sealed class BlockIterator : IStorageIterator
 
         foreach (var entry in _entries)
         {
-            yield return new KeyValuePair<ByteSlice, ByteSlice>(entry.Key, ByteSlice.FromMemory(_block.GetValueMemory(entry)));
+            var value = entry.IsTombstone ? ByteSlice.Tombstone : ByteSlice.FromMemory(_block.GetValueMemory(entry));
+            yield return new KeyValuePair<ByteSlice, ByteSlice>(entry.Key, value);
         }
     }
 
@@ -50,7 +51,8 @@ internal sealed class BlockIterator : IStorageIterator
         for (var i = startIndex; i < _entries.Length; i++)
         {
             var entry = _entries[i];
-            yield return new KeyValuePair<ByteSlice, ByteSlice>(_entries[i].Key, ByteSlice.FromMemory(_block.GetValueMemory(entry)));
+            var value = entry.IsTombstone ? ByteSlice.Tombstone : ByteSlice.FromMemory(_block.GetValueMemory(entry));
+            yield return new KeyValuePair<ByteSlice, ByteSlice>(entry.Key, value);
         }
     }
 }

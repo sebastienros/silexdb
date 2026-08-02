@@ -15,10 +15,6 @@ public sealed class UInt64Encoder : IBinaryEncoder<ulong>
 
     public int GetLength(ulong value) => sizeof(ulong);
 
-    public ulong GetTombstoneValue() => ulong.MaxValue;
-
-    public bool IsTombstoneValue(ulong value) => value == ulong.MaxValue;
-
     public int Encode(ulong value, ref EncoderBinaryWriter writer)
     {
         var length = sizeof(ulong);

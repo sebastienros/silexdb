@@ -10,8 +10,9 @@ namespace Silex.Wal;
 /// recovered after a process crash.
 /// </summary>
 /// <remarks>
-/// Each record is <c>[7-bit key length][key bytes][7-bit value length][value bytes]</c>. The same
-/// zero-length value is used for tombstones (consistent with the rest of the engine). The log is
+/// Each record is <c>[7-bit key length][key bytes][7-bit value length code][value bytes]</c>. A zero
+/// length code is a tombstone, <see cref="RecordValueEncoding.EmptyValueLengthCode"/> is a live empty value,
+/// and every other code is the value's byte length. The log is
 /// written to the operating system after every append, which is sufficient to survive a process
 /// crash; enabling <c>syncToDisk</c> additionally <c>fsync</c>s on every append to survive power loss.
 ///
@@ -53,7 +54,7 @@ internal sealed class WriteAheadLog : IDisposable
         var writer = new EncoderBinaryWriter(_buffer);
         writer.Write7BitEncodedInt(keyLength);
         _keySerializer.Encode(key, ref writer);
-        writer.Write7BitEncodedInt(valueLength);
+        writer.Write7BitEncodedInt(RecordValueEncoding.EncodeLength(valueLength, value.IsTombstone));
         _valueSerializer.Encode(value, ref writer);
         writer.Flush();
 
@@ -78,8 +79,27 @@ internal sealed class WriteAheadLog : IDisposable
         var writer = new EncoderBinaryWriter(_buffer);
         writer.Write7BitEncodedInt(key.Length);
         writer.WriteRaw(key);
-        writer.Write7BitEncodedInt(value.Length);
+        writer.Write7BitEncodedInt(RecordValueEncoding.EncodeLength(value.Length, isTombstone: false));
         writer.WriteRaw(value);
+        writer.Flush();
+
+        _stream.Write(_buffer.WrittenMemory.Span);
+        if (_syncToDisk)
+        {
+            _stream.Flush(flushToDisk: true);
+        }
+    }
+
+    public void AppendDeleteRaw(ReadOnlySpan<byte> key)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        _buffer.Clear();
+
+        var writer = new EncoderBinaryWriter(_buffer);
+        writer.Write7BitEncodedInt(key.Length);
+        writer.WriteRaw(key);
+        writer.Write7BitEncodedInt(RecordValueEncoding.EncodeLength(0, isTombstone: true));
         writer.Flush();
 
         _stream.Write(_buffer.WrittenMemory.Span);
@@ -124,17 +144,24 @@ internal sealed class WriteAheadLog : IDisposable
                 var keyLength = reader.Read7BitEncodedInt();
                 var keyBytes = reader.ReadBytesSpan(keyLength);
 
-                var valueLength = reader.Read7BitEncodedInt();
+                var valueLength = RecordValueEncoding.DecodeLength(reader.Read7BitEncodedInt(), out var isTombstone);
                 var valueBytes = reader.ReadBytesSpan(valueLength);
 
                 if (target is IRawBytesMemTable rawMemTable && typeof(ByteSlice) == typeof(ByteSlice) && typeof(ByteSlice) == typeof(ByteSlice))
                 {
-                    rawMemTable.PutRaw(keyBytes, valueBytes);
+                    if (isTombstone)
+                    {
+                        rawMemTable.DeleteRaw(keyBytes);
+                    }
+                    else
+                    {
+                        rawMemTable.PutRaw(keyBytes, valueBytes);
+                    }
                 }
                 else
                 {
                     var key = _keySerializer.Decode(keyBytes);
-                    var value = _valueSerializer.Decode(valueBytes);
+                    var value = isTombstone ? ByteSlice.Tombstone : _valueSerializer.Decode(valueBytes);
                     target.Put(key, value);
                 }
             }

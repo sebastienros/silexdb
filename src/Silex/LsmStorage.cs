@@ -45,7 +45,7 @@ public sealed class LsmStorage : IDisposable, IAsyncDisposable
             CheckDisposed();
             using var encodedKey = Encode(_keyEncoder, key);
             using var value = await _inner.GetAsync(encodedKey.Slice, cancellationToken);
-            return value is null || value.IsEmpty ? default! : _valueEncoder.Decode(value.Span);
+            return value is null ? default! : _valueEncoder.Decode(value.Span);
         }
 
         public async ValueTask<bool> TryGetRawAsync(TKey key, IBufferWriter<byte> destination, CancellationToken cancellationToken = default)

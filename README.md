@@ -86,8 +86,8 @@ db.Put(key, value);
 ```
 
 `Put(ReadOnlySpan<byte>, ReadOnlySpan<byte>)` is the core path: Silex copies borrowed bytes immediately
-into the active memtable's append-only arena. A zero-length value is currently reserved as the delete
-marker.
+into the active memtable's append-only arena. Empty values are stored as live values; deletion uses a
+distinct internal tombstone marker.
 
 Copy-from extension overloads can materialize values from richer sources before copying them to the store:
 
@@ -133,6 +133,7 @@ Copy into a caller-owned buffer and get the value length back:
 byte[] buffer = new byte[256];
 int length = await db.GetRawAsync(key, buffer);
 // length == -1            -> key missing or deleted
+// length ==  0            -> key exists with an empty value
 // length >  buffer.Length -> buffer too small, nothing was written; resize to `length` and retry
 // otherwise               -> value is buffer.AsSpan(0, length)
 ```

@@ -93,19 +93,43 @@ internal sealed class MemTable : IMemTable, IRawBytesMemTable
     /// <inheritdocs />
     public void Put(ByteSlice key, ByteSlice value)
     {
-        PutRaw(key.Span, value.Span);
+        if (value.IsTombstone)
+        {
+            DeleteRaw(key.Span);
+        }
+        else
+        {
+            PutRaw(key.Span, value.Span);
+        }
     }
 
     public void PutRaw(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
+    {
+        PutRawCore(key, value, isTombstone: false);
+    }
+
+    public void DeleteRaw(ReadOnlySpan<byte> key)
+    {
+        PutRawCore(key, default, isTombstone: true);
+    }
+
+    private void PutRawCore(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool isTombstone)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
         var arena = _arena ?? throw new ObjectDisposedException(nameof(MemTable));
 
-        _wal?.AppendRaw(key, value);
+        if (isTombstone)
+        {
+            _wal?.AppendDeleteRaw(key);
+        }
+        else
+        {
+            _wal?.AppendRaw(key, value);
+        }
 
         var ownedKey = arena.Copy(key);
-        var ownedValue = arena.Copy(value);
+        var ownedValue = isTombstone ? ByteSlice.Tombstone : arena.Copy(value);
 
         var dic = _dic;
         if (dic != null)
