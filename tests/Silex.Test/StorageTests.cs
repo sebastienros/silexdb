@@ -519,13 +519,13 @@ public class StorageTests
         // flush the oldest mem table to disk
 
         using var tempFolder = TempFolder.Create();
-        var options = new StorageOptions { MemTableMaxCount = 2 };
+        var options = new StorageOptions { MemTableMaxCount = 2, FlushPeriod = TimeSpan.Zero };
         var storage = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
 
         storage.Put(1, 1);
         storage._inner.ForceFreezeMemTable();
 
-        await Task.Delay(100);
+        await storage._compacter.RunMaintenanceAsync();
         await Assert.That(Directory.EnumerateFiles(tempFolder, "*.sst")).IsEmpty();
         await Assert.That(storage._inner._state.ImmutableMemTables).HasSingleItem();
         await Assert.That(storage._inner._state.ImmutableMemTables.Peek().TryGet(1, out _)).IsTrue();
@@ -534,7 +534,7 @@ public class StorageTests
         storage.Put(2, 2);
         storage._inner.ForceFreezeMemTable();
 
-        await Task.Delay(100);
+        await storage._compacter.RunMaintenanceAsync();
         await Assert.That(Directory.EnumerateFiles(tempFolder, "*.sst")).HasSingleItem();
         await Assert.That(storage._inner._state.ImmutableMemTables).HasSingleItem();
         await Assert.That(storage._inner._state.ImmutableMemTables.Peek().TryGet(1, out _)).IsFalse();
