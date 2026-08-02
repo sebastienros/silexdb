@@ -128,12 +128,23 @@ internal sealed class WriteAheadLog : IDisposable
     /// </summary>
     public static void Replay(string path, IMemTable target)
     {
-        var bytes = File.ReadAllBytes(path);
+        // Windows sharing is symmetric: the reader must grant write sharing to an open WAL writer.
+        using var stream = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete,
+            bufferSize: 1,
+            FileOptions.SequentialScan);
 
-        if (bytes.Length == 0)
+        var length = checked((int)stream.Length);
+        if (length == 0)
         {
             return;
         }
+
+        var bytes = GC.AllocateUninitializedArray<byte>(length);
+        stream.ReadExactly(bytes);
 
         var reader = new EncoderBinaryReader(bytes, 0);
 

@@ -852,12 +852,7 @@ public class StorageTests
         // Disable background flushing so the data stays only in the memtable + WAL (never an SST).
         var options = new StorageOptions { FlushPeriod = TimeSpan.Zero };
 
-        await SimulateCrashAfterPutsAsync(tempFolder, options);
-
-        // Finalize the abandoned instance so its WAL handle is released (the file and its data remain).
-        GC.Collect();
-        GC.WaitForPendingFinalizers();
-        GC.Collect();
+        await CrashRecoveryTestProcess.WriteAndExitWithoutDisposalAsync(tempFolder, entryCount: 10);
 
         // Nothing was ever flushed, yet the WAL is on disk holding the unflushed writes.
         await Assert.That(Directory.EnumerateFiles(tempFolder, "*.sst")).IsEmpty();
@@ -871,17 +866,6 @@ public class StorageTests
         }
 
         await reopened.CloseAsync();
-        static async Task SimulateCrashAfterPutsAsync(string folder, StorageOptions options)
-        {
-            var storage = await LsmStorage.OpenAsync<int, int>(folder, options);
-
-            for (var i = 0; i < 10; i++)
-            {
-                storage.Put(i, i + 1);
-            }
-
-            // Abandon without closing to simulate a crash: the WAL is left on disk.
-        }
     }
 
     [Test]
@@ -911,6 +895,33 @@ public class StorageTests
     }
 
     [Test]
+    public async Task WriteAheadLogReplayCanReadAnOpenWriter()
+    {
+        using var tempFolder = TempFolder.Create();
+        var walPath = Path.Combine(tempFolder, "open-writer.wal");
+
+        using var wal = new WriteAheadLog(walPath, syncToDisk: false);
+        wal.AppendRaw([1], [2]);
+        wal.Flush();
+
+        using var memTable = new MemTable(1);
+        WriteAheadLog.Replay(walPath, memTable);
+
+        using var key = OwnedByteSlice.CopyFrom([1]);
+        await Assert.That(memTable.TryGet(key.Slice, out var value)).IsTrue();
+        await Assert.That(value!.Length).IsEqualTo(1);
+        await Assert.That(value.Span[0]).IsEqualTo((byte)2);
+
+        if (OperatingSystem.IsWindows())
+        {
+            await Assert.That(() =>
+            {
+                using var concurrentWriter = new WriteAheadLog(walPath, syncToDisk: false);
+            }).Throws<IOException>();
+        }
+    }
+
+    [Test]
     public async Task WriteAheadLogRecoveryRequiresTheWalFile()
     {
         // Sanity check that the recovery above is genuinely driven by the WAL: with the WAL removed
@@ -918,11 +929,7 @@ public class StorageTests
         using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { FlushPeriod = TimeSpan.Zero };
 
-        await SimulateCrashAfterPutsAsync(tempFolder, options);
-
-        GC.Collect();
-        GC.WaitForPendingFinalizers();
-        GC.Collect();
+        await CrashRecoveryTestProcess.WriteAndExitWithoutDisposalAsync(tempFolder, entryCount: 1);
 
         foreach (var wal in Directory.EnumerateFiles(tempFolder, "*.wal"))
         {
@@ -933,11 +940,6 @@ public class StorageTests
         await Assert.That(DecodeInt32(await reopened.GetAsync(0))).IsEqualTo(0);
 
         await reopened.CloseAsync();
-        static async Task SimulateCrashAfterPutsAsync(string folder, StorageOptions options)
-        {
-            var storage = await LsmStorage.OpenAsync<int, int>(folder, options);
-            storage.Put(0, 1);
-        }
     }
 
     [Test]
@@ -946,31 +948,20 @@ public class StorageTests
         using var tempFolder = TempFolder.Create();
         var options = new StorageOptions { FlushPeriod = TimeSpan.Zero };
 
-        await SimulateCrashAfterPutsAsync(tempFolder, options);
-
-        GC.Collect();
-        GC.WaitForPendingFinalizers();
-        GC.Collect();
+        await CrashRecoveryTestProcess.WriteAndExitWithoutDisposalAsync(tempFolder, entryCount: 10);
 
         // Truncate the final byte to simulate a crash in the middle of the last append.
         var walFile = Directory.EnumerateFiles(tempFolder, "*.wal").Single();
-        var bytes = await File.ReadAllBytesAsync(walFile);
-        await File.WriteAllBytesAsync(walFile, bytes[..^1]);
+        using (var stream = new FileStream(walFile, FileMode.Open, FileAccess.Write, FileShare.None))
+        {
+            stream.SetLength(stream.Length - 1);
+        }
 
         // Recovery must not throw and the earlier, intact records must still be recovered.
         var reopened = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
         await Assert.That(DecodeInt32(await reopened.GetAsync(0))).IsEqualTo(1);
 
         await reopened.CloseAsync();
-        static async Task SimulateCrashAfterPutsAsync(string folder, StorageOptions options)
-        {
-            var storage = await LsmStorage.OpenAsync<int, int>(folder, options);
-
-            for (var i = 0; i < 10; i++)
-            {
-                storage.Put(i, i + 1);
-            }
-        }
     }
 
     [Test]
