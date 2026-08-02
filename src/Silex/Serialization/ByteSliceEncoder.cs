@@ -11,8 +11,6 @@ internal sealed class ByteSliceEncoder : IBinaryEncoder<ByteSlice>
         throw new NotSupportedException($"{nameof(ByteSlice)} is a non-owning view. Decode from a memory-backed owner explicitly instead.");
     }
 
-    public bool UsesEmptyTombstone => true;
-
     public bool TryGetRawBytes(ByteSlice value, out ReadOnlySpan<byte> bytes)
     {
         bytes = value.Span;
@@ -20,10 +18,6 @@ internal sealed class ByteSliceEncoder : IBinaryEncoder<ByteSlice>
     }
 
     public int GetLength(ByteSlice value) => value.Length;
-
-    public ByteSlice GetTombstoneValue() => ByteSlice.Empty;
-
-    public bool IsTombstoneValue(ByteSlice value) => value.IsEmpty;
 
     public int Encode(ByteSlice value, ref EncoderBinaryWriter writer)
     {

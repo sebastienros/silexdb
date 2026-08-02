@@ -48,9 +48,14 @@ internal sealed class Block : IDisposable
 
     /// <summary>
     /// Looks up <paramref name="key"/> and reports whether it is present, distinguishing a genuine miss
-    /// from a key stored with an empty value (a tombstone for empty-tombstone encoders).
+    /// from a key stored with an empty value.
     /// </summary>
     public bool TryGetValue(ByteSlice key, out ReadOnlySpan<byte> value)
+    {
+        return TryGetValue(key, out value, out _);
+    }
+
+    public bool TryGetValue(ByteSlice key, out ReadOnlySpan<byte> value, out bool isTombstone)
     {
         var start = 0;
         var end = Offsets.Count - 1;
@@ -65,6 +70,7 @@ internal sealed class Block : IDisposable
             {
                 case 0:
                     value = GetValue(entry);
+                    isTombstone = entry.IsTombstone;
                     return true;
                 case > 0:
                     start = m + 1;
@@ -76,6 +82,7 @@ internal sealed class Block : IDisposable
         }
 
         value = default;
+        isTombstone = false;
         return false;
     }
 
@@ -84,9 +91,14 @@ internal sealed class Block : IDisposable
     /// without materializing a <typeparamref name="ByteSlice"/> per visited entry. This is the zero-allocation
     /// hot path for point lookups; it is correct because key encoders are order-preserving, so a bytewise
     /// comparison of encoded keys matches the typed key comparison. As with the typed overload, a returned
-    /// empty span is a key stored with an empty value (a tombstone for empty-tombstone encoders).
+    /// empty span may be a live empty value; use the three-argument overload when tombstone state matters.
     /// </summary>
     public bool TryGetValue(ReadOnlySpan<byte> encodedKey, out ReadOnlySpan<byte> value)
+    {
+        return TryGetValue(encodedKey, out value, out _);
+    }
+
+    public bool TryGetValue(ReadOnlySpan<byte> encodedKey, out ReadOnlySpan<byte> value, out bool isTombstone)
     {
         var memory = Memory;
 
@@ -105,7 +117,7 @@ internal sealed class Block : IDisposable
 
             if (cmp == 0)
             {
-                var valueLength = reader.Read7BitEncodedInt();
+                var valueLength = RecordValueEncoding.DecodeLength(reader.Read7BitEncodedInt(), out isTombstone);
                 value = reader.ReadBytesSpan(valueLength);
                 return true;
             }
@@ -121,6 +133,7 @@ internal sealed class Block : IDisposable
         }
 
         value = default;
+        isTombstone = false;
         return false;
     }
 
@@ -132,7 +145,7 @@ internal sealed class Block : IDisposable
     /// When no entry in the block reaches <paramref name="encodedFrom"/> the callback is never invoked and the
     /// method returns <c>true</c> so the caller can continue into the next block.
     /// </summary>
-    internal bool ForEachRawFrom<TArg>(ReadOnlySpan<byte> encodedFrom, TArg arg, ReadRawEntryAction<TArg> reader, bool skipEmptyValues)
+    internal bool ForEachRawFrom<TArg>(ReadOnlySpan<byte> encodedFrom, TArg arg, ReadRawEntryAction<TArg> reader, bool skipTombstones)
     {
         var memory = Memory;
         var start = LowerBound(memory, encodedFrom);
@@ -142,10 +155,10 @@ internal sealed class Block : IDisposable
             var blockReader = new EncoderBinaryReader(memory, Offsets[i]);
             var keyLength = blockReader.Read7BitEncodedInt();
             var key = blockReader.ReadBytesSpan(keyLength);
-            var valueLength = blockReader.Read7BitEncodedInt();
+            var valueLength = RecordValueEncoding.DecodeLength(blockReader.Read7BitEncodedInt(), out var isTombstone);
             var value = blockReader.ReadBytesSpan(valueLength);
 
-            if (skipEmptyValues && value.IsEmpty)
+            if (skipTombstones && isTombstone)
             {
                 continue;
             }
@@ -189,7 +202,7 @@ internal sealed class Block : IDisposable
         return start;
     }
 
-    internal bool ForEachRaw<TArg>(TArg arg, ReadRawEntryAction<TArg> reader, bool skipEmptyValues)
+    internal bool ForEachRaw<TArg>(TArg arg, ReadRawEntryAction<TArg> reader, bool skipTombstones)
     {
         var memory = Memory;
 
@@ -198,10 +211,10 @@ internal sealed class Block : IDisposable
             var blockReader = new EncoderBinaryReader(memory, Offsets[i]);
             var keyLength = blockReader.Read7BitEncodedInt();
             var key = blockReader.ReadBytesSpan(keyLength);
-            var valueLength = blockReader.Read7BitEncodedInt();
+            var valueLength = RecordValueEncoding.DecodeLength(blockReader.Read7BitEncodedInt(), out var isTombstone);
             var value = blockReader.ReadBytesSpan(valueLength);
 
-            if (skipEmptyValues && value.IsEmpty)
+            if (skipTombstones && isTombstone)
             {
                 continue;
             }
@@ -219,12 +232,12 @@ internal sealed class Block : IDisposable
     /// <returns></returns>
     public ReadOnlySpan<byte> GetValue(RecordLocation entry)
     {
-        return _encoder.DecodeValue(Memory, entry.BlockOffset, entry.Length).Span;
+        return _encoder.DecodeValue(Memory, entry.BlockOffset, entry.StoredValueLength).Span;
     }
 
     public ReadOnlyMemory<byte> GetValueMemory(RecordLocation entry)
     {
-        return _encoder.DecodeValue(Memory, entry.BlockOffset, entry.Length);
+        return _encoder.DecodeValue(Memory, entry.BlockOffset, entry.StoredValueLength);
     }
 
     public void Dispose()

@@ -15,10 +15,6 @@ public sealed class UInt16Serializer : IBinaryEncoder<ushort>
 
     public int GetLength(ushort value) => sizeof(ushort);
 
-    public ushort GetTombstoneValue() => ushort.MaxValue;
-
-    public bool IsTombstoneValue(ushort value) => value == ushort.MaxValue;
-
     public int Encode(ushort value, ref EncoderBinaryWriter writer)
     {
         var length = sizeof(ushort);

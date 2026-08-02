@@ -19,13 +19,17 @@ internal sealed class ByteSlice : IEquatable<ByteSlice>, IComparable<ByteSlice>
 
     public static readonly IComparer<ByteSlice> Comparer = ByteSliceComparer.Instance;
     public static readonly IEqualityComparer<ByteSlice> EqualityComparer = ByteSliceComparer.Instance;
-    public static readonly ByteSlice Empty = new(ReadOnlyMemory<byte>.Empty);
+    public static readonly ByteSlice Empty = new(ReadOnlyMemory<byte>.Empty, isTombstone: false);
+    public static readonly ByteSlice Tombstone = new(ReadOnlyMemory<byte>.Empty, isTombstone: true);
 
-    private ByteSlice(ReadOnlyMemory<byte> memory)
+    private readonly bool _isTombstone;
+
+    private ByteSlice(ReadOnlyMemory<byte> memory, bool isTombstone = false)
     {
         _memory = memory;
         _offset = 0;
         _length = memory.Length;
+        _isTombstone = isTombstone;
     }
 
     private ByteSlice(IMemoryOwner<byte> owner, int offset, int length)
@@ -58,6 +62,8 @@ internal sealed class ByteSlice : IEquatable<ByteSlice>, IComparable<ByteSlice>
 
     public bool IsEmpty => _length == 0;
 
+    public bool IsTombstone => _isTombstone;
+
     public override bool Equals([NotNullWhen(true)] object? obj)
     {
         return obj is ByteSlice b && Equals(b);
@@ -65,7 +71,7 @@ internal sealed class ByteSlice : IEquatable<ByteSlice>, IComparable<ByteSlice>
 
     public bool Equals(ByteSlice? other)
     {
-        return other is not null && Span.SequenceEqual(other.Span);
+        return other is not null && IsTombstone == other.IsTombstone && Span.SequenceEqual(other.Span);
     }
 
     public int CompareTo(ByteSlice? other)
@@ -75,19 +81,23 @@ internal sealed class ByteSlice : IEquatable<ByteSlice>, IComparable<ByteSlice>
             return 1;
         }
 
-        return Span.SequenceCompareTo(other.Span);
+        var comparison = Span.SequenceCompareTo(other.Span);
+        return comparison != 0 ? comparison : IsTombstone.CompareTo(other.IsTombstone);
     }
 
     public override int GetHashCode()
     {
         var hashCode = new HashCode();
         hashCode.AddBytes(Span);
+        hashCode.Add(IsTombstone);
         return hashCode.ToHashCode();
     }
 
     public override string ToString()
     {
-        return $"[{Length}] {Convert.ToHexString(Span)} (\"{JsonEncodedText.Encode(Span, JavaScriptEncoder.UnsafeRelaxedJsonEscaping).Value}\")";
+        return IsTombstone
+            ? "<tombstone>"
+            : $"[{Length}] {Convert.ToHexString(Span)} (\"{JsonEncodedText.Encode(Span, JavaScriptEncoder.UnsafeRelaxedJsonEscaping).Value}\")";
     }
 
     public string ToString(IFormatProvider? provider) => ToString();

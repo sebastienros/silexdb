@@ -6,6 +6,8 @@ using System.Text.Json;
 using Silex.BloomFilters;
 using Silex.Blocks;
 using Silex.Serialization;
+using Silex.MemTables;
+using Silex.Wal;
 using TUnit.Assertions.Enums;
 
 namespace Silex.Test;
@@ -880,6 +882,32 @@ public class StorageTests
 
             // Abandon without closing to simulate a crash: the WAL is left on disk.
         }
+    }
+
+    [Test]
+    public async Task WriteAheadLogDistinguishesEmptyValueFromDelete()
+    {
+        using var tempFolder = TempFolder.Create();
+        var walPath = Path.Combine(tempFolder, "empty-values.wal");
+
+        using (var wal = new WriteAheadLog(walPath, syncToDisk: false))
+        {
+            wal.AppendRaw([1], []);
+            wal.AppendDeleteRaw([2]);
+        }
+
+        using var memTable = new MemTable(1);
+        WriteAheadLog.Replay(walPath, memTable);
+
+        using var emptyKey = OwnedByteSlice.CopyFrom([1]);
+        using var deletedKey = OwnedByteSlice.CopyFrom([2]);
+
+        await Assert.That(memTable.TryGet(emptyKey.Slice, out var empty)).IsTrue();
+        await Assert.That(empty!.IsEmpty).IsTrue();
+        await Assert.That(empty.IsTombstone).IsFalse();
+
+        await Assert.That(memTable.TryGet(deletedKey.Slice, out var deleted)).IsTrue();
+        await Assert.That(deleted!.IsTombstone).IsTrue();
     }
 
     [Test]
@@ -2401,6 +2429,95 @@ public class StorageTests
     }
 
     [Test]
+    public async Task RawReadsReturnPresentEmptyValueFromMemTable()
+    {
+        using var tempFolder = TempFolder.Create();
+        using var storage = new LsmStorageInner(tempFolder, _defaultStorageOptions);
+
+        byte[] key = [1, 2, 3];
+        storage.Put(key, []);
+
+        var destination = new ArrayBufferWriter<byte>();
+        await Assert.That(await storage.TryGetRawAsync(key, destination)).IsTrue();
+        await Assert.That(destination.WrittenCount).IsEqualTo(0);
+        await Assert.That(await storage.GetRawAsync(key, Memory<byte>.Empty)).IsEqualTo(0);
+
+        var lengths = new List<int>();
+        await Assert.That(await storage.TryReadRawAsync(key, lengths, static (state, value) => state.Add(value.Length))).IsTrue();
+        await Assert.That(lengths).IsEquivalentTo(new[] { 0 }, CollectionOrdering.Matching);
+
+        using var value = await storage.GetAsync(key);
+        await Assert.That(value).IsNotNull();
+        await Assert.That(value!.IsEmpty).IsTrue();
+
+        storage.Delete(key);
+        await Assert.That(await storage.TryGetRawAsync(key, destination)).IsFalse();
+
+        storage.Put(key, []);
+        await Assert.That(await storage.TryGetRawAsync(key, destination)).IsTrue();
+    }
+
+    [Test]
+    public async Task EmptyByteArraySurvivesFlushScanAndReopen()
+    {
+        using var tempFolder = TempFolder.Create();
+        var options = new StorageOptions { UseWriteAheadLog = false, FlushPeriod = TimeSpan.Zero };
+
+        var storage = await LsmStorage.OpenAsync<byte[], byte[]>(tempFolder, options);
+        storage.Put([1], []);
+        storage.Put([2], [20]);
+        storage._inner.ForceFreezeMemTable();
+        await storage._inner.ForceFlushNextImmutableMemTableAsync();
+
+        var entries = new List<(byte Key, int ValueLength)>();
+        await storage.ScanRawAsync(entries, static (state, key, value) =>
+        {
+            state.Add((key[0], value.Length));
+            return true;
+        });
+
+        await Assert.That(entries).IsEquivalentTo(new[] { ((byte)1, 0), ((byte)2, 1) }, CollectionOrdering.Matching);
+        await storage.CloseAsync();
+
+        storage = await LsmStorage.OpenAsync<byte[], byte[]>(tempFolder, options);
+        var empty = await storage.GetAsync([1]);
+        await Assert.That(empty).IsNotNull();
+        await Assert.That(empty!).IsEmpty();
+        await Assert.That(await storage.GetRawAsync([1], Memory<byte>.Empty)).IsEqualTo(0);
+
+        var destination = new ArrayBufferWriter<byte>();
+        await Assert.That(await storage.TryGetRawAsync([1], destination)).IsTrue();
+        await storage.CloseAsync();
+    }
+
+    [Test]
+    public async Task CompactionKeepsEmptyValueThatShadowsOlderData()
+    {
+        using var tempFolder = TempFolder.Create();
+        var options = new StorageOptions
+        {
+            UseWriteAheadLog = false,
+            FlushPeriod = TimeSpan.Zero,
+            MaxCompactionTiers = 2,
+        };
+        using var storage = new LsmStorageInner(tempFolder, options);
+
+        await FlushByteTierAsync(storage, () => storage.Put([1], [10]));
+        await FlushByteTierAsync(storage, () => storage.Put([1], []));
+
+        await Assert.That(await storage.TryTieredCompactionAsync()).IsTrue();
+        await Assert.That(await storage.GetRawAsync([1], Memory<byte>.Empty)).IsEqualTo(0);
+
+        var entries = new List<int>();
+        await storage.ScanRawAsync(entries, static (state, _, value) =>
+        {
+            state.Add(value.Length);
+            return true;
+        });
+        await Assert.That(entries).IsEquivalentTo(new[] { 0 }, CollectionOrdering.Matching);
+    }
+
+    [Test]
     public async Task TryGetRawAsyncReturnsFalseForMissingKey()
     {
         using var tempFolder = TempFolder.Create();
@@ -2416,8 +2533,7 @@ public class StorageTests
     [Test]
     public async Task TryGetRawAsyncReturnsFalseForDeletedKeyInMemTable()
     {
-        // Unlike GetAsync (which surfaces an empty array for a memtable tombstone), the raw API reports a
-        // deleted key as not found.
+        // A delete is distinct from a live empty value and is reported as not found.
         using var tempFolder = TempFolder.Create();
         using var storage = new LsmStorageInner(tempFolder, _defaultStorageOptions);
 
@@ -2545,9 +2661,8 @@ public class StorageTests
     }
 
     [Test]
-    public async Task RawReadsWorkWithSentinelTombstoneEncoder()
+    public async Task RawReadsDistinguishTypedDeletes()
     {
-        // int uses a sentinel tombstone (not an empty value); the raw path must decode to recognise it.
         using var tempFolder = TempFolder.Create();
         using var storage = await LsmStorage.OpenAsync<int, int>(tempFolder, new() { UseWriteAheadLog = false });
 
@@ -2567,6 +2682,20 @@ public class StorageTests
         var missingLength = await storage.GetRawAsync(999, destination);
         await Assert.That(missingLength).IsEqualTo(-1);
 
+        await storage.CloseAsync();
+    }
+
+    [Test]
+    public async Task TypedEncoderSentinelValueRemainsStorable()
+    {
+        using var tempFolder = TempFolder.Create();
+        using var storage = await LsmStorage.OpenAsync<int, int>(tempFolder, new() { UseWriteAheadLog = false });
+
+        storage.Put(1, int.MaxValue);
+        storage._inner.ForceFreezeMemTable();
+        await storage._inner.ForceFlushNextImmutableMemTableAsync();
+
+        await Assert.That(await storage.GetAsync(1)).IsEqualTo(int.MaxValue);
         await storage.CloseAsync();
     }
 

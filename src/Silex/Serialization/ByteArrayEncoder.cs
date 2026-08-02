@@ -15,8 +15,6 @@ public sealed class ByteArrayEncoder : IBinaryEncoder<byte[]>
         return data.ToArray();
     }
 
-    public bool UsesEmptyTombstone => true;
-
     public bool TryGetRawBytes(byte[] value, out ReadOnlySpan<byte> bytes)
     {
         bytes = value;
@@ -24,10 +22,6 @@ public sealed class ByteArrayEncoder : IBinaryEncoder<byte[]>
     }
 
     public int GetLength(byte[] value) => value.Length;
-
-    public byte[] GetTombstoneValue() => Array.Empty<byte>();
-
-    public bool IsTombstoneValue(byte[] value) => value == Array.Empty<byte>();
 
     public int Encode(byte[] value, ref EncoderBinaryWriter writer)
     {

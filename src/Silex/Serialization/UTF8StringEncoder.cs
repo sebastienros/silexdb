@@ -54,16 +54,6 @@ public sealed class UTF8StringEncoder : IBinaryEncoder<string>
         return Encoding.UTF8.GetByteCount(value);
     }
 
-    public string GetTombstoneValue()
-    {
-        return null!;
-    }
-
-    public bool IsTombstoneValue(string value)
-    {
-        return value is null;
-    }
-
     public int Encode(string value, ref EncoderBinaryWriter writer)
     {
         if (string.IsNullOrEmpty(value))

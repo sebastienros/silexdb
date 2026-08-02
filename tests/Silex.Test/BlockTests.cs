@@ -52,6 +52,39 @@ public class BlockTests
     }
 
     [Test]
+    public async Task ShouldDistinguishEmptyValueFromTombstone()
+    {
+        using var blockBuilder = new BlockBuilder(new DefaultBlockEncoder());
+        blockBuilder.Add(ByteSliceTestExtensions.Slice(1), ByteSlice.Empty);
+        blockBuilder.Add(ByteSliceTestExtensions.Slice(2), ByteSlice.Tombstone);
+
+        using var block = blockBuilder.BuildBlock();
+        using var key1 = OwnedByteSlice.CopyFrom(ByteSliceTestExtensions.Slice(1).Span);
+        using var key2 = OwnedByteSlice.CopyFrom(ByteSliceTestExtensions.Slice(2).Span);
+
+        var empty = Lookup(block, key1.Span);
+        await Assert.That(empty.Found).IsTrue();
+        await Assert.That(empty.Length).IsEqualTo(0);
+        await Assert.That(empty.IsTombstone).IsFalse();
+
+        var deleted = Lookup(block, key2.Span);
+        await Assert.That(deleted.Found).IsTrue();
+        await Assert.That(deleted.Length).IsEqualTo(0);
+        await Assert.That(deleted.IsTombstone).IsTrue();
+
+        var entries = new BlockIterator(block).EnumerateAsync().ToBlockingEnumerable().ToArray();
+        await Assert.That(entries[0].Value.IsEmpty).IsTrue();
+        await Assert.That(entries[0].Value.IsTombstone).IsFalse();
+        await Assert.That(entries[1].Value.IsTombstone).IsTrue();
+
+        static (bool Found, int Length, bool IsTombstone) Lookup(Block block, ReadOnlySpan<byte> key)
+        {
+            var found = block.TryGetValue(key, out var value, out var isTombstone);
+            return (found, value.Length, isTombstone);
+        }
+    }
+
+    [Test]
     public async Task ShouldIterateAllEntries()
     {
         var blockBuilder = new BlockBuilder(new DefaultBlockEncoder());

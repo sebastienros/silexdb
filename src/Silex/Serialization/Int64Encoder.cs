@@ -19,10 +19,6 @@ public sealed class Int64Encoder : IBinaryEncoder<long>
 
     public int GetLength(long value) => sizeof(long);
 
-    public long GetTombstoneValue() => long.MaxValue;
-
-    public bool IsTombstoneValue(long value) => value == long.MaxValue;
-
     public int Encode(long value, ref EncoderBinaryWriter writer)
     {
         var length = sizeof(long);

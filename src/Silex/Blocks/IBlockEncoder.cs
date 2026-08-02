@@ -45,5 +45,5 @@ internal interface IBlockEncoder
     /// <summary>
     /// Estimates the size, in bytes, that an entry with the given encoded key and value lengths takes in a block.
     /// </summary>
-    int EstimateSize(int encodedKeyLength, int valueLength);
+    int EstimateSize(int encodedKeyLength, int valueLength, bool isTombstone);
 }
