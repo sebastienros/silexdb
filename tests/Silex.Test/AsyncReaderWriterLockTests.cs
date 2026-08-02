@@ -79,6 +79,49 @@ public class AsyncReaderWriterLockTests
     }
 
     [Test]
+    public async Task ReadersAndWritersRemainExclusiveUnderContention()
+    {
+        var rwLock = new AsyncReaderWriterLock();
+        var activeReaders = 0;
+        var activeWriters = 0;
+
+        var readers = Enumerable.Range(0, 4).Select(_ => Task.Run(async () =>
+        {
+            for (var i = 0; i < 10_000; i++)
+            {
+                await rwLock.EnterReadLockAsync();
+                Interlocked.Increment(ref activeReaders);
+
+                if (Volatile.Read(ref activeWriters) != 0)
+                {
+                    throw new InvalidOperationException("A reader and writer held the lock concurrently.");
+                }
+
+                Interlocked.Decrement(ref activeReaders);
+                rwLock.ExitReadLock();
+            }
+        }));
+
+        var writers = Enumerable.Range(0, 2).Select(_ => Task.Run(async () =>
+        {
+            for (var i = 0; i < 10_000; i++)
+            {
+                await rwLock.EnterWriteLockAsync();
+
+                if (Interlocked.Increment(ref activeWriters) != 1 || Volatile.Read(ref activeReaders) != 0)
+                {
+                    throw new InvalidOperationException("Multiple writers or a reader and writer held the lock concurrently.");
+                }
+
+                Interlocked.Decrement(ref activeWriters);
+                rwLock.ExitWriteLock();
+            }
+        }));
+
+        await Task.WhenAll(readers.Concat(writers)).WaitAsync(TimeSpan.FromSeconds(10));
+    }
+
+    [Test]
     public async Task ReadersShouldExit()
     {
         var loq = new AsyncReaderWriterLock();

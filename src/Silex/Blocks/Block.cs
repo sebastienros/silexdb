@@ -172,6 +172,38 @@ internal sealed class Block : IDisposable
         return true;
     }
 
+    internal bool TryGetFirstRawFrom(
+        ReadOnlySpan<byte> encodedFrom,
+        out ReadOnlySpan<byte> key,
+        out ReadOnlySpan<byte> value,
+        bool skipTombstones)
+    {
+        var memory = Memory;
+        var start = encodedFrom.IsEmpty ? 0 : LowerBound(memory, encodedFrom);
+
+        for (var i = start; i < Offsets.Count; i++)
+        {
+            var blockReader = new EncoderBinaryReader(memory, Offsets[i]);
+            var keyLength = blockReader.Read7BitEncodedInt();
+            var candidateKey = blockReader.ReadBytesSpan(keyLength);
+            var valueLength = RecordValueEncoding.DecodeLength(blockReader.Read7BitEncodedInt(), out var isTombstone);
+            var candidateValue = blockReader.ReadBytesSpan(valueLength);
+
+            if (skipTombstones && isTombstone)
+            {
+                continue;
+            }
+
+            key = candidateKey;
+            value = candidateValue;
+            return true;
+        }
+
+        key = default;
+        value = default;
+        return false;
+    }
+
     /// <summary>
     /// Returns the index in <see cref="Offsets"/> of the first entry whose encoded key is greater than or
     /// equal to <paramref name="encodedKey"/>, or <see cref="BlockOffsets.Count"/> when every key is smaller.

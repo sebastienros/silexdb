@@ -6,6 +6,9 @@ internal sealed class AsyncReaderWriterLock
     private Waiter? _queueHead;
     private Waiter? _queueTail;
     private int _activeReaders;
+    // Writers close the gate with a full fence before checking the reader count. Readers increment first,
+    // then recheck the gate, so neither side can miss an acquisition racing on another core.
+    private int _readerGate;
     private bool _activeWriter;
 
     public bool IsWriteLockHeld
@@ -21,13 +24,7 @@ internal sealed class AsyncReaderWriterLock
 
     internal int ActiveReaderCount
     {
-        get
-        {
-            lock (_gate)
-            {
-                return _activeReaders;
-            }
-        }
+        get => Volatile.Read(ref _activeReaders);
     }
 
     public Task EnterReadLockAsync(CancellationToken cancellationToken = default)
@@ -37,13 +34,16 @@ internal sealed class AsyncReaderWriterLock
             return Task.FromCanceled(cancellationToken);
         }
 
-        lock (_gate)
+        if (Volatile.Read(ref _readerGate) == 0)
         {
-            if (!_activeWriter && _queueHead is null)
+            Interlocked.Increment(ref _activeReaders);
+
+            if (Volatile.Read(ref _readerGate) == 0)
             {
-                _activeReaders++;
                 return Task.CompletedTask;
             }
+
+            ExitReadLock();
         }
 
         return QueueWaiter(EnterLockType.Read, cancellationToken);
@@ -51,17 +51,23 @@ internal sealed class AsyncReaderWriterLock
 
     public void ExitReadLock()
     {
-        Waiter? granted;
+        var remaining = Interlocked.Decrement(ref _activeReaders);
+        if (remaining < 0)
+        {
+            Interlocked.Increment(ref _activeReaders);
+            throw new SynchronizationLockException($"Invalid usage of {nameof(ExitReadLock)}(), expected {nameof(EnterReadLockAsync)}() first.");
+        }
 
+        if (remaining != 0 || Volatile.Read(ref _readerGate) == 0)
+        {
+            return;
+        }
+
+        Waiter? granted;
         lock (_gate)
         {
-            if (_activeReaders == 0)
-            {
-                throw new SynchronizationLockException($"Invalid usage of {nameof(ExitReadLock)}(), expected {nameof(EnterReadLockAsync)}() first.");
-            }
-
-            _activeReaders--;
             granted = PromoteWaiters();
+            UpdateReaderGate();
         }
 
         CompleteGrantedWaiters(granted);
@@ -74,16 +80,48 @@ internal sealed class AsyncReaderWriterLock
             return Task.FromCanceled(cancellationToken);
         }
 
+        Waiter? waiter = null;
+        var canceled = false;
+
         lock (_gate)
         {
-            if (!_activeWriter && _activeReaders == 0 && _queueHead is null)
+            Interlocked.Exchange(ref _readerGate, 1);
+
+            if (!_activeWriter && Volatile.Read(ref _activeReaders) == 0 && _queueHead is null)
             {
                 _activeWriter = true;
                 return Task.CompletedTask;
             }
+
+            waiter = new Waiter(this, EnterLockType.Write, cancellationToken);
+            if (cancellationToken.CanBeCanceled)
+            {
+                waiter.CancellationRegistration = cancellationToken.UnsafeRegister(static state =>
+                {
+                    var queuedWaiter = (Waiter)state!;
+                    queuedWaiter.Owner.CancelWaiter(queuedWaiter);
+                }, waiter);
+            }
+
+            if (waiter.Status == WaiterStatus.Canceled)
+            {
+                canceled = true;
+            }
+            else
+            {
+                waiter.Status = WaiterStatus.Queued;
+                Enqueue(waiter);
+            }
+
+            UpdateReaderGate();
         }
 
-        return QueueWaiter(EnterLockType.Write, cancellationToken);
+        if (canceled)
+        {
+            waiter.CancellationRegistration.Dispose();
+        }
+
+        return waiter.CompletionSource.Task;
     }
 
     /// <summary>
@@ -100,11 +138,15 @@ internal sealed class AsyncReaderWriterLock
 
         lock (_gate)
         {
-            if (!_activeWriter && _activeReaders == 0 && _queueHead is null)
+            Interlocked.Exchange(ref _readerGate, 1);
+
+            if (!_activeWriter && Volatile.Read(ref _activeReaders) == 0 && _queueHead is null)
             {
                 _activeWriter = true;
                 return ValueTask.FromResult(true);
             }
+
+            UpdateReaderGate();
         }
 
         return ValueTask.FromResult(false);
@@ -123,6 +165,7 @@ internal sealed class AsyncReaderWriterLock
 
             _activeWriter = false;
             granted = PromoteWaiters();
+            UpdateReaderGate();
         }
 
         CompleteGrantedWaiters(granted);
@@ -146,6 +189,11 @@ internal sealed class AsyncReaderWriterLock
 
         lock (_gate)
         {
+            if (enterLockType == EnterLockType.Write)
+            {
+                Interlocked.Exchange(ref _readerGate, 1);
+            }
+
             if (waiter.Status == WaiterStatus.Canceled)
             {
                 canceled = true;
@@ -160,6 +208,8 @@ internal sealed class AsyncReaderWriterLock
                 waiter.Status = WaiterStatus.Queued;
                 Enqueue(waiter);
             }
+
+            UpdateReaderGate();
         }
 
         if (canceled)
@@ -181,7 +231,7 @@ internal sealed class AsyncReaderWriterLock
             return false;
         }
 
-        return enterLockType == EnterLockType.Read || _activeReaders == 0;
+        return enterLockType == EnterLockType.Read || Volatile.Read(ref _activeReaders) == 0;
     }
 
     private void CancelWaiter(Waiter waiter)
@@ -204,6 +254,8 @@ internal sealed class AsyncReaderWriterLock
                     granted = PromoteWaiters();
                     break;
             }
+
+            UpdateReaderGate();
         }
 
         if (canceled)
@@ -224,7 +276,7 @@ internal sealed class AsyncReaderWriterLock
 
         if (_queueHead.EnterLockType == EnterLockType.Write)
         {
-            if (_activeReaders != 0)
+            if (Volatile.Read(ref _activeReaders) != 0)
             {
                 return null;
             }
@@ -263,12 +315,17 @@ internal sealed class AsyncReaderWriterLock
 
         if (waiter.EnterLockType == EnterLockType.Read)
         {
-            _activeReaders++;
+            Interlocked.Increment(ref _activeReaders);
         }
         else
         {
             _activeWriter = true;
         }
+    }
+
+    private void UpdateReaderGate()
+    {
+        Volatile.Write(ref _readerGate, _activeWriter || _queueHead is not null ? 1 : 0);
     }
 
     private void Enqueue(Waiter waiter)

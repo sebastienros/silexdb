@@ -59,6 +59,7 @@ internal sealed class LsmStorageInner : IDisposable
     private readonly int _maxReadParallelism;
     private readonly IBlockEncoderFactory _blockEncoderFactory;
     private readonly ISsTableEncoderFactory _ssTableEncoderFactory;
+    private SsTable[]? _sortedSsTableRun;
 
     // Below this many overlapping L0 SSTs a point lookup probes them sequentially newest-first (the
     // short-circuit is optimal when the key lives in a recent table). Past it, and when read parallelism is
@@ -349,6 +350,33 @@ internal sealed class LsmStorageInner : IDisposable
         return -1;
     }
 
+    private static int FindMatchingBlockIndex(IReadOnlyList<BlockMetadata> blockMetadata, ReadOnlySpan<byte> key)
+    {
+        var start = 0;
+        var end = blockMetadata.Count - 1;
+
+        while (start <= end)
+        {
+            var middle = start + (end - start) / 2;
+            var metadata = blockMetadata[middle];
+
+            if (key.SequenceCompareTo(metadata.FirstKey.Span) < 0)
+            {
+                end = middle - 1;
+            }
+            else if (key.SequenceCompareTo(metadata.LastKey.Span) > 0)
+            {
+                start = middle + 1;
+            }
+            else
+            {
+                return metadata.Index;
+            }
+        }
+
+        return -1;
+    }
+
     // ---------------------------------------------------------------------------------------------
     // Raw (zero-copy) read path
     //
@@ -420,6 +448,13 @@ internal sealed class LsmStorageInner : IDisposable
     {
         ArgumentNullException.ThrowIfNull(destination);
 
+        return TryGetRawAsync(key.Memory, destination, cancellationToken);
+    }
+
+    public ValueTask<bool> TryGetRawAsync(ReadOnlyMemory<byte> key, IBufferWriter<byte> destination, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(destination);
+
         return FoundAsync(TryReadRawCoreAsync(key, new BufferWriterSink(destination), cancellationToken));
 
         static async ValueTask<bool> FoundAsync(ValueTask<int> length) => await length >= 0;
@@ -435,6 +470,11 @@ internal sealed class LsmStorageInner : IDisposable
     /// </returns>
     public async ValueTask<int> GetRawAsync(ByteSlice key, Memory<byte> destination, CancellationToken cancellationToken = default)
     {
+        return await GetRawAsync(key.Memory, destination, cancellationToken);
+    }
+
+    public async ValueTask<int> GetRawAsync(ReadOnlyMemory<byte> key, Memory<byte> destination, CancellationToken cancellationToken = default)
+    {
         return await TryReadRawCoreAsync(key, new MemoryCopySink(destination), cancellationToken);
     }
 
@@ -449,6 +489,13 @@ internal sealed class LsmStorageInner : IDisposable
     /// <paramref name="arg"/> is passed through to avoid a closure allocation.
     /// </remarks>
     public ValueTask<bool> TryReadRawAsync<TArg>(ByteSlice key, TArg arg, ReadValueAction<TArg> reader, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(reader);
+
+        return TryReadRawAsync(key.Memory, arg, reader, cancellationToken);
+    }
+
+    public ValueTask<bool> TryReadRawAsync<TArg>(ReadOnlyMemory<byte> key, TArg arg, ReadValueAction<TArg> reader, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(reader);
 
@@ -490,7 +537,7 @@ internal sealed class LsmStorageInner : IDisposable
                     {
                         cancellationToken.ThrowIfCancellationRequested();
 
-                        using var block = await table.ReadBlockAsync(i, cancellationToken);
+                        using var block = table.ReadBlock(i);
 
                         if (block == null)
                         {
@@ -546,6 +593,11 @@ internal sealed class LsmStorageInner : IDisposable
     /// </summary>
     public async ValueTask<long> SeekRawAsync<TArg>(ByteSlice from, TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries = long.MaxValue, CancellationToken cancellationToken = default)
     {
+        return await SeekRawAsync(from.Memory, arg, reader, maxEntries, cancellationToken);
+    }
+
+    public async ValueTask<long> SeekRawAsync<TArg>(ReadOnlyMemory<byte> from, TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries = long.MaxValue, CancellationToken cancellationToken = default)
+    {
         ArgumentNullException.ThrowIfNull(reader);
         ArgumentOutOfRangeException.ThrowIfNegative(maxEntries);
 
@@ -554,92 +606,94 @@ internal sealed class LsmStorageInner : IDisposable
             return 0;
         }
 
-        var keyLength = _keySerializer.GetLength(from);
-        var bufferWriter = new PooledArrayBufferWriter<byte>(keyLength);
-        var writer = new EncoderBinaryWriter(bufferWriter);
-        _keySerializer.Encode(from, ref writer);
-        writer.Flush();
-        var keyMemory = bufferWriter.WrittenMemory;
+        await _level0Lock.EnterReadLockAsync(cancellationToken);
 
         try
         {
-            await _level0Lock.EnterReadLockAsync(cancellationToken);
-
-            try
+            if (TryGetGloballySortedSsTableRun(out var tables))
             {
-                if (TryGetGloballySortedSsTableRun(out var tables))
+                RawScanState<TArg>? state = maxEntries == 1 ? null : new RawScanState<TArg>(arg, reader, maxEntries);
+                var startTableIndex = FindStartTableIndex(tables, from.Span);
+
+                for (var t = startTableIndex; t < tables.Count; t++)
                 {
-                    var state = new RawScanState<TArg>(arg, reader, maxEntries);
-                    var startTableIndex = FindStartTableIndex(tables, from);
+                    var table = tables[t];
+                    var blockMetadata = table.BlockMetadata;
 
-                    for (var t = startTableIndex; t < tables.Count; t++)
+                    var blockStart = 0;
+                    var seekInFirstBlock = false;
+
+                    if (t == startTableIndex)
                     {
-                        var table = tables[t];
-                        var blockMetadata = table.BlockMetadata;
+                        blockStart = FindStartBlockIndex(blockMetadata, from.Span);
 
-                        var blockStart = 0;
-                        var seekInFirstBlock = false;
-
-                        if (t == startTableIndex)
+                        // The stepped-back block ends before 'from' (this happens when 'from' falls exactly on
+                        // a later block's FirstKey, or in a gap between blocks): the first key >= from lives in
+                        // a later block, so advance to it instead of giving up.
+                        if (blockMetadata[blockStart].LastKey.Span.SequenceCompareTo(from.Span) < 0)
                         {
-                            blockStart = FindStartBlockIndex(blockMetadata, from);
-
-                            // The stepped-back block ends before 'from' (this happens when 'from' falls exactly on
-                            // a later block's FirstKey, or in a gap between blocks): the first key >= from lives in
-                            // a later block, so advance to it instead of giving up.
-                            if (_keyComparer.Compare(blockMetadata[blockStart].LastKey, from) < 0)
-                            {
-                                blockStart++;
-                            }
-                            else
-                            {
-                                seekInFirstBlock = true;
-                            }
+                            blockStart++;
                         }
-
-                        for (var b = blockStart; b < blockMetadata.Count; b++)
+                        else
                         {
-                            cancellationToken.ThrowIfCancellationRequested();
-
-                            using var lease = await table.ReadBlockCachedAsync(blockMetadata[b].Index, _blockCache, cancellationToken);
-                            var block = lease.Block;
-
-                            if (block == null)
-                            {
-                                continue;
-                            }
-
-                            bool keepGoing;
-                            if (seekInFirstBlock && b == blockStart)
-                            {
-                                keepGoing = block.ForEachRawFrom(keyMemory.Span, state, static (s, key, value) => s.Accept(key, value), skipTombstones: true);
-                            }
-                            else
-                            {
-                                keepGoing = block.ForEachRaw(state, static (s, key, value) => s.Accept(key, value), skipTombstones: true);
-                            }
-
-                            if (!keepGoing)
-                            {
-                                return state.Count;
-                            }
+                            seekInFirstBlock = true;
                         }
                     }
 
-                    return state.Count;
-                }
-            }
-            finally
-            {
-                _level0Lock.ExitReadLock();
-            }
+                    for (var b = blockStart; b < blockMetadata.Count; b++)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
 
-            return await SeekRawFallbackAsync(from, arg, reader, maxEntries, cancellationToken);
+                        using var lease = await table.ReadBlockCachedAsync(blockMetadata[b].Index, _blockCache, cancellationToken);
+                        var block = lease.Block;
+
+                        if (block == null)
+                        {
+                            continue;
+                        }
+
+                        if (maxEntries == 1)
+                        {
+                            var encodedFrom = seekInFirstBlock && b == blockStart
+                                ? from.Span
+                                : ReadOnlySpan<byte>.Empty;
+
+                            if (block.TryGetFirstRawFrom(encodedFrom, out var key, out var value, skipTombstones: true))
+                            {
+                                reader(arg, key, value);
+                                return 1;
+                            }
+
+                            continue;
+                        }
+
+                        bool keepGoing;
+                        if (seekInFirstBlock && b == blockStart)
+                        {
+                            keepGoing = block.ForEachRawFrom(from.Span, state!, static (s, key, value) => s.Accept(key, value), skipTombstones: true);
+                        }
+                        else
+                        {
+                            keepGoing = block.ForEachRaw(state!, static (s, key, value) => s.Accept(key, value), skipTombstones: true);
+                        }
+
+                        if (!keepGoing)
+                        {
+                            return state?.Count ?? 0;
+                        }
+                    }
+                }
+
+                return state!.Count;
+            }
         }
         finally
         {
-            bufferWriter.Dispose();
+            _level0Lock.ExitReadLock();
         }
+
+        using var ownedFrom = OwnedByteSlice.CopyFrom(from.Span);
+        return await SeekRawFallbackAsync(ownedFrom.Slice, arg, reader, maxEntries, cancellationToken);
     }
 
     private async ValueTask<long> SeekRawFallbackAsync<TArg>(ByteSlice from, TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries, CancellationToken cancellationToken)
@@ -668,7 +722,7 @@ internal sealed class LsmStorageInner : IDisposable
     /// Returns the index of the first table whose <see cref="SsTable{ByteSlice, ByteSlice}.LastKey"/> is greater than or
     /// equal to <paramref name="from"/>, or <paramref name="tables"/>.Count when every table ends before it.
     /// </summary>
-    private static int FindStartTableIndex(List<SsTable> tables, ByteSlice from)
+    private static int FindStartTableIndex(IReadOnlyList<SsTable> tables, ReadOnlySpan<byte> from)
     {
         var start = 0;
         var end = tables.Count - 1;
@@ -677,7 +731,7 @@ internal sealed class LsmStorageInner : IDisposable
         {
             var m = start + (end - start) / 2;
 
-            if (_keyComparer.Compare(tables[m].LastKey, from) < 0)
+            if (tables[m].LastKey.Span.SequenceCompareTo(from) < 0)
             {
                 start = m + 1;
             }
@@ -695,7 +749,7 @@ internal sealed class LsmStorageInner : IDisposable
     /// less than or equal to <paramref name="from"/>, clamped to the first block. Mirrors the seek used by
     /// <see cref="SsTableIterator{ByteSlice, ByteSlice}"/>; callers must apply the stepped-back-block correction.
     /// </summary>
-    private static int FindStartBlockIndex(IReadOnlyList<BlockMetadata> blockMetadata, ByteSlice from)
+    private static int FindStartBlockIndex(IReadOnlyList<BlockMetadata> blockMetadata, ReadOnlySpan<byte> from)
     {
         var start = 0;
         var end = blockMetadata.Count - 1;
@@ -703,7 +757,7 @@ internal sealed class LsmStorageInner : IDisposable
         while (start <= end)
         {
             var m = start + (end - start) / 2;
-            var compare = _keyComparer.Compare(blockMetadata[m].FirstKey, from);
+            var compare = blockMetadata[m].FirstKey.Span.SequenceCompareTo(from);
 
             if (compare == 0)
             {
@@ -752,8 +806,15 @@ internal sealed class LsmStorageInner : IDisposable
         return reader(arg, keyBytes, valueBytes);
     }
 
-    private bool TryGetGloballySortedSsTableRun(out List<SsTable> tables)
+    private bool TryGetGloballySortedSsTableRun(out IReadOnlyList<SsTable> tables)
     {
+        var cached = Volatile.Read(ref _sortedSsTableRun);
+        if (cached != null)
+        {
+            tables = cached;
+            return true;
+        }
+
         _currentMemTableLock.EnterReadLock();
 
         try
@@ -762,7 +823,7 @@ internal sealed class LsmStorageInner : IDisposable
 
             if (state.CurrentMemTable.Count != 0 || !state.ImmutableMemTables.IsEmpty)
             {
-                tables = [];
+                tables = Array.Empty<SsTable>();
                 return false;
             }
 
@@ -773,36 +834,48 @@ internal sealed class LsmStorageInner : IDisposable
                 count += level.Count;
             }
 
-            tables = new List<SsTable>(count);
-            tables.AddRange(state.LevelZeroTables);
+            var sorted = new SsTable[count];
+            var index = 0;
+
+            foreach (var table in state.LevelZeroTables)
+            {
+                sorted[index++] = table;
+            }
 
             foreach (var level in state.LeveledSsTables)
             {
-                tables.AddRange(level);
+                foreach (var table in level)
+                {
+                    sorted[index++] = table;
+                }
             }
+
+            tables = sorted;
+            if (sorted.Length > 1)
+            {
+                Array.Sort(sorted, static (left, right) => _keyComparer.Compare(left.FirstKey, right.FirstKey));
+
+                for (var i = 1; i < sorted.Length; i++)
+                {
+                    if (_keyComparer.Compare(sorted[i - 1].LastKey, sorted[i].FirstKey) >= 0)
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            // Publish before releasing the memtable read lock so a writer cannot invalidate the cache
+            // and then have this older snapshot republished after its mutation.
+            Volatile.Write(ref _sortedSsTableRun, sorted);
+            return true;
         }
         finally
         {
             _currentMemTableLock.ExitReadLock();
         }
-
-        if (tables.Count <= 1)
-        {
-            return true;
-        }
-
-        tables.Sort(static (left, right) => _keyComparer.Compare(left.FirstKey, right.FirstKey));
-
-        for (var i = 1; i < tables.Count; i++)
-        {
-            if (_keyComparer.Compare(tables[i - 1].LastKey, tables[i].FirstKey) >= 0)
-            {
-                return false;
-            }
-        }
-
-        return true;
     }
+
+    private void InvalidateSortedSsTableRun() => Volatile.Write(ref _sortedSsTableRun, null);
 
     private sealed class RawScanState<TArg>(TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries)
     {
@@ -824,7 +897,7 @@ internal sealed class LsmStorageInner : IDisposable
     /// Shared sequential traversal for the raw read overloads. Hands the live value bytes to
     /// <paramref name="sink"/> and returns the value length, or <c>-1</c> when the key is missing or deleted.
     /// </summary>
-    private async ValueTask<int> TryReadRawCoreAsync<TSink>(ByteSlice key, TSink sink, CancellationToken cancellationToken)
+    private async ValueTask<int> TryReadRawCoreAsync<TSink>(ReadOnlyMemory<byte> keyMemory, TSink sink, CancellationToken cancellationToken)
         where TSink : struct, IValueByteSink
     {
         // Current and immutable memtables: see GetAsync for the locking rationale.
@@ -832,21 +905,26 @@ internal sealed class LsmStorageInner : IDisposable
 
         IMemTable currentMemTable;
         ImmutableQueue<IMemTable> immutableMemTables;
+        ByteSlice? key = null;
 
         try
         {
             currentMemTable = _state.CurrentMemTable;
             immutableMemTables = _state.ImmutableMemTables;
 
-            var memResult = TryResolveMemTableRaw(currentMemTable, key, sink, out var length);
-            if (memResult == RawLookup.Live)
+            if (currentMemTable.Count != 0)
             {
-                return length;
-            }
+                key = ByteSlice.FromMemory(keyMemory);
+                var memResult = TryResolveMemTableRaw(currentMemTable, key, sink, out var length);
+                if (memResult == RawLookup.Live)
+                {
+                    return length;
+                }
 
-            if (memResult == RawLookup.Tombstone)
-            {
-                return -1;
+                if (memResult == RawLookup.Tombstone)
+                {
+                    return -1;
+                }
             }
         }
         finally
@@ -859,6 +937,7 @@ internal sealed class LsmStorageInner : IDisposable
             try
             {
                 _immutableMemTablesLock.EnterReadLock();
+                key ??= ByteSlice.FromMemory(keyMemory);
 
                 foreach (var memTable in immutableMemTables.Reverse())
                 {
@@ -880,17 +959,9 @@ internal sealed class LsmStorageInner : IDisposable
             }
         }
 
-        var keyLength = _keySerializer.GetLength(key);
-        var bufferWriter = new PooledArrayBufferWriter<byte>(keyLength);
-        var writer = new EncoderBinaryWriter(bufferWriter);
-        _keySerializer.Encode(key, ref writer);
-        writer.Flush();
-        var keyMemory = bufferWriter.WrittenMemory;
-
+        await _level0Lock.EnterReadLockAsync(cancellationToken);
         try
         {
-            await _level0Lock.EnterReadLockAsync(cancellationToken);
-
             var l0 = _state.LevelZeroTables;
 
             // Probe L0 newest-first sequentially. Unlike GetAsync this path does not fan out across L0 with
@@ -899,7 +970,7 @@ internal sealed class LsmStorageInner : IDisposable
             // cost is bounded.
             for (var i = l0.Count - 1; i >= 0; i--)
             {
-                var (kind, length) = await TryReadRawFromTableAsync(l0[i], key, keyMemory, sink, cancellationToken);
+                var (kind, length) = await TryReadRawFromTableAsync(l0[i], keyMemory, sink, cancellationToken);
                 if (kind == RawLookup.Live)
                 {
                     return length;
@@ -919,7 +990,7 @@ internal sealed class LsmStorageInner : IDisposable
 
                 for (var i = 0; i < tables.Count; i++)
                 {
-                    var (kind, length) = await TryReadRawFromTableAsync(tables[i], key, keyMemory, sink, cancellationToken);
+                    var (kind, length) = await TryReadRawFromTableAsync(tables[i], keyMemory, sink, cancellationToken);
                     if (kind == RawLookup.Live)
                     {
                         return length;
@@ -934,8 +1005,6 @@ internal sealed class LsmStorageInner : IDisposable
         }
         finally
         {
-            bufferWriter.Dispose();
-
             _level0Lock.ExitReadLock();
         }
 
@@ -993,10 +1062,10 @@ internal sealed class LsmStorageInner : IDisposable
     /// Probes a single SST for <paramref name="key"/> on the raw path, returning a tri-state result and the
     /// live value length. Mirrors <see cref="TryReadFromTableAsync"/> but hands value bytes to the sink.
     /// </summary>
-    private async ValueTask<(RawLookup kind, int length)> TryReadRawFromTableAsync<TSink>(SsTable table, ByteSlice key, ReadOnlyMemory<byte> keyMemory, TSink sink, CancellationToken cancellationToken)
+    private async ValueTask<(RawLookup kind, int length)> TryReadRawFromTableAsync<TSink>(SsTable table, ReadOnlyMemory<byte> keyMemory, TSink sink, CancellationToken cancellationToken)
         where TSink : struct, IValueByteSink
     {
-        if (_keyComparer.Compare(key, table.FirstKey) < 0 || _keyComparer.Compare(key, table.LastKey) > 0)
+        if (keyMemory.Span.SequenceCompareTo(table.FirstKey.Span) < 0 || keyMemory.Span.SequenceCompareTo(table.LastKey.Span) > 0)
         {
             return (RawLookup.Miss, 0);
         }
@@ -1006,7 +1075,7 @@ internal sealed class LsmStorageInner : IDisposable
             return (RawLookup.Miss, 0);
         }
 
-        var blockIndex = FindMatchingBlockIndex(table.BlockMetadata, key);
+        var blockIndex = FindMatchingBlockIndex(table.BlockMetadata, keyMemory.Span);
         if (blockIndex >= 0)
         {
             using var blockLease = await table.ReadBlockCachedAsync(blockIndex, _blockCache, cancellationToken);
@@ -1057,6 +1126,7 @@ internal sealed class LsmStorageInner : IDisposable
         try
         {
             _state.CurrentMemTable.Put(key, value);
+            InvalidateSortedSsTableRun();
 
             if (_state.CurrentMemTable.Size >= _memTableSizeLimit)
             {
@@ -1081,6 +1151,7 @@ internal sealed class LsmStorageInner : IDisposable
         try
         {
             ((IRawBytesMemTable)_state.CurrentMemTable).PutRaw(key, value);
+            InvalidateSortedSsTableRun();
 
             if (_state.CurrentMemTable.Size >= _memTableSizeLimit)
             {
@@ -1104,6 +1175,7 @@ internal sealed class LsmStorageInner : IDisposable
         try
         {
             _state.CurrentMemTable.Put(key, ByteSlice.Tombstone);
+            InvalidateSortedSsTableRun();
 
             if (_state.CurrentMemTable.Size >= _memTableSizeLimit)
             {
@@ -1123,6 +1195,7 @@ internal sealed class LsmStorageInner : IDisposable
         try
         {
             ((IRawBytesMemTable)_state.CurrentMemTable).DeleteRaw(key);
+            InvalidateSortedSsTableRun();
 
             if (_state.CurrentMemTable.Size >= _memTableSizeLimit)
             {
@@ -1233,6 +1306,7 @@ internal sealed class LsmStorageInner : IDisposable
                 }
 
                 _state.LevelZeroTables.Add(ssTable);
+                InvalidateSortedSsTableRun();
 
                 // Snapshot the new structure while the lock is held so the persisted manifest exactly matches
                 // the installed state. The (small) JSON is written to disk after releasing the lock.
@@ -1441,6 +1515,7 @@ internal sealed class LsmStorageInner : IDisposable
                         live.Add(output);
                     }
 
+                    InvalidateSortedSsTableRun();
                     installed = true;
                     manifest = BuildManifestSnapshot();
                 }
@@ -1765,6 +1840,7 @@ internal sealed class LsmStorageInner : IDisposable
             }
 
             _state.LeveledSsTables[targetLevelIndex] = newTargetLevel;
+            InvalidateSortedSsTableRun();
 
             Debug.Assert(IsSortedNonOverlapping(newTargetLevel), "leveled compaction produced an overlapping destination level");
 
@@ -2386,7 +2462,7 @@ internal sealed class LsmStorageInner : IDisposable
         /// whose range can contain <paramref name="from"/>.
         /// </summary>
         private async IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateSortedRunAsync(
-            List<SsTable> tables,
+            IReadOnlyList<SsTable> tables,
             bool hasFrom,
             ByteSlice from,
             [EnumeratorCancellation] CancellationToken cancellationToken)

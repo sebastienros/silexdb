@@ -1,15 +1,20 @@
 using Silex.Blocks;
+using System.Collections.Concurrent;
 
 namespace Silex.Tables;
 
 internal sealed class BlockCache : IDisposable
 {
+    private const int RecencySampleMask = 15;
+
     private readonly object _gate = new();
     private readonly long _sizeLimit;
-    private readonly Dictionary<BlockCacheKey, Entry> _entries = [];
-    private readonly Dictionary<BlockCacheKey, PendingLoad> _loads = [];
-    private readonly LinkedList<Entry> _lru = [];
+    private readonly ConcurrentDictionary<BlockCacheKey, Entry> _entries = [];
+    private Entry? _lruHead;
+    private Entry? _lruTail;
     private long _size;
+    [ThreadStatic]
+    private static int t_recencyCounter;
     private bool _disposed;
 
     public BlockCache(long sizeLimit)
@@ -27,126 +32,77 @@ internal sealed class BlockCache : IDisposable
     {
         cancellationToken.ThrowIfCancellationRequested();
 
-        lock (_gate)
+        if (Volatile.Read(ref _disposed))
         {
             ThrowIfDisposed();
-
-            if (TryAcquireCore(key, out var lease))
-            {
-                return new ValueTask<BlockLease>(lease);
-            }
         }
 
-        return new ValueTask<BlockLease>(GetOrLoadSlowAsync(key, loader, cancellationToken));
+        if (TryAcquire(key, out var lease))
+        {
+            return new ValueTask<BlockLease>(lease);
+        }
+
+        return new ValueTask<BlockLease>(GetOrLoadSlow(key, loader, cancellationToken));
     }
 
-    private async Task<BlockLease> GetOrLoadSlowAsync<TLoader>(BlockCacheKey key, TLoader loader, CancellationToken cancellationToken)
+    private BlockLease GetOrLoadSlow<TLoader>(BlockCacheKey key, TLoader loader, CancellationToken cancellationToken)
         where TLoader : struct, IBlockLoader
     {
         cancellationToken.ThrowIfCancellationRequested();
-        PendingLoad pendingLoad;
-
-        lock (_gate)
-        {
-            ThrowIfDisposed();
-
-            if (TryAcquireCore(key, out var lease))
-            {
-                return lease;
-            }
-
-            if (!_loads.TryGetValue(key, out pendingLoad!))
-            {
-                pendingLoad = new PendingLoad { Waiters = 1 };
-                _loads.Add(key, pendingLoad);
-                pendingLoad.Task = LoadAndCacheAsync(key, loader, pendingLoad, cancellationToken);
-            }
-            else
-            {
-                pendingLoad.Waiters++;
-            }
-        }
-
-        var entry = await pendingLoad.Task.ConfigureAwait(false);
-
-        return entry == null ? default : new BlockLease(this, entry);
-    }
-
-    private async Task<Entry?> LoadAndCacheAsync<TLoader>(BlockCacheKey key, TLoader loader, PendingLoad pendingLoad, CancellationToken cancellationToken)
-        where TLoader : struct, IBlockLoader
-    {
         Block? block = null;
-        Entry? entry = null;
 
         try
         {
-            block = await loader.LoadAsync(cancellationToken).ConfigureAwait(false);
-            if (block == null)
-            {
-                return null;
-            }
-
             lock (_gate)
             {
-                if (_disposed)
+                ThrowIfDisposed();
+
+                if (TryAcquireLocked(key, out var lease))
                 {
-                    block.Dispose();
-                    return null;
+                    return lease;
                 }
+
+                block = loader.Load(cancellationToken);
+                if (block == null)
+                {
+                    return default;
+                }
+
+                var entry = new Entry(key, block, block.Memory.Length, refCount: 1);
+                block = null;
 
                 if (_sizeLimit == 0)
                 {
-                    entry = new Entry(key, block, block.Memory.Length)
-                    {
-                        RefCount = pendingLoad.Waiters,
-                        Evicted = true
-                    };
-                    block = null;
-                    return entry;
+                    entry.MarkEvicted();
+                    return new BlockLease(entry);
                 }
 
-                if (_entries.TryGetValue(key, out entry))
+                if (!_entries.TryAdd(key, entry))
                 {
-                    entry.RefCount += pendingLoad.Waiters;
-                    MoveToFront(entry);
-                    block.Dispose();
-                    block = null;
-                    return entry;
+                    entry.MarkEvicted();
+                    throw new InvalidOperationException("A block cache entry was inserted while the cache gate was held.");
                 }
 
-                entry = new Entry(key, block, block.Memory.Length)
-                {
-                    RefCount = pendingLoad.Waiters
-                };
-                block = null;
-
-                _entries.Add(key, entry);
-                entry.Node = _lru.AddFirst(entry);
+                AddFirst(entry);
                 _size += entry.Size;
 
                 EvictOverLimit(entry);
 
-                return entry;
+                return new BlockLease(entry);
             }
         }
         finally
         {
-            lock (_gate)
-            {
-                _loads.Remove(key);
-            }
-
             block?.Dispose();
         }
     }
 
-    private bool TryAcquireCore(BlockCacheKey key, out BlockLease lease)
+    private bool TryAcquire(BlockCacheKey key, out BlockLease lease)
     {
-        if (_entries.TryGetValue(key, out var entry))
+        if (_entries.TryGetValue(key, out var entry) && entry.TryAcquire())
         {
-            entry.RefCount++;
-            MoveToFront(entry);
-            lease = new BlockLease(this, entry);
+            SampleRecency(entry);
+            lease = new BlockLease(entry);
             return true;
         }
 
@@ -154,60 +110,112 @@ internal sealed class BlockCache : IDisposable
         return false;
     }
 
-    private void MoveToFront(Entry entry)
+    private bool TryAcquireLocked(BlockCacheKey key, out BlockLease lease)
     {
-        if (entry.Node == null || entry.Node == _lru.First)
+        if (_entries.TryGetValue(key, out var entry) && entry.TryAcquire())
+        {
+            MoveToFront(entry);
+            lease = new BlockLease(entry);
+            return true;
+        }
+
+        lease = default;
+        return false;
+    }
+
+    private void SampleRecency(Entry entry)
+    {
+        if ((++t_recencyCounter & RecencySampleMask) != 0
+            || !Monitor.TryEnter(_gate))
         {
             return;
         }
 
-        _lru.Remove(entry.Node);
-        _lru.AddFirst(entry.Node);
+        try
+        {
+            if (!entry.IsEvicted)
+            {
+                MoveToFront(entry);
+            }
+        }
+        finally
+        {
+            Monitor.Exit(_gate);
+        }
+    }
+
+    private void MoveToFront(Entry entry)
+    {
+        if (!entry.IsLinked || ReferenceEquals(entry, _lruHead))
+        {
+            return;
+        }
+
+        Remove(entry);
+        AddFirst(entry);
     }
 
     private void EvictOverLimit(Entry protectedEntry)
     {
-        var node = _lru.Last;
+        var entry = _lruTail;
 
-        while (_size > _sizeLimit && node != null)
+        while (_size > _sizeLimit && entry != null)
         {
-            var previous = node.Previous;
-            var entry = node.Value;
+            var previous = entry.Previous;
 
             if (!ReferenceEquals(entry, protectedEntry))
             {
-                _lru.Remove(node);
-                entry.Node = null;
-                entry.Evicted = true;
-                _entries.Remove(entry.Key);
+                Remove(entry);
+                _entries.TryRemove(entry.Key, out _);
                 _size -= entry.Size;
-
-                if (entry.RefCount == 0)
-                {
-                    entry.Block.Dispose();
-                }
+                entry.MarkEvicted();
             }
 
-            node = previous;
+            entry = previous;
         }
     }
 
-    private void Release(Entry entry)
+    private void AddFirst(Entry entry)
     {
-        lock (_gate)
+        entry.Previous = null;
+        entry.Next = _lruHead;
+        entry.IsLinked = true;
+
+        if (_lruHead == null)
         {
-            if (entry.RefCount == 0)
-            {
-                return;
-            }
-
-            entry.RefCount--;
-
-            if (entry.RefCount == 0 && entry.Evicted)
-            {
-                entry.Block.Dispose();
-            }
+            _lruTail = entry;
         }
+        else
+        {
+            _lruHead.Previous = entry;
+        }
+
+        _lruHead = entry;
+    }
+
+    private void Remove(Entry entry)
+    {
+        if (entry.Previous == null)
+        {
+            _lruHead = entry.Next;
+        }
+        else
+        {
+            entry.Previous.Next = entry.Next;
+        }
+
+        if (entry.Next == null)
+        {
+            _lruTail = entry.Previous;
+        }
+        else
+        {
+            entry.Next.Previous = entry.Previous;
+        }
+
+        entry.Previous = null;
+        entry.Next = null;
+        entry.IsLinked = false;
     }
 
     public void Dispose()
@@ -229,16 +237,12 @@ internal sealed class BlockCache : IDisposable
 
             foreach (var entry in _entries.Values)
             {
-                entry.Evicted = true;
-                if (entry.RefCount == 0)
-                {
-                    entry.Block.Dispose();
-                }
+                entry.MarkEvicted();
             }
 
             _entries.Clear();
-            _loads.Clear();
-            _lru.Clear();
+            _lruHead = null;
+            _lruTail = null;
             _size = 0;
         }
     }
@@ -256,30 +260,73 @@ internal sealed class BlockCache : IDisposable
         DisposeInternal();
     }
 
-    private sealed class PendingLoad
-    {
-        public Task<Entry?> Task { get; set; } = null!;
-        public int Waiters { get; set; }
-    }
-
     internal sealed class Entry
     {
-        public Entry(BlockCacheKey key, Block block, int size)
+        private int _refCount;
+        private int _evicted;
+        private int _disposed;
+
+        public Entry(BlockCacheKey key, Block block, int size, int refCount)
         {
             Key = key;
             Block = block;
             Size = size;
+            _refCount = refCount;
         }
 
         public BlockCacheKey Key { get; }
         public Block Block { get; }
         public int Size { get; }
-        public LinkedListNode<Entry>? Node { get; set; }
-        public int RefCount { get; set; }
-        public bool Evicted { get; set; }
-    }
+        public Entry? Previous { get; set; }
+        public Entry? Next { get; set; }
+        public bool IsLinked { get; set; }
+        public bool IsEvicted => Volatile.Read(ref _evicted) != 0;
 
-    internal void ReleaseForLease(Entry entry) => Release(entry);
+        public bool TryAcquire()
+        {
+            if (IsEvicted)
+            {
+                return false;
+            }
+
+            Interlocked.Increment(ref _refCount);
+            if (!IsEvicted)
+            {
+                return true;
+            }
+
+            Interlocked.Decrement(ref _refCount);
+            TryDispose();
+            return false;
+        }
+
+        public void Release()
+        {
+            if (Interlocked.Decrement(ref _refCount) < 0)
+            {
+                Interlocked.Increment(ref _refCount);
+                return;
+            }
+
+            TryDispose();
+        }
+
+        public void MarkEvicted()
+        {
+            Volatile.Write(ref _evicted, 1);
+            TryDispose();
+        }
+
+        private void TryDispose()
+        {
+            if (IsEvicted
+                && Volatile.Read(ref _refCount) == 0
+                && Interlocked.CompareExchange(ref _disposed, 1, 0) == 0)
+            {
+                Block.Dispose();
+            }
+        }
+    }
 }
 
 internal readonly record struct BlockCacheKey(long TableId, int BlockIndex);
@@ -290,17 +337,15 @@ internal readonly record struct BlockCacheKey(long TableId, int BlockIndex);
 /// </summary>
 internal interface IBlockLoader
 {
-    Task<Block?> LoadAsync(CancellationToken cancellationToken = default);
+    Block? Load(CancellationToken cancellationToken = default);
 }
 
 internal readonly struct BlockLease : IDisposable
 {
-    private readonly BlockCache? _owner;
     private readonly BlockCache.Entry? _entry;
 
-    internal BlockLease(BlockCache owner, BlockCache.Entry entry)
+    internal BlockLease(BlockCache.Entry entry)
     {
-        _owner = owner;
         _entry = entry;
     }
 
@@ -308,9 +353,6 @@ internal readonly struct BlockLease : IDisposable
 
     public void Dispose()
     {
-        if (_owner != null && _entry != null)
-        {
-            _owner.ReleaseForLease(_entry);
-        }
+        _entry?.Release();
     }
 }
