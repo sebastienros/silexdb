@@ -1216,6 +1216,31 @@ internal sealed class LsmStorageInner : IDisposable
         }
     }
 
+    public void WriteBatchRaw(ReadOnlySpan<WriteBatchEntry> entries)
+    {
+        if (entries.IsEmpty)
+        {
+            return;
+        }
+
+        _currentMemTableLock.EnterWriteLock();
+
+        try
+        {
+            ((MemTable)_state.CurrentMemTable).WriteBatchRaw(entries);
+            InvalidateSortedSsTableRun();
+
+            if (_state.CurrentMemTable.Size >= _memTableSizeLimit)
+            {
+                FreezeMemTable();
+            }
+        }
+        finally
+        {
+            _currentMemTableLock.ExitWriteLock();
+        }
+    }
+
     /// <summary>
     /// Force freeze the current MemTable to an immutable MemTable.
     /// </summary>

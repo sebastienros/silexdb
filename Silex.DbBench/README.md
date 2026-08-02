@@ -71,6 +71,10 @@ dotnet run --project Silex.DbBench -c Release -- \
 dotnet run --project Silex.DbBench -c Release -- \
   --benchmarks=fillsync --num=100000 --wal_sync
 
+# Durability-preserving group commit: one WAL write/fsync per 100 operations
+dotnet run --project Silex.DbBench -c Release -- \
+  --benchmarks=fillrandom,fillsync --num=1000000 --batch_size=100
+
 # Reproducible run against a fixed database directory
 dotnet run --project Silex.DbBench -c Release -- \
   --benchmarks=fillseq,readrandom --num=1000000 --seed=42 --db=/tmp/silex-bench
@@ -97,6 +101,7 @@ dbbench --benchmarks=fillseq,readrandom --num=500000 --reads=200000 --cache_size
 dbbench --benchmarks=fillrandom --num=500000 --wal=true
 dbbench --benchmarks=fillrandom --num=500000 --wal=false
 dbbench --benchmarks=fillsync --num=100000 --wal_sync
+dbbench --benchmarks=fillrandom,fillsync --num=500000 --batch_size=100
 
 # Concurrent write/read scaling
 for threads in 1 2 4 8; do
@@ -110,7 +115,7 @@ done
 | -------------- | --------------------------------------------------------------------------- |
 | `fillseq`      | Write `--num` entries in ascending key order (fresh database).              |
 | `fillrandom`   | Write `--num` entries at random keys in `[0, num)` (fresh database).        |
-| `fillsync`     | Write `num/1000` random entries with the WAL fsync'd on every write.        |
+| `fillsync`     | Write `num/1000` random entries with one WAL fsync per write or batch.      |
 | `overwrite`    | Write `--num` random entries over the existing database.                    |
 | `readrandom`   | Point-read `--reads` random keys; reports `(found N of M)`.                 |
 | `readmissing`  | Point-read `--reads` keys that were never written (all miss).               |
@@ -177,7 +182,7 @@ time. `--histogram` additionally prints avg / p50 / p95 / p99 / max latency per 
 | `--compression_type` | `lz4` | SST block compression: `none`, `lz4`, or `zstd`. |
 | `--compression_level` | `0` | Fast LZ4/default Zstandard, or a codec-specific level. |
 | `--compression_ratio` | `1` | Generated-value compressibility from 0 (highly compressible) to 1 (random). |
-| `--batch_size` | `1` | Accepted but ignored unless `1` (Silex has no write-batch API); warns. |
+| `--batch_size` | `1` | Writes per durability-preserving WAL batch/group commit. |
 
 `db_bench`-compatible flags use the same names so the same command line can drive both tools.
 The `--compaction*`, `--wal*`, `--target_sst_size` and `--read_parallelism` flags are Silex-specific
@@ -236,11 +241,11 @@ Options:
 ## Comparing against RocksDB
 
 Silex supports `none`, `lz4`, and `zstd` compression. For a fair comparison, use the same
-`--compression_type`, `--compression_level`, and `--compression_ratio` with both tools and set
-`--batch_size=1` because Silex has no write-batch API. Keys are generated
-exactly like `db_bench`'s `GenerateKeyFromInt` (the integer is written big-endian in the first
-`min(8, key_size)` bytes, the rest padded with `'0'`). A non-1 `--batch_size` is accepted but ignored,
-with a warning.
+`--compression_type`, `--compression_level`, `--compression_ratio`, and `--batch_size` with both tools.
+Silex appends every operation in a batch to the WAL before applying the group in memory, then issues one
+WAL write (and one fsync when requested) per group. Keys are generated exactly like `db_bench`'s
+`GenerateKeyFromInt` (the integer is written big-endian in the first `min(8, key_size)` bytes, the rest
+padded with `'0'`).
 
 Recorded comparison runs (with methodology notes) live in
 [`benchmarks/`](benchmarks/) — e.g. [`2026-05-30-rocksdb-comparison.md`](benchmarks/2026-05-30-rocksdb-comparison.md).

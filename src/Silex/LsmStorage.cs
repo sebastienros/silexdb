@@ -422,6 +422,21 @@ public sealed class LsmStorage : IDisposable, IAsyncDisposable
         _inner.DeleteRaw(key);
     }
 
+    /// <summary>
+    /// Applies a group of puts and deletes after appending the complete group to the WAL.
+    /// </summary>
+    /// <remarks>
+    /// The call performs one operating-system WAL write and, when
+    /// <see cref="StorageOptions.SyncWriteAheadLogToDisk"/> is enabled, one disk flush for the group.
+    /// Acknowledledged entries retain the same process-crash and power-loss guarantees as individual
+    /// writes. The batch is serialized with concurrent writes and does not allocate in the storage API.
+    /// </remarks>
+    public void WriteBatch(ReadOnlySpan<WriteBatchEntry> entries)
+    {
+        CheckDisposed();
+        _inner.WriteBatchRaw(entries);
+    }
+
     public ValueTask<bool> TryGetRawAsync(ReadOnlySpan<byte> key, IBufferWriter<byte> destination, CancellationToken cancellationToken = default)
     {
         CheckDisposed();

@@ -141,7 +141,10 @@ internal sealed class Runner
                 break;
             case FillSync:
                 await OpenFreshAsync(walSync: true);
-                var fillSync = await RunWritesAsync(name, Math.Max(1, _options.Num / 1000), sequential: false, extra: "(num/1000 ops, WAL fsync per write)");
+                var syncDescription = _options.BatchSize == 1
+                    ? "(num/1000 ops, WAL fsync per write)"
+                    : "(num/1000 ops, WAL fsync per batch)";
+                var fillSync = await RunWritesAsync(name, Math.Max(1, _options.Num / 1000), sequential: false, extra: syncDescription);
                 _needsReadBarrier = true;
                 Report(fillSync);
                 break;
@@ -304,6 +307,11 @@ internal sealed class Runner
     {
         var db = _db!;
         var entryBytes = _options.KeySize + _options.ValueSize;
+        var batchSize = _options.BatchSize;
+        if (batchSize > 1)
+        {
+            extra = string.IsNullOrEmpty(extra) ? $"(batch={batchSize})" : $"{extra} (batch={batchSize})";
+        }
 
         // Writes total exactly totalOps so the resulting database is well defined for later read
         // benchmarks; the work is partitioned across threads (sequential fills stay globally ordered).
@@ -314,6 +322,41 @@ internal sealed class Runner
             var rng = RngStreams.Create(_options.Seed, threadId, RngStreams.Write);
             var key = new byte[_options.KeySize];
             var value = new byte[_options.ValueSize];
+
+            if (batchSize > 1)
+            {
+                var keys = new byte[checked(batchSize * _options.KeySize)];
+                var values = new byte[checked(batchSize * _options.ValueSize)];
+                var entries = new WriteBatchEntry[batchSize];
+                long next = 0;
+
+                return new ThreadWorker(_ =>
+                {
+                    if (next >= count)
+                    {
+                        return new ValueTask<bool>(false);
+                    }
+
+                    var entryCount = (int)Math.Min(batchSize, count - next);
+                    for (var i = 0; i < entryCount; i++)
+                    {
+                        var keyOffset = i * _options.KeySize;
+                        var valueOffset = i * _options.ValueSize;
+                        var keyMemory = keys.AsMemory(keyOffset, _options.KeySize);
+                        var valueMemory = values.AsMemory(valueOffset, _options.ValueSize);
+                        var keyIndex = sequential ? start + next + i : rng.NextInt64(totalOps);
+                        keyGen.GenerateInto(keyIndex, keyMemory.Span);
+                        valueGen.GenerateInto(valueMemory.Span);
+                        entries[i] = WriteBatchEntry.Put(keyMemory, valueMemory);
+                    }
+
+                    db.WriteBatch(entries.AsSpan(0, entryCount));
+                    next += entryCount;
+                    stats.Ops += entryCount;
+                    stats.ByteSlice += (long)entryBytes * entryCount;
+                    return new ValueTask<bool>(true);
+                });
+            }
 
             return new ThreadWorker(op =>
             {
@@ -331,15 +374,48 @@ internal sealed class Runner
     private Task<BenchmarkResult> RunDeletesAsync(string name)
     {
         var db = _db!;
+        var batchSize = _options.BatchSize;
+        var extra = batchSize > 1 ? $"(batch={batchSize})" : string.Empty;
 
-        return RunParallelAsync(name, _options.Num, partitioned: true, extra: string.Empty, (threadId, start, count, stats) =>
+        return RunParallelAsync(name, _options.Num, partitioned: true, extra, (threadId, start, count, stats) =>
         {
             var keyGen = new KeyGenerator(_options.KeySize);
             var rng = RngStreams.Create(_options.Seed, threadId, RngStreams.Write);
+            var key = new byte[_options.KeySize];
+
+            if (batchSize > 1)
+            {
+                var keys = new byte[checked(batchSize * _options.KeySize)];
+                var entries = new WriteBatchEntry[batchSize];
+                long next = 0;
+
+                return new ThreadWorker(_ =>
+                {
+                    if (next >= count)
+                    {
+                        return new ValueTask<bool>(false);
+                    }
+
+                    var entryCount = (int)Math.Min(batchSize, count - next);
+                    for (var i = 0; i < entryCount; i++)
+                    {
+                        var keyMemory = keys.AsMemory(i * _options.KeySize, _options.KeySize);
+                        keyGen.GenerateInto(rng.NextInt64(_options.Num), keyMemory.Span);
+                        entries[i] = WriteBatchEntry.Delete(keyMemory);
+                    }
+
+                    db.WriteBatch(entries.AsSpan(0, entryCount));
+                    next += entryCount;
+                    stats.Ops += entryCount;
+                    stats.ByteSlice += (long)_options.KeySize * entryCount;
+                    return new ValueTask<bool>(true);
+                });
+            }
 
             return new ThreadWorker(op =>
             {
-                db.Delete(keyGen.Generate(rng.NextInt64(_options.Num)));
+                keyGen.GenerateInto(rng.NextInt64(_options.Num), key);
+                db.Delete(key);
                 stats.Ops++;
                 stats.ByteSlice += _options.KeySize;
                 return new ValueTask<bool>(true);
@@ -575,13 +651,19 @@ internal sealed class Runner
                         }
                         else
                         {
+                            var opsBefore = stats.Ops;
                             var opWatch = Stopwatch.StartNew();
                             more = await runOp(i);
                             opWatch.Stop();
 
                             if (more)
                             {
-                                histogram.Add(opWatch.Elapsed.TotalMicroseconds);
+                                var completedOps = stats.Ops - opsBefore;
+                                var microsPerOp = opWatch.Elapsed.TotalMicroseconds / completedOps;
+                                for (long completed = 0; completed < completedOps; completed++)
+                                {
+                                    histogram.Add(microsPerOp);
+                                }
                             }
                         }
 
@@ -687,7 +769,7 @@ internal sealed class Runner
         Console.WriteLine($"Entries:    {_options.Num:N0}");
         Console.WriteLine($"RawSize:    {rawSizeMb:F1} MB (estimated)");
         Console.WriteLine($"Threads:    {_options.Threads}");
-        Console.WriteLine($"Compaction: {_options.Compaction}  WAL: {(_options.Wal ? "on" : "off")}{(_options.WalSync ? " (sync)" : "")}");
+        Console.WriteLine($"Compaction: {_options.Compaction}  WAL: {(_options.Wal ? "on" : "off")}{(_options.WalSync ? " (sync)" : "")}  Batch: {_options.BatchSize}");
         Console.WriteLine($"DB path:    {_dbPath}");
         Console.WriteLine(Separator);
     }

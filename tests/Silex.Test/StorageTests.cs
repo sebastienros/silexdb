@@ -921,6 +921,98 @@ public class StorageTests
     }
 
     [Test]
+    public async Task WriteBatchRecoversEveryAcknowledgedEntryAfterCrash()
+    {
+        using var tempFolder = TempFolder.Create();
+        var options = new StorageOptions { FlushPeriod = TimeSpan.Zero };
+
+        await CrashRecoveryTestProcess.WriteAndExitWithoutDisposalAsync(
+            tempFolder,
+            entryCount: 37,
+            batchSize: 8);
+
+        await Assert.That(Directory.EnumerateFiles(tempFolder, "*.sst")).IsEmpty();
+        var reopened = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
+
+        for (var i = 0; i < 37; i++)
+        {
+            await Assert.That(DecodeInt32(await reopened.GetAsync(i))).IsEqualTo(i + 1);
+        }
+
+        await reopened.CloseAsync();
+    }
+
+    [Test]
+    public async Task WriteBatchAppliesPutsEmptyValuesAndDeletes()
+    {
+        using var tempFolder = TempFolder.Create();
+        var storage = await LsmStorage.OpenAsync(
+            tempFolder,
+            new StorageOptions { FlushPeriod = TimeSpan.Zero });
+        storage.Put([2], [9]);
+
+        var entries = new[]
+        {
+            WriteBatchEntry.Put(new byte[] { 1 }, ReadOnlyMemory<byte>.Empty),
+            WriteBatchEntry.Delete(new byte[] { 2 }),
+            WriteBatchEntry.Put(new byte[] { 3 }, new byte[] { 4, 5 }),
+        };
+        storage.WriteBatch(entries);
+
+        var value = new byte[2];
+        await Assert.That(await storage.GetRawAsync(new byte[] { 1 }, value)).IsEqualTo(0);
+        await Assert.That(await storage.GetRawAsync(new byte[] { 2 }, value)).IsEqualTo(-1);
+        await Assert.That(await storage.GetRawAsync(new byte[] { 3 }, value)).IsEqualTo(2);
+        await Assert.That(value).IsEquivalentTo(new byte[] { 4, 5 });
+
+        await storage.CloseAsync();
+    }
+
+    [Test]
+    public async Task ConcurrentWriteBatchesAreSerializedWithoutLosingEntries()
+    {
+        using var tempFolder = TempFolder.Create();
+        var storage = await LsmStorage.OpenAsync(
+            tempFolder,
+            new StorageOptions { FlushPeriod = TimeSpan.Zero });
+        const int writerCount = 4;
+        const int entriesPerWriter = 128;
+
+        await Parallel.ForAsync(0, writerCount, async (writer, _) =>
+        {
+            var keys = new byte[entriesPerWriter * 2];
+            var values = new byte[entriesPerWriter];
+            var entries = new WriteBatchEntry[entriesPerWriter];
+
+            for (var i = 0; i < entries.Length; i++)
+            {
+                var key = keys.AsMemory(i * 2, 2);
+                key.Span[0] = (byte)writer;
+                key.Span[1] = (byte)i;
+                var value = values.AsMemory(i, 1);
+                value.Span[0] = (byte)(writer + i);
+                entries[i] = WriteBatchEntry.Put(key, value);
+            }
+
+            storage.WriteBatch(entries);
+            await ValueTask.CompletedTask;
+        });
+
+        var destination = new byte[1];
+        for (var writer = 0; writer < writerCount; writer++)
+        {
+            for (var i = 0; i < entriesPerWriter; i++)
+            {
+                var key = new byte[] { (byte)writer, (byte)i };
+                await Assert.That(await storage.GetRawAsync(key, destination)).IsEqualTo(1);
+                await Assert.That(destination[0]).IsEqualTo((byte)(writer + i));
+            }
+        }
+
+        await storage.CloseAsync();
+    }
+
+    [Test]
     public async Task WriteAheadLogDistinguishesEmptyValueFromDelete()
     {
         using var tempFolder = TempFolder.Create();
@@ -971,6 +1063,67 @@ public class StorageTests
                 using var concurrentWriter = new WriteAheadLog(walPath, syncToDisk: false);
             }).Throws<IOException>();
         }
+    }
+
+    [Test]
+    public async Task WriteAheadLogDoesNotReplayAPartiallyWrittenBatch()
+    {
+        using var tempFolder = TempFolder.Create();
+        var walPath = Path.Combine(tempFolder, "torn-batch.wal");
+        var entries = new[]
+        {
+            WriteBatchEntry.Put(new byte[] { 2 }, new byte[] { 20 }),
+            WriteBatchEntry.Put(new byte[] { 3 }, new byte[] { 30 }),
+        };
+
+        using (var wal = new WriteAheadLog(walPath, syncToDisk: false))
+        {
+            wal.AppendRaw([1], [10]);
+            wal.AppendBatch(entries);
+        }
+
+        using (var stream = new FileStream(walPath, FileMode.Open, FileAccess.Write, FileShare.None))
+        {
+            stream.SetLength(stream.Length - 1);
+        }
+
+        using var memTable = new MemTable(1);
+        WriteAheadLog.Replay(walPath, memTable);
+        using var firstKey = OwnedByteSlice.CopyFrom([1]);
+        using var secondKey = OwnedByteSlice.CopyFrom([2]);
+
+        await Assert.That(memTable.TryGet(firstKey.Slice, out var first)).IsTrue();
+        await Assert.That(first!.Span[0]).IsEqualTo((byte)10);
+        await Assert.That(memTable.TryGet(secondKey.Slice, out _)).IsFalse();
+    }
+
+    [Test]
+    public async Task WriteAheadLogDoesNotReplayACorruptedBatch()
+    {
+        using var tempFolder = TempFolder.Create();
+        var walPath = Path.Combine(tempFolder, "corrupted-batch.wal");
+        var entries = new[]
+        {
+            WriteBatchEntry.Put(new byte[] { 1 }, new byte[] { 10 }),
+            WriteBatchEntry.Put(new byte[] { 2 }, new byte[] { 20 }),
+        };
+
+        using (var wal = new WriteAheadLog(walPath, syncToDisk: false))
+        {
+            wal.AppendBatch(entries);
+        }
+
+        var bytes = await File.ReadAllBytesAsync(walPath);
+        bytes[8] ^= 0xFF;
+        await File.WriteAllBytesAsync(walPath, bytes);
+
+        using var memTable = new MemTable(1);
+        WriteAheadLog.Replay(walPath, memTable);
+        using var firstKey = OwnedByteSlice.CopyFrom([1]);
+        using var secondKey = OwnedByteSlice.CopyFrom([2]);
+
+        await Assert.That(memTable.TryGet(firstKey.Slice, out _)).IsFalse();
+        await Assert.That(memTable.TryGet(secondKey.Slice, out _)).IsFalse();
     }
 
     [Test]
