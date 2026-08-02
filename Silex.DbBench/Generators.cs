@@ -19,11 +19,7 @@ internal sealed class KeyGenerator
         _prefixBytes = Math.Min(8, keySize);
     }
 
-    /// <summary>
-    /// Allocates a fresh key array for <paramref name="value"/>. A new array is required on every call
-    /// because Silex takes ownership of the key (zero-copy); a shared/reused buffer would be mutated under
-    /// the engine.
-    /// </summary>
+    /// <summary>Allocates and populates a key array for <paramref name="value"/>.</summary>
     public byte[] Generate(long value)
     {
         var key = new byte[_keySize];
@@ -33,8 +29,8 @@ internal sealed class KeyGenerator
 
     /// <summary>
     /// Writes the key for <paramref name="value"/> into <paramref name="destination"/> without allocating.
-    /// Use this only for reads/lookups, where Silex does not take ownership of the key buffer, so a single
-    /// per-thread scratch array can be reused across operations.
+    /// Silex copies writes into its memtable arena before returning, so benchmark write and read loops can
+    /// both reuse a per-thread scratch array.
     /// </summary>
     public void GenerateInto(long value, Span<byte> destination)
     {
@@ -51,8 +47,7 @@ internal sealed class KeyGenerator
 
 /// <summary>
 /// Generates value payloads of a fixed size. Like <c>db_bench</c>'s <c>RandomGenerator</c> it precomputes
-/// one backing buffer of random bytes and serves successive slices from a rolling offset, but it copies
-/// each slice into its own array because Silex takes ownership of stored values.
+/// one backing buffer of random bytes and serves successive slices from a rolling offset.
 /// </summary>
 internal sealed class ValueGenerator
 {
@@ -90,16 +85,21 @@ internal sealed class ValueGenerator
 
     public byte[] Generate(int valueSize)
     {
+        var value = new byte[valueSize];
+        GenerateInto(value);
+        return value;
+    }
+
+    public void GenerateInto(Span<byte> destination)
+    {
+        var valueSize = destination.Length;
         if (_offset + valueSize > _data.Length)
         {
             _offset = 0;
         }
 
-        var value = new byte[valueSize];
-        _data.AsSpan(_offset, valueSize).CopyTo(value);
+        _data.AsSpan(_offset, valueSize).CopyTo(destination);
         _offset += valueSize;
-
-        return value;
     }
 }
 

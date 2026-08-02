@@ -6,10 +6,12 @@ namespace Silex.Tables;
 internal sealed class BlockCache : IDisposable
 {
     private const int RecencySampleMask = 15;
+    private const int LoadStripeCount = 256;
 
     private readonly object _gate = new();
     private readonly long _sizeLimit;
     private readonly ConcurrentDictionary<BlockCacheKey, Entry> _entries = [];
+    private readonly object[] _loadGates = CreateLoadGates();
     private Entry? _lruHead;
     private Entry? _lruTail;
     private long _size;
@@ -49,10 +51,56 @@ internal sealed class BlockCache : IDisposable
         where TLoader : struct, IBlockLoader
     {
         cancellationToken.ThrowIfCancellationRequested();
+
+        if (_sizeLimit == 0)
+        {
+            return LoadAndCache(key, loader, cancellationToken);
+        }
+
+        lock (GetLoadGate(key))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            ThrowIfDisposed();
+
+            if (TryAcquire(key, out var lease))
+            {
+                return lease;
+            }
+
+            return LoadAndCache(key, loader, cancellationToken);
+        }
+    }
+
+    private object GetLoadGate(BlockCacheKey key)
+    {
+        var hash = unchecked((int)key.TableId * 397) ^ key.BlockIndex;
+        return _loadGates[hash & (LoadStripeCount - 1)];
+    }
+
+    private static object[] CreateLoadGates()
+    {
+        var gates = new object[LoadStripeCount];
+        for (var i = 0; i < gates.Length; i++)
+        {
+            gates[i] = new object();
+        }
+
+        return gates;
+    }
+
+    private BlockLease LoadAndCache<TLoader>(BlockCacheKey key, TLoader loader, CancellationToken cancellationToken)
+        where TLoader : struct, IBlockLoader
+    {
         Block? block = null;
 
         try
         {
+            block = loader.Load(cancellationToken);
+            if (block == null)
+            {
+                return default;
+            }
+
             lock (_gate)
             {
                 ThrowIfDisposed();
@@ -60,12 +108,6 @@ internal sealed class BlockCache : IDisposable
                 if (TryAcquireLocked(key, out var lease))
                 {
                     return lease;
-                }
-
-                block = loader.Load(cancellationToken);
-                if (block == null)
-                {
-                    return default;
                 }
 
                 var entry = new Entry(key, block, block.Memory.Length, refCount: 1);
@@ -327,12 +369,13 @@ internal sealed class BlockCache : IDisposable
             }
         }
     }
+
 }
 
 internal readonly record struct BlockCacheKey(long TableId, int BlockIndex);
 
 /// <summary>
-/// Loads a block on a cache miss. Implemented by a struct so <see cref="BlockCache{ByteSlice, ByteSlice}.GetOrLoadAsync"/>
+/// Loads a block on a cache miss. Implemented by a struct so <see cref="BlockCache"/>
 /// can populate a miss without allocating a closure per read.
 /// </summary>
 internal interface IBlockLoader

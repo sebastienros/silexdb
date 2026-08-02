@@ -9,11 +9,14 @@ namespace Silex.Tables;
 
 internal sealed class SsTable : IDisposable
 {
+    private const int SequentialReadBufferSize = 64 * 1024;
+
     private readonly long _id;
     private readonly string _filename;
     private readonly ByteSlice? _firstKey;
     private readonly ByteSlice? _lastKey;
     private readonly BlockBuilder _blockBuilder;
+    private readonly BlockMetadata[] _blockMetadata;
     private readonly FileStream _stream;
     private readonly SafeFileHandle _handle;
     private bool _disposed;
@@ -24,18 +27,21 @@ internal sealed class SsTable : IDisposable
         _filename = filename;
         _stream = stream;
         _handle = stream.SafeFileHandle;
-        BlockMetadata = blockMetadata;
+        _blockMetadata = blockMetadata as BlockMetadata[] ?? blockMetadata.ToArray();
+        BlockMetadata = _blockMetadata;
         MetaBlockOffset = metadataBlockOffset;
         _blockBuilder = blockBuilder;
         BloomFilter = bloomFilter;
-        if (blockMetadata.Count > 0)
+        if (_blockMetadata.Length > 0)
         {
-            _firstKey = BlockMetadata[0].FirstKey;
-            _lastKey = BlockMetadata[BlockMetadata.Count - 1].LastKey;
+            _firstKey = _blockMetadata[0].FirstKey;
+            _lastKey = _blockMetadata[^1].LastKey;
         }
     }
 
     public IReadOnlyList<BlockMetadata> BlockMetadata { get; } = [];
+
+    internal BlockMetadata[] BlockMetadataArray => _blockMetadata;
 
     public long MetaBlockOffset { get; }
 
@@ -61,7 +67,7 @@ internal sealed class SsTable : IDisposable
 
     public async Task<Block?> ReadBlockAsync(int index, CancellationToken cancellationToken = default)
     {
-        var metadata = BlockMetadata[index];
+        var metadata = _blockMetadata[index];
         var (offset, length) = GetBlockExtent(index);
 
         if (metadata.Compression != SstCompression.None)
@@ -117,7 +123,7 @@ internal sealed class SsTable : IDisposable
     /// </summary>
     public Block? ReadBlock(int index)
     {
-        var metadata = BlockMetadata[index];
+        var metadata = _blockMetadata[index];
         var (offset, length) = GetBlockExtent(index);
 
         if (metadata.Compression != SstCompression.None)
@@ -163,6 +169,8 @@ internal sealed class SsTable : IDisposable
         }
     }
 
+    internal SequentialBlockReader CreateSequentialBlockReader() => new(this);
+
     private async ValueTask ReadExactlyAsync(Memory<byte> destination, long offset, CancellationToken cancellationToken)
     {
         var read = 0;
@@ -204,11 +212,11 @@ internal sealed class SsTable : IDisposable
 
     private (long Offset, int Length) GetBlockExtent(int index)
     {
-        var offset = BlockMetadata[index].Offset;
+        var offset = _blockMetadata[index].Offset;
 
         // If there is a single block it ends at the metadata block
-        var offsetEnd = BlockMetadata.Count > index + 1
-            ? BlockMetadata[index + 1].Offset
+        var offsetEnd = _blockMetadata.Length > index + 1
+            ? _blockMetadata[index + 1].Offset
             : MetaBlockOffset;
 
         return (offset, (int)(offsetEnd - offset));
@@ -223,7 +231,7 @@ internal sealed class SsTable : IDisposable
     }
 
     /// <summary>
-    /// Struct loader passed to <see cref="BlockCache{ByteSlice, ByteSlice}.GetOrLoadAsync"/> so the cache can populate a
+    /// Struct loader passed to <see cref="BlockCache"/> so the cache can populate a
     /// miss without allocating a closure on every read (including cache hits, which never invoke it). The miss
     /// reads the block synchronously on the calling thread to avoid a per-miss thread-pool dispatch.
     /// </summary>
@@ -242,6 +250,91 @@ internal sealed class SsTable : IDisposable
         {
             cancellationToken.ThrowIfCancellationRequested();
             return _table.ReadBlock(_index);
+        }
+    }
+
+    internal sealed class SequentialBlockReader : IDisposable
+    {
+        private readonly SsTable _table;
+        private readonly FileStream _stream;
+        private byte[]? _storedBuffer;
+        private byte[]? _uncompressedBuffer;
+        private int _index;
+
+        public SequentialBlockReader(SsTable table)
+        {
+            _table = table;
+            _stream = new FileStream(
+                table._filename,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read | FileShare.Delete,
+                SequentialReadBufferSize,
+                FileOptions.SequentialScan);
+        }
+
+        public Block ReadNextBlock()
+        {
+            if ((uint)_index >= (uint)_table._blockMetadata.Length)
+            {
+                throw new InvalidOperationException("There are no more blocks in this SST.");
+            }
+
+            var metadata = _table._blockMetadata[_index];
+            var (offset, length) = _table.GetBlockExtent(_index);
+            _index++;
+
+            if (_stream.Position != offset)
+            {
+                _stream.Seek(offset, SeekOrigin.Begin);
+            }
+
+            var stored = GetBuffer(ref _storedBuffer, length);
+            _stream.ReadExactly(stored.AsSpan(0, length));
+            VerifyChecksum(metadata, stored.AsSpan(0, length));
+
+            if (metadata.Compression == SstCompression.None)
+            {
+                return _table._blockBuilder.Decode(stored.AsMemory(0, length));
+            }
+
+            var uncompressed = GetBuffer(ref _uncompressedBuffer, metadata.UncompressedLength);
+            BlockDecompressor.Decompress(
+                metadata.Compression,
+                stored.AsSpan(0, length),
+                uncompressed.AsSpan(0, metadata.UncompressedLength));
+
+            return _table._blockBuilder.Decode(uncompressed.AsMemory(0, metadata.UncompressedLength));
+        }
+
+        public void Dispose()
+        {
+            _stream.Dispose();
+            ReturnBuffer(ref _storedBuffer);
+            ReturnBuffer(ref _uncompressedBuffer);
+        }
+
+        private static byte[] GetBuffer(ref byte[]? buffer, int length)
+        {
+            if (buffer is { Length: var currentLength } && currentLength >= length)
+            {
+                return buffer;
+            }
+
+            ReturnBuffer(ref buffer);
+            buffer = ArrayPool<byte>.Shared.Rent(length);
+            return buffer;
+        }
+
+        private static void ReturnBuffer(ref byte[]? buffer)
+        {
+            var returned = buffer;
+            buffer = null;
+
+            if (returned != null)
+            {
+                ArrayPool<byte>.Shared.Return(returned);
+            }
         }
     }
 
@@ -419,7 +512,7 @@ internal sealed class SsTable : IDisposable
     {
         _stream.Dispose();
         _blockBuilder.Dispose();
-        foreach (var metadata in BlockMetadata)
+        foreach (var metadata in _blockMetadata)
         {
             metadata.Dispose();
         }
