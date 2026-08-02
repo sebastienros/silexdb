@@ -172,11 +172,7 @@ public sealed class LsmStorage : IDisposable, IAsyncDisposable
 
         private static OwnedByteSlice Encode<T>(IBinaryEncoder<T> encoder, T value)
         {
-            using var bufferWriter = new PooledArrayBufferWriter<byte>(Math.Max(1, encoder.GetLength(value)));
-            var writer = new EncoderBinaryWriter(bufferWriter);
-            encoder.Encode(value, ref writer);
-            writer.Flush();
-            return OwnedByteSlice.CopyFrom(bufferWriter.WrittenMemory.Span);
+            return LsmStorageTypedExtensions.EncodeOwned(encoder, value);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]

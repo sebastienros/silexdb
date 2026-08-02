@@ -14,7 +14,8 @@ public ref struct EncoderBinaryWriter
     //
     // note it also has APIs for writing raw BLOBs
 
-    private readonly IBufferWriter<byte> _target;
+    private readonly IBufferWriter<byte>? _target;
+    private readonly bool _isFixedBuffer;
     private int _offset; // position in the current buffer
     private int _length; // size of the current buffer
     private int _written; // number of bytes written if previous buffers
@@ -24,8 +25,19 @@ public ref struct EncoderBinaryWriter
     {
         ArgumentNullException.ThrowIfNull(target);
         _target = target;
+        _isFixedBuffer = false;
         _root = ref Unsafe.NullRef<byte>(); // no buffer initially
         _written = _offset = _length = 0;
+        DebugAssertValid();
+    }
+
+    internal EncoderBinaryWriter(Span<byte> destination)
+    {
+        _target = null;
+        _isFixedBuffer = true;
+        _root = ref MemoryMarshal.GetReference(destination);
+        _written = _offset = 0;
+        _length = destination.Length;
         DebugAssertValid();
     }
 
@@ -44,6 +56,13 @@ public ref struct EncoderBinaryWriter
     [Conditional("DEBUG")]
     private void DebugAssertValid()
     {
+        if (_isFixedBuffer)
+        {
+            Debug.Assert(_target is null);
+            Debug.Assert(_offset >= 0 && _offset <= _length);
+            return;
+        }
+
         Debug.Assert(_target is not null);
         if (Unsafe.IsNullRef(ref _root))
         {
@@ -77,10 +96,15 @@ public ref struct EncoderBinaryWriter
 
     private void RequestNewBuffer()
     {
+        if (_isFixedBuffer)
+        {
+            throw new InvalidOperationException("The fixed encoding buffer is too small.");
+        }
+
         _written += _offset;
 
         Flush();
-        var span = _target.GetSpan(1024); // fairly arbitrary non-trivial buffer; we can explore larger if useful
+        var span = _target!.GetSpan(1024); // fairly arbitrary non-trivial buffer; we can explore larger if useful
         if (span.IsEmpty)
         {
             Throw();
@@ -95,9 +119,14 @@ public ref struct EncoderBinaryWriter
 
     public void Flush() // commits the current buffer and leave in a buffer-free state
     {
+        if (_isFixedBuffer)
+        {
+            return;
+        }
+
         if (!Unsafe.IsNullRef(ref _root))
         {
-            _target.Advance(_offset);
+            _target!.Advance(_offset);
             _length = _offset = 0;
             _root = ref Unsafe.NullRef<byte>();
         }
