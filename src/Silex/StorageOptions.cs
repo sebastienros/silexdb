@@ -45,7 +45,8 @@ public class StorageOptions
     /// </summary>
     /// <remarks>
     /// This value and <see cref="MemTableMaxCount"/> will define the maximum size of allocated memory for keys and values.
-    /// </remarks>/// <value>
+    /// </remarks>
+    /// <value>
     /// The default value is <inheritdoc cref="_defaultTableSizeLimit"/>.
     /// </value>
     public long MemTableSizeLimit { get; set; } = _defaultTableSizeLimit;
