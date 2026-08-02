@@ -12,6 +12,8 @@ bound read and space amplification.
 - **Zero-copy reads** – values served from memory are returned as read-only borrows of engine-owned
   memory rather than defensive copies.
 - **Ordered range scans** – iterate the whole key space, or from a given key, in ascending key order.
+- **Optional MVCC** – stable snapshots and optimistic transactions are available through a separate facade,
+  without adding sequence checks or larger internal keys to the default store.
 - **Pluggable compaction** – choose `Tiered` (write-optimized), `Leveled` (read-optimized), or `None`.
 - **Bloom filters and a block cache** – skip SSTs that cannot contain a key and cache hot blocks.
 - **Multi-targeted** – builds for `net8.0` and `net10.0`.
@@ -178,6 +180,55 @@ await db.ScanRawAsync(Console.Out, static (writer, key, value) =>
     return true;
 });
 ```
+
+## Optional MVCC and transactions
+
+Open a path with `MvccStorage` when it needs stable snapshots or multi-key transactions:
+
+```csharp
+await using var db = await MvccStorage.OpenAsync("accounts-db", new StorageOptions());
+
+db.Put("alice"u8, "30"u8);
+db.Put("bob"u8, "0"u8);
+
+using var snapshot = db.CreateSnapshot();
+
+using var transaction = db.BeginTransaction();
+var balance = new byte[16];
+int length = await transaction.GetForUpdateRawAsync("alice"u8, balance);
+
+transaction.Put("alice"u8, "20"u8);
+transaction.Put("bob"u8, "10"u8);
+
+if (!await transaction.TryCommitAsync())
+{
+    // A tracked or written key changed after the transaction started; retry from a new transaction.
+}
+```
+
+`MvccStorage` is deliberately a separate facade rather than a `StorageOptions` switch in the core engine.
+Regular `LsmStorage` databases keep their original key format and hot paths: no sequence allocation, version
+suffix, snapshot registry, or transaction validation is paid by applications that do not use MVCC. A database
+path must always be opened through the same facade; an existing plain database is rejected by
+`MvccStorage.OpenAsync`.
+
+The MVCC facade stores user keys in escaped lexicographic form followed by a descending sequence number.
+Commits reserve a sequence, write every version, and publish the sequence last. Readers capture only the
+published sequence, so they see either all of a multi-key commit or none of it. With the WAL enabled, the
+allocated/published sequence barrier also leaves interrupted commits invisible after recovery.
+
+Transactions provide snapshot isolation with optimistic commit-time validation:
+
+- Written keys detect write-write conflicts automatically.
+- `GetForUpdateRawAsync` also tracks read-write conflicts and prevents point-read write skew.
+- Plain `GetRawAsync` reads do not participate in conflict detection.
+- Range reads are not range-locked, so transactions can still observe phantom conflicts at the application
+  level; serializable range transactions are not provided.
+
+MVCC users pay for larger physical keys (11 bytes plus one escape byte per zero in the user key), retained old
+versions, transaction buffers, and sequence metadata writes. Dispose snapshots and transactions promptly, then
+call `CollectGarbageAsync` periodically to remove versions that no active view can observe. Pass
+`compact: true` when the call should also flush and compact the resulting physical tombstones.
 
 ## Closing the store
 
