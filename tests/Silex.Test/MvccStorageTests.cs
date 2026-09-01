@@ -12,6 +12,49 @@ public class MvccStorageTests
     };
 
     [Test]
+    public async Task PackedWriteBufferShouldNotAllocatePerMutation()
+    {
+        using (var warmup = new MvccWriteBuffer())
+        {
+            for (var i = 0; i < 128; i++)
+            {
+                warmup.AddMutation(BitConverter.GetBytes(i), [1], isTombstone: false);
+            }
+        }
+
+        using var writes = new MvccWriteBuffer();
+        Span<byte> key = stackalloc byte[sizeof(int)];
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        for (var i = 0; i < 128; i++)
+        {
+            BitConverter.TryWriteBytes(key, i);
+            writes.AddMutation(key, [1], isTombstone: false);
+        }
+
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+        await Assert.That(allocated).IsEqualTo(0);
+    }
+
+    [Test]
+    public async Task TransactionOverwriteDeleteAndTrackedReadsPreserveSemantics()
+    {
+        using var folder = TempFolder.Create();
+        await using var storage = await MvccStorage.OpenAsync(folder, _options);
+        storage.Put([1], [1]);
+
+        using var transaction = storage.BeginTransaction();
+        await AssertValueForUpdateAsync(transaction, [1], [1]);
+        transaction.Put([1], [2]);
+        transaction.Put([1], [3]);
+        transaction.Delete([1]);
+        transaction.Put([1], []);
+
+        await Assert.That(await transaction.GetRawAsync([1], Memory<byte>.Empty)).IsEqualTo(0);
+        await transaction.CommitAsync();
+        await Assert.That(await storage.GetRawAsync([1], Memory<byte>.Empty)).IsEqualTo(0);
+    }
+
+    [Test]
     public async Task SnapshotKeepsStableVersionForBinaryKey()
     {
         using var folder = TempFolder.Create();

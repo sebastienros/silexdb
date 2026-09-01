@@ -6,6 +6,8 @@ namespace Silex;
 
 public static class LsmStorageTypedExtensions
 {
+    private const int StackallocThreshold = 256;
+
     public static void Put(this LsmStorage storage, int key, ReadOnlySpan<byte> value) => PutEncodedKey(storage, key, value);
     public static void Put(this LsmStorage storage, uint key, ReadOnlySpan<byte> value) => PutEncodedKey(storage, key, value);
     public static void Put(this LsmStorage storage, long key, ReadOnlySpan<byte> value) => PutEncodedKey(storage, key, value);
@@ -140,8 +142,10 @@ public static class LsmStorageTypedExtensions
         }
 
         var length = encoder.GetLength(key);
-        var rented = ArrayPool<byte>.Shared.Rent(Math.Max(1, length));
-        var buffer = rented.AsSpan(0, length);
+        byte[]? rented = null;
+        Span<byte> buffer = length <= StackallocThreshold
+            ? stackalloc byte[length]
+            : (rented = ArrayPool<byte>.Shared.Rent(length)).AsSpan(0, length);
 
         try
         {
@@ -150,7 +154,10 @@ public static class LsmStorageTypedExtensions
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(rented);
+            if (rented is not null)
+            {
+                ArrayPool<byte>.Shared.Return(rented);
+            }
         }
     }
 
@@ -164,41 +171,76 @@ public static class LsmStorageTypedExtensions
         var keyLength = hasRawKey ? 0 : keyEncoder.GetLength(key);
         var valueLength = hasRawValue ? 0 : valueEncoder.GetLength(value);
 
-        byte[]? rented = null;
-        Span<byte> keyBuffer = default;
-        Span<byte> valueBuffer = default;
+        var encodedLength = checked(keyLength + valueLength);
+        if (encodedLength <= StackallocThreshold)
+        {
+            Span<byte> buffer = stackalloc byte[encodedLength];
+            EncodeAndPut(
+                storage,
+                keyEncoder,
+                key,
+                hasRawKey,
+                encodedKey,
+                keyLength,
+                valueEncoder,
+                value,
+                hasRawValue,
+                encodedValue,
+                valueLength,
+                buffer);
+            return;
+        }
 
+        var rented = ArrayPool<byte>.Shared.Rent(encodedLength);
         try
         {
-            var encodedLength = checked(keyLength + valueLength);
-            if (encodedLength != 0)
-            {
-                rented = ArrayPool<byte>.Shared.Rent(encodedLength);
-            }
-
-            if (!hasRawKey)
-            {
-                keyBuffer = rented.AsSpan(0, keyLength);
-                EncodeInto(keyEncoder, key, keyBuffer);
-                encodedKey = keyBuffer;
-            }
-
-            if (!hasRawValue)
-            {
-                valueBuffer = rented.AsSpan(keyLength, valueLength);
-                EncodeInto(valueEncoder, value, valueBuffer);
-                encodedValue = valueBuffer;
-            }
-
-            storage.Put(encodedKey, encodedValue);
+            EncodeAndPut(
+                storage,
+                keyEncoder,
+                key,
+                hasRawKey,
+                encodedKey,
+                keyLength,
+                valueEncoder,
+                value,
+                hasRawValue,
+                encodedValue,
+                valueLength,
+                rented.AsSpan(0, encodedLength));
         }
         finally
         {
-            if (rented is not null)
-            {
-                ArrayPool<byte>.Shared.Return(rented);
-            }
+            ArrayPool<byte>.Shared.Return(rented);
         }
+    }
+
+    private static void EncodeAndPut<TKey, TValue>(
+        LsmStorage storage,
+        IBinaryEncoder<TKey> keyEncoder,
+        TKey key,
+        bool hasRawKey,
+        ReadOnlySpan<byte> rawKey,
+        int keyLength,
+        IBinaryEncoder<TValue> valueEncoder,
+        TValue value,
+        bool hasRawValue,
+        ReadOnlySpan<byte> rawValue,
+        int valueLength,
+        scoped Span<byte> buffer)
+    {
+        if (!hasRawKey)
+        {
+            EncodeInto(keyEncoder, key, buffer[..keyLength]);
+        }
+
+        if (!hasRawValue)
+        {
+            EncodeInto(valueEncoder, value, buffer.Slice(keyLength, valueLength));
+        }
+
+        storage.Put(
+            hasRawKey ? rawKey : buffer[..keyLength],
+            hasRawValue ? rawValue : buffer.Slice(keyLength, valueLength));
     }
 
     private static void DeleteEncoded<TKey>(LsmStorage storage, TKey key)
@@ -211,8 +253,10 @@ public static class LsmStorageTypedExtensions
         }
 
         var length = encoder.GetLength(key);
-        var rented = ArrayPool<byte>.Shared.Rent(Math.Max(1, length));
-        var buffer = rented.AsSpan(0, length);
+        byte[]? rented = null;
+        Span<byte> buffer = length <= StackallocThreshold
+            ? stackalloc byte[length]
+            : (rented = ArrayPool<byte>.Shared.Rent(length)).AsSpan(0, length);
 
         try
         {
@@ -221,7 +265,10 @@ public static class LsmStorageTypedExtensions
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(rented);
+            if (rented is not null)
+            {
+                ArrayPool<byte>.Shared.Return(rented);
+            }
         }
     }
 

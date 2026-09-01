@@ -7,6 +7,7 @@ internal sealed class MemTableArena : IDisposable
     private readonly int _blockSize;
     private readonly List<SlabOwner> _slabs = [];
     private SlabOwner? _currentSlab;
+    private int _currentSlabIndex = -1;
     private int _position;
     private bool _disposed;
 
@@ -16,16 +17,17 @@ internal sealed class MemTableArena : IDisposable
         _blockSize = blockSize;
     }
 
-    public ByteSlice Copy(ReadOnlySpan<byte> value)
+    public ArenaSlice Copy(ReadOnlySpan<byte> value)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
         if (value.IsEmpty)
         {
-            return ByteSlice.Empty;
+            return ArenaSlice.Empty;
         }
 
         var slab = GetWritableSlab(value.Length);
+        var slabIndex = ReferenceEquals(slab, _currentSlab) ? _currentSlabIndex : _slabs.Count - 1;
         var offset = ReferenceEquals(slab, _currentSlab) ? _position : 0;
         value.CopyTo(slab.Memory.Span.Slice(offset, value.Length));
 
@@ -34,7 +36,31 @@ internal sealed class MemTableArena : IDisposable
             _position += value.Length;
         }
 
-        return ByteSlice.CreateView(slab, offset, value.Length);
+        return new ArenaSlice(slabIndex, offset, value.Length);
+    }
+
+    public ReadOnlySpan<byte> GetSpan(ArenaSlice slice)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        return slice.Length == 0
+            ? ReadOnlySpan<byte>.Empty
+            : _slabs[slice.SlabIndex].Memory.Span.Slice(slice.Offset, slice.Length);
+    }
+
+    public ReadOnlyMemory<byte> GetMemory(ArenaSlice slice)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        return slice.Length == 0
+            ? ReadOnlyMemory<byte>.Empty
+            : _slabs[slice.SlabIndex].Memory.Slice(slice.Offset, slice.Length);
+    }
+
+    public ByteSlice GetByteSlice(ArenaSlice slice)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        return slice.Length == 0
+            ? ByteSlice.Empty
+            : ByteSlice.CreateView(_slabs[slice.SlabIndex], slice.Offset, slice.Length);
     }
 
     public void Dispose()
@@ -53,6 +79,7 @@ internal sealed class MemTableArena : IDisposable
 
         _slabs.Clear();
         _currentSlab = null;
+        _currentSlabIndex = -1;
         _position = 0;
     }
 
@@ -66,6 +93,7 @@ internal sealed class MemTableArena : IDisposable
         if (_currentSlab is null || _currentSlab.Memory.Length - _position < length)
         {
             _currentSlab = AddSlab(_blockSize);
+            _currentSlabIndex = _slabs.Count - 1;
             _position = 0;
         }
 
@@ -77,6 +105,11 @@ internal sealed class MemTableArena : IDisposable
         var slab = new SlabOwner(length);
         _slabs.Add(slab);
         return slab;
+    }
+
+    internal readonly record struct ArenaSlice(int SlabIndex, int Offset, int Length)
+    {
+        public static readonly ArenaSlice Empty = new(-1, 0, 0);
     }
 
     private sealed class SlabOwner : IMemoryOwner<byte>

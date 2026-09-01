@@ -1,6 +1,6 @@
-using System.Buffers.Binary;
 using BenchmarkDotNet.Attributes;
 using Silex.Blocks;
+using System.Buffers.Binary;
 
 namespace Silex.Benchmarks;
 
@@ -87,7 +87,6 @@ public class BlockLookupBenchmarks
 
         return found;
     }
-
     [Benchmark, BenchmarkCategory("Miss")]
     public int ByteSliceMiss()
     {

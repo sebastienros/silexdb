@@ -140,9 +140,9 @@ internal sealed class LsmStorageInner : IDisposable
 
             // CurrentMemTable is the only thing that needs to be locked
             // since all other collections are immutable
-            if (currentMemTable.TryGet(key, out var result))
+            if (currentMemTable.TryGetRaw(key.Span, out var result, out var isTombstone))
             {
-                return result.IsTombstone ? null : OwnedByteSlice.CopyFrom(result.Span);
+                return isTombstone ? null : OwnedByteSlice.CopyFrom(result.Span);
             }
         }
         finally 
@@ -163,9 +163,9 @@ internal sealed class LsmStorageInner : IDisposable
                 // recently frozen table win when the same key exists in several of them.
                 foreach (var memTable in immutableMemTables.Reverse())
                 {
-                    if (memTable.TryGet(key, out var result))
+                    if (memTable.TryGetRaw(key.Span, out var result, out var isTombstone))
                     {
-                        return result.IsTombstone ? null : OwnedByteSlice.CopyFrom(result.Span);
+                        return isTombstone ? null : OwnedByteSlice.CopyFrom(result.Span);
                     }
                 }
             }
@@ -937,42 +937,20 @@ internal sealed class LsmStorageInner : IDisposable
     {
         length = 0;
 
-        if (!memTable.TryGet(key, out var value))
+        if (!memTable.TryGetRaw(key.Span, out var value, out var isTombstone))
         {
             return RawLookup.Miss;
         }
 
         // A present key shadows every older source, whether live or a tombstone.
-        if (value.IsTombstone)
+        if (isTombstone)
         {
             return RawLookup.Tombstone;
         }
 
-        if (_valueSerializer.TryGetRawBytes(value, out var bytes))
-        {
-            sink.Accept(bytes);
-            length = bytes.Length;
-            return RawLookup.Live;
-        }
-
-        // The value cannot expose its bytes directly (non-identity encoder); encode it into a pooled buffer.
-        var bufferWriter = new PooledArrayBufferWriter<byte>(Math.Max(1, _valueSerializer.GetLength(value)));
-
-        try
-        {
-            var writer = new EncoderBinaryWriter(bufferWriter);
-            _valueSerializer.Encode(value, ref writer);
-            writer.Flush();
-            var encoded = bufferWriter.WrittenMemory.Span;
-
-            sink.Accept(encoded);
-            length = encoded.Length;
-            return RawLookup.Live;
-        }
-        finally
-        {
-            bufferWriter.Dispose();
-        }
+        sink.Accept(value.Span);
+        length = value.Length;
+        return RawLookup.Live;
     }
 
     /// <summary>

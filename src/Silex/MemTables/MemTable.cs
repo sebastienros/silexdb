@@ -1,96 +1,82 @@
-﻿using Silex.Collections;
-using Silex.Serialization;
 using Silex.Tables;
 using Silex.Wal;
-using System.Diagnostics;
+using System.Buffers;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 
 namespace Silex.MemTables;
 
 /// <summary>
-/// An instance of <see cref="MemTable"/> contains a sorted list of key value pairs of bytes to be stored.
-/// The default collection is a dictionary, and mutates to a custom implementation of <see cref="SortedDictionary{ByteSlice, ByteSlice}"/> once
-/// the table is enumerated. We use a custom implementation in order to add Enumerate(from, to) without needing to 
-/// clone the keys collection.
+/// Stores keys and values in arena slabs and keeps compact record descriptors in contiguous arrays.
+/// Point lookups use open addressing; sorted iteration uses a lazily rebuilt index of record positions.
 /// </summary>
 /// <remarks>
-/// The current implementation is not thread-safe when writes are involved. Thread-safety is handled in <see cref="LsmStorageInner"/>
-/// as it knows when a MemTable is frozen or used concurrently in read/write.
-/// The dictionary supports multiple concurrent readers, as long as the collection is not modified, meaning the 
-/// higher-level component needs to lock reads during writes.
-/// 
-/// A MemTable doesn't hold an entry that was read from the store. It is not a reads cache.
-/// 
-/// A MemTable usually has a size limit and it will be frozen to an immutable MemTable when it reaches the size limit.
-/// This logic is part of <see cref="LsmStorageInner"/>.
+/// Writes are synchronized by <see cref="LsmStorageInner"/>. Frozen tables support concurrent readers.
+/// A MemTable only owns writes and tombstones; it is not a read cache.
 /// </remarks>
 internal sealed class MemTable : IMemTable, IRawBytesMemTable
 {
-    private static readonly IBinaryEncoder<ByteSlice> _keySerializer = BinaryEncoderFactory<ByteSlice>.BinarySerializer;
+    private const int InitialRecordCapacity = 16;
+    private const int InitialBucketCapacity = 32;
 
-    private volatile Dictionary<ByteSlice, ByteSlice>? _dic = new(_keySerializer.EqualityComparer);
-    private volatile SortedDictionary<ByteSlice, ByteSlice>? _sorted;
-
-    private long _size;
-    private bool _disposed;
     private readonly long _id;
     private readonly WriteAheadLog? _wal;
-    private readonly MemTableArena? _arena;
+    private readonly MemTableArena _arena;
+    private readonly RecordIndexComparer _recordComparer;
+
+    private MemTableRecord[] _records;
+    private int[] _buckets;
+    private int _bucketCapacity;
+    private int[]? _sortedIndices;
+    private int _count;
+    private long _size;
+    private volatile bool _sortDirty;
+    private bool _disposed;
 
     public MemTable(long id, WriteAheadLog? wal = null, int arenaBlockSize = 32 * 1024)
     {
         _id = id;
         _wal = wal;
         _arena = new MemTableArena(arenaBlockSize);
+        _records = ArrayPool<MemTableRecord>.Shared.Rent(InitialRecordCapacity);
+        _buckets = ArrayPool<int>.Shared.Rent(InitialBucketCapacity);
+        _bucketCapacity = InitialBucketCapacity;
+        _buckets.AsSpan(0, _bucketCapacity).Clear();
+        _recordComparer = new RecordIndexComparer(this);
     }
 
-    /// <summary>
-    /// The identifier of the <see cref="MemTable"/>. Used for debugging purpose.
-    /// </summary>
     public long Id => _id;
 
-    /// <inheritdocs />
     public long Size => _size;
 
-    /// <inheritdocs />
-    public int Count
-    {
-        get
-        {
-            var dic = _dic;
-            return dic == null ? _sorted!.Count : dic.Count;
-        }
-    }
+    public int Count => _count;
 
-    /// <inheritdocs />
     public bool TryGet(ByteSlice key, [MaybeNullWhen(false)] out ByteSlice result)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
-
-        var dic = _dic;
-        if (dic == null)
+        if (!TryFindRecord(key.Span, out var record))
         {
-            Debug.Assert(_sorted != null);
-
-            if (_sorted.TryGetValue(key, out result))
-            {
-                return true;
-            }
-        }
-        else
-        {
-            if (dic.TryGetValue(key, out result))
-            {
-                return true;
-            }
+            result = default;
+            return false;
         }
 
-        result = default!;
-        return false;
+        result = record.IsTombstone ? ByteSlice.Tombstone : _arena.GetByteSlice(record.Value);
+        return true;
     }
 
-    /// <inheritdocs />
+    public bool TryGetRaw(ReadOnlySpan<byte> key, out ReadOnlyMemory<byte> value, out bool isTombstone)
+    {
+        if (!TryFindRecord(key, out var record))
+        {
+            value = default;
+            isTombstone = false;
+            return false;
+        }
+
+        isTombstone = record.IsTombstone;
+        value = isTombstone ? default : _arena.GetMemory(record.Value);
+        return true;
+    }
+
     public void Put(ByteSlice key, ByteSlice value)
     {
         if (value.IsTombstone)
@@ -103,15 +89,11 @@ internal sealed class MemTable : IMemTable, IRawBytesMemTable
         }
     }
 
-    public void PutRaw(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
-    {
+    public void PutRaw(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value) =>
         PutRawCore(key, value, isTombstone: false);
-    }
 
-    public void DeleteRaw(ReadOnlySpan<byte> key)
-    {
+    public void DeleteRaw(ReadOnlySpan<byte> key) =>
         PutRawCore(key, default, isTombstone: true);
-    }
 
     internal void WriteBatch(List<LsmWriteBatchEntry> entries)
     {
@@ -148,59 +130,60 @@ internal sealed class MemTable : IMemTable, IRawBytesMemTable
 
     private void ApplyRaw(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool isTombstone)
     {
-        var arena = _arena ?? throw new ObjectDisposedException(nameof(MemTable));
+        var hash = Hash(key);
+        var bucket = FindBucket(key, hash, out var recordIndex);
+        var storedValue = isTombstone ? MemTableArena.ArenaSlice.Empty : _arena.Copy(value);
 
-        var ownedKey = arena.Copy(key);
-        var ownedValue = isTombstone ? ByteSlice.Tombstone : arena.Copy(value);
-
-        var dic = _dic;
-        if (dic != null)
+        if (recordIndex >= 0)
         {
-            dic[ownedKey] = ownedValue;
+            _records[recordIndex].Value = storedValue;
+            _records[recordIndex].IsTombstone = isTombstone;
         }
         else
         {
-            Debug.Assert(_sorted != null);
-            _sorted[ownedKey] = ownedValue;
+            EnsureInsertCapacity();
+            bucket = FindBucket(key, hash, out _);
+            EnsureRecordCapacity();
+
+            var newIndex = _count;
+            _records[newIndex] = new MemTableRecord
+            {
+                Key = _arena.Copy(key),
+                Value = storedValue,
+                Hash = hash,
+                IsTombstone = isTombstone,
+            };
+            _buckets[bucket] = newIndex + 1;
+
+            if (_sortedIndices is not null && !_sortDirty)
+            {
+                InsertSortedRecord(newIndex);
+            }
+            else
+            {
+                _sortDirty = true;
+            }
+
+            _count++;
         }
 
         _size += key.Length + value.Length + sizeof(int);
     }
 
-    public IStorageIterator CreateIterator()
-    {
-        return new MemTableIterator(this);
-    }
+    public IStorageIterator CreateIterator() => new MemTableIterator(this);
 
     public async Task FlushAsync(ISsTableBuilder builder, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        EnsureSortedMap();
+        EnsureSortedIndex();
 
-        IDictionary<ByteSlice, ByteSlice> store = _dic != null ? _dic : _sorted;
-
-        foreach (var entry in store)
+        for (var i = 0; i < _count; i++)
         {
-            await builder.AddAsync(entry.Key, entry.Value, cancellationToken);
-        }
-    }
-
-    [MemberNotNull(nameof(_sorted))]
-    private void EnsureSortedMap()
-    {
-        var dic = _dic;
-
-        if (dic == null)
-        {
-            Debug.Assert(_sorted != null);
-
-            return;
-        }
-
-        lock (dic)
-        {
-            _sorted = new SortedDictionary<ByteSlice, ByteSlice>(dic, _keySerializer.Comparer);
-            _dic = null;
+            cancellationToken.ThrowIfCancellationRequested();
+            var record = _records[_sortedIndices![i]];
+            var key = _arena.GetByteSlice(record.Key);
+            var value = record.IsTombstone ? ByteSlice.Tombstone : _arena.GetByteSlice(record.Value);
+            await builder.AddAsync(key, value, cancellationToken).ConfigureAwait(false);
         }
     }
 
@@ -213,87 +196,292 @@ internal sealed class MemTable : IMemTable, IRawBytesMemTable
 
         GC.SuppressFinalize(this);
         DisposeInternal();
-
-        // Close the write-ahead log handle (keeps the file). Done only on deterministic disposal, never
-        // from the finalizer: an abandoned (crashed) memtable must leave its WAL on disk for recovery.
         _wal?.Dispose();
-
         _disposed = true;
+    }
+
+    private bool TryFindRecord(ReadOnlySpan<byte> key, out MemTableRecord record)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        FindBucket(key, Hash(key), out var recordIndex);
+        if (recordIndex < 0)
+        {
+            record = default;
+            return false;
+        }
+
+        record = _records[recordIndex];
+        return true;
+    }
+
+    private int FindBucket(ReadOnlySpan<byte> key, uint hash, out int recordIndex)
+    {
+        var mask = _bucketCapacity - 1;
+        var bucket = (int)hash & mask;
+
+        while (true)
+        {
+            recordIndex = _buckets[bucket] - 1;
+            if (recordIndex < 0)
+            {
+                return bucket;
+            }
+
+            ref var record = ref _records[recordIndex];
+            if (record.Hash == hash && key.SequenceEqual(_arena.GetSpan(record.Key)))
+            {
+                return bucket;
+            }
+
+            bucket = (bucket + 1) & mask;
+        }
+    }
+
+    private void EnsureInsertCapacity()
+    {
+        if ((_count + 1) * 10 < _bucketCapacity * 7)
+        {
+            return;
+        }
+
+        var oldBuckets = _buckets;
+        _bucketCapacity *= 2;
+        _buckets = ArrayPool<int>.Shared.Rent(_bucketCapacity);
+        _buckets.AsSpan(0, _bucketCapacity).Clear();
+
+        for (var i = 0; i < _count; i++)
+        {
+            ref var record = ref _records[i];
+            var bucket = FindBucket(_arena.GetSpan(record.Key), record.Hash, out _);
+            _buckets[bucket] = i + 1;
+        }
+
+        ArrayPool<int>.Shared.Return(oldBuckets);
+    }
+
+    private void EnsureRecordCapacity()
+    {
+        if (_count < _records.Length)
+        {
+            return;
+        }
+
+        var oldRecords = _records;
+        _records = ArrayPool<MemTableRecord>.Shared.Rent(oldRecords.Length * 2);
+        oldRecords.AsSpan(0, _count).CopyTo(_records);
+        ArrayPool<MemTableRecord>.Shared.Return(oldRecords);
+    }
+
+    private void EnsureSortedIndex()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (!_sortDirty && _sortedIndices is not null)
+        {
+            return;
+        }
+
+        lock (_recordComparer)
+        {
+            if (!_sortDirty && _sortedIndices is not null)
+            {
+                return;
+            }
+
+            EnsureSortedCapacity(_count);
+
+            for (var i = 0; i < _count; i++)
+            {
+                _sortedIndices[i] = i;
+            }
+
+            Array.Sort(_sortedIndices, 0, _count, _recordComparer);
+            _sortDirty = false;
+        }
+    }
+
+    private void InsertSortedRecord(int recordIndex)
+    {
+        EnsureSortedCapacity(_count + 1);
+
+        var key = _arena.GetSpan(_records[recordIndex].Key);
+        var low = 0;
+        var high = _count;
+        while (low < high)
+        {
+            var middle = low + ((high - low) >> 1);
+            var middleKey = _arena.GetSpan(_records[_sortedIndices![middle]].Key);
+            if (middleKey.SequenceCompareTo(key) < 0)
+            {
+                low = middle + 1;
+            }
+            else
+            {
+                high = middle;
+            }
+        }
+
+        _sortedIndices!.AsSpan(low, _count - low).CopyTo(_sortedIndices.AsSpan(low + 1));
+        _sortedIndices[low] = recordIndex;
+    }
+
+    [MemberNotNull(nameof(_sortedIndices))]
+    private void EnsureSortedCapacity(int required)
+    {
+        if (_sortedIndices is not null && _sortedIndices.Length >= required)
+        {
+            return;
+        }
+
+        var replacement = ArrayPool<int>.Shared.Rent(Math.Max(1, required));
+        if (_sortedIndices is not null)
+        {
+            _sortedIndices.AsSpan(0, Math.Min(_count, required)).CopyTo(replacement);
+            ArrayPool<int>.Shared.Return(_sortedIndices);
+        }
+
+        _sortedIndices = replacement;
+    }
+
+    private int FindFirstAtOrAfter(ReadOnlySpan<byte> key)
+    {
+        var low = 0;
+        var high = _count;
+
+        while (low < high)
+        {
+            var middle = low + ((high - low) >> 1);
+            var record = _records[_sortedIndices![middle]];
+            if (_arena.GetSpan(record.Key).SequenceCompareTo(key) < 0)
+            {
+                low = middle + 1;
+            }
+            else
+            {
+                high = middle;
+            }
+        }
+
+        return low;
+    }
+
+    private KeyValuePair<ByteSlice, ByteSlice> Materialize(int sortedIndex)
+    {
+        var record = _records[_sortedIndices![sortedIndex]];
+        return new KeyValuePair<ByteSlice, ByteSlice>(
+            _arena.GetByteSlice(record.Key),
+            record.IsTombstone ? ByteSlice.Tombstone : _arena.GetByteSlice(record.Value));
     }
 
     private void DisposeInternal()
     {
-        var dic = _dic;
-        IDictionary<ByteSlice, ByteSlice> store = dic == null ? _sorted! : dic;
+        _arena.Dispose();
 
-        store.Clear();
-        _arena?.Dispose();
+        var records = _records;
+        _records = [];
+        ArrayPool<MemTableRecord>.Shared.Return(records);
+
+        var buckets = _buckets;
+        _buckets = [];
+        ArrayPool<int>.Shared.Return(buckets);
+
+        if (_sortedIndices is not null)
+        {
+            ArrayPool<int>.Shared.Return(_sortedIndices);
+            _sortedIndices = null;
+        }
+    }
+
+    private static uint Hash(ReadOnlySpan<byte> key)
+    {
+        var hash = 2166136261u;
+        for (var i = 0; i < key.Length; i++)
+        {
+            hash = (hash ^ key[i]) * 16777619u;
+        }
+
+        hash ^= hash >> 16;
+        return hash;
     }
 
     ~MemTable()
     {
-        DisposeInternal();
+        if (!_disposed)
+        {
+            DisposeInternal();
+        }
     }
 
-    private sealed class MemTableIterator : IStorageIterator
+    private struct MemTableRecord
     {
-        private readonly MemTable _table;
-        
-        public MemTableIterator(MemTable table)
+        public MemTableArena.ArenaSlice Key;
+        public MemTableArena.ArenaSlice Value;
+        public uint Hash;
+        public bool IsTombstone;
+    }
+
+    private sealed class RecordIndexComparer(MemTable table) : IComparer<int>
+    {
+        public int Compare(int x, int y) =>
+            table._arena.GetSpan(table._records[x].Key).SequenceCompareTo(
+                table._arena.GetSpan(table._records[y].Key));
+    }
+
+    private sealed class MemTableIterator(MemTable table) : IStorageIterator
+    {
+#pragma warning disable CS1998
+        public async IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateAsync(
+            [EnumeratorCancellation] CancellationToken cancellationToken = default)
         {
-            _table = table;
-        }
-
-#pragma warning disable CS1998 // Async method lacks 'await' operators and will run synchronously
-        public async IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
-#pragma warning restore CS1998 // Async method lacks 'await' operators and will run synchronously
-        {
-            _table.EnsureSortedMap();
-
-            // _map is a SortedDictionary at this point
-
-            foreach (var entry in _table._sorted)
+            table.EnsureSortedIndex();
+            for (var i = 0; i < table._count; i++)
             {
-                yield return entry;
+                cancellationToken.ThrowIfCancellationRequested();
+                yield return table.Materialize(i);
             }
         }
 
-#pragma warning disable CS1998 // Async method lacks 'await' operators and will run synchronously
-        public async IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateAsync(ByteSlice afterKey, [EnumeratorCancellation] CancellationToken _ = default)
-#pragma warning restore CS1998 // Async method lacks 'await' operators and will run synchronously
+        public async IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateAsync(
+            ByteSlice from,
+            [EnumeratorCancellation] CancellationToken cancellationToken = default)
         {
-            _table.EnsureSortedMap();
-
-            var items = _table._sorted.Enumerate(afterKey, default!, true, false);
-
-            foreach (var item in items)
+            table.EnsureSortedIndex();
+            var start = table.FindFirstAtOrAfter(from.Span);
+            for (var i = start; i < table._count; i++)
             {
-                yield return item;
+                cancellationToken.ThrowIfCancellationRequested();
+                yield return table.Materialize(i);
             }
         }
 
-#pragma warning disable CS1998 // Async method lacks 'await' operators and will run synchronously
-        public async IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateBackwardsAsync([EnumeratorCancellation] CancellationToken _ = default)
-#pragma warning restore CS1998 // Async method lacks 'await' operators and will run synchronously
+        public async IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateBackwardsAsync(
+            [EnumeratorCancellation] CancellationToken cancellationToken = default)
         {
-            _table.EnsureSortedMap();
-
-            foreach (var item in _table._sorted.EnumerateBackwards(default!, default!, false, false))
+            table.EnsureSortedIndex();
+            for (var i = table._count - 1; i >= 0; i--)
             {
-                yield return item;
+                cancellationToken.ThrowIfCancellationRequested();
+                yield return table.Materialize(i);
             }
         }
 
-#pragma warning disable CS1998 // Async method lacks 'await' operators and will run synchronously
-        public async IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateBackwardsAsync(ByteSlice from, [EnumeratorCancellation] CancellationToken _ = default)
-#pragma warning restore CS1998 // Async method lacks 'await' operators and will run synchronously
+        public async IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateBackwardsAsync(
+            ByteSlice from,
+            [EnumeratorCancellation] CancellationToken cancellationToken = default)
         {
-            _table.EnsureSortedMap();
-
-            foreach (var item in _table._sorted.EnumerateBackwards(default!, from, false, true))
+            table.EnsureSortedIndex();
+            var start = table.FindFirstAtOrAfter(from.Span);
+            if (start == table._count ||
+                !table._arena.GetSpan(table._records[table._sortedIndices![start]].Key).SequenceEqual(from.Span))
             {
-                yield return item;
+                start--;
+            }
+
+            for (var i = start; i >= 0; i--)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                yield return table.Materialize(i);
             }
         }
+#pragma warning restore CS1998
     }
 }
