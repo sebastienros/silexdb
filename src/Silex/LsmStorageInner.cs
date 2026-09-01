@@ -1273,7 +1273,7 @@ internal sealed class LsmStorageInner : IDisposable
 
     public string GetWalPath(long id)
     {
-        return Path.Combine(StoragePath, $"{id.ToString(CultureInfo.InvariantCulture)}.wal2");
+        return Path.Combine(StoragePath, $"{id.ToString(CultureInfo.InvariantCulture)}.wal");
     }
 
     /// <summary>
@@ -2200,7 +2200,6 @@ internal sealed class LsmStorageInner : IDisposable
         }
 
         DeleteWalFile(GetWalPath(id));
-        DeleteWalFile(Path.Combine(StoragePath, $"{id.ToString(CultureInfo.InvariantCulture)}.wal"));
 
         static void DeleteWalFile(string path)
         {

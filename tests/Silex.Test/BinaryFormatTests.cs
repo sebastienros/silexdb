@@ -110,7 +110,7 @@ public class BinaryFormatTests
             + WriteAheadLog.FrameHeaderSize
             + payload.Length
             + WriteAheadLog.FrameFooterSize];
-        new byte[] { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, (byte)'S', (byte)'L', (byte)'X' }.CopyTo(expected, 0);
+        "SILEXWAL"u8.CopyTo(expected);
         expected[8] = 1;
         BinaryPrimitives.WriteUInt32LittleEndian(expected.AsSpan(12), Crc32C.Compute(expected.AsSpan(0, 12)));
         BinaryPrimitives.WriteUInt32LittleEndian(expected.AsSpan(WriteAheadLog.FileHeaderSize), (uint)payload.Length);

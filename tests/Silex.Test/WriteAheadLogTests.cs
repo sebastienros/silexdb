@@ -7,44 +7,21 @@ namespace Silex.Test;
 public class WriteAheadLogTests
 {
     [Test]
-    public async Task ReplayReadsLegacyHeaderlessLogs()
+    public async Task ReplayRejectsHeaderlessLogs()
     {
         using var folder = TempFolder.Create();
-        var path = Path.Combine(folder, "legacy.wal");
+        var path = Path.Combine(folder, "headerless.wal");
         await File.WriteAllBytesAsync(path, [1, 7, 1, 9, 1, 8, 0]);
 
         using var memTable = new MemTable(1);
-        WriteAheadLog.Replay(path, memTable);
-
-        await AssertValue(memTable, [7], [9]);
-        await AssertTombstone(memTable, [8]);
-    }
-
-    [Test]
-    public async Task LegacyKeyCannotCollideWithVersionedHeader()
-    {
-        using var folder = TempFolder.Create();
-        var path = Path.Combine(folder, "legacy-magic-prefix.wal");
-        var key = new byte[83];
-        "ILEXWAL"u8.CopyTo(key);
-        var bytes = new byte[1 + key.Length + 2];
-        bytes[0] = (byte)key.Length;
-        key.CopyTo(bytes, 1);
-        bytes[^2] = 1;
-        bytes[^1] = 42;
-        await File.WriteAllBytesAsync(path, bytes);
-
-        using var memTable = new MemTable(1);
-        WriteAheadLog.Replay(path, memTable);
-
-        await AssertValue(memTable, key, [42]);
+        await Assert.That(() => WriteAheadLog.Replay(path, memTable)).Throws<InvalidDataException>();
     }
 
     [Test]
     public async Task ReplayRejectsCorruptedVersionedHeader()
     {
         using var folder = TempFolder.Create();
-        var path = Path.Combine(folder, "corrupt-header.wal2");
+        var path = Path.Combine(folder, "corrupt-header.wal");
 
         using (var wal = new WriteAheadLog(path, syncToDisk: false))
         {
@@ -108,7 +85,7 @@ public class WriteAheadLogTests
     public async Task ReplayRejectsCorruptedCommittedFooterLength()
     {
         using var folder = TempFolder.Create();
-        var path = Path.Combine(folder, "corrupt-footer.wal2");
+        var path = Path.Combine(folder, "corrupt-footer.wal");
 
         using (var wal = new WriteAheadLog(path, syncToDisk: false))
         {
@@ -229,14 +206,14 @@ public class WriteAheadLogTests
             batch.Put(BitConverter.GetBytes(i), BitConverter.GetBytes(i + 1));
         }
 
-        using var individual = new WriteAheadLog(Path.Combine(folder, "individual.wal2"), syncToDisk: false);
+        using var individual = new WriteAheadLog(Path.Combine(folder, "individual.wal"), syncToDisk: false);
         for (var i = 0; i < batch.Entries.Count; i++)
         {
             var entry = batch.Entries[i];
             individual.AppendRaw(entry.Key, entry.Value!);
         }
 
-        using var grouped = new WriteAheadLog(Path.Combine(folder, "grouped.wal2"), syncToDisk: false);
+        using var grouped = new WriteAheadLog(Path.Combine(folder, "grouped.wal"), syncToDisk: false);
         grouped.AppendBatch(batch.Entries);
 
         await Assert.That(individual.RecordWriteCount).IsEqualTo(1_000);

@@ -16,7 +16,7 @@ namespace Silex.Wal;
 /// and each record remains
 /// <c>[7-bit key length][key bytes][7-bit value length code][value bytes]</c>. A zero length code is a
 /// tombstone, <see cref="RecordValueEncoding.EmptyValueLengthCode"/> is a live empty value, and every
-/// other code is the value's byte length. Legacy headerless logs remain replayable.
+/// other code is the value's byte length.
 ///
 /// A frame is written to the operating system before its mutations are applied in memory, which is
 /// sufficient to survive a process crash. Enabling <c>syncToDisk</c> additionally <c>fsync</c>s each
@@ -38,7 +38,7 @@ internal sealed class WriteAheadLog : IDisposable
 
     private static readonly IBinaryEncoder<ByteSlice> _keySerializer = BinaryEncoderFactory<ByteSlice>.BinarySerializer;
     private static readonly IBinaryEncoder<ByteSlice> _valueSerializer = BinaryEncoderFactory<ByteSlice>.BinarySerializer;
-    private static ReadOnlySpan<byte> FileSignature => [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, (byte)'S', (byte)'L', (byte)'X'];
+    private static ReadOnlySpan<byte> FileSignature => "SILEXWAL"u8;
 
     private readonly FileStream _stream;
     private readonly bool _syncToDisk;
@@ -156,20 +156,7 @@ internal sealed class WriteAheadLog : IDisposable
         var bytes = GC.AllocateUninitializedArray<byte>(length);
         stream.ReadExactly(bytes);
 
-        var content = bytes.AsMemory();
-        if (Path.GetExtension(path).Equals(".wal2", StringComparison.OrdinalIgnoreCase)
-            || HasFileSignature(bytes))
-        {
-            ReplayFramed(path, content, target);
-            return;
-        }
-
-        if (IsTornFileHeader(bytes))
-        {
-            return;
-        }
-
-        ReplayLegacy(content, target);
+        ReplayFramed(path, bytes.AsMemory(), target);
     }
 
     private EncoderBinaryWriter StartFrame(int recordCount)
@@ -219,23 +206,17 @@ internal sealed class WriteAheadLog : IDisposable
         writer.WriteRaw(value);
     }
 
-    private static bool HasFileSignature(ReadOnlySpan<byte> bytes)
-    {
-        return bytes.Length >= FileSignature.Length
-            && bytes[..FileSignature.Length].SequenceEqual(FileSignature);
-    }
-
-    private static bool IsTornFileHeader(ReadOnlySpan<byte> bytes)
-    {
-        return bytes.Length < FileHeaderSize
-            && bytes.SequenceEqual(FileSignature[..Math.Min(bytes.Length, FileSignature.Length)]);
-    }
-
     private static void ReplayFramed(string path, ReadOnlyMemory<byte> content, IMemTable target)
     {
         var bytes = content.Span;
         if (bytes.Length < FileHeaderSize)
         {
+            var prefixLength = Math.Min(bytes.Length, FileSignature.Length);
+            if (!bytes[..prefixLength].SequenceEqual(FileSignature[..prefixLength]))
+            {
+                throw new InvalidDataException($"WAL '{path}' has a corrupt file header.");
+            }
+
             return;
         }
 
@@ -345,24 +326,6 @@ internal sealed class WriteAheadLog : IDisposable
         catch (Exception exception) when (exception is EndOfStreamException or OverflowException or ArgumentOutOfRangeException)
         {
             throw new InvalidDataException($"WAL '{path}' has a malformed frame at offset {frameOffset}.", exception);
-        }
-    }
-
-    private static void ReplayLegacy(ReadOnlyMemory<byte> content, IMemTable target)
-    {
-        var reader = new EncoderBinaryReader(content, 0);
-
-        while (!reader.IsEOF)
-        {
-            try
-            {
-                ReplayRecord(ref reader, target);
-            }
-            catch (EndOfStreamException)
-            {
-                // The last record was only partially written before the crash; ignore it.
-                break;
-            }
         }
     }
 

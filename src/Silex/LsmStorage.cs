@@ -206,10 +206,7 @@ public sealed class LsmStorage : IDisposable, IAsyncDisposable
         // Capture the WAL files that exist *before* the inner is constructed: the inner immediately
         // creates a fresh WAL for its initial current memtable, and that one must not be replayed.
         var walFiles = options.UseWriteAheadLog
-            ? Directory.EnumerateFiles(path, "*.wal*")
-                .Where(static filename =>
-                    Path.GetExtension(filename).Equals(".wal", StringComparison.OrdinalIgnoreCase)
-                    || Path.GetExtension(filename).Equals(".wal2", StringComparison.OrdinalIgnoreCase))
+            ? Directory.EnumerateFiles(path, "*.wal")
                 .Select(filename => (filename, id: TryParseId(filename)))
                 .Where(x => x.id.HasValue)
                 .OrderBy(x => x.id!.Value)
