@@ -1,4 +1,6 @@
-﻿namespace Silex.Tables;
+﻿using Silex.Ownership;
+
+namespace Silex.Tables;
 
 internal sealed class BlockMetadata : IDisposable
 {
@@ -7,7 +9,9 @@ internal sealed class BlockMetadata : IDisposable
     public int UncompressedLength { get; set; }
     public SstCompression Compression { get; set; }
     public uint Checksum { get; set; }
+    [OwnedResource]
     public required OwnedByteSlice FirstKeyOwner { get; set; }
+    [OwnedResource]
     public required OwnedByteSlice LastKeyOwner { get; set; }
     public ByteSlice FirstKey => FirstKeyOwner.Slice;
     public ByteSlice LastKey => LastKeyOwner.Slice;

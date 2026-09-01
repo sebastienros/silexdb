@@ -1,4 +1,5 @@
 using Silex.Blocks;
+using Silex.Ownership;
 using System.Collections.Concurrent;
 
 namespace Silex.Tables;
@@ -383,6 +384,8 @@ internal interface IBlockLoader
     Block? Load(CancellationToken cancellationToken = default);
 }
 
+[CopySensitive]
+[MustDispose]
 internal readonly struct BlockLease : IDisposable
 {
     private readonly BlockCache.Entry? _entry;

@@ -21,4 +21,10 @@
     <PackageReference Include="System.IO.Hashing" />
   </ItemGroup>
 
+  <ItemGroup>
+    <ProjectReference Include="..\Silex.Analyzers\Silex.Analyzers.csproj"
+                      OutputItemType="Analyzer"
+                      ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
 </Project>

@@ -1,6 +1,7 @@
 using Silex.Blocks;
 using Silex.BloomFilters;
 using Silex.Buffers;
+using Silex.Ownership;
 using Silex.Serialization;
 using System.Buffers;
 using System.IO;
@@ -43,7 +44,9 @@ internal sealed class BufferedSsTableBuilder : ISsTableBuilder
     private readonly ISsTableEncoder _tableEncoder;
     private long _offset;
     private bool _isFirstKey = true;
+    [OwnedResource]
     private OwnedByteSlice? _firstKey = default;
+    [OwnedResource]
     private OwnedByteSlice? _lastKey = default;
     private readonly IBloomFilter _bloomFilter;
     private readonly BlockBuilder _blockBuilder;

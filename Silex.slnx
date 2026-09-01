@@ -8,9 +8,11 @@
     <File Path="../.editorconfig" />
   </Folder>
   <Folder Name="/src/" />
+  <Project Path="src/Silex.Analyzers/Silex.Analyzers.csproj" />
   <Project Path="Silex.DbBench/Silex.DbBench.csproj" />
   <Project Path="Silex.Playground/Silex.Playground.csproj" />
   <Project Path="src/Silex/Silex.csproj" />
   <Project Path="tests/Silex.Benchmarks/Silex.Benchmarks.csproj" />
+  <Project Path="tests/Silex.Analyzers.Tests/Silex.Analyzers.Tests.csproj" />
   <Project Path="tests/Silex.Test/Silex.Test.csproj" />
 </Solution>
