@@ -55,13 +55,14 @@ public class BinaryFormatTests
     {
         using var firstKey = OwnedByteSlice.CopyFrom([0x01, 0x02, 0x03, 0x04]);
         using var lastKey = OwnedByteSlice.CopyFrom([0xFE, 0xFF]);
-        using var metadata = new BlockMetadata
-        {
-            Index = 0,
-            Offset = 0x01020304,
-            FirstKeyOwner = OwnedByteSlice.CopyFrom(firstKey.Span),
-            LastKeyOwner = OwnedByteSlice.CopyFrom(lastKey.Span)
-        };
+        var metadata = new BlockMetadata(
+            0,
+            0x01020304,
+            0,
+            SstCompression.None,
+            0,
+            firstKey.Memory,
+            lastKey.Memory);
         using var buffer = new PooledArrayBufferWriter<byte>();
         var writer = new EncoderBinaryWriter(buffer);
 

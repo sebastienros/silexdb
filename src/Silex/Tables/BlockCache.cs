@@ -13,6 +13,7 @@ internal sealed class BlockCache : IDisposable
     private readonly long _sizeLimit;
     private readonly ConcurrentDictionary<BlockCacheKey, Entry> _entries = [];
     private readonly object[] _loadGates = CreateLoadGates();
+    private Entry? _mostRecent;
     private Entry? _lruHead;
     private Entry? _lruTail;
     private long _size;
@@ -128,6 +129,7 @@ internal sealed class BlockCache : IDisposable
 
                 AddFirst(entry);
                 _size += entry.Size;
+                SetMostRecent(entry);
 
                 EvictOverLimit(entry);
 
@@ -142,8 +144,17 @@ internal sealed class BlockCache : IDisposable
 
     private bool TryAcquire(BlockCacheKey key, out BlockLease lease)
     {
-        if (_entries.TryGetValue(key, out var entry) && entry.TryAcquire())
+        var entry = Volatile.Read(ref _mostRecent);
+        if (entry is not null && entry.Key == key && entry.TryAcquire())
         {
+            SampleRecency(entry);
+            lease = new BlockLease(entry);
+            return true;
+        }
+
+        if (_entries.TryGetValue(key, out entry) && entry.TryAcquire())
+        {
+            SetMostRecent(entry);
             SampleRecency(entry);
             lease = new BlockLease(entry);
             return true;
@@ -157,6 +168,7 @@ internal sealed class BlockCache : IDisposable
     {
         if (_entries.TryGetValue(key, out var entry) && entry.TryAcquire())
         {
+            SetMostRecent(entry);
             MoveToFront(entry);
             lease = new BlockLease(entry);
             return true;
@@ -212,9 +224,19 @@ internal sealed class BlockCache : IDisposable
                 _entries.TryRemove(entry.Key, out _);
                 _size -= entry.Size;
                 entry.MarkEvicted();
+                Interlocked.CompareExchange(ref _mostRecent, null, entry);
             }
 
             entry = previous;
+        }
+    }
+
+    private void SetMostRecent(Entry entry)
+    {
+        Volatile.Write(ref _mostRecent, entry);
+        if (entry.IsEvicted)
+        {
+            Interlocked.CompareExchange(ref _mostRecent, null, entry);
         }
     }
 
@@ -283,6 +305,7 @@ internal sealed class BlockCache : IDisposable
                 entry.MarkEvicted();
             }
 
+            Volatile.Write(ref _mostRecent, null);
             _entries.Clear();
             _lruHead = null;
             _lruTail = null;

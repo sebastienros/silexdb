@@ -312,7 +312,7 @@ internal sealed class LsmStorageInner : IDisposable
             return (false, null);
         }
 
-        var blockIndex = FindMatchingBlockIndex(table.BlockMetadataArray, key);
+        var blockIndex = table.BlockMetadataArray.FindMatchingBlockIndex(key.Span);
         if (blockIndex >= 0)
         {
             using var blockLease = await table.ReadBlockCachedAsync(blockIndex, _blockCache, cancellationToken);
@@ -327,64 +327,6 @@ internal sealed class LsmStorageInner : IDisposable
         }
 
         return (false, null);
-    }
-
-    private static int FindMatchingBlockIndex(BlockMetadata[] blockMetadata, ByteSlice key)
-    {
-        var start = 0;
-        var end = blockMetadata.Length - 1;
-
-        while (start <= end)
-        {
-            var middle = start + (end - start) / 2;
-            var metadata = blockMetadata[middle];
-
-            if (_keyComparer.Compare(key, metadata.LastKey) > 0)
-            {
-                start = middle + 1;
-            }
-            else
-            {
-                end = middle - 1;
-            }
-        }
-
-        if ((uint)start >= (uint)blockMetadata.Length)
-        {
-            return -1;
-        }
-
-        var candidate = blockMetadata[start];
-        return _keyComparer.Compare(key, candidate.FirstKey) >= 0 ? candidate.Index : -1;
-    }
-
-    private static int FindMatchingBlockIndex(BlockMetadata[] blockMetadata, ReadOnlySpan<byte> key)
-    {
-        var start = 0;
-        var end = blockMetadata.Length - 1;
-
-        while (start <= end)
-        {
-            var middle = start + (end - start) / 2;
-            var metadata = blockMetadata[middle];
-
-            if (key.SequenceCompareTo(metadata.LastKey.Span) > 0)
-            {
-                start = middle + 1;
-            }
-            else
-            {
-                end = middle - 1;
-            }
-        }
-
-        if ((uint)start >= (uint)blockMetadata.Length)
-        {
-            return -1;
-        }
-
-        var candidate = blockMetadata[start];
-        return key.SequenceCompareTo(candidate.FirstKey.Span) >= 0 ? candidate.Index : -1;
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -633,12 +575,12 @@ internal sealed class LsmStorageInner : IDisposable
 
                     if (t == startTableIndex)
                     {
-                        blockStart = FindStartBlockIndex(blockMetadata, from.Span);
+                        blockStart = blockMetadata.FindStartBlockIndex(from.Span);
 
                         // The stepped-back block ends before 'from' (this happens when 'from' falls exactly on
                         // a later block's FirstKey, or in a gap between blocks): the first key >= from lives in
                         // a later block, so advance to it instead of giving up.
-                        if (blockMetadata[blockStart].LastKey.Span.SequenceCompareTo(from.Span) < 0)
+                        if (blockMetadata.GetLastKeySpan(blockStart).SequenceCompareTo(from.Span) < 0)
                         {
                             blockStart++;
                         }
@@ -652,7 +594,7 @@ internal sealed class LsmStorageInner : IDisposable
                     {
                         cancellationToken.ThrowIfCancellationRequested();
 
-                        using var lease = await table.ReadBlockCachedAsync(blockMetadata[b].Index, _blockCache, cancellationToken);
+                        using var lease = await table.ReadBlockCachedAsync(b, _blockCache, cancellationToken);
                         var block = lease.Block;
 
                         if (block == null)
@@ -750,39 +692,6 @@ internal sealed class LsmStorageInner : IDisposable
         }
 
         return start;
-    }
-
-    /// <summary>
-    /// Returns the index of the block that may contain <paramref name="from"/>: the last block whose FirstKey is
-    /// less than or equal to <paramref name="from"/>, clamped to the first block. Mirrors the seek used by
-    /// <see cref="SsTableIterator{ByteSlice, ByteSlice}"/>; callers must apply the stepped-back-block correction.
-    /// </summary>
-    private static int FindStartBlockIndex(BlockMetadata[] blockMetadata, ReadOnlySpan<byte> from)
-    {
-        var start = 0;
-        var end = blockMetadata.Length - 1;
-
-        while (start <= end)
-        {
-            var m = start + (end - start) / 2;
-            var compare = blockMetadata[m].FirstKey.Span.SequenceCompareTo(from);
-
-            if (compare == 0)
-            {
-                return Math.Max(0, m - 1);
-            }
-
-            if (compare < 0)
-            {
-                start = m + 1;
-            }
-            else
-            {
-                end = m - 1;
-            }
-        }
-
-        return Math.Max(0, start - 1);
     }
 
     private static bool InvokeRawEntryReader<TArg>(TArg arg, ReadRawEntryAction<TArg> reader, ByteSlice key, ByteSlice value)
@@ -1083,7 +992,7 @@ internal sealed class LsmStorageInner : IDisposable
             return (RawLookup.Miss, 0);
         }
 
-        var blockIndex = FindMatchingBlockIndex(table.BlockMetadataArray, keyMemory.Span);
+        var blockIndex = table.BlockMetadataArray.FindMatchingBlockIndex(keyMemory.Span);
         if (blockIndex >= 0)
         {
             using var blockLease = await table.ReadBlockCachedAsync(blockIndex, _blockCache, cancellationToken);

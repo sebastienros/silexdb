@@ -1,5 +1,4 @@
 using Silex.Buffers;
-using Silex.Serialization;
 
 namespace Silex.Tables;
 
@@ -21,9 +20,7 @@ namespace Silex.Tables;
 /// </summary>
 internal sealed class DefaultSsTableEncoder : ISsTableEncoder
 {
-    private static readonly IBinaryEncoder<ByteSlice> _keySerializer = BinaryEncoderFactory<ByteSlice>.BinarySerializer;
-
-    public IReadOnlyList<BlockMetadata> DecodeMetadata(ReadOnlyMemory<byte> buffer, int offset, int formatVersion)
+    public BlockMetadataStore DecodeMetadata(ReadOnlyMemory<byte> buffer, int offset, int formatVersion)
     {
         var binaryReader = new EncoderBinaryReader(buffer, offset);
 
@@ -54,32 +51,31 @@ internal sealed class DefaultSsTableEncoder : ISsTableEncoder
             }
 
             var firstKeyLen = binaryReader.Read7BitEncodedInt();
-            var firstKey = OwnedByteSlice.CopyFrom(binaryReader.ReadBytesSpan(firstKeyLen));
+            var firstKey = binaryReader.ReadBytesMemory(firstKeyLen);
 
             var lastKeyLen = binaryReader.Read7BitEncodedInt();
-            var lastKey = OwnedByteSlice.CopyFrom(binaryReader.ReadBytesSpan(lastKeyLen));
+            var lastKey = binaryReader.ReadBytesMemory(lastKeyLen);
 
-            result[i] = new BlockMetadata
-            {
-                Index = i,
-                Offset = blockOffset,
-                UncompressedLength = uncompressedLength,
-                Compression = compression,
-                Checksum = checksum,
-                FirstKeyOwner = firstKey,
-                LastKeyOwner = lastKey
-            };
+            result[i] = new BlockMetadata(
+                i,
+                blockOffset,
+                uncompressedLength,
+                compression,
+                checksum,
+                firstKey,
+                lastKey);
         }
 
-        return result;
+        return BlockMetadataStore.Create(result);
     }
 
     public void EncodeMetadata(ref EncoderBinaryWriter writer, IReadOnlyList<BlockMetadata> blockMetadata, long metadataOffset, int formatVersion)
     {
         writer.Write7BitEncodedInt(blockMetadata.Count);
 
-        foreach (var block in blockMetadata)
+        for (var i = 0; i < blockMetadata.Count; i++)
         {
+            var block = blockMetadata[i];
             writer.Write7BitEncodedInt64(block.Offset);
 
             if (formatVersion >= 1)
@@ -89,11 +85,11 @@ internal sealed class DefaultSsTableEncoder : ISsTableEncoder
                 writer.WriteUInt32(block.Checksum);
             }
 
-            writer.Write7BitEncodedInt(_keySerializer.GetLength(block.FirstKey));
-            _keySerializer.Encode(block.FirstKey, ref writer);
+            writer.Write7BitEncodedInt(block.FirstKeySpan.Length);
+            writer.WriteRaw(block.FirstKeySpan);
 
-            writer.Write7BitEncodedInt(_keySerializer.GetLength(block.LastKey));
-            _keySerializer.Encode(block.LastKey, ref writer);
+            writer.Write7BitEncodedInt(block.LastKeySpan.Length);
+            writer.WriteRaw(block.LastKeySpan);
         }
 
         writer.WriteUInt32((uint)metadataOffset);
@@ -105,8 +101,9 @@ internal sealed class DefaultSsTableEncoder : ISsTableEncoder
 
         estimate += sizeof(uint);
 
-        foreach (var block in blockMetadata)
+        for (var i = 0; i < blockMetadata.Count; i++)
         {
+            var block = blockMetadata[i];
             estimate += sizeof(uint);
 
             if (formatVersion >= 1)
@@ -117,11 +114,11 @@ internal sealed class DefaultSsTableEncoder : ISsTableEncoder
             }
 
             estimate += sizeof(uint);
-            estimate += _keySerializer.GetLength(block.FirstKey);
+            estimate += block.FirstKeySpan.Length;
 
             estimate += sizeof(uint);
             estimate += sizeof(uint);
-            estimate += _keySerializer.GetLength(block.LastKey);
+            estimate += block.LastKeySpan.Length;
         }
 
         estimate += sizeof(uint);

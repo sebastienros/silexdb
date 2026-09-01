@@ -1,9 +1,3 @@
-﻿using BenchmarkDotNet.Attributes;
-using BenchmarkDotNet.Running;
+﻿using BenchmarkDotNet.Running;
 
-BenchmarkRunner.Run(typeof(Program).Assembly);
-
-[MemoryDiagnoser, ShortRunJob]
-public class Benchmarks
-{
-}
+BenchmarkSwitcher.FromAssembly(typeof(Program).Assembly).Run(args);

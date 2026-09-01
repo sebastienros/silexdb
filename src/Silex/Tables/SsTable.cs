@@ -16,32 +16,32 @@ internal sealed class SsTable : IDisposable
     private readonly ByteSlice? _firstKey;
     private readonly ByteSlice? _lastKey;
     private readonly BlockBuilder _blockBuilder;
-    private readonly BlockMetadata[] _blockMetadata;
+    private readonly BlockMetadataStore _blockMetadata;
     private readonly FileStream _stream;
     private readonly SafeFileHandle _handle;
     private bool _disposed;
 
-    public SsTable(long id, FileStream stream, string filename, IReadOnlyList<BlockMetadata> blockMetadata, long metadataBlockOffset, BlockBuilder blockBuilder, IBloomFilter bloomFilter)
+    public SsTable(long id, FileStream stream, string filename, BlockMetadataStore blockMetadata, long metadataBlockOffset, BlockBuilder blockBuilder, IBloomFilter bloomFilter)
     {
         _id = id;
         _filename = filename;
         _stream = stream;
         _handle = stream.SafeFileHandle;
-        _blockMetadata = blockMetadata as BlockMetadata[] ?? blockMetadata.ToArray();
+        _blockMetadata = blockMetadata;
         BlockMetadata = _blockMetadata;
         MetaBlockOffset = metadataBlockOffset;
         _blockBuilder = blockBuilder;
         BloomFilter = bloomFilter;
         if (_blockMetadata.Length > 0)
         {
-            _firstKey = _blockMetadata[0].FirstKey;
-            _lastKey = _blockMetadata[^1].LastKey;
+            _firstKey = ByteSlice.FromMemory(_blockMetadata.GetFirstKeyMemory(0));
+            _lastKey = ByteSlice.FromMemory(_blockMetadata.GetLastKeyMemory(_blockMetadata.Length - 1));
         }
     }
 
-    public IReadOnlyList<BlockMetadata> BlockMetadata { get; } = [];
+    public BlockMetadataStore BlockMetadata { get; }
 
-    internal BlockMetadata[] BlockMetadataArray => _blockMetadata;
+    internal BlockMetadataStore BlockMetadataArray => _blockMetadata;
 
     public long MetaBlockOffset { get; }
 
@@ -434,7 +434,7 @@ internal sealed class SsTable : IDisposable
             }
 
             var buffer = ArrayPool<byte>.Shared.Rent((int)metadataLength);
-            IReadOnlyList<BlockMetadata> blockMetadata;
+            BlockMetadataStore blockMetadata;
             try
             {
                 stream.Seek(metaBlockOffset, SeekOrigin.Begin);
@@ -446,10 +446,18 @@ internal sealed class SsTable : IDisposable
                 ArrayPool<byte>.Shared.Return(buffer);
             }
 
-            ValidateBlockMetadata(blockMetadata, metaBlockOffset, formatVersion);
-
-            success = true;
-            return new SsTable(id ?? IdGenerator.GetNextId(), stream, filename, blockMetadata, metaBlockOffset, blockBuilder, bloomFilter);
+            try
+            {
+                ValidateBlockMetadata(blockMetadata, metaBlockOffset, formatVersion);
+                var table = new SsTable(id ?? IdGenerator.GetNextId(), stream, filename, blockMetadata, metaBlockOffset, blockBuilder, bloomFilter);
+                success = true;
+                return table;
+            }
+            catch
+            {
+                blockMetadata.Dispose();
+                throw;
+            }
         }
         finally
         {
@@ -512,10 +520,7 @@ internal sealed class SsTable : IDisposable
     {
         _stream.Dispose();
         _blockBuilder.Dispose();
-        foreach (var metadata in _blockMetadata)
-        {
-            metadata.Dispose();
-        }
+        _blockMetadata.Dispose();
     }
 
     ~SsTable()
