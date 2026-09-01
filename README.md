@@ -58,6 +58,17 @@ await db.CloseAsync();
 `LsmStorage.OpenAsync` reopens an existing store at the same path, replaying the WAL and loading existing
 SSTs, so persisted data survives process restarts.
 
+Use `LsmWriteBatch` when several byte-oriented mutations can share one durability boundary. The batch is
+written as one checksum-protected WAL frame, reducing write and `fsync` calls while preserving the default
+process-crash and optional power-loss guarantees:
+
+```csharp
+var batch = new LsmWriteBatch();
+batch.Put("user:1"u8, "active"u8);
+batch.Delete("user:2"u8);
+db.Write(batch);
+```
+
 ## Supported key and value helpers
 
 The core store accepts `ReadOnlySpan<byte>` and copies keys and values into memtable-owned arena blocks.
@@ -265,7 +276,7 @@ is a valid starting point. The most commonly used options:
 | `FlushPeriod`              | 50 ms              | Interval between background flushes. `TimeSpan.Zero` disables the thread.|
 | `BlockCacheSizeLimit`      | 1 MiB              | Size of the in-memory cache of decoded blocks.                           |
 | `UseWriteAheadLog`         | `true`             | Maintain a WAL so unflushed data is recovered after a crash.             |
-| `SyncWriteAheadLogToDisk`  | `false`            | `fsync` every WAL append (slower, survives power loss).                  |
+| `SyncWriteAheadLogToDisk`  | `false`            | `fsync` every WAL frame (slower, survives power loss).                   |
 | `CompactionStrategy`       | `Tiered`           | `None`, `Tiered` (write-optimized), or `Leveled` (read-optimized).       |
 
 Convenient size helpers are available as extension methods: `64.MiB()`, `4.KiB()`, `1.GiB()`,

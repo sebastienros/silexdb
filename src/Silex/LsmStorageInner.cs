@@ -1125,6 +1125,32 @@ internal sealed class LsmStorageInner : IDisposable
         }
     }
 
+    public void WriteBatch(LsmWriteBatch batch)
+    {
+        ArgumentNullException.ThrowIfNull(batch);
+        if (batch.Count == 0)
+        {
+            return;
+        }
+
+        _currentMemTableLock.EnterWriteLock();
+
+        try
+        {
+            ((MemTable)_state.CurrentMemTable).WriteBatch(batch.Entries);
+            InvalidateSortedSsTableRun();
+
+            if (_state.CurrentMemTable.Size >= _memTableSizeLimit)
+            {
+                FreezeMemTable();
+            }
+        }
+        finally
+        {
+            _currentMemTableLock.ExitWriteLock();
+        }
+    }
+
     /// <summary>
     /// Force freeze the current MemTable to an immutable MemTable.
     /// </summary>
@@ -1269,7 +1295,7 @@ internal sealed class LsmStorageInner : IDisposable
 
     public string GetWalPath(long id)
     {
-        return Path.Combine(StoragePath, $"{id.ToString(CultureInfo.InvariantCulture)}.wal");
+        return Path.Combine(StoragePath, $"{id.ToString(CultureInfo.InvariantCulture)}.wal2");
     }
 
     /// <summary>
@@ -2195,15 +2221,21 @@ internal sealed class LsmStorageInner : IDisposable
             return;
         }
 
-        try
+        DeleteWalFile(GetWalPath(id));
+        DeleteWalFile(Path.Combine(StoragePath, $"{id.ToString(CultureInfo.InvariantCulture)}.wal"));
+
+        static void DeleteWalFile(string path)
         {
-            File.Delete(GetWalPath(id));
-        }
-        catch (IOException)
-        {
-        }
-        catch (UnauthorizedAccessException)
-        {
+            try
+            {
+                File.Delete(path);
+            }
+            catch (IOException)
+            {
+            }
+            catch (UnauthorizedAccessException)
+            {
+            }
         }
     }
 

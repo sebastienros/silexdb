@@ -908,7 +908,7 @@ public class StorageTests
 
         // Nothing was ever flushed, yet the WAL is on disk holding the unflushed writes.
         await Assert.That(Directory.EnumerateFiles(tempFolder, "*.sst")).IsEmpty();
-        await Assert.That(Directory.EnumerateFiles(tempFolder, "*.wal")).IsNotEmpty();
+        await Assert.That(Directory.EnumerateFiles(tempFolder, "*.wal*")).IsNotEmpty();
 
         var reopened = await LsmStorage.OpenAsync<int, int>(tempFolder, options);
 
@@ -983,7 +983,7 @@ public class StorageTests
 
         await CrashRecoveryTestProcess.WriteAndExitWithoutDisposalAsync(tempFolder, entryCount: 1);
 
-        foreach (var wal in Directory.EnumerateFiles(tempFolder, "*.wal"))
+        foreach (var wal in Directory.EnumerateFiles(tempFolder, "*.wal*"))
         {
             File.Delete(wal);
         }
@@ -1003,7 +1003,7 @@ public class StorageTests
         await CrashRecoveryTestProcess.WriteAndExitWithoutDisposalAsync(tempFolder, entryCount: 10);
 
         // Truncate the final byte to simulate a crash in the middle of the last append.
-        var walFile = Directory.EnumerateFiles(tempFolder, "*.wal").Single();
+        var walFile = Directory.EnumerateFiles(tempFolder, "*.wal*").Single();
         using (var stream = new FileStream(walFile, FileMode.Open, FileAccess.Write, FileShare.None))
         {
             stream.SetLength(stream.Length - 1);

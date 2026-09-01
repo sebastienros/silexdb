@@ -206,7 +206,10 @@ public sealed class LsmStorage : IDisposable, IAsyncDisposable
         // Capture the WAL files that exist *before* the inner is constructed: the inner immediately
         // creates a fresh WAL for its initial current memtable, and that one must not be replayed.
         var walFiles = options.UseWriteAheadLog
-            ? Directory.EnumerateFiles(path, "*.wal")
+            ? Directory.EnumerateFiles(path, "*.wal*")
+                .Where(static filename =>
+                    Path.GetExtension(filename).Equals(".wal", StringComparison.OrdinalIgnoreCase)
+                    || Path.GetExtension(filename).Equals(".wal2", StringComparison.OrdinalIgnoreCase))
                 .Select(filename => (filename, id: TryParseId(filename)))
                 .Where(x => x.id.HasValue)
                 .OrderBy(x => x.id!.Value)
@@ -417,6 +420,20 @@ public sealed class LsmStorage : IDisposable, IAsyncDisposable
     {
         CheckDisposed();
         _inner.DeleteRaw(key);
+    }
+
+    /// <summary>
+    /// Applies every mutation in <paramref name="batch"/> under one storage lock and one WAL frame.
+    /// </summary>
+    /// <remarks>
+    /// The call returns only after the frame has reached the operating system, or stable storage when
+    /// <see cref="StorageOptions.SyncWriteAheadLogToDisk"/> is enabled.
+    /// </remarks>
+    public void Write(LsmWriteBatch batch)
+    {
+        CheckDisposed();
+        ArgumentNullException.ThrowIfNull(batch);
+        _inner.WriteBatch(batch);
     }
 
     public ValueTask<bool> TryGetRawAsync(ReadOnlySpan<byte> key, IBufferWriter<byte> destination, CancellationToken cancellationToken = default)

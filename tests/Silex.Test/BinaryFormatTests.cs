@@ -1,3 +1,4 @@
+﻿using System.Buffers.Binary;
 using Silex.Buffers;
 using Silex.Serialization;
 using Silex.Tables;
@@ -96,12 +97,29 @@ public class BinaryFormatTests
         }
 
         var bytes = await File.ReadAllBytesAsync(path);
-        var expected = new byte[2 + key.Length + 1 + value.Length];
-        expected[0] = 0x82;
-        expected[1] = 0x01;
-        key.CopyTo(expected, 2);
-        expected[2 + key.Length] = 0x02;
-        value.CopyTo(expected, 3 + key.Length);
+        var payload = new byte[sizeof(uint) + 2 + key.Length + 1 + value.Length];
+        BinaryPrimitives.WriteUInt32LittleEndian(payload, 1);
+        payload[sizeof(uint)] = 0x82;
+        payload[sizeof(uint) + 1] = 0x01;
+        key.CopyTo(payload, sizeof(uint) + 2);
+        payload[sizeof(uint) + 2 + key.Length] = 0x02;
+        value.CopyTo(payload, sizeof(uint) + 3 + key.Length);
+
+        var expected = new byte[
+            WriteAheadLog.FileHeaderSize
+            + WriteAheadLog.FrameHeaderSize
+            + payload.Length
+            + WriteAheadLog.FrameFooterSize];
+        new byte[] { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, (byte)'S', (byte)'L', (byte)'X' }.CopyTo(expected, 0);
+        expected[8] = 1;
+        BinaryPrimitives.WriteUInt32LittleEndian(expected.AsSpan(12), Crc32C.Compute(expected.AsSpan(0, 12)));
+        BinaryPrimitives.WriteUInt32LittleEndian(expected.AsSpan(WriteAheadLog.FileHeaderSize), (uint)payload.Length);
+        BinaryPrimitives.WriteUInt32LittleEndian(expected.AsSpan(WriteAheadLog.FileHeaderSize + sizeof(uint)), ~(uint)payload.Length);
+        BinaryPrimitives.WriteUInt32LittleEndian(expected.AsSpan(WriteAheadLog.FileHeaderSize + (2 * sizeof(uint))), Crc32C.Compute(payload));
+        var payloadOffset = WriteAheadLog.FileHeaderSize + WriteAheadLog.FrameHeaderSize;
+        payload.CopyTo(expected, payloadOffset);
+        BinaryPrimitives.WriteUInt32LittleEndian(expected.AsSpan(payloadOffset + payload.Length), (uint)payload.Length);
+        BinaryPrimitives.WriteUInt32LittleEndian(expected.AsSpan(payloadOffset + payload.Length + sizeof(uint)), 0x31584C53);
 
         await Assert.That(bytes).IsEquivalentTo(expected, CollectionOrdering.Matching);
     }

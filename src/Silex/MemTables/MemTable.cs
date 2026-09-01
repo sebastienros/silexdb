@@ -113,11 +113,26 @@ internal sealed class MemTable : IMemTable, IRawBytesMemTable
         PutRawCore(key, default, isTombstone: true);
     }
 
-    private void PutRawCore(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool isTombstone)
+    internal void WriteBatch(List<LsmWriteBatchEntry> entries)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
-        var arena = _arena ?? throw new ObjectDisposedException(nameof(MemTable));
+        if (entries.Count == 0)
+        {
+            return;
+        }
+
+        _wal?.AppendBatch(entries);
+        for (var i = 0; i < entries.Count; i++)
+        {
+            var entry = entries[i];
+            ApplyRaw(entry.Key, entry.Value ?? default, entry.IsTombstone);
+        }
+    }
+
+    private void PutRawCore(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool isTombstone)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
 
         if (isTombstone)
         {
@@ -127,6 +142,13 @@ internal sealed class MemTable : IMemTable, IRawBytesMemTable
         {
             _wal?.AppendRaw(key, value);
         }
+
+        ApplyRaw(key, value, isTombstone);
+    }
+
+    private void ApplyRaw(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool isTombstone)
+    {
+        var arena = _arena ?? throw new ObjectDisposedException(nameof(MemTable));
 
         var ownedKey = arena.Copy(key);
         var ownedValue = isTombstone ? ByteSlice.Tombstone : arena.Copy(value);
