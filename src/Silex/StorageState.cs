@@ -20,7 +20,7 @@ internal struct StorageState
     /// <summary>
     /// The list of immutable MemTables.
     /// </summary>
-    public ImmutableQueue<IMemTable> ImmutableMemTables { get; set; } = [];
+    public ImmutableArray<IMemTable> ImmutableMemTables { get; set; } = [];
 
     public required IMemTable CurrentMemTable { get; set; }
 

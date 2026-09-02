@@ -66,7 +66,7 @@ internal class Compacter : IAsyncDisposable
 
     internal async Task RunMaintenanceAsync(CancellationToken cancellationToken = default)
     {
-        if (_storage._state.ImmutableMemTables.Count() + 1 > _memTableTableMaxCount)
+        if (_storage._state.ImmutableMemTables.Length + 1 > _memTableTableMaxCount)
         {
             await _storage.ForceFlushNextImmutableMemTableAsync(cancellationToken);
         }

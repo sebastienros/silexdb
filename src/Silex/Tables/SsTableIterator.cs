@@ -1,13 +1,10 @@
 ﻿using Silex.Blocks;
-using Silex.Serialization;
 using System.Runtime.CompilerServices;
 
 namespace Silex.Tables;
 
 internal sealed class SsTableIterator : IStorageIterator
 {
-    private static readonly IComparer<ByteSlice> _keyComparer = BinaryEncoderFactory<ByteSlice>.BinarySerializer.Comparer;
-
     private readonly SsTable _table;
 
     public SsTableIterator(SsTable table)
@@ -48,7 +45,7 @@ internal sealed class SsTableIterator : IStorageIterator
         // The stepped-back block ends before 'from' (this happens when 'from' falls exactly on a later
         // block's FirstKey, or in a gap between blocks): the first key >= from lives in a later block, so
         // advance to it instead of giving up. Breaking here would silently drop every key from 'from' on.
-        if (_keyComparer.Compare(_table.BlockMetadata[startBlockIndex].LastKey, from) < 0)
+        if (_table.BlockMetadata.GetLastKeySpan(startBlockIndex).SequenceCompareTo(from.Span) < 0)
         {
             startBlockIndex++;
 
@@ -164,7 +161,7 @@ internal sealed class SsTableIterator : IStorageIterator
         while (start <= end)
         {
             var m = start + (end - start) / 2;
-            var compare = _keyComparer.Compare(_table.BlockMetadata[m].FirstKey, from);
+            var compare = _table.BlockMetadata.GetFirstKeySpan(m).SequenceCompareTo(from.Span);
 
             if (compare == 0)
             {
@@ -195,7 +192,7 @@ internal sealed class SsTableIterator : IStorageIterator
         {
             var m = start + (end - start) / 2;
 
-            if (_keyComparer.Compare(_table.BlockMetadata[m].FirstKey, from) <= 0)
+            if (_table.BlockMetadata.GetFirstKeySpan(m).SequenceCompareTo(from.Span) <= 0)
             {
                 start = m + 1;
             }

@@ -131,7 +131,7 @@ internal sealed class LsmStorageInner : IDisposable
         _currentMemTableLock.EnterReadLock();
 
         IMemTable currentMemTable;
-        ImmutableQueue<IMemTable> immutableMemTables;
+        ImmutableArray<IMemTable> immutableMemTables;
 
         try
         {
@@ -158,11 +158,13 @@ internal sealed class LsmStorageInner : IDisposable
             try
             {
                 _immutableMemTablesLock.EnterReadLock();
+                immutableMemTables = _state.ImmutableMemTables;
 
-                // Immutable MemTables are enqueued oldest-first, so iterate in reverse to let the most
+                // Immutable MemTables are stored oldest-first, so iterate in reverse to let the most
                 // recently frozen table win when the same key exists in several of them.
-                foreach (var memTable in immutableMemTables.Reverse())
+                for (var i = immutableMemTables.Length - 1; i >= 0; i--)
                 {
+                    var memTable = immutableMemTables[i];
                     if (memTable.TryGetRaw(key.Span, out var result, out var isTombstone))
                     {
                         return isTombstone ? null : OwnedByteSlice.CopyFrom(result.Span);
@@ -783,7 +785,7 @@ internal sealed class LsmStorageInner : IDisposable
         CancellationToken cancellationToken)
     {
         List<KeyValuePair<ByteSlice, ByteSlice>>? currentSnapshot = null;
-        ImmutableQueue<IMemTable> immutableMemTables;
+        ImmutableArray<IMemTable> immutableMemTables;
         List<SsTable> tables;
         var fromSlice = hasFrom ? ByteSlice.FromMemory(from) : null;
 
@@ -826,15 +828,15 @@ internal sealed class LsmStorageInner : IDisposable
         }
 
         var inputs = new List<MergeIterator.Input>(
-            (currentSnapshot == null ? 0 : 1) + immutableMemTables.Count() + tables.Count);
+            (currentSnapshot == null ? 0 : 1) + immutableMemTables.Length + tables.Count);
         if (currentSnapshot != null)
         {
             inputs.Add(MergeIterator.Input.FromEntries(currentSnapshot));
         }
 
-        foreach (var memTable in immutableMemTables.Reverse())
+        for (var i = immutableMemTables.Length - 1; i >= 0; i--)
         {
-            inputs.Add(MergeIterator.Input.FromIterator(memTable.CreateIterator()));
+            inputs.Add(MergeIterator.Input.FromIterator(immutableMemTables[i].CreateIterator()));
         }
 
         foreach (var table in tables)
@@ -902,8 +904,7 @@ internal sealed class LsmStorageInner : IDisposable
         _currentMemTableLock.EnterReadLock();
 
         IMemTable currentMemTable;
-        ImmutableQueue<IMemTable> immutableMemTables;
-        ByteSlice? key = null;
+        ImmutableArray<IMemTable> immutableMemTables;
 
         try
         {
@@ -912,8 +913,7 @@ internal sealed class LsmStorageInner : IDisposable
 
             if (currentMemTable.Count != 0)
             {
-                key = ByteSlice.FromMemory(keyMemory);
-                var memResult = TryResolveMemTableRaw(currentMemTable, key, sink, out var length);
+                var memResult = TryResolveMemTableRaw(currentMemTable, keyMemory.Span, sink, out var length);
                 if (memResult == RawLookup.Live)
                 {
                     return length;
@@ -935,11 +935,12 @@ internal sealed class LsmStorageInner : IDisposable
             try
             {
                 _immutableMemTablesLock.EnterReadLock();
-                key ??= ByteSlice.FromMemory(keyMemory);
+                immutableMemTables = _state.ImmutableMemTables;
 
-                foreach (var memTable in immutableMemTables.Reverse())
+                for (var i = immutableMemTables.Length - 1; i >= 0; i--)
                 {
-                    var memResult = TryResolveMemTableRaw(memTable, key, sink, out var length);
+                    var memTable = immutableMemTables[i];
+                    var memResult = TryResolveMemTableRaw(memTable, keyMemory.Span, sink, out var length);
                     if (memResult == RawLookup.Live)
                     {
                         return length;
@@ -1013,12 +1014,16 @@ internal sealed class LsmStorageInner : IDisposable
     /// Resolves <paramref name="key"/> against a memtable, handing live value bytes to <paramref name="sink"/>.
     /// Kept synchronous so the borrowed value span never crosses an <c>await</c>.
     /// </summary>
-    private static RawLookup TryResolveMemTableRaw<TSink>(IMemTable memTable, ByteSlice key, TSink sink, out int length)
+    private static RawLookup TryResolveMemTableRaw<TSink>(
+        IMemTable memTable,
+        ReadOnlySpan<byte> key,
+        TSink sink,
+        out int length)
         where TSink : struct, IValueByteSink
     {
         length = 0;
 
-        if (!memTable.TryGetRaw(key.Span, out var value, out var isTombstone))
+        if (!memTable.TryGetRaw(key, out var value, out var isTombstone))
         {
             return RawLookup.Miss;
         }
@@ -1271,9 +1276,9 @@ internal sealed class LsmStorageInner : IDisposable
                     return;
                 }
 
-                // Peek the oldest immutable MemTable without removing it. It stays queued (and therefore
+                // Read the oldest immutable MemTable without removing it. It stays in the array (and therefore
                 // visible to concurrent scans) until its SST is published into L0 atomically below.
-                memTableToFlush = _state.ImmutableMemTables.Peek();
+                memTableToFlush = _state.ImmutableMemTables[0];
             }
             finally
             {
@@ -1300,14 +1305,15 @@ internal sealed class LsmStorageInner : IDisposable
 
             try
             {
-                // Atomic, scan-visible transition: drop the MemTable from the immutable queue and publish its
+                // Atomic, scan-visible transition: drop the MemTable from the immutable array and publish its
                 // SST into L0 under the same level0 write lock. A scan holding the level0 read lock therefore
-                // always sees the data in exactly one place (the queued MemTable or the L0 SST), never neither.
+                // always sees the data in exactly one place (the immutable MemTable or the L0 SST), never neither.
                 _immutableMemTablesLock.EnterWriteLock();
 
                 try
                 {
-                    _state.ImmutableMemTables = _state.ImmutableMemTables.Dequeue(out var dequeued);
+                    var dequeued = _state.ImmutableMemTables[0];
+                    _state.ImmutableMemTables = _state.ImmutableMemTables.RemoveAt(0);
                     Debug.Assert(ReferenceEquals(dequeued, memTableToFlush));
                 }
                 finally
@@ -2351,7 +2357,7 @@ internal sealed class LsmStorageInner : IDisposable
             _state = new StorageState
             {
                 CurrentMemTable = CreateCurrentMemTable(IdGenerator.GetNextId()),
-                ImmutableMemTables = _state.ImmutableMemTables.Enqueue(_previousMemTable),
+                ImmutableMemTables = _state.ImmutableMemTables.Add(_previousMemTable),
                 LevelZeroTables = _state.LevelZeroTables,
                 LeveledSsTables = _state.LeveledSsTables
             };
@@ -2379,7 +2385,7 @@ internal sealed class LsmStorageInner : IDisposable
     {
         _state.CurrentMemTable?.Dispose();
 
-        if (_state.ImmutableMemTables is not null)
+        if (!_state.ImmutableMemTables.IsDefaultOrEmpty)
         {
             foreach (var memTable in _state.ImmutableMemTables)
             {
