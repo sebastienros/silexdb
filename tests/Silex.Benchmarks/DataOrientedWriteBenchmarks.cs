@@ -1,6 +1,7 @@
 using BenchmarkDotNet.Attributes;
 using Silex.MemTables;
 using System.Buffers;
+using System.Buffers.Binary;
 
 namespace Silex.Benchmarks;
 
@@ -169,5 +170,129 @@ public class TypedEncodingBenchmarks
         }
 
         return checksum;
+    }
+}
+
+[MemoryDiagnoser, ShortRunJob]
+public class MemTableLookupBenchmarks
+{
+    private const int EntryCount = 4_096;
+    private const int LookupCount = 16_384;
+
+    private MemTable _table = null!;
+    private byte[][] _hitKeys = null!;
+    private byte[][] _missKeys = null!;
+    private int[] _lookupIndices = null!;
+
+    [Params(16, 1024, 16 * 1024)]
+    public int ValueSize { get; set; }
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        _table = new MemTable(1);
+        _hitKeys = new byte[EntryCount][];
+        _missKeys = new byte[EntryCount][];
+        _lookupIndices = new int[LookupCount];
+        var value = new byte[ValueSize];
+        var random = new Random(42);
+
+        for (var i = 0; i < EntryCount; i++)
+        {
+            _hitKeys[i] = EncodeKey(i);
+            _missKeys[i] = EncodeKey(EntryCount + i);
+            _table.PutRaw(_hitKeys[i], value);
+        }
+
+        for (var i = 0; i < LookupCount; i++)
+        {
+            _lookupIndices[i] = random.Next(EntryCount);
+        }
+    }
+
+    [GlobalCleanup]
+    public void Cleanup() => _table.Dispose();
+
+    [Benchmark(OperationsPerInvoke = LookupCount)]
+    public int RandomHit()
+    {
+        var found = 0;
+        for (var i = 0; i < LookupCount; i++)
+        {
+            found += _table.TryGetRaw(_hitKeys[_lookupIndices[i]], out _, out _) ? 1 : 0;
+        }
+
+        return found;
+    }
+
+    [Benchmark(OperationsPerInvoke = LookupCount)]
+    public int RandomMiss()
+    {
+        var found = 0;
+        for (var i = 0; i < LookupCount; i++)
+        {
+            found += _table.TryGetRaw(_missKeys[_lookupIndices[i]], out _, out _) ? 1 : 0;
+        }
+
+        return found;
+    }
+
+    private static byte[] EncodeKey(int value)
+    {
+        var key = new byte[16];
+        BinaryPrimitives.WriteInt32BigEndian(key.AsSpan(12), value);
+        return key;
+    }
+}
+
+[MemoryDiagnoser, ShortRunJob]
+public class ImmutableMemTableLookupBenchmarks
+{
+    private const int ImmutableTableCount = 8;
+    private const int OperationsPerInvoke = 1_000;
+
+    private string _directory = null!;
+    private LsmStorageInner _storage = null!;
+    private byte[] _key = null!;
+    private byte[] _destination = null!;
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        _directory = Path.Combine(Path.GetTempPath(), $"silex-immutable-lookup-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(_directory);
+        _storage = new LsmStorageInner(_directory, new StorageOptions
+        {
+            UseWriteAheadLog = false,
+            FlushPeriod = TimeSpan.Zero,
+        });
+        _key = new byte[16];
+        _destination = new byte[sizeof(int)];
+
+        for (var i = 0; i < ImmutableTableCount; i++)
+        {
+            BinaryPrimitives.WriteInt32BigEndian(_destination, i);
+            _storage.Put(ByteSlice.FromMemory(_key), ByteSlice.FromMemory(_destination));
+            _storage.ForceFreezeMemTable();
+        }
+    }
+
+    [GlobalCleanup]
+    public void Cleanup()
+    {
+        _storage.Dispose();
+        Directory.Delete(_directory, recursive: true);
+    }
+
+    [Benchmark(OperationsPerInvoke = OperationsPerInvoke)]
+    public int NewestImmutableHit()
+    {
+        var length = 0;
+        for (var i = 0; i < OperationsPerInvoke; i++)
+        {
+            length += _storage.GetRawAsync(_key, _destination).GetAwaiter().GetResult();
+        }
+
+        return length;
     }
 }

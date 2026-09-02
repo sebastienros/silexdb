@@ -580,8 +580,8 @@ public class StorageTests
         await storage._compacter.RunMaintenanceAsync();
         await Assert.That(Directory.EnumerateFiles(tempFolder, "*.sst")).IsEmpty();
         await Assert.That(storage._inner._state.ImmutableMemTables).HasSingleItem();
-        await Assert.That(storage._inner._state.ImmutableMemTables.Peek().TryGet(1, out _)).IsTrue();
-        await Assert.That(storage._inner._state.ImmutableMemTables.Peek().TryGet(2, out _)).IsFalse();
+        await Assert.That(storage._inner._state.ImmutableMemTables[0].TryGet(1, out _)).IsTrue();
+        await Assert.That(storage._inner._state.ImmutableMemTables[0].TryGet(2, out _)).IsFalse();
 
         storage.Put(2, 2);
         storage._inner.ForceFreezeMemTable();
@@ -589,8 +589,8 @@ public class StorageTests
         await storage._compacter.RunMaintenanceAsync();
         await Assert.That(Directory.EnumerateFiles(tempFolder, "*.sst")).HasSingleItem();
         await Assert.That(storage._inner._state.ImmutableMemTables).HasSingleItem();
-        await Assert.That(storage._inner._state.ImmutableMemTables.Peek().TryGet(1, out _)).IsFalse();
-        await Assert.That(storage._inner._state.ImmutableMemTables.Peek().TryGet(2, out _)).IsTrue();
+        await Assert.That(storage._inner._state.ImmutableMemTables[0].TryGet(1, out _)).IsFalse();
+        await Assert.That(storage._inner._state.ImmutableMemTables[0].TryGet(2, out _)).IsTrue();
 
         await storage.CloseAsync();
     }

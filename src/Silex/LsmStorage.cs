@@ -363,7 +363,7 @@ public sealed class LsmStorage : IDisposable, IAsyncDisposable
 
             if (recovered.Count > 0)
             {
-                storageInner._state.ImmutableMemTables = ImmutableQueue.CreateRange(recovered);
+                storageInner._state.ImmutableMemTables = ImmutableArray.CreateRange(recovered);
             }
         }
 

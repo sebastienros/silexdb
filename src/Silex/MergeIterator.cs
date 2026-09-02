@@ -454,7 +454,7 @@ internal sealed class MergeIterator : IStorageIterator
                     while (start < end)
                     {
                         var middle = start + ((end - start) >> 1);
-                        if (metadata[middle].FirstKey.Span.SequenceCompareTo(from.Span) <= 0)
+                        if (metadata.GetFirstKeySpan(middle).SequenceCompareTo(from.Span) <= 0)
                         {
                             start = middle + 1;
                         }
@@ -473,7 +473,7 @@ internal sealed class MergeIterator : IStorageIterator
                     while (start < end)
                     {
                         var middle = start + ((end - start) >> 1);
-                        if (metadata[middle].FirstKey.Span.SequenceCompareTo(from.Span) <= 0)
+                        if (metadata.GetFirstKeySpan(middle).SequenceCompareTo(from.Span) <= 0)
                         {
                             start = middle + 1;
                         }
@@ -485,7 +485,7 @@ internal sealed class MergeIterator : IStorageIterator
 
                     blockIndex = Math.Max(0, start - 1);
                     if (blockIndex < metadata.Length
-                        && metadata[blockIndex].LastKey.Span.SequenceCompareTo(from.Span) < 0)
+                        && metadata.GetLastKeySpan(blockIndex).SequenceCompareTo(from.Span) < 0)
                     {
                         blockIndex++;
                     }

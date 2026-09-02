@@ -1,10 +1,12 @@
 using System.Buffers.Binary;
 using BenchmarkDotNet.Attributes;
+using BenchmarkDotNet.Configs;
 using Silex.Tables;
 
 namespace Silex.Benchmarks;
 
 [MemoryDiagnoser, ShortRunJob]
+[GroupBenchmarksBy(BenchmarkLogicalGroupRule.ByCategory)]
 public class BlockMetadataBenchmarks
 {
     private const int BlockCount = 1_024;
@@ -49,6 +51,7 @@ public class BlockMetadataBenchmarks
     }
 
     [Benchmark(Baseline = true, OperationsPerInvoke = LookupCount)]
+    [BenchmarkCategory("Lookup")]
     public int ObjectArrayLookup()
     {
         var result = 0;
@@ -61,6 +64,7 @@ public class BlockMetadataBenchmarks
     }
 
     [Benchmark(OperationsPerInvoke = LookupCount)]
+    [BenchmarkCategory("Lookup")]
     public int PackedLookup()
     {
         var result = 0;
@@ -70,6 +74,34 @@ public class BlockMetadataBenchmarks
         }
 
         return result;
+    }
+
+    [Benchmark(Baseline = true, OperationsPerInvoke = LookupCount)]
+    [BenchmarkCategory("BoundaryAccess")]
+    public int MaterializedBoundaryAccess()
+    {
+        var length = 0;
+        for (var i = 0; i < LookupCount; i++)
+        {
+            var metadata = _packed[i & (BlockCount - 1)];
+            length += metadata.FirstKey.Length + metadata.LastKey.Length;
+        }
+
+        return length;
+    }
+
+    [Benchmark(OperationsPerInvoke = LookupCount)]
+    [BenchmarkCategory("BoundaryAccess")]
+    public int SpanBoundaryAccess()
+    {
+        var length = 0;
+        for (var i = 0; i < LookupCount; i++)
+        {
+            var index = i & (BlockCount - 1);
+            length += _packed.GetFirstKeySpan(index).Length + _packed.GetLastKeySpan(index).Length;
+        }
+
+        return length;
     }
 
     private int FindLegacy(ReadOnlySpan<byte> key)
