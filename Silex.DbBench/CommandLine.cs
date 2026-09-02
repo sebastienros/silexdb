@@ -219,9 +219,10 @@ internal static class CommandLine
         DefaultValueFactory = _ => 1,
     };
 
-    private static readonly Option<int?> BatchSize = new("--batch_size")
+    private static readonly Option<int> BatchSize = new("--batch_size")
     {
-        Description = "Ignored unless 1: Silex has no write-batch API.",
+        Description = "Mutations per atomic write batch.",
+        DefaultValueFactory = _ => 1,
     };
 
     public static RootCommand BuildRootCommand(Func<BenchmarkOptions, List<string>, Task<int>> run)
@@ -274,6 +275,7 @@ internal static class CommandLine
             Seed = parseResult.GetValue(Seed),
             Histogram = parseResult.GetValue(Histogram),
             Threads = Math.Max(1, parseResult.GetValue(Threads)),
+            BatchSize = Math.Max(1, parseResult.GetValue(BatchSize)),
             WriteBufferSize = parseResult.GetValue(WriteBufferSize),
             MaxWriteBufferNumber = parseResult.GetValue(MaxWriteBufferNumber),
             BloomBits = parseResult.GetValue(BloomBits),
@@ -303,12 +305,6 @@ internal static class CommandLine
         if (maxBackgroundCompactions > 1)
         {
             warnings.Add("--max_background_compactions accepted for compatibility, but Silex currently runs one background compaction loop.");
-        }
-
-        var batch = parseResult.GetValue(BatchSize);
-        if (batch is not null and not 1)
-        {
-            warnings.Add("--batch_size ignored: Silex has no write-batch API; every write is an individual Put.");
         }
 
         return (options, warnings);

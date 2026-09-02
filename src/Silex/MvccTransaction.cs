@@ -11,8 +11,7 @@ namespace Silex;
 public sealed class MvccTransaction : IDisposable
 {
     private MvccStorage? _storage;
-    private readonly List<MvccMutation> _mutations = [];
-    private readonly List<byte[]> _trackedReads = [];
+    private readonly MvccWriteBuffer _writes = new();
 
     internal MvccTransaction(MvccStorage storage, long sequence)
     {
@@ -28,51 +27,53 @@ public sealed class MvccTransaction : IDisposable
     public void Put(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
     {
         GetStorage();
-        var mutation = FindMutation(key);
-        if (mutation is null)
+        var mutationIndex = _writes.FindMutation(key);
+        if (mutationIndex < 0)
         {
-            _mutations.Add(new MvccMutation(key.ToArray(), value.ToArray()));
+            _writes.AddMutation(key, value, isTombstone: false);
         }
         else
         {
-            mutation.Value = value.ToArray();
+            _writes.SetValue(mutationIndex, value, isTombstone: false);
         }
     }
 
     public void Delete(ReadOnlySpan<byte> key)
     {
         GetStorage();
-        var mutation = FindMutation(key);
-        if (mutation is null)
+        var mutationIndex = _writes.FindMutation(key);
+        if (mutationIndex < 0)
         {
-            _mutations.Add(new MvccMutation(key.ToArray(), null));
+            _writes.AddMutation(key, default, isTombstone: true);
         }
         else
         {
-            mutation.Value = null;
+            _writes.SetValue(mutationIndex, default, isTombstone: true);
         }
     }
 
     public ValueTask<int> GetRawAsync(ReadOnlySpan<byte> key, Memory<byte> destination, CancellationToken cancellationToken = default)
     {
         var storage = GetStorage();
-        var mutation = FindMutation(key);
-        if (mutation is null)
+        var mutationIndex = _writes.FindMutation(key);
+        if (mutationIndex < 0)
         {
             return storage.GetRawAtAsync(key, Sequence, destination, cancellationToken);
         }
 
-        if (mutation.Value is null)
+        var mutation = _writes.GetMutation(mutationIndex);
+        if (mutation.IsTombstone)
         {
             return ValueTask.FromResult(-1);
         }
 
-        if (mutation.Value.Length <= destination.Length)
+        var value = _writes.GetValue(mutation);
+        if (value.Length <= destination.Length)
         {
-            mutation.Value.CopyTo(destination);
+            value.Span.CopyTo(destination.Span);
         }
 
-        return ValueTask.FromResult(mutation.Value.Length);
+        return ValueTask.FromResult(value.Length);
     }
 
     /// <summary>
@@ -98,7 +99,7 @@ public sealed class MvccTransaction : IDisposable
 
         try
         {
-            return await storage.TryCommitAsync(Sequence, _mutations, _trackedReads, cancellationToken).ConfigureAwait(false);
+            return await storage.TryCommitAsync(Sequence, _writes, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -119,30 +120,12 @@ public sealed class MvccTransaction : IDisposable
 
     public void Dispose() => Complete();
 
-    private MvccMutation? FindMutation(ReadOnlySpan<byte> key)
-    {
-        for (var i = _mutations.Count - 1; i >= 0; i--)
-        {
-            if (key.SequenceEqual(_mutations[i].Key))
-            {
-                return _mutations[i];
-            }
-        }
-
-        return null;
-    }
-
     private void TrackRead(ReadOnlySpan<byte> key)
     {
-        for (var i = 0; i < _trackedReads.Count; i++)
+        if (_writes.FindMutation(key) < 0)
         {
-            if (key.SequenceEqual(_trackedReads[i]))
-            {
-                return;
-            }
+            _writes.TrackRead(key);
         }
-
-        _trackedReads.Add(key.ToArray());
     }
 
     private MvccStorage GetStorage()
@@ -153,6 +136,10 @@ public sealed class MvccTransaction : IDisposable
     private void Complete()
     {
         var storage = Interlocked.Exchange(ref _storage, null);
-        storage?.ReleaseSnapshot(Sequence);
+        if (storage is not null)
+        {
+            _writes.Dispose();
+            storage.ReleaseSnapshot(Sequence);
+        }
     }
 }

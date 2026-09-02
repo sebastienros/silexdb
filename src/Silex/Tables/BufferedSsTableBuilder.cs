@@ -1,6 +1,7 @@
 using Silex.Blocks;
 using Silex.BloomFilters;
 using Silex.Buffers;
+using Silex.Ownership;
 using Silex.Serialization;
 using System.Buffers;
 using System.IO;
@@ -43,13 +44,17 @@ internal sealed class BufferedSsTableBuilder : ISsTableBuilder
     private readonly ISsTableEncoder _tableEncoder;
     private long _offset;
     private bool _isFirstKey = true;
+    [OwnedResource]
     private OwnedByteSlice? _firstKey = default;
+    [OwnedResource]
     private OwnedByteSlice? _lastKey = default;
     private readonly IBloomFilter _bloomFilter;
     private readonly BlockBuilder _blockBuilder;
     private readonly BlockCompressor _blockCompressor;
     private readonly int _formatVersion;
     private List<BlockMetadata>? _metadata;
+    private List<OwnedByteSlice>? _metadataKeyOwners;
+    private BlockMetadataStore? _flattenedMetadata;
     private bool _disposed;
     private bool _ownsBuiltResources = true;
     private readonly FileStream _stream;
@@ -155,16 +160,19 @@ internal sealed class BufferedSsTableBuilder : ISsTableBuilder
         var storedBlock = _blockCompressor.Compress(block.Memory.Span);
 
         _metadata ??= [];
-        _metadata.Add(new BlockMetadata()
-        {
-            Index = _metadata.Count,
-            Offset = _offset,
-            UncompressedLength = storedBlock.UncompressedLength,
-            Compression = storedBlock.Compression,
-            Checksum = XxHash32.HashToUInt32(storedBlock.Data),
-            FirstKeyOwner = _firstKey!,
-            LastKeyOwner = _lastKey!
-        });
+        _metadataKeyOwners ??= [];
+        var firstKey = _firstKey!;
+        var lastKey = _lastKey!;
+        _metadata.Add(new BlockMetadata(
+            _metadata.Count,
+            _offset,
+            storedBlock.UncompressedLength,
+            storedBlock.Compression,
+            XxHash32.HashToUInt32(storedBlock.Data),
+            firstKey.Memory,
+            lastKey.Memory));
+        _metadataKeyOwners.Add(firstKey);
+        _metadataKeyOwners.Add(lastKey);
 
         // If the buffer is too small, it will grow automatically, and this new size will be kept
         // as the new threshold until the end of the SST
@@ -197,6 +205,8 @@ internal sealed class BufferedSsTableBuilder : ISsTableBuilder
             throw new InvalidOperationException("Nothing to store in SsTable.");
         }
 
+        _flattenedMetadata = BlockMetadataStore.Create(_metadata);
+
         // Flush the blocks data before we use the buffer for metadata and bloom filter
         if (_bufferWriter.WrittenCount > 0)
         {
@@ -224,11 +234,28 @@ internal sealed class BufferedSsTableBuilder : ISsTableBuilder
         // readers and recovery only ever see a fully written SST.
         File.Move(_tempFilename, _filename, overwrite: true);
 
-        // Ownership of the block builder and metadata transfers to the SsTable, which uses them to
-        // decode and locate blocks, so this builder must no longer dispose or clear them.
+        var flattenedMetadata = _flattenedMetadata!;
+        var readStream = File.OpenRead(_filename);
+        SsTable table;
+
+        try
+        {
+            table = new SsTable(IdGenerator.GetNextId(), readStream, _filename, flattenedMetadata, metadataOffset, _blockBuilder, _bloomFilter);
+        }
+        catch
+        {
+            readStream.Dispose();
+            throw;
+        }
+
+        // Ownership of the block builder and packed metadata transfers to the SsTable.
+        _flattenedMetadata = null;
+        _metadata.Clear();
+        _metadata = null;
+        DisposeMetadataKeyOwners();
         _ownsBuiltResources = false;
 
-        return new SsTable(IdGenerator.GetNextId(), File.OpenRead(_filename), _filename, _metadata, metadataOffset, _blockBuilder, _bloomFilter);
+        return table;
     }
 
     private async Task FLushBufferToDiskAsync(CancellationToken cancellationToken = default)
@@ -282,26 +309,36 @@ internal sealed class BufferedSsTableBuilder : ISsTableBuilder
         _firstKey = null;
         _lastKey = null;
 
-        // After a successful build, the block builder and metadata are owned by the SsTable, so the
-        // builder must not dispose the block builder nor clear the metadata list the SsTable now uses.
+        // After a successful build, the block builder and packed metadata are owned by the SsTable.
         if (_ownsBuiltResources)
         {
             _blockBuilder?.Dispose();
-            if (_metadata is not null)
-            {
-                foreach (var metadata in _metadata)
-                {
-                    metadata.Dispose();
-                }
-
-                _metadata.Clear();
-            }
+            _flattenedMetadata?.Dispose();
+            _flattenedMetadata = null;
+            DisposeMetadataKeyOwners();
+            _metadata?.Clear();
             _metadata = null;
 
             // The build never completed (otherwise the temp file was renamed to the final name), so
             // remove the abandoned partial temp file rather than leaving it behind.
             TryDeleteTempFile();
         }
+    }
+
+    private void DisposeMetadataKeyOwners()
+    {
+        if (_metadataKeyOwners is null)
+        {
+            return;
+        }
+
+        foreach (var owner in _metadataKeyOwners)
+        {
+            owner.Dispose();
+        }
+
+        _metadataKeyOwners.Clear();
+        _metadataKeyOwners = null;
     }
 
     private void TryDeleteTempFile()

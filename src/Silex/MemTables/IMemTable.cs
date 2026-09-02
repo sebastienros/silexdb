@@ -24,6 +24,8 @@ internal interface IMemTable : IDisposable
     /// <returns><c>true</c> if the key was found, <c>false</c> otherwise.</returns>
     bool TryGet(ByteSlice key, [MaybeNullWhen(false)] out ByteSlice result);
 
+    bool TryGetRaw(ReadOnlySpan<byte> key, out ReadOnlyMemory<byte> value, out bool isTombstone);
+
     void Put(ByteSlice key, ByteSlice value);
 
     IStorageIterator CreateIterator();

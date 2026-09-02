@@ -3,6 +3,7 @@ using Silex.Compaction;
 using Silex.Buffers;
 using Silex.MemTables;
 using Silex.Serialization;
+using Silex.Ownership;
 using Silex.Tables;
 using Silex.Wal;
 using System.Buffers;
@@ -418,6 +419,20 @@ public sealed class LsmStorage : IDisposable, IAsyncDisposable
         _inner.DeleteRaw(key);
     }
 
+    /// <summary>
+    /// Applies every mutation in <paramref name="batch"/> under one storage lock and one WAL frame.
+    /// </summary>
+    /// <remarks>
+    /// The call returns only after the frame has reached the operating system, or stable storage when
+    /// <see cref="StorageOptions.SyncWriteAheadLogToDisk"/> is enabled.
+    /// </remarks>
+    public void Write(LsmWriteBatch batch)
+    {
+        CheckDisposed();
+        ArgumentNullException.ThrowIfNull(batch);
+        _inner.WriteBatch(batch);
+    }
+
     public ValueTask<bool> TryGetRawAsync(ReadOnlySpan<byte> key, IBufferWriter<byte> destination, CancellationToken cancellationToken = default)
     {
         CheckDisposed();
@@ -426,7 +441,7 @@ public sealed class LsmStorage : IDisposable, IAsyncDisposable
         var ownedKey = OwnedByteSlice.CopyFrom(key);
         return DisposeKeyAsync(_inner.TryGetRawAsync(ownedKey.Slice, destination, cancellationToken), ownedKey);
 
-        static async ValueTask<bool> DisposeKeyAsync(ValueTask<bool> result, OwnedByteSlice ownedKey)
+        static async ValueTask<bool> DisposeKeyAsync(ValueTask<bool> result, [ConsumesOwnership] OwnedByteSlice ownedKey)
         {
             try
             {
@@ -454,7 +469,7 @@ public sealed class LsmStorage : IDisposable, IAsyncDisposable
         var ownedKey = OwnedByteSlice.CopyFrom(key);
         return DisposeKeyAsync(_inner.GetRawAsync(ownedKey.Slice, destination, cancellationToken), ownedKey);
 
-        static async ValueTask<int> DisposeKeyAsync(ValueTask<int> result, OwnedByteSlice ownedKey)
+        static async ValueTask<int> DisposeKeyAsync(ValueTask<int> result, [ConsumesOwnership] OwnedByteSlice ownedKey)
         {
             try
             {
@@ -482,7 +497,7 @@ public sealed class LsmStorage : IDisposable, IAsyncDisposable
         var ownedKey = OwnedByteSlice.CopyFrom(key);
         return DisposeKeyAsync(_inner.TryReadRawAsync(ownedKey.Slice, arg, reader, cancellationToken), ownedKey);
 
-        static async ValueTask<bool> DisposeKeyAsync(ValueTask<bool> result, OwnedByteSlice ownedKey)
+        static async ValueTask<bool> DisposeKeyAsync(ValueTask<bool> result, [ConsumesOwnership] OwnedByteSlice ownedKey)
         {
             try
             {
@@ -517,7 +532,7 @@ public sealed class LsmStorage : IDisposable, IAsyncDisposable
         var ownedFrom = OwnedByteSlice.CopyFrom(from);
         return DisposeKeyAsync(_inner.SeekRawAsync(ownedFrom.Slice, arg, reader, maxEntries, cancellationToken), ownedFrom);
 
-        static async ValueTask<long> DisposeKeyAsync(ValueTask<long> result, OwnedByteSlice ownedFrom)
+        static async ValueTask<long> DisposeKeyAsync(ValueTask<long> result, [ConsumesOwnership] OwnedByteSlice ownedFrom)
         {
             try
             {

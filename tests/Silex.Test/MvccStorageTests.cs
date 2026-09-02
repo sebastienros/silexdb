@@ -1,3 +1,5 @@
+using System.Buffers.Binary;
+using Silex.Wal;
 using TUnit.Assertions.Enums;
 
 namespace Silex.Test;
@@ -10,6 +12,49 @@ public class MvccStorageTests
         FlushPeriod = TimeSpan.Zero,
         CompactionStrategy = CompactionStrategy.None,
     };
+
+    [Test]
+    public async Task PackedWriteBufferShouldNotAllocatePerMutation()
+    {
+        using (var warmup = new MvccWriteBuffer())
+        {
+            for (var i = 0; i < 128; i++)
+            {
+                warmup.AddMutation(BitConverter.GetBytes(i), [1], isTombstone: false);
+            }
+        }
+
+        using var writes = new MvccWriteBuffer();
+        Span<byte> key = stackalloc byte[sizeof(int)];
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        for (var i = 0; i < 128; i++)
+        {
+            BitConverter.TryWriteBytes(key, i);
+            writes.AddMutation(key, [1], isTombstone: false);
+        }
+
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+        await Assert.That(allocated).IsEqualTo(0);
+    }
+
+    [Test]
+    public async Task TransactionOverwriteDeleteAndTrackedReadsPreserveSemantics()
+    {
+        using var folder = TempFolder.Create();
+        await using var storage = await MvccStorage.OpenAsync(folder, _options);
+        storage.Put([1], [1]);
+
+        using var transaction = storage.BeginTransaction();
+        await AssertValueForUpdateAsync(transaction, [1], [1]);
+        transaction.Put([1], [2]);
+        transaction.Put([1], [3]);
+        transaction.Delete([1]);
+        transaction.Put([1], []);
+
+        await Assert.That(await transaction.GetRawAsync([1], Memory<byte>.Empty)).IsEqualTo(0);
+        await transaction.CommitAsync();
+        await Assert.That(await storage.GetRawAsync([1], Memory<byte>.Empty)).IsEqualTo(0);
+    }
 
     [Test]
     public async Task SnapshotKeepsStableVersionForBinaryKey()
@@ -54,6 +99,32 @@ public class MvccStorageTests
     }
 
     [Test]
+    public async Task InitializationAndLogicalCommitsUseSingleWalFrames()
+    {
+        using var folder = TempFolder.Create();
+        var options = new StorageOptions
+        {
+            UseWriteAheadLog = true,
+            FlushPeriod = TimeSpan.Zero,
+            CompactionStrategy = CompactionStrategy.None,
+        };
+        await using var storage = await MvccStorage.OpenAsync(folder, options);
+
+        using (var transaction = storage.BeginTransaction())
+        {
+            transaction.Put([1], [10]);
+            transaction.Put([2], [20]);
+            await transaction.CommitAsync();
+        }
+
+        var wal = Directory.EnumerateFiles(folder, "*.wal").Single();
+        await Assert.That(CountWalFrames(await ReadActiveWalAsync(wal))).IsEqualTo(2);
+
+        storage.Put([3], [30]);
+        await Assert.That(CountWalFrames(await ReadActiveWalAsync(wal))).IsEqualTo(3);
+    }
+
+    [Test]
     public async Task ConcurrentWritersConflictAtCommit()
     {
         using var folder = TempFolder.Create();
@@ -74,6 +145,40 @@ public class MvccStorageTests
         var destination = new byte[1];
         await storage.GetRawAsync([1], destination);
         await Assert.That(destination[0] is 2 or 3).IsTrue();
+    }
+
+    private static int CountWalFrames(ReadOnlySpan<byte> wal)
+    {
+        var offset = WriteAheadLog.FileHeaderSize;
+        var count = 0;
+
+        while (offset < wal.Length)
+        {
+            var payloadLength = checked((int)BinaryPrimitives.ReadUInt32LittleEndian(wal[offset..]));
+            offset = checked(offset + WriteAheadLog.FrameHeaderSize + payloadLength + WriteAheadLog.FrameFooterSize);
+            count++;
+        }
+
+        if (offset != wal.Length)
+        {
+            throw new InvalidDataException("The WAL did not end at a frame boundary.");
+        }
+
+        return count;
+    }
+
+    private static async Task<byte[]> ReadActiveWalAsync(string path)
+    {
+        await using var stream = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete,
+            bufferSize: 4096,
+            FileOptions.Asynchronous | FileOptions.SequentialScan);
+        var bytes = GC.AllocateUninitializedArray<byte>(checked((int)stream.Length));
+        await stream.ReadExactlyAsync(bytes);
+        return bytes;
     }
 
     [Test]

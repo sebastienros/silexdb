@@ -1,11 +1,14 @@
 using Silex.Buffers;
+using Silex.Ownership;
 using System.Buffers;
 using System.Text.Json;
 
 namespace Silex;
 
+[MustDispose]
 internal sealed class OwnedByteSlice : IDisposable
 {
+    [OwnedResource]
     private IMemoryOwner<byte>? _owner;
     private ByteSlice _slice;
     private bool _disposed;

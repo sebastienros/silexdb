@@ -26,6 +26,8 @@ internal sealed class BenchmarkOptions
 
     public int Threads { get; set; } = 1;
 
+    public int BatchSize { get; set; } = 1;
+
     public long WriteBufferSize { get; set; } = 64L * 1024 * 1024;
 
     public int MaxWriteBufferNumber { get; set; } = 50;

@@ -35,6 +35,13 @@ internal interface IBlockEncoder
 
     RecordLocation DecodeEntry(ReadOnlyMemory<byte> data, int offset);
 
+    void DecodeRawEntry(
+        ReadOnlyMemory<byte> data,
+        int offset,
+        out ReadOnlyMemory<byte> key,
+        out ReadOnlyMemory<byte> value,
+        out bool isTombstone);
+
     ReadOnlyMemory<byte> DecodeValue(ReadOnlyMemory<byte> data, int offset, int length);
 
     /// <summary>

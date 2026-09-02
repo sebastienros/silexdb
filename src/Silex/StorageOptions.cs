@@ -197,8 +197,8 @@ public class StorageOptions
     public bool UseWriteAheadLog { get; set; } = true;
 
     /// <summary>
-    /// Gets or sets whether each write-ahead log append is flushed all the way to disk (<c>fsync</c>).
-    /// When <c>false</c> the append is only flushed to the operating system, which still survives a
+    /// Gets or sets whether each write-ahead log frame is flushed all the way to disk (<c>fsync</c>).
+    /// When <c>false</c> the frame is only written to the operating system, which still survives a
     /// process crash but not a power loss. Enabling this is slower but survives power loss.
     /// </summary>
     /// <remarks>This has no effect when <see cref="UseWriteAheadLog"/> is <c>false</c>.</remarks>

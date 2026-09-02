@@ -49,6 +49,15 @@ internal sealed class PooledArrayBufferWriter<T> : IBufferWriter<T>, IDisposable
         }
     }
 
+    internal Span<T> WrittenSpan
+    {
+        get
+        {
+            CheckIfDisposed();
+            return _rentedBuffer.AsSpan(0, _index);
+        }
+    }
+
     /// <summary>
     /// Gets the number of elements written to the buffer.
     /// </summary>
@@ -96,6 +105,15 @@ internal sealed class PooledArrayBufferWriter<T> : IBufferWriter<T>, IDisposable
         CheckIfDisposed();
 
         ClearHelper();
+    }
+
+    /// <summary>
+    /// Resets the writer without clearing bytes that will be overwritten by subsequent writes.
+    /// </summary>
+    internal void Reset()
+    {
+        CheckIfDisposed();
+        _index = 0;
     }
 
     private void ClearHelper()

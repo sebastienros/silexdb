@@ -76,9 +76,11 @@ public sealed class MvccStorage : IAsyncDisposable
                     throw new InvalidOperationException("The database contains plain keys and cannot be opened as an MVCC database.");
                 }
 
-                storage.Put(_formatKey, _formatValue);
-                WriteSequence(storage, _allocatedSequenceKey, 0);
-                WriteSequence(storage, _publishedSequenceKey, 0);
+                var initialization = new LsmWriteBatch();
+                initialization.Put(_formatKey, _formatValue);
+                WriteSequence(initialization, _allocatedSequenceKey, 0);
+                WriteSequence(initialization, _publishedSequenceKey, 0);
+                storage.Write(initialization);
                 return new MvccStorage(storage, 0, 0);
             }
 
@@ -386,8 +388,7 @@ public sealed class MvccStorage : IAsyncDisposable
 
     internal async ValueTask<bool> TryCommitAsync(
         long snapshotSequence,
-        IReadOnlyList<MvccMutation> mutations,
-        IReadOnlyList<byte[]> trackedReads,
+        MvccWriteBuffer writes,
         CancellationToken cancellationToken)
     {
         CheckDisposed();
@@ -398,18 +399,18 @@ public sealed class MvccStorage : IAsyncDisposable
             CheckDisposed();
             var published = Volatile.Read(ref _publishedSequence);
 
-            for (var i = 0; i < mutations.Count; i++)
+            for (var i = 0; i < writes.MutationCount; i++)
             {
-                if (await WasModifiedAfterAsync(mutations[i].Key, snapshotSequence, published, cancellationToken).ConfigureAwait(false))
+                if (await WasModifiedAfterAsync(writes.GetMutationKey(i), snapshotSequence, published, cancellationToken).ConfigureAwait(false))
                 {
                     return false;
                 }
             }
 
-            for (var i = 0; i < trackedReads.Count; i++)
+            for (var i = 0; i < writes.TrackedReadCount; i++)
             {
-                var key = trackedReads[i];
-                if (ContainsKey(mutations, key))
+                var key = writes.GetTrackedRead(i);
+                if (writes.FindMutation(key.Span) >= 0)
                 {
                     continue;
                 }
@@ -420,22 +421,30 @@ public sealed class MvccStorage : IAsyncDisposable
                 }
             }
 
-            if (mutations.Count == 0)
+            if (writes.MutationCount == 0)
             {
                 return true;
             }
 
             var sequence = AllocateSequence();
-            WriteSequence(_storage, _allocatedSequenceKey, sequence);
-            _allocatedSequence = sequence;
+            var batch = new LsmWriteBatch();
+            WriteSequence(batch, _allocatedSequenceKey, sequence);
 
-            for (var i = 0; i < mutations.Count; i++)
+            for (var i = 0; i < writes.MutationCount; i++)
             {
-                var mutation = mutations[i];
-                WriteVersion(mutation.Key, mutation.Value ?? default, mutation.Value is null, sequence);
+                var mutation = writes.GetMutation(i);
+                WriteVersion(
+                    batch,
+                    writes.GetKey(mutation).Span,
+                    writes.GetValue(mutation).Span,
+                    mutation.IsTombstone,
+                    sequence);
             }
 
-            Publish(sequence);
+            WriteSequence(batch, _publishedSequenceKey, sequence);
+            _storage.Write(batch);
+            _allocatedSequence = sequence;
+            Volatile.Write(ref _publishedSequence, sequence);
             return true;
         }
         finally
@@ -467,15 +476,12 @@ public sealed class MvccStorage : IAsyncDisposable
     private void CommitSingle(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool isTombstone)
     {
         var sequence = AllocateSequence();
-        WriteSequence(_storage, _allocatedSequenceKey, sequence);
+        var batch = new LsmWriteBatch();
+        WriteSequence(batch, _allocatedSequenceKey, sequence);
+        WriteVersion(batch, key, value, isTombstone, sequence);
+        WriteSequence(batch, _publishedSequenceKey, sequence);
+        _storage.Write(batch);
         _allocatedSequence = sequence;
-        WriteVersion(key, value, isTombstone, sequence);
-        Publish(sequence);
-    }
-
-    private void Publish(long sequence)
-    {
-        WriteSequence(_storage, _publishedSequenceKey, sequence);
         Volatile.Write(ref _publishedSequence, sequence);
     }
 
@@ -489,7 +495,12 @@ public sealed class MvccStorage : IAsyncDisposable
         return _allocatedSequence + 1;
     }
 
-    private void WriteVersion(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool isTombstone, long sequence)
+    private static void WriteVersion(
+        LsmWriteBatch batch,
+        ReadOnlySpan<byte> key,
+        ReadOnlySpan<byte> value,
+        bool isTombstone,
+        long sequence)
     {
         using var internalKey = EncodeVersionKey(key, sequence);
 
@@ -497,7 +508,7 @@ public sealed class MvccStorage : IAsyncDisposable
         {
             Span<byte> stored = stackalloc byte[1];
             stored[0] = TombstoneValue;
-            _storage.Put(internalKey.Span, stored);
+            batch.Put(internalKey.Span, stored);
             return;
         }
 
@@ -510,7 +521,7 @@ public sealed class MvccStorage : IAsyncDisposable
         {
             encoded[0] = LiveValue;
             value.CopyTo(encoded[1..]);
-            _storage.Put(internalKey.Span, encoded);
+            batch.Put(internalKey.Span, encoded);
         }
         finally
         {
@@ -522,12 +533,12 @@ public sealed class MvccStorage : IAsyncDisposable
     }
 
     private async ValueTask<bool> WasModifiedAfterAsync(
-        byte[] key,
+        ReadOnlyMemory<byte> key,
         long snapshotSequence,
         long publishedSequence,
         CancellationToken cancellationToken)
     {
-        var sequence = await FindVisibleSequenceAsync(key, publishedSequence, cancellationToken).ConfigureAwait(false);
+        var sequence = await FindVisibleSequenceAsync(key.Span, publishedSequence, cancellationToken).ConfigureAwait(false);
         return sequence > snapshotSequence;
     }
 
@@ -665,19 +676,6 @@ public sealed class MvccStorage : IAsyncDisposable
         _activeSnapshots[sequence] = count + 1;
     }
 
-    private static bool ContainsKey(IReadOnlyList<MvccMutation> mutations, ReadOnlySpan<byte> key)
-    {
-        for (var i = 0; i < mutations.Count; i++)
-        {
-            if (key.SequenceEqual(mutations[i].Key))
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
     private static OwnedByteSlice EncodeVersionKey(ReadOnlySpan<byte> userKey, long sequence)
     {
         var zeroCount = 0;
@@ -795,11 +793,11 @@ public sealed class MvccStorage : IAsyncDisposable
         }
     }
 
-    private static void WriteSequence(LsmStorage storage, ReadOnlySpan<byte> key, long sequence)
+    private static void WriteSequence(LsmWriteBatch batch, ReadOnlySpan<byte> key, long sequence)
     {
         Span<byte> value = stackalloc byte[sizeof(long)];
         BinaryPrimitives.WriteInt64LittleEndian(value, sequence);
-        storage.Put(key, value);
+        batch.Put(key, value);
     }
 
     private static async ValueTask<long> ReadSequenceAsync(
@@ -1056,8 +1054,230 @@ public sealed class MvccStorage : IAsyncDisposable
     }
 }
 
-internal sealed class MvccMutation(byte[] key, byte[]? value)
+internal sealed class MvccWriteBuffer : IDisposable
 {
-    public byte[] Key { get; } = key;
-    public byte[]? Value { get; set; } = value;
+    private const int InitialByteCapacity = 256;
+    private const int InitialDescriptorCapacity = 8;
+
+    private byte[] _bytes = [];
+    private MvccMutation[] _mutations = [];
+    private MvccKey[] _trackedReads = [];
+    private int _byteCount;
+    private bool _disposed;
+
+    public int MutationCount { get; private set; }
+
+    public int TrackedReadCount { get; private set; }
+
+    public int FindMutation(ReadOnlySpan<byte> key)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        for (var i = MutationCount - 1; i >= 0; i--)
+        {
+            if (key.SequenceEqual(GetKey(_mutations[i]).Span))
+            {
+                return i;
+            }
+        }
+
+        return -1;
+    }
+
+    public void AddMutation(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool isTombstone)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        EnsureMutationCapacity();
+        var keyOffset = Append(key);
+        var valueOffset = isTombstone ? 0 : Append(value);
+        _mutations[MutationCount++] = new MvccMutation(
+            keyOffset,
+            key.Length,
+            valueOffset,
+            isTombstone ? -1 : value.Length,
+            isTombstone ? 0 : value.Length);
+    }
+
+    public void SetValue(int index, ReadOnlySpan<byte> value, bool isTombstone)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ArgumentOutOfRangeException.ThrowIfNegative(index);
+        if (index >= MutationCount)
+        {
+            throw new ArgumentOutOfRangeException(nameof(index));
+        }
+
+        ref var mutation = ref _mutations[index];
+        if (isTombstone)
+        {
+            mutation.ValueLength = -1;
+            return;
+        }
+
+        if (value.Length <= mutation.ValueCapacity)
+        {
+            value.CopyTo(_bytes.AsSpan(mutation.ValueOffset));
+            mutation.ValueLength = value.Length;
+            return;
+        }
+
+        if (mutation.ValueOffset + mutation.ValueCapacity == _byteCount)
+        {
+            EnsureByteCapacity(value.Length - mutation.ValueCapacity);
+            value.CopyTo(_bytes.AsSpan(mutation.ValueOffset));
+            _byteCount = mutation.ValueOffset + value.Length;
+            mutation.ValueLength = value.Length;
+            mutation.ValueCapacity = value.Length;
+            return;
+        }
+
+        mutation.ValueOffset = Append(value);
+        mutation.ValueLength = value.Length;
+        mutation.ValueCapacity = value.Length;
+    }
+
+    public void TrackRead(ReadOnlySpan<byte> key)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        for (var i = 0; i < TrackedReadCount; i++)
+        {
+            if (key.SequenceEqual(GetTrackedRead(i).Span))
+            {
+                return;
+            }
+        }
+
+        EnsureTrackedReadCapacity();
+        _trackedReads[TrackedReadCount++] = new MvccKey(Append(key), key.Length);
+    }
+
+    public MvccMutation GetMutation(int index) => _mutations[index];
+
+    public ReadOnlyMemory<byte> GetMutationKey(int index) => GetKey(_mutations[index]);
+
+    public ReadOnlyMemory<byte> GetTrackedRead(int index)
+    {
+        var key = _trackedReads[index];
+        return _bytes.AsMemory(key.Offset, key.Length);
+    }
+
+    public ReadOnlyMemory<byte> GetKey(MvccMutation mutation) =>
+        _bytes.AsMemory(mutation.KeyOffset, mutation.KeyLength);
+
+    public ReadOnlyMemory<byte> GetValue(MvccMutation mutation) =>
+        mutation.IsTombstone
+            ? ReadOnlyMemory<byte>.Empty
+            : _bytes.AsMemory(mutation.ValueOffset, mutation.ValueLength);
+
+    public void Dispose()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _disposed = true;
+        if (_bytes.Length != 0)
+        {
+            ArrayPool<byte>.Shared.Return(_bytes);
+            _bytes = [];
+        }
+
+        if (_mutations.Length != 0)
+        {
+            ArrayPool<MvccMutation>.Shared.Return(_mutations);
+            _mutations = [];
+        }
+
+        if (_trackedReads.Length != 0)
+        {
+            ArrayPool<MvccKey>.Shared.Return(_trackedReads);
+            _trackedReads = [];
+        }
+    }
+
+    private int Append(ReadOnlySpan<byte> value)
+    {
+        var offset = _byteCount;
+        if (value.IsEmpty)
+        {
+            return offset;
+        }
+
+        EnsureByteCapacity(value.Length);
+        value.CopyTo(_bytes.AsSpan(offset));
+        _byteCount += value.Length;
+        return offset;
+    }
+
+    private void EnsureByteCapacity(int additionalLength)
+    {
+        var required = checked(_byteCount + additionalLength);
+        if (required <= _bytes.Length)
+        {
+            return;
+        }
+
+        var newSize = Math.Max(InitialByteCapacity, _bytes.Length);
+        while (newSize < required)
+        {
+            newSize = checked(newSize * 2);
+        }
+
+        var replacement = ArrayPool<byte>.Shared.Rent(newSize);
+        _bytes.AsSpan(0, _byteCount).CopyTo(replacement);
+        if (_bytes.Length != 0)
+        {
+            ArrayPool<byte>.Shared.Return(_bytes);
+        }
+
+        _bytes = replacement;
+    }
+
+    private void EnsureMutationCapacity()
+    {
+        if (MutationCount < _mutations.Length)
+        {
+            return;
+        }
+
+        var replacement = ArrayPool<MvccMutation>.Shared.Rent(
+            Math.Max(InitialDescriptorCapacity, _mutations.Length * 2));
+        _mutations.AsSpan(0, MutationCount).CopyTo(replacement);
+        if (_mutations.Length != 0)
+        {
+            ArrayPool<MvccMutation>.Shared.Return(_mutations);
+        }
+
+        _mutations = replacement;
+    }
+
+    private void EnsureTrackedReadCapacity()
+    {
+        if (TrackedReadCount < _trackedReads.Length)
+        {
+            return;
+        }
+
+        var replacement = ArrayPool<MvccKey>.Shared.Rent(
+            Math.Max(InitialDescriptorCapacity, _trackedReads.Length * 2));
+        _trackedReads.AsSpan(0, TrackedReadCount).CopyTo(replacement);
+        if (_trackedReads.Length != 0)
+        {
+            ArrayPool<MvccKey>.Shared.Return(_trackedReads);
+        }
+
+        _trackedReads = replacement;
+    }
 }
+
+internal struct MvccMutation(int keyOffset, int keyLength, int valueOffset, int valueLength, int valueCapacity)
+{
+    public int KeyOffset { get; } = keyOffset;
+    public int KeyLength { get; } = keyLength;
+    public int ValueOffset { get; set; } = valueOffset;
+    public int ValueLength { get; set; } = valueLength;
+    public int ValueCapacity { get; set; } = valueCapacity;
+    public readonly bool IsTombstone => ValueLength < 0;
+}
+
+internal readonly record struct MvccKey(int Offset, int Length);
