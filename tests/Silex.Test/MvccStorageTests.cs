@@ -118,10 +118,10 @@ public class MvccStorageTests
         }
 
         var wal = Directory.EnumerateFiles(folder, "*.wal").Single();
-        await Assert.That(CountWalFrames(await File.ReadAllBytesAsync(wal))).IsEqualTo(2);
+        await Assert.That(CountWalFrames(await ReadActiveWalAsync(wal))).IsEqualTo(2);
 
         storage.Put([3], [30]);
-        await Assert.That(CountWalFrames(await File.ReadAllBytesAsync(wal))).IsEqualTo(3);
+        await Assert.That(CountWalFrames(await ReadActiveWalAsync(wal))).IsEqualTo(3);
     }
 
     [Test]
@@ -165,6 +165,20 @@ public class MvccStorageTests
         }
 
         return count;
+    }
+
+    private static async Task<byte[]> ReadActiveWalAsync(string path)
+    {
+        await using var stream = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete,
+            bufferSize: 4096,
+            FileOptions.Asynchronous | FileOptions.SequentialScan);
+        var bytes = GC.AllocateUninitializedArray<byte>(checked((int)stream.Length));
+        await stream.ReadExactlyAsync(bytes);
+        return bytes;
     }
 
     [Test]
