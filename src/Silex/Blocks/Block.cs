@@ -208,6 +208,40 @@ internal sealed class Block : IDisposable
     /// Returns the index in <see cref="Offsets"/> of the first entry whose encoded key is greater than or
     /// equal to <paramref name="encodedKey"/>, or <see cref="BlockOffsets.Count"/> when every key is smaller.
     /// </summary>
+    internal int LowerBound(ReadOnlySpan<byte> encodedKey)
+    {
+        return LowerBound(Memory, encodedKey);
+    }
+
+    internal int UpperBound(ReadOnlySpan<byte> encodedKey)
+    {
+        var memory = Memory;
+        var start = 0;
+        var end = Offsets.Count;
+
+        while (start < end)
+        {
+            var m = start + (end - start) / 2;
+            GetRawEntry(m, out var entryKey, out _, out _);
+
+            if (entryKey.Span.SequenceCompareTo(encodedKey) <= 0)
+            {
+                start = m + 1;
+            }
+            else
+            {
+                end = m;
+            }
+        }
+
+        return start;
+    }
+
+    internal void GetRawEntry(int index, out ReadOnlyMemory<byte> key, out ReadOnlyMemory<byte> value, out bool isTombstone)
+    {
+        _encoder.DecodeRawEntry(Memory, Offsets[index], out key, out value, out isTombstone);
+    }
+
     private int LowerBound(ReadOnlyMemory<byte> memory, ReadOnlySpan<byte> encodedKey)
     {
         var start = 0;
@@ -217,11 +251,9 @@ internal sealed class Block : IDisposable
         {
             var m = start + (end - start) / 2;
 
-            var reader = new EncoderBinaryReader(memory, Offsets[m]);
-            var keyLength = reader.Read7BitEncodedInt();
-            var entryKey = reader.ReadBytesSpan(keyLength);
+            GetRawEntry(m, out var entryKey, out _, out _);
 
-            if (entryKey.SequenceCompareTo(encodedKey) < 0)
+            if (entryKey.Span.SequenceCompareTo(encodedKey) < 0)
             {
                 start = m + 1;
             }

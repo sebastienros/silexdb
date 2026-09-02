@@ -109,6 +109,20 @@ internal sealed class DefaultBlockEncoder : IBlockEncoder
         };
     }
 
+    public void DecodeRawEntry(
+        ReadOnlyMemory<byte> data,
+        int offset,
+        out ReadOnlyMemory<byte> key,
+        out ReadOnlyMemory<byte> value,
+        out bool isTombstone)
+    {
+        var reader = new EncoderBinaryReader(data, offset);
+        var keyLength = reader.Read7BitEncodedInt();
+        key = reader.ReadBytesMemory(keyLength);
+        var valueLength = RecordValueEncoding.DecodeLength(reader.Read7BitEncodedInt(), out isTombstone);
+        value = reader.ReadBytesMemory(valueLength);
+    }
+
     public ReadOnlyMemory<byte> DecodeValue(ReadOnlyMemory<byte> data, int offset, int length)
     {
         return data.Slice(offset, length);

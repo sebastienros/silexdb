@@ -1722,6 +1722,139 @@ public class StorageTests
     }
 
     [Test]
+    public async Task RawScanAndSeekMergeOverlapsTombstonesAndNewestValues()
+    {
+        using var tempFolder = TempFolder.Create();
+        using var storage = new LsmStorageInner(tempFolder, new StorageOptions
+        {
+            UseWriteAheadLog = false,
+            BlockSize = 64,
+        });
+
+        await FlushByteTierAsync(storage, () =>
+        {
+            storage.Put([1], [10]);
+            storage.Put([2], [20]);
+            storage.Put([4], [40]);
+            storage.Put([6], [60]);
+        });
+        await FlushByteTierAsync(storage, () =>
+        {
+            storage.Put([2], [22]);
+            storage.Put([3], [30]);
+            storage.Delete([4]);
+            storage.Put([5], [50]);
+        });
+        await FlushByteTierAsync(storage, () =>
+        {
+            storage.Delete([1]);
+            storage.Put([3], [33]);
+            storage.Put([4], [44]);
+        });
+
+        var scanned = new List<(byte Key, byte Value)>();
+        await storage.ScanRawAsync(scanned, static (state, key, value) =>
+        {
+            state.Add((key[0], value[0]));
+            return true;
+        });
+
+        await Assert.That(scanned).IsEquivalentTo(
+            new (byte, byte)[] { (2, 22), (3, 33), (4, 44), (5, 50), (6, 60) },
+            CollectionOrdering.Matching);
+        await Assert.That(await SeekRawCollectAsync(storage, [3], maxEntries: 3)).IsEquivalentTo(
+            new (byte, byte)[] { (3, 33), (4, 44), (5, 50) },
+            CollectionOrdering.Matching);
+    }
+
+    [Test]
+    public async Task OverlappingSsTableIteratorPreservesDirectionsAndSeekBounds()
+    {
+        using var tempFolder = TempFolder.Create();
+        using var storage = new LsmStorageInner(tempFolder, new StorageOptions
+        {
+            UseWriteAheadLog = false,
+            BlockSize = 64,
+        });
+
+        await FlushByteTierAsync(storage, () =>
+        {
+            storage.Put([1], [10]);
+            storage.Put([2], [20]);
+            storage.Put([4], [40]);
+            storage.Put([6], [60]);
+        });
+        await FlushByteTierAsync(storage, () =>
+        {
+            storage.Delete([1]);
+            storage.Put([2], [22]);
+            storage.Put([3], [30]);
+            storage.Put([5], [50]);
+        });
+
+        var iterator = storage.CreateIterator();
+        using var forwardBound = OwnedByteSlice.CopyFrom([3]);
+        using var backwardBound = OwnedByteSlice.CopyFrom([4]);
+        var forward = iterator.EnumerateAsync().ToBlockingEnumerable().SnapshotList();
+        var forwardFrom = iterator.EnumerateAsync(forwardBound.Slice).ToBlockingEnumerable().SnapshotList();
+        var backwards = iterator.EnumerateBackwardsAsync().ToBlockingEnumerable().SnapshotList();
+        var backwardsFrom = iterator.EnumerateBackwardsAsync(backwardBound.Slice).ToBlockingEnumerable().SnapshotList();
+
+        await Assert.That(forward.Select(static entry => entry.Key.Span[0])).IsEquivalentTo(
+            new byte[] { 2, 3, 4, 5, 6 },
+            CollectionOrdering.Matching);
+        await Assert.That(forward.Select(static entry => entry.Value.Span[0])).IsEquivalentTo(
+            new byte[] { 22, 30, 40, 50, 60 },
+            CollectionOrdering.Matching);
+        await Assert.That(forwardFrom.Select(static entry => entry.Key.Span[0])).IsEquivalentTo(
+            new byte[] { 3, 4, 5, 6 },
+            CollectionOrdering.Matching);
+        await Assert.That(backwards.Select(static entry => entry.Key.Span[0])).IsEquivalentTo(
+            new byte[] { 6, 5, 4, 3, 2 },
+            CollectionOrdering.Matching);
+        await Assert.That(backwardsFrom.Select(static entry => entry.Key.Span[0])).IsEquivalentTo(
+            new byte[] { 4, 3, 2 },
+            CollectionOrdering.Matching);
+    }
+
+    [Test]
+    public async Task CanceledOverlappingRawScanReleasesResourcesForNextScan()
+    {
+        using var tempFolder = TempFolder.Create();
+        using var storage = new LsmStorageInner(tempFolder, new StorageOptions { UseWriteAheadLog = false });
+
+        await FlushByteTierAsync(storage, () =>
+        {
+            storage.Put([1], [10]);
+            storage.Put([2], [20]);
+        });
+        await FlushByteTierAsync(storage, () =>
+        {
+            storage.Put([1], [11]);
+            storage.Put([3], [30]);
+        });
+
+        using var cancellation = new CancellationTokenSource();
+        var canceled = false;
+
+        try
+        {
+            await storage.ScanRawAsync(cancellation, static (state, _, _) =>
+            {
+                state.Cancel();
+                return true;
+            }, cancellationToken: cancellation.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            canceled = true;
+        }
+
+        await Assert.That(canceled).IsTrue();
+        await Assert.That(await storage.ScanRawAsync(0, static (_, _, _) => true)).IsEqualTo(3);
+    }
+
+    [Test]
     public async Task FlushAndCompactAsyncFlushesPendingWritesForRawScan()
     {
         using var tempFolder = TempFolder.Create();

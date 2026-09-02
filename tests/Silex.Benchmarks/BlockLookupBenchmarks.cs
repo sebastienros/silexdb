@@ -87,6 +87,7 @@ public class BlockLookupBenchmarks
 
         return found;
     }
+
     [Benchmark, BenchmarkCategory("Miss")]
     public int ByteSliceMiss()
     {

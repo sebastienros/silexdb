@@ -25,10 +25,11 @@ internal sealed class SsTableIterator : IStorageIterator
 
             if (block != null)
             {
-                var blockIterator = new BlockIterator(block);
-                await foreach (var entry in blockIterator.EnumerateAsync(cancellationToken))
+                var cursor = new BlockIterator.Cursor(block, backwards: false);
+                while (cursor.MoveNext())
                 {
-                    yield return entry;
+                    cancellationToken.ThrowIfCancellationRequested();
+                    yield return cursor.Current;
                 }
             }
         }
@@ -64,10 +65,11 @@ internal sealed class SsTableIterator : IStorageIterator
 
         if (block != null)
         {
-            var blockIterator = new BlockIterator(block);
-            await foreach (var entry in blockIterator.EnumerateAsync(from, cancellationToken))
+            var cursor = new BlockIterator.Cursor(block, backwards: false, from.Span);
+            while (cursor.MoveNext())
             {
-                yield return entry;
+                cancellationToken.ThrowIfCancellationRequested();
+                yield return cursor.Current;
             }
         }
 
@@ -81,10 +83,11 @@ internal sealed class SsTableIterator : IStorageIterator
 
             if (block2 != null)
             {
-                var blockIterator = new BlockIterator(block2);
-                await foreach (var entry in blockIterator.EnumerateAsync(cancellationToken))
+                var cursor = new BlockIterator.Cursor(block2, backwards: false);
+                while (cursor.MoveNext())
                 {
-                    yield return entry;
+                    cancellationToken.ThrowIfCancellationRequested();
+                    yield return cursor.Current;
                 }
             }
         }
@@ -102,10 +105,11 @@ internal sealed class SsTableIterator : IStorageIterator
 
             if (block != null)
             {
-                var blockIterator = new BlockIterator(block);
-                await foreach (var entry in blockIterator.EnumerateBackwardsAsync(cancellationToken))
+                var cursor = new BlockIterator.Cursor(block, backwards: true);
+                while (cursor.MoveNext())
                 {
-                    yield return entry;
+                    cancellationToken.ThrowIfCancellationRequested();
+                    yield return cursor.Current;
                 }
             }
         }
@@ -126,10 +130,11 @@ internal sealed class SsTableIterator : IStorageIterator
 
         if (block != null)
         {
-            var blockIterator = new BlockIterator(block);
-            await foreach (var entry in blockIterator.EnumerateBackwardsAsync(from, cancellationToken))
+            var cursor = new BlockIterator.Cursor(block, backwards: true, from.Span);
+            while (cursor.MoveNext())
             {
-                yield return entry;
+                cancellationToken.ThrowIfCancellationRequested();
+                yield return cursor.Current;
             }
         }
 
@@ -141,10 +146,11 @@ internal sealed class SsTableIterator : IStorageIterator
 
             if (earlierBlock != null)
             {
-                var blockIterator = new BlockIterator(earlierBlock);
-                await foreach (var entry in blockIterator.EnumerateBackwardsAsync(cancellationToken))
+                var cursor = new BlockIterator.Cursor(earlierBlock, backwards: true);
+                while (cursor.MoveNext())
                 {
-                    yield return entry;
+                    cancellationToken.ThrowIfCancellationRequested();
+                    yield return cursor.Current;
                 }
             }
         }

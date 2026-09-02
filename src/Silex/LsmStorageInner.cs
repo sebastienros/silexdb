@@ -461,9 +461,8 @@ internal sealed class LsmStorageInner : IDisposable
     /// value bytes. The spans are borrowed and valid only during the synchronous callback.
     /// </summary>
     /// <remarks>
-    /// The allocation-free SST fast path is used only when the on-disk tables form a single globally
-    /// non-overlapping sorted run. Other layouts fall back to the regular iterator to preserve duplicate-key
-    /// and tombstone semantics.
+    /// Non-overlapping SSTs stream directly. Overlapping SSTs use pooled raw block cursors and an index heap
+    /// to resolve duplicate-key and tombstone semantics without materializing entries.
     /// </remarks>
     public async ValueTask<long> ScanRawAsync<TArg>(TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries = long.MaxValue, CancellationToken cancellationToken = default)
     {
@@ -503,35 +502,24 @@ internal sealed class LsmStorageInner : IDisposable
 
                 return state.Count;
             }
+
+            var merge = new MergeIterator(BuildMergeInputs(
+                hasFrom: false,
+                default,
+                backwards: false,
+                cancellationToken));
+            return await merge.ScanRawAsync(
+                hasFrom: false,
+                default,
+                arg,
+                reader,
+                maxEntries,
+                cancellationToken);
         }
         finally
         {
             _level0Lock.ExitReadLock();
         }
-
-        return await ScanRawFallbackAsync(arg, reader, maxEntries, cancellationToken);
-    }
-
-    private async ValueTask<long> ScanRawFallbackAsync<TArg>(TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries, CancellationToken cancellationToken)
-    {
-        long count = 0;
-
-        await foreach (var entry in CreateIterator().EnumerateAsync(cancellationToken))
-        {
-            if (count >= maxEntries)
-            {
-                break;
-            }
-
-            count++;
-
-            if (!InvokeRawEntryReader(arg, reader, entry.Key, entry.Value))
-            {
-                break;
-            }
-        }
-
-        return count;
     }
 
     /// <summary>
@@ -636,36 +624,24 @@ internal sealed class LsmStorageInner : IDisposable
 
                 return state!.Count;
             }
+
+            var merge = new MergeIterator(BuildMergeInputs(
+                hasFrom: true,
+                from,
+                backwards: false,
+                cancellationToken), _blockCache);
+            return await merge.ScanRawAsync(
+                hasFrom: true,
+                from,
+                arg,
+                reader,
+                maxEntries,
+                cancellationToken);
         }
         finally
         {
             _level0Lock.ExitReadLock();
         }
-
-        using var ownedFrom = OwnedByteSlice.CopyFrom(from.Span);
-        return await SeekRawFallbackAsync(ownedFrom.Slice, arg, reader, maxEntries, cancellationToken);
-    }
-
-    private async ValueTask<long> SeekRawFallbackAsync<TArg>(ByteSlice from, TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries, CancellationToken cancellationToken)
-    {
-        long count = 0;
-
-        await foreach (var entry in CreateIterator().EnumerateAsync(from, cancellationToken))
-        {
-            if (count >= maxEntries)
-            {
-                break;
-            }
-
-            count++;
-
-            if (!InvokeRawEntryReader(arg, reader, entry.Key, entry.Value))
-            {
-                break;
-            }
-        }
-
-        return count;
     }
 
     /// <summary>
@@ -793,6 +769,105 @@ internal sealed class LsmStorageInner : IDisposable
     }
 
     private void InvalidateSortedSsTableRun() => Volatile.Write(ref _sortedSsTableRun, null);
+
+    private List<MergeIterator.Input> BuildMergeInputs(
+        bool hasFrom,
+        ReadOnlyMemory<byte> from,
+        bool backwards,
+        CancellationToken cancellationToken)
+    {
+        List<KeyValuePair<ByteSlice, ByteSlice>>? currentSnapshot = null;
+        ImmutableQueue<IMemTable> immutableMemTables;
+        List<SsTable> tables;
+        var fromSlice = hasFrom ? ByteSlice.FromMemory(from) : null;
+
+        _currentMemTableLock.EnterReadLock();
+
+        try
+        {
+            var state = _state;
+            immutableMemTables = state.ImmutableMemTables;
+            var tableCount = state.LevelZeroTables.Count;
+            foreach (var level in state.LeveledSsTables)
+            {
+                tableCount += level.Count;
+            }
+
+            if (state.CurrentMemTable.Count != 0)
+            {
+                currentSnapshot = MaterializeMemTable(
+                    state.CurrentMemTable,
+                    hasFrom,
+                    fromSlice,
+                    backwards,
+                    cancellationToken);
+            }
+
+            tables = new List<SsTable>(tableCount);
+            for (var i = state.LevelZeroTables.Count - 1; i >= 0; i--)
+            {
+                tables.Add(state.LevelZeroTables[i]);
+            }
+
+            foreach (var level in state.LeveledSsTables)
+            {
+                tables.AddRange(level);
+            }
+        }
+        finally
+        {
+            _currentMemTableLock.ExitReadLock();
+        }
+
+        var inputs = new List<MergeIterator.Input>(
+            (currentSnapshot == null ? 0 : 1) + immutableMemTables.Count() + tables.Count);
+        if (currentSnapshot != null)
+        {
+            inputs.Add(MergeIterator.Input.FromEntries(currentSnapshot));
+        }
+
+        foreach (var memTable in immutableMemTables.Reverse())
+        {
+            inputs.Add(MergeIterator.Input.FromIterator(memTable.CreateIterator()));
+        }
+
+        foreach (var table in tables)
+        {
+            inputs.Add(MergeIterator.Input.FromTable(table));
+        }
+
+        return inputs;
+    }
+
+    private static List<KeyValuePair<ByteSlice, ByteSlice>> MaterializeMemTable(
+        IMemTable memTable,
+        bool hasFrom,
+        ByteSlice? from,
+        bool backwards,
+        CancellationToken cancellationToken)
+    {
+        var snapshot = new List<KeyValuePair<ByteSlice, ByteSlice>>(memTable.Count);
+        var iterator = memTable.CreateIterator();
+        var enumerable = backwards
+            ? hasFrom
+                ? iterator.EnumerateBackwardsAsync(from!, cancellationToken)
+                : iterator.EnumerateBackwardsAsync(cancellationToken)
+            : hasFrom
+                ? iterator.EnumerateAsync(from!, cancellationToken)
+                : iterator.EnumerateAsync(cancellationToken);
+
+        foreach (var entry in enumerable.ToBlockingEnumerable(cancellationToken))
+        {
+            snapshot.Add(entry);
+        }
+
+        if (backwards)
+        {
+            snapshot.Reverse();
+        }
+
+        return snapshot;
+    }
 
     private sealed class RawScanState<TArg>(TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries)
     {
@@ -1402,15 +1477,15 @@ internal sealed class LsmStorageInner : IDisposable
                 _compressionLevel,
                 _minimumCompressionSavingsPercent))
             {
-                // Feed iterators newest-first so the MergeIterator keeps the most recent value per key.
-                var iterators = new List<IStorageIterator>(count);
+                // Feed tables newest-first so the MergeIterator keeps the most recent value per key.
+                var mergeInputs = new List<SsTable>(count);
 
                 for (var i = tiers.Count - 1; i >= startIndex; i--)
                 {
-                    iterators.Add(new SsTableIterator(tiers[i]));
+                    mergeInputs.Add(tiers[i]);
                 }
 
-                var merge = new MergeIterator(iterators);
+                var merge = new MergeIterator(mergeInputs);
 
                 await foreach (var entry in merge.EnumerateAsync(cancellationToken))
                 {
@@ -1935,14 +2010,7 @@ internal sealed class LsmStorageInner : IDisposable
 
         try
         {
-            var iterators = new List<IStorageIterator>(inputs.Count);
-
-            foreach (var input in inputs)
-            {
-                iterators.Add(new SsTableIterator(input));
-            }
-
-            var merge = new MergeIterator(iterators);
+            var merge = new MergeIterator(inputs);
 
             // Seek every input to the lower bound (skips earlier blocks); the merge stays ascending so the
             // upper bound is enforced with a single break below.
@@ -2397,8 +2465,11 @@ internal sealed class LsmStorageInner : IDisposable
                     yield break;
                 }
 
-                var iterators = BuildIterators(hasFrom, from, cancellationToken);
-                var merge = new MergeIterator(iterators);
+                var merge = new MergeIterator(_storage.BuildMergeInputs(
+                    hasFrom,
+                    hasFrom ? from.Memory : default,
+                    backwards,
+                    cancellationToken));
 
                 var enumerable = backwards
                     ? hasFrom
@@ -2531,156 +2602,5 @@ internal sealed class LsmStorageInner : IDisposable
             }
         }
 
-        /// <summary>
-        /// Builds the merge inputs in most-recent-first order (current MemTable, then immutable MemTables
-        /// newest-first, then L0 SSTables newest-first) so the <see cref="MergeIterator{ByteSlice, ByteSlice}"/>
-        /// keeps the latest value on duplicate keys. The current MemTable is materialized under its
-        /// (thread-affine) lock so the rest of the scan can perform async SST I/O without holding it.
-        /// </summary>
-        private List<IStorageIterator> BuildIterators(bool hasFrom, ByteSlice from, CancellationToken cancellationToken)
-        {
-            List<KeyValuePair<ByteSlice, ByteSlice>> currentSnapshot;
-            ImmutableQueue<IMemTable> immutableMemTables;
-            List<SsTable> levelZeroTables;
-            List<List<SsTable>> leveledTables;
-
-            _storage._currentMemTableLock.EnterReadLock();
-
-            try
-            {
-                // Read a consistent state snapshot: FreezeMemTable swaps the whole state object under this
-                // same lock, so current + immutable + L0 references are coherent here.
-                var state = _storage._state;
-
-                // Drain the current MemTable into a list while holding the lock. Its iterator is synchronous,
-                // so this completes inline without a thread switch (required for the thread-affine lock).
-                currentSnapshot = MaterializeCurrentMemTable(state.CurrentMemTable, cancellationToken);
-
-                immutableMemTables = state.ImmutableMemTables;
-                // The level0 read lock (held by the caller) keeps these stable; copy them defensively anyway.
-                levelZeroTables = state.LevelZeroTables.ToList();
-                leveledTables = state.LeveledSsTables.Select(level => level.ToList()).ToList();
-            }
-            finally
-            {
-                _storage._currentMemTableLock.ExitReadLock();
-            }
-
-            var iterators = new List<IStorageIterator>
-            {
-                new ListStorageIterator(currentSnapshot)
-            };
-
-            // Immutable MemTables are enqueued oldest-first; add them newest-first to preserve precedence.
-            foreach (var memTable in immutableMemTables.Reverse())
-            {
-                iterators.Add(memTable.CreateIterator());
-            }
-
-            // L0 SSTs are appended oldest-first; add them newest-first so a newer table wins on duplicates.
-            for (var i = levelZeroTables.Count - 1; i >= 0; i--)
-            {
-                iterators.Add(new SsTableIterator(levelZeroTables[i]));
-            }
-
-            // Then the compaction levels, newest-first (L1 before L2 ...). Within a level the SSTs are
-            // non-overlapping, so their relative order does not affect correctness.
-            foreach (var level in leveledTables)
-            {
-                foreach (var table in level)
-                {
-                    iterators.Add(new SsTableIterator(table));
-                }
-            }
-
-            return iterators;
-        }
-
-        private static List<KeyValuePair<ByteSlice, ByteSlice>> MaterializeCurrentMemTable(IMemTable memTable, CancellationToken cancellationToken)
-        {
-            var snapshot = new List<KeyValuePair<ByteSlice, ByteSlice>>();
-
-            // The MemTable iterator is synchronous, so this blocking drain stays on the calling thread.
-            foreach (var entry in memTable.CreateIterator().EnumerateAsync(cancellationToken).ToBlockingEnumerable(cancellationToken))
-            {
-                snapshot.Add(entry);
-            }
-
-            return snapshot;
-        }
-    }
-
-    /// <summary>
-    /// An <see cref="IStorageIterator{ByteSlice, ByteSlice}"/> over an already-materialized, key-ascending list.
-    /// Used to snapshot the current MemTable so the rest of a scan can run async I/O off its lock.
-    /// </summary>
-    private sealed class ListStorageIterator : IStorageIterator
-    {
-        private readonly List<KeyValuePair<ByteSlice, ByteSlice>> _entries;
-
-        public ListStorageIterator(List<KeyValuePair<ByteSlice, ByteSlice>> entries)
-        {
-            _entries = entries;
-        }
-
-        public async IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
-        {
-            await Task.CompletedTask;
-
-            foreach (var entry in _entries)
-            {
-                yield return entry;
-            }
-        }
-
-        public async IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateAsync(ByteSlice from, [EnumeratorCancellation] CancellationToken cancellationToken = default)
-        {
-            await Task.CompletedTask;
-
-            foreach (var entry in _entries)
-            {
-                if (_keyComparer.Compare(entry.Key, from) >= 0)
-                {
-                    yield return entry;
-                }
-            }
-        }
-
-        public async IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateBackwardsAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
-        {
-            await Task.CompletedTask;
-
-            for (var i = _entries.Count - 1; i >= 0; i--)
-            {
-                yield return _entries[i];
-            }
-        }
-
-        public async IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateBackwardsAsync(ByteSlice from, [EnumeratorCancellation] CancellationToken cancellationToken = default)
-        {
-            await Task.CompletedTask;
-
-            var lo = 0;
-            var hi = _entries.Count;
-
-            while (lo < hi)
-            {
-                var mid = (lo + hi) >> 1;
-
-                if (_keyComparer.Compare(_entries[mid].Key, from) <= 0)
-                {
-                    lo = mid + 1;
-                }
-                else
-                {
-                    hi = mid;
-                }
-            }
-
-            for (var i = lo - 1; i >= 0; i--)
-            {
-                yield return _entries[i];
-            }
-        }
     }
 }
