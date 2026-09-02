@@ -203,25 +203,31 @@ internal sealed class LsmStorageInner : IDisposable
             {
                 var probes = new (bool found, OwnedByteSlice? resolved)[l0.Count];
 
-                await Parallel.ForEachAsync(
-                    Enumerable.Range(0, l0.Count),
-                    new ParallelOptions { MaxDegreeOfParallelism = _maxReadParallelism, CancellationToken = cancellationToken },
-                    async (index, ct) =>
-                    {
-                        probes[index] = await TryReadFromTableAsync(l0[index], key, keyMemory, ct);
-                    });
-
-                for (var i = l0.Count - 1; i >= 0; i--)
+                try
                 {
-                    if (probes[i].found)
-                    {
-                        var selected = probes[i].resolved;
-                        for (var j = 0; j < i; j++)
+                    await Parallel.ForEachAsync(
+                        Enumerable.Range(0, l0.Count),
+                        new ParallelOptions { MaxDegreeOfParallelism = _maxReadParallelism, CancellationToken = cancellationToken },
+                        async (index, ct) =>
                         {
-                            probes[j].resolved?.Dispose();
-                        }
+                            probes[index] = await TryReadFromTableAsync(l0[index], key, keyMemory, ct);
+                        });
 
-                        return selected;
+                    for (var i = l0.Count - 1; i >= 0; i--)
+                    {
+                        if (probes[i].found)
+                        {
+                            var selected = probes[i].resolved;
+                            probes[i].resolved = null;
+                            return selected;
+                        }
+                    }
+                }
+                finally
+                {
+                    for (var i = 0; i < probes.Length; i++)
+                    {
+                        probes[i].resolved?.Dispose();
                     }
                 }
             }
@@ -1190,7 +1196,7 @@ internal sealed class LsmStorageInner : IDisposable
 
         try
         {
-            ((MemTable)_state.CurrentMemTable).WriteBatch(batch.Entries);
+            ((MemTable)_state.CurrentMemTable).WriteBatch(batch);
             InvalidateSortedSsTableRun();
 
             if (_state.CurrentMemTable.Size >= _memTableSizeLimit)

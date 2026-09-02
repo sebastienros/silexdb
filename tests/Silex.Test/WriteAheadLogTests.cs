@@ -172,7 +172,7 @@ public class WriteAheadLogTests
 
         using (var wal = new WriteAheadLog(path, syncToDisk: true))
         {
-            wal.AppendBatch(batch.Entries);
+            wal.AppendBatch(batch);
             await Assert.That(wal.RecordWriteCount).IsEqualTo(1);
             await Assert.That(wal.DiskFlushCount).IsEqualTo(1);
         }
@@ -207,14 +207,19 @@ public class WriteAheadLogTests
         }
 
         using var individual = new WriteAheadLog(Path.Combine(folder, "individual.wal"), syncToDisk: false);
-        for (var i = 0; i < batch.Entries.Count; i++)
+        for (var i = 0; i < batch.Count; i++)
         {
-            var entry = batch.Entries[i];
-            individual.AppendRaw(entry.Key, entry.Value!);
+            batch.GetEntry(i, out var key, out var value, out var isTombstone);
+            if (isTombstone)
+            {
+                throw new InvalidOperationException("The benchmark batch contains only puts.");
+            }
+
+            individual.AppendRaw(key, value);
         }
 
         using var grouped = new WriteAheadLog(Path.Combine(folder, "grouped.wal"), syncToDisk: false);
-        grouped.AppendBatch(batch.Entries);
+        grouped.AppendBatch(batch);
 
         await Assert.That(individual.RecordWriteCount).IsEqualTo(1_000);
         await Assert.That(grouped.RecordWriteCount).IsEqualTo(1);

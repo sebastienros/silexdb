@@ -177,7 +177,7 @@ time. `--histogram` additionally prints avg / p50 / p95 / p99 / max latency per 
 | `--compression_type` | `lz4` | SST block compression: `none`, `lz4`, or `zstd`. |
 | `--compression_level` | `0` | Fast LZ4/default Zstandard, or a codec-specific level. |
 | `--compression_ratio` | `1` | Generated-value compressibility from 0 (highly compressible) to 1 (random). |
-| `--batch_size` | `1` | Accepted but ignored unless `1` (Silex has no write-batch API); warns. |
+| `--batch_size` | `1` | Mutations per atomic write batch. |
 
 `db_bench`-compatible flags use the same names so the same command line can drive both tools.
 The `--compaction*`, `--wal*`, `--target_sst_size` and `--read_parallelism` flags are Silex-specific
@@ -224,7 +224,7 @@ Options:
                                                      default Zstandard level. [default: 0]
   --compression_ratio <compression_ratio>            Approximate compressibility of generated values from 0 (highly
                                                      compressible) to 1 (random). [default: 1]
-  --batch_size <batch_size>                          Ignored unless 1: Silex has no write-batch API.
+  --batch_size <batch_size>                          Mutations per atomic write batch. [default: 1]
   -?, -h, --help                                     Show help and usage information
   --version                                          Show version information
 ```
@@ -237,10 +237,9 @@ Options:
 
 Silex supports `none`, `lz4`, and `zstd` compression. For a fair comparison, use the same
 `--compression_type`, `--compression_level`, and `--compression_ratio` with both tools and set
-`--batch_size=1` because Silex has no write-batch API. Keys are generated
+`--batch_size=1` when comparing individual writes. Keys are generated
 exactly like `db_bench`'s `GenerateKeyFromInt` (the integer is written big-endian in the first
-`min(8, key_size)` bytes, the rest padded with `'0'`). A non-1 `--batch_size` is accepted but ignored,
-with a warning.
+`min(8, key_size)` bytes, the rest padded with `'0'`).
 
 Recorded comparison runs (with methodology notes) live in
 [`benchmarks/`](benchmarks/) — e.g. [`2026-05-30-rocksdb-comparison.md`](benchmarks/2026-05-30-rocksdb-comparison.md).

@@ -76,9 +76,11 @@ public sealed class MvccStorage : IAsyncDisposable
                     throw new InvalidOperationException("The database contains plain keys and cannot be opened as an MVCC database.");
                 }
 
-                storage.Put(_formatKey, _formatValue);
-                WriteSequence(storage, _allocatedSequenceKey, 0);
-                WriteSequence(storage, _publishedSequenceKey, 0);
+                var initialization = new LsmWriteBatch();
+                initialization.Put(_formatKey, _formatValue);
+                WriteSequence(initialization, _allocatedSequenceKey, 0);
+                WriteSequence(initialization, _publishedSequenceKey, 0);
+                storage.Write(initialization);
                 return new MvccStorage(storage, 0, 0);
             }
 
@@ -425,20 +427,24 @@ public sealed class MvccStorage : IAsyncDisposable
             }
 
             var sequence = AllocateSequence();
-            WriteSequence(_storage, _allocatedSequenceKey, sequence);
-            _allocatedSequence = sequence;
+            var batch = new LsmWriteBatch();
+            WriteSequence(batch, _allocatedSequenceKey, sequence);
 
             for (var i = 0; i < writes.MutationCount; i++)
             {
                 var mutation = writes.GetMutation(i);
                 WriteVersion(
+                    batch,
                     writes.GetKey(mutation).Span,
                     writes.GetValue(mutation).Span,
                     mutation.IsTombstone,
                     sequence);
             }
 
-            Publish(sequence);
+            WriteSequence(batch, _publishedSequenceKey, sequence);
+            _storage.Write(batch);
+            _allocatedSequence = sequence;
+            Volatile.Write(ref _publishedSequence, sequence);
             return true;
         }
         finally
@@ -470,15 +476,12 @@ public sealed class MvccStorage : IAsyncDisposable
     private void CommitSingle(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool isTombstone)
     {
         var sequence = AllocateSequence();
-        WriteSequence(_storage, _allocatedSequenceKey, sequence);
+        var batch = new LsmWriteBatch();
+        WriteSequence(batch, _allocatedSequenceKey, sequence);
+        WriteVersion(batch, key, value, isTombstone, sequence);
+        WriteSequence(batch, _publishedSequenceKey, sequence);
+        _storage.Write(batch);
         _allocatedSequence = sequence;
-        WriteVersion(key, value, isTombstone, sequence);
-        Publish(sequence);
-    }
-
-    private void Publish(long sequence)
-    {
-        WriteSequence(_storage, _publishedSequenceKey, sequence);
         Volatile.Write(ref _publishedSequence, sequence);
     }
 
@@ -492,7 +495,12 @@ public sealed class MvccStorage : IAsyncDisposable
         return _allocatedSequence + 1;
     }
 
-    private void WriteVersion(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool isTombstone, long sequence)
+    private static void WriteVersion(
+        LsmWriteBatch batch,
+        ReadOnlySpan<byte> key,
+        ReadOnlySpan<byte> value,
+        bool isTombstone,
+        long sequence)
     {
         using var internalKey = EncodeVersionKey(key, sequence);
 
@@ -500,7 +508,7 @@ public sealed class MvccStorage : IAsyncDisposable
         {
             Span<byte> stored = stackalloc byte[1];
             stored[0] = TombstoneValue;
-            _storage.Put(internalKey.Span, stored);
+            batch.Put(internalKey.Span, stored);
             return;
         }
 
@@ -513,7 +521,7 @@ public sealed class MvccStorage : IAsyncDisposable
         {
             encoded[0] = LiveValue;
             value.CopyTo(encoded[1..]);
-            _storage.Put(internalKey.Span, encoded);
+            batch.Put(internalKey.Span, encoded);
         }
         finally
         {
@@ -785,11 +793,11 @@ public sealed class MvccStorage : IAsyncDisposable
         }
     }
 
-    private static void WriteSequence(LsmStorage storage, ReadOnlySpan<byte> key, long sequence)
+    private static void WriteSequence(LsmWriteBatch batch, ReadOnlySpan<byte> key, long sequence)
     {
         Span<byte> value = stackalloc byte[sizeof(long)];
         BinaryPrimitives.WriteInt64LittleEndian(value, sequence);
-        storage.Put(key, value);
+        batch.Put(key, value);
     }
 
     private static async ValueTask<long> ReadSequenceAsync(

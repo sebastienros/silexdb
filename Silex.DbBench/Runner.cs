@@ -314,13 +314,29 @@ internal sealed class Runner
             var rng = RngStreams.Create(_options.Seed, threadId, RngStreams.Write);
             var key = new byte[_options.KeySize];
             var value = new byte[_options.ValueSize];
+            var batchSize = _options.BatchSize;
+            var batch = batchSize == 1 ? null : new LsmWriteBatch();
 
             return new ThreadWorker(op =>
             {
                 var keyIndex = sequential ? start + op : rng.NextInt64(totalOps);
                 keyGen.GenerateInto(keyIndex, key);
                 valueGen.GenerateInto(value);
-                db.Put(key, value);
+
+                if (batch is null)
+                {
+                    db.Put(key, value);
+                }
+                else
+                {
+                    batch.Put(key, value);
+                    if (batch.Count == batchSize || op + 1 == count)
+                    {
+                        db.Write(batch);
+                        batch.Clear();
+                    }
+                }
+
                 stats.Ops++;
                 stats.ByteSlice += entryBytes;
                 return new ValueTask<bool>(true);
@@ -336,10 +352,28 @@ internal sealed class Runner
         {
             var keyGen = new KeyGenerator(_options.KeySize);
             var rng = RngStreams.Create(_options.Seed, threadId, RngStreams.Write);
+            var key = new byte[_options.KeySize];
+            var batchSize = _options.BatchSize;
+            var batch = batchSize == 1 ? null : new LsmWriteBatch();
 
             return new ThreadWorker(op =>
             {
-                db.Delete(keyGen.Generate(rng.NextInt64(_options.Num)));
+                keyGen.GenerateInto(rng.NextInt64(_options.Num), key);
+
+                if (batch is null)
+                {
+                    db.Delete(key);
+                }
+                else
+                {
+                    batch.Delete(key);
+                    if (batch.Count == batchSize || op + 1 == count)
+                    {
+                        db.Write(batch);
+                        batch.Clear();
+                    }
+                }
+
                 stats.Ops++;
                 stats.ByteSlice += _options.KeySize;
                 return new ValueTask<bool>(true);

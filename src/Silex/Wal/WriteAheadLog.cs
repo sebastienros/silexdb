@@ -99,20 +99,20 @@ internal sealed class WriteAheadLog : IDisposable
         CommitFrame(ref writer);
     }
 
-    public void AppendBatch(List<LsmWriteBatchEntry> entries)
+    public void AppendBatch(LsmWriteBatch batch)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
-        if (entries.Count == 0)
+        if (batch.Count == 0)
         {
             return;
         }
 
-        var writer = StartFrame(entries.Count);
-        for (var i = 0; i < entries.Count; i++)
+        var writer = StartFrame(batch.Count);
+        for (var i = 0; i < batch.Count; i++)
         {
-            var entry = entries[i];
-            WriteRawRecord(ref writer, entry.Key, entry.Value ?? default, entry.IsTombstone);
+            batch.GetEntry(i, out var key, out var value, out var isTombstone);
+            WriteRawRecord(ref writer, key, value, isTombstone);
         }
 
         CommitFrame(ref writer);

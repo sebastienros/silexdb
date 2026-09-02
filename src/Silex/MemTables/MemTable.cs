@@ -95,20 +95,20 @@ internal sealed class MemTable : IMemTable, IRawBytesMemTable
     public void DeleteRaw(ReadOnlySpan<byte> key) =>
         PutRawCore(key, default, isTombstone: true);
 
-    internal void WriteBatch(List<LsmWriteBatchEntry> entries)
+    internal void WriteBatch(LsmWriteBatch batch)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
-        if (entries.Count == 0)
+        if (batch.Count == 0)
         {
             return;
         }
 
-        _wal?.AppendBatch(entries);
-        for (var i = 0; i < entries.Count; i++)
+        _wal?.AppendBatch(batch);
+        for (var i = 0; i < batch.Count; i++)
         {
-            var entry = entries[i];
-            ApplyRaw(entry.Key, entry.Value ?? default, entry.IsTombstone);
+            batch.GetEntry(i, out var key, out var value, out var isTombstone);
+            ApplyRaw(key, value, isTombstone);
         }
     }
 
