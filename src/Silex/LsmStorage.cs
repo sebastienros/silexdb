@@ -149,6 +149,14 @@ public sealed partial class LsmStorage : IDisposable, IAsyncDisposable
         var ownership = DirectoryOwnership.Acquire(path);
         try
         {
+            if (File.Exists(Path.Combine(path, StorageBackup.PendingFileName)))
+            {
+                throw new InvalidDataException("The directory contains an incomplete physical backup/restore. Use a completed backup and an empty destination.");
+            }
+            if (File.Exists(Path.Combine(path, StorageBackup.FileName)))
+            {
+                throw new InvalidOperationException("A completed physical backup is immutable. Use RestoreBackupAsync to create a writable database.");
+            }
             return await OpenOwnedAsync(path, options, ownership, cancellationToken);
         }
         catch

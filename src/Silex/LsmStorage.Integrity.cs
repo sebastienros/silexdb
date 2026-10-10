@@ -27,9 +27,16 @@ public sealed partial class LsmStorage
     }
 
     private static async Task<StorageIntegrityReport> VerifyIntegrityOwnedAsync(
-        string path, StorageOptions options, CancellationToken cancellationToken)
+        string path, StorageOptions options, CancellationToken cancellationToken, bool allowPendingCopy = false)
     {
         var issues = new List<StorageIntegrityIssue>();
+        var pendingPath = Path.Combine(path, StorageBackup.PendingFileName);
+        if (!allowPendingCopy && File.Exists(pendingPath))
+        {
+            issues.Add(new(StorageIntegrityIssueKind.IncompletePhysicalCopy, pendingPath,
+                "The physical backup/restore did not finish. Restore a completed backup to an empty destination; do not accept this partial file set."));
+            return new StorageIntegrityReport(issues);
+        }
         Manifest? manifest = null;
         try
         {
@@ -134,7 +141,7 @@ public sealed partial class LsmStorage
         try
         {
             var report = await VerifyIntegrityOwnedAsync(path, options, cancellationToken);
-            if (report.Issues.Any(issue => issue.Kind == StorageIntegrityIssueKind.CorruptManifest))
+            if (report.Issues.Any(issue => issue.Kind is StorageIntegrityIssueKind.CorruptManifest or StorageIntegrityIssueKind.IncompletePhysicalCopy))
             {
                 throw new StorageRecoveryException(report);
             }

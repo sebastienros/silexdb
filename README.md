@@ -114,6 +114,62 @@ batch.Delete("user:2"u8);
 db.Write(batch);
 ```
 
+### Physical backup/checkpoint and restore
+
+Create an independently recoverable checkpoint while the source remains open:
+
+```csharp
+await db.CreateBackupAsync("my-db-backup");
+await LsmStorage.RestoreBackupAsync("my-db-backup", "my-db-restored", options);
+await using var restored = await LsmStorage.OpenAsync("my-db-restored", options);
+```
+
+The checkpoint captures one serialized write boundary, including all previously completed writes
+and excluding writes acquired afterward. It holds the maintenance and write locks while copying:
+compaction cannot replace/delete required SSTs, and writers cannot append or rotate the copied WALs.
+The committed manifest, live SSTs, and current/rotated/recovered WALs form the recovery set; orphans,
+stale WALs, temporary files, and the source `LOCK` are not copied. WAL-disabled stores instead write
+their memory tables into backup-only SSTs. The source is not flushed or otherwise modified.
+This favors a simple correctness boundary over uninterrupted writes during large backups.
+
+`MvccStorage.CreateBackupAsync` additionally holds the commit gate, preserving a published sequence
+and complete transaction/group-commit boundaries. Staged transactions and subsequent commits are
+excluded. Stored versions are preserved, but live snapshot/transaction objects do not transfer.
+Use `MvccStorage.RestoreBackupAsync` and reopen through `MvccStorage`; the restore also checks MVCC
+format and sequence metadata. Backups from the wrong facade are rejected.
+
+Both APIs require an empty destination (a persistent `LOCK` alone is allowed), exclusively own it
+until completion, and never overwrite existing data. Restore also exclusively owns the backup source.
+Neither directory may contain the other; directory aliases are resolved and recovery-file links are
+rejected. External file/directory replacement while these operations run is unsupported, just as with
+an open database. Use matching encoding factories and enable WAL recovery if the backup contains WALs.
+Keep completed backup directories **immutable**: do not open them as writable stores. Restore copies
+them without consuming them, so one backup can restore multiple independent databases.
+
+A completion inventory records filenames, lengths, and SHA-256 checksums. Creation verifies recovery
+integrity before publishing that inventory. Restore validates the inventory and every recovery file,
+then verifies the copied files and recovery structure before returning a normally openable destination.
+Missing WALs/manifests are detected, even where ordinary legacy recovery could not detect their loss.
+Malformed, corrupt, missing, or unexpected files and unfinished copies are rejected. An incomplete
+uncommitted WAL tail inherited from source recovery is still recoverable and is not confused with
+committed corruption; its exact bytes are protected by the inventory checksum.
+Checksums detect accidental changes, not malicious replacement of
+both the inventory and files; this is not an authenticated backup format.
+
+Cancellation is checked during copying and verification, and while waiting for maintenance/commit
+gates; a synchronous write-lock wait cannot be interrupted. Copying uses bounded pooled buffers and
+runs off the caller's synchronization context. Failure/cancellation removes only files created by
+that call, leaving the destination directory and its persistent `LOCK`, so it can be retried.
+Cleanup errors are reported explicitly as `AggregateException`; do not use that partial destination.
+A `backup.pending` guard makes process-interrupted copies reject normal opening and restore. Start
+again with an empty destination rather than trying to recover an interrupted copy. Backup/copy failure
+does not undo commits or fault an otherwise healthy source. Salvage and faulted sources are rejected.
+Do not invoke these APIs from borrowed-read callbacks or wait for shutdown inside one.
+
+Copied/generated files and completion metadata request OS file-content synchronization. As with
+`SynchronizeAsync`, directory-entry persistence and power-loss safety depend on the filesystem/device;
+Silex does not promise directory synchronization or power-loss certification.
+
 ### Durability boundaries and explicit synchronization
 
 **Applied/visible**, **written to the operating system**, and **synchronized** are different boundaries.

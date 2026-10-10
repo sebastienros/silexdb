@@ -79,5 +79,8 @@ internal enum StorageFaultPoint
     SynchronizationBeforeManifest,
     SynchronizationAfterManifest,
     ManifestBeforeSync,
-    ManifestAfterSync
+    ManifestAfterSync,
+    BackupBeforeCopy,
+    BackupAfterCopy,
+    BackupBeforePublish
 }
