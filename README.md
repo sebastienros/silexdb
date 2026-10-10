@@ -169,6 +169,9 @@ and releases resources **without flushing partial memory, retrying WAL synchroni
 manifest, or deleting recovery files**. Reopening resolves recoverable WAL/manifest state; if it fails,
 restore or use explicit integrity/salvage tooling instead of treating the instance as healthy. A failed
 `CloseAsync` can fault the instance; subsequent disposal performs this recovery-preserving cleanup.
+If creation of the next WAL fails during its header write, the valid header prefix contains no mutations:
+strict recovery treats it as an incomplete tail, retains earlier committed WAL frames, and removes the
+empty WAL only after opening succeeds. Invalid signatures or corrupt complete headers remain errors.
 Lifecycle races and multi-process directory ownership are not strengthened by this contract: applications
 must stop accepting work and drain operations before disposal.
 

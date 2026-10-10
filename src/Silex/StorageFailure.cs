@@ -58,5 +58,6 @@ internal enum StorageFaultPoint
     CompactionBeforeInstall,
     CompactionAfterInstall,
     ManifestBeforePublish,
-    ManifestAfterPublish
+    ManifestAfterPublish,
+    WalDuringHeaderWrite
 }

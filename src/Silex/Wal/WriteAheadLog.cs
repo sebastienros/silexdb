@@ -65,7 +65,16 @@ internal sealed class WriteAheadLog : IDisposable
             FileSignature.CopyTo(header);
             header[VersionOffset] = CurrentVersion;
             BinaryPrimitives.WriteUInt32LittleEndian(header[HeaderCrcOffset..], Crc32C.Compute(header[..HeaderCrcOffset]));
-            _stream.Write(header);
+            if (_faultInjector is null)
+            {
+                _stream.Write(header);
+            }
+            else
+            {
+                _stream.Write(header[..FileSignature.Length]);
+                _faultInjector.Invoke(StorageFaultPoint.WalDuringHeaderWrite);
+                _stream.Write(header[FileSignature.Length..]);
+            }
         }
         catch
         {

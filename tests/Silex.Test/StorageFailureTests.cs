@@ -211,6 +211,82 @@ public class StorageFailureTests
     }
 
     [Test]
+    public async Task PartialHeaderFailureDuringRotationPreservesCommittedBatchAndReopensStrictly()
+    {
+        using var folder = TempFolder.Create();
+        var options = Options;
+        options.MemTableSizeLimit = 1;
+        var armed = false;
+        var cause = new IOException("Injected disk full halfway through the next WAL header.");
+        options.FaultInjector = p =>
+        {
+            if (armed && p == StorageFaultPoint.WalDuringHeaderWrite)
+            {
+                throw cause;
+            }
+        };
+        var storage = await LsmStorage.OpenAsync(folder, options);
+        var originalWal = Directory.GetFiles(folder, "*.wal").Single();
+        armed = true;
+        var failure = CaptureWriteFailure(() => storage.Write(Batch()));
+        await Assert.That(failure.Outcome).IsEqualTo(StorageCommitOutcome.Committed);
+        await Assert.That(ReferenceEquals(failure.InnerException, cause)).IsTrue();
+        await AssertFaultedAsync(storage);
+        var originalBytes = ReadOpenWal(originalWal);
+        var partialWal = Directory.GetFiles(folder, "*.wal").Single(path => path != originalWal);
+        // Constructor failure closed this file. Ordinary reads also verify Windows handle cleanup.
+        await Assert.That(File.ReadAllBytes(partialWal).SequenceEqual("SILEXWAL"u8.ToArray())).IsTrue();
+        await storage.DisposeAsync();
+        await Assert.That(File.ReadAllBytes(originalWal).SequenceEqual(originalBytes)).IsTrue();
+        var report = await LsmStorage.VerifyIntegrityAsync(folder, Options);
+        await Assert.That(report.IsRecoveryComplete).IsTrue();
+        await Assert.That(report.Issues.Any(issue => issue.Kind == StorageIntegrityIssueKind.IncompleteWalTail
+            && issue.Path == partialWal)).IsTrue();
+        await using var reopened = await LsmStorage.OpenAsync(folder, Options);
+        await Assert.That(reopened.Health).IsEqualTo(StorageHealth.Healthy);
+        await AssertValuesAsync(reopened);
+        await Assert.That(File.Exists(partialWal)).IsFalse();
+    }
+
+    [Test]
+    [Arguments(0)]
+    [Arguments(1)]
+    [Arguments(2)]
+    [Arguments(3)]
+    [Arguments(4)]
+    [Arguments(5)]
+    [Arguments(6)]
+    [Arguments(7)]
+    [Arguments(8)]
+    [Arguments(9)]
+    [Arguments(10)]
+    [Arguments(11)]
+    [Arguments(12)]
+    [Arguments(13)]
+    [Arguments(14)]
+    [Arguments(15)]
+    [Arguments(16)]
+    public async Task EveryValidHeaderPrefixAllowsStrictRecoveryOfAcknowledgedBatch(int length)
+    {
+        using var folder = TempFolder.Create();
+        await CrashRecoveryTestProcess.WriteBatchAndExitWithoutDisposalAsync(folder, 2);
+        var originalWal = Directory.GetFiles(folder, "*.wal").Single();
+        var originalBytes = File.ReadAllBytes(originalWal);
+        var originalId = long.Parse(Path.GetFileNameWithoutExtension(originalWal),
+            System.Globalization.CultureInfo.InvariantCulture);
+        var partialWal = Path.Combine(folder,
+            $"{(originalId + 1).ToString(System.Globalization.CultureInfo.InvariantCulture)}.wal");
+        await File.WriteAllBytesAsync(partialWal, originalBytes.AsMemory(0, length).ToArray());
+        var report = await LsmStorage.VerifyIntegrityAsync(folder, Options);
+        await Assert.That(report.IsRecoveryComplete).IsTrue();
+        await using var reopened = await LsmStorage.OpenAsync(folder, Options);
+        await Assert.That(reopened.Health).IsEqualTo(StorageHealth.Healthy);
+        await Assert.That(await CountAsync(reopened)).IsEqualTo(2L);
+        await Assert.That(File.ReadAllBytes(originalWal).SequenceEqual(originalBytes)).IsTrue();
+        await Assert.That(File.Exists(partialWal)).IsFalse();
+    }
+
+    [Test]
     [Arguments((int)StorageFaultPoint.FlushBeforeBuild)]
     [Arguments((int)StorageFaultPoint.FlushBeforeInstall)]
     [Arguments((int)StorageFaultPoint.FlushAfterInstall)]
