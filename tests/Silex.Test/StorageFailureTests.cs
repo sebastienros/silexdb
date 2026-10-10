@@ -45,7 +45,7 @@ public class StorageFailureTests
             await AssertFaultedAsync(storage);
         }
         var walFiles = Directory.GetFiles(folder, "*.wal");
-        var walBytes = walFiles.Select(File.ReadAllBytes).ToArray();
+        var walBytes = walFiles.Select(ReadOpenWal).ToArray();
         await storage.DisposeAsync();
         await Assert.That(storage.Health).IsEqualTo(StorageHealth.Disposed);
         if (failure.Outcome != StorageCommitOutcome.NotCommitted)
@@ -530,6 +530,14 @@ public class StorageFailureTests
         batch.Put([1], [11]);
         batch.Put([2], [22]);
         return batch;
+    }
+
+    private static byte[] ReadOpenWal(string path)
+    {
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        var bytes = new byte[checked((int)stream.Length)];
+        stream.ReadExactly(bytes);
+        return bytes;
     }
 
     private static StorageOperationException CaptureWriteFailure(Action write)
