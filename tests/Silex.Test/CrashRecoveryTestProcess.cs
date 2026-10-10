@@ -91,9 +91,10 @@ internal static class CrashRecoveryTestProcess
         var options = mode is "tiered" or "leveled"
             ? StorageFailureTests.MaintenanceOptions(mode == "leveled")
             : new StorageOptions { FlushPeriod = TimeSpan.Zero, SyncWriteAheadLogToDisk = true };
+        var armed = mode != "restore";
         options.FaultInjector = p =>
         {
-            if (p == point)
+            if (armed && p == point)
             {
                 Environment.Exit(0);
             }
@@ -107,7 +108,7 @@ internal static class CrashRecoveryTestProcess
         else
         {
             var storage = LsmStorage.OpenAsync(path, options).GetAwaiter().GetResult();
-            if (mode is "write" or "flush" or "synchronize")
+            if (mode is "write" or "flush" or "synchronize" or "backup" or "restore")
             {
                 var batch = new LsmWriteBatch();
                 batch.Put([1], [11]);
@@ -121,6 +122,15 @@ internal static class CrashRecoveryTestProcess
             if (mode == "synchronize")
             {
                 storage.SynchronizeAsync().GetAwaiter().GetResult();
+            }
+            if (mode is "backup" or "restore")
+            {
+                storage.CreateBackupAsync(path + "-backup").GetAwaiter().GetResult();
+                if (mode == "restore")
+                {
+                    armed = true;
+                    LsmStorage.RestoreBackupAsync(path + "-backup", path + "-restored", options).GetAwaiter().GetResult();
+                }
             }
             GC.KeepAlive(storage);
         }

@@ -16,7 +16,7 @@ namespace Silex;
 /// <summary>
 /// The inner storage engine. It handles thread-safety for the <see cref="StorageState"/>.
 /// </summary>
-internal sealed class LsmStorageInner : IDisposable
+internal sealed partial class LsmStorageInner : IDisposable
 {
     private static readonly IBinaryEncoder<ByteSlice> _valueSerializer = BinaryEncoderFactory<ByteSlice>.BinarySerializer;
     private static readonly IBinaryEncoder<ByteSlice> _keySerializer= BinaryEncoderFactory<ByteSlice>.BinarySerializer;

@@ -6,7 +6,8 @@ public enum StorageIntegrityIssueKind
     CorruptSst,
     CorruptWal,
     CorruptManifest,
-    IncompleteWalTail
+    IncompleteWalTail,
+    IncompletePhysicalCopy
 }
 
 /// <summary>An on-disk integrity finding, including the affected path and recovery guidance.</summary>
