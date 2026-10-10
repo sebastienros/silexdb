@@ -630,29 +630,32 @@ public class StorageTests
     }
 
     [Test]
-    public async Task FinalizerShouldNotFlushOrCrashWhenStorageIsNotClosed()
+    public async Task FinalizerShouldReleaseOwnershipWithoutFlushingWhenStorageIsNotClosed()
     {
-        // A storage that is never closed must not flush to disk during finalization (no WAL exists,
-        // durability is only guaranteed by CloseAsync). Even when its directory has been removed, the
-        // finalizer must be a no-op and never crash the process.
+        // Disable background work so an abandoned store becomes collectible. Finalization releases
+        // ownership without flushing; removing a directory while it is owned is unsupported.
         using var tempFolder = TempFolder.Create();
 
-        await CreateUnclosedStorageAsync(tempFolder);
-        tempFolder.Dispose();
+        var abandoned = CreateUnclosedStorage(tempFolder);
 
         GC.Collect();
         GC.WaitForPendingFinalizers();
         GC.Collect();
 
-        // Reaching this point means finalization neither flushed to the deleted folder nor crashed.
+        await Assert.That(abandoned.IsAlive).IsFalse();
+        await Assert.That(Directory.EnumerateFiles(tempFolder, "*.sst").Any()).IsFalse();
+        using (DirectoryOwnership.Acquire(tempFolder)) { }
+        tempFolder.Dispose();
         await Assert.That(Directory.Exists(tempFolder)).IsFalse();
 
-        // The storage was never closed, so nothing was ever persisted.
-        static async Task CreateUnclosedStorageAsync(string folder)
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+        static WeakReference CreateUnclosedStorage(string folder)
         {
-            var storage = await LsmStorage.OpenAsync<int, int>(folder, new StorageOptions { UseWriteAheadLog = false });
+            var storage = LsmStorage.OpenAsync<int, int>(folder,
+                new StorageOptions { UseWriteAheadLog = false, FlushPeriod = TimeSpan.Zero })
+                .GetAwaiter().GetResult();
             storage.Put(1, 1);
-            // Intentionally not closed/disposed: it becomes eligible for finalization on return.
+            return new WeakReference(storage._inner);
         }
     }
 
