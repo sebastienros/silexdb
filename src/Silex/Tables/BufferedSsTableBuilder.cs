@@ -57,6 +57,8 @@ internal sealed class BufferedSsTableBuilder : ISsTableBuilder
     private BlockMetadataStore? _flattenedMetadata;
     private bool _disposed;
     private bool _ownsBuiltResources = true;
+    private static readonly bool SyncOnceBeforePublish = OperatingSystem.IsWindows();
+
     private readonly FileStream _stream;
 
     private static readonly int _flushBufferSize = (int)32.KiB();
@@ -93,9 +95,15 @@ internal sealed class BufferedSsTableBuilder : ISsTableBuilder
         var bufferSize = 0;
 
         var options =
-            FileOptions.WriteThrough | // Skip OS cache
             FileOptions.Asynchronous // All operation are async
             ;
+
+        // Windows pays a full device flush per write-through write, so it syncs once in BuildAsync instead.
+        // Elsewhere write-through is cheap, and Flush(true) is F_FULLFSYNC on macOS (far slower).
+        if (!SyncOnceBeforePublish)
+        {
+            options |= FileOptions.WriteThrough;
+        }
 
         _stream = File.Create(_tempFilename, bufferSize, options);
     }
@@ -228,6 +236,16 @@ internal sealed class BufferedSsTableBuilder : ISsTableBuilder
         binaryWriter.Flush();
 
         await FLushBufferToDiskAsync(cancellationToken);
+
+        // A single durability barrier for the whole file instead of write-through on every write: a
+        // write-through write costs a full device flush (~5 ms on Windows runners), and a small SST paid
+        // it once for the blocks and again for the metadata. The SST must be durable before the manifest
+        // commits it, and the rename below only publishes it after this point.
+        if (SyncOnceBeforePublish)
+        {
+            _stream.Flush(flushToDisk: true);
+        }
+
         await _stream.DisposeAsync();
 
         // The temporary file is now complete and closed; publish it under the final name atomically so
