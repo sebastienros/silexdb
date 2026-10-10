@@ -91,5 +91,6 @@ internal class Compacter : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         await CloseAsync();
+        _flushTimer?.Dispose();
     }
 }

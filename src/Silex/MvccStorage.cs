@@ -31,6 +31,8 @@ public sealed class MvccStorage : IAsyncDisposable
     private long _allocatedSequence;
     private long _publishedSequence;
     private int _disposeState;
+    private readonly object _disposeLock = new();
+    private Task? _disposeTask;
 
     private MvccStorage(LsmStorage storage, long allocatedSequence, long publishedSequence)
     {
@@ -331,13 +333,21 @@ public sealed class MvccStorage : IAsyncDisposable
     /// <summary>
     /// Flushes pending data and closes the database.
     /// </summary>
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
     {
-        if (Interlocked.Exchange(ref _disposeState, 1) != 0)
+        lock (_disposeLock)
         {
-            return;
+            if (_disposeTask is null)
+            {
+                Volatile.Write(ref _disposeState, 1);
+                _disposeTask = DisposeInternalAsync();
+            }
+            return new ValueTask(_disposeTask);
         }
+    }
 
+    private async Task DisposeInternalAsync()
+    {
         await _commitGate.WaitAsync().ConfigureAwait(false);
 
         try

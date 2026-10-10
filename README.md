@@ -65,7 +65,7 @@ the same id survives: that WAL alone does not prove that all committed contents 
 `StorageRecoveryException.Report` identifies the missing files and recommends restoring a consistent
 backup. A failed recovery leaves the committed manifest and source files intact.
 
-Inspect a database **offline**, with no open writer or maintenance operation:
+Inspect a database **offline**, with no other handle using its directory:
 
 ```csharp
 var report = await LsmStorage.VerifyIntegrityAsync("my-db", options);
@@ -75,7 +75,8 @@ foreach (var issue in report.Issues)
 
 Verification reads live SST metadata and every data block (including checksums, decoding, entry
 extents, and index/key ordering), and validates WAL frames needed for recovery. It does not modify
-files. Orphan SSTs and stale WALs superseded by verified SSTs are ignored. An incomplete trailing WAL
+recovery files; verification and salvage may create the persistent `LOCK` ownership file. Orphan SSTs
+and stale WALs superseded by verified SSTs are ignored. An incomplete trailing WAL
 frame is reported as `IncompleteWalTail`, not an error: earlier committed frames still recover normally.
 Missing committed SSTs and corrupt committed WAL frames instead make `IsRecoveryComplete` false.
 Checksums cannot detect every possible alteration of legacy formats or unchecksummed metadata;
@@ -172,8 +173,7 @@ restore or use explicit integrity/salvage tooling instead of treating the instan
 If creation of the next WAL fails during its header write, the valid header prefix contains no mutations:
 strict recovery treats it as an incomplete tail, retains earlier committed WAL frames, and removes the
 empty WAL only after opening succeeds. Invalid signatures or corrupt complete headers remain errors.
-Lifecycle races and multi-process directory ownership are not strengthened by this contract: applications
-must stop accepting work and drain operations before disposal.
+Directory ownership and shutdown admission are enforced as described below.
 
 ## Supported key and value helpers
 
@@ -351,6 +351,26 @@ call `CollectGarbageAsync` periodically to remove versions that no active view c
 
 ## Closing the store
 
+### Exclusive directory ownership
+
+Each normally opened database, MVCC database, and read-only salvage handle exclusively owns its
+directory until resource cleanup completes. `VerifyIntegrityAsync` takes the same exclusive ownership
+for its entire inspection. A competing open or verification, from the same process or a different process,
+fails promptly with `IOException` before reading or modifying recovery files. The error identifies the
+directory and advises closing the existing owner; it does not wait or return a partially opened handle.
+Path aliases that reach the same directory use the same lock file.
+
+Ownership uses an OS-backed exclusive handle to the persistent `LOCK` file. Process exit releases
+the handle, including after an unclean exit; the file's existence is not evidence of an active owner.
+**Do not delete, replace, or move the lock file or database directory while any handle owns it.**
+Deleting an open lock file can defeat exclusion on Unix. Legacy directories acquire this metadata file
+on first use; verification/salvage still never change WAL, SST, or manifest evidence. An existing lock
+file can be opened read-only, but creating it requires directory write permission.
+All participants must use this ownership protocol on a filesystem that supports OS file sharing locks.
+It does not protect against external tools bypassing locks or certify network-filesystem locking.
+
+### Coordinated shutdown
+
 Always close the store to flush healthy in-memory data to disk and stop background maintenance.
 `CloseAsync`, `DisposeAsync`, and `Dispose` are equivalent — call one:
 
@@ -366,6 +386,27 @@ WAL-enabled writes reach their configured durability boundary before returning, 
 shutdown. Deterministic disposal is still required to release resources and flush healthy memtables into
 SSTs; with WAL disabled, unflushed memory is not crash-durable. Faulted instances are closed without
 flushing, preserving their recovery evidence as described above.
+
+The supported application lifecycle is to **stop accepting work, drain requests, and then dispose
+storage**. The engine also defines races: shutdown atomically closes operation admission, rejects new
+reads/writes/scans/maintenance with `ObjectDisposedException`, and waits for admitted operations and
+background maintenance before releasing memory, file handles, and directory ownership. An admitted
+operation may finish or report its normal cancellation/failure outcome; disposal does not cancel it
+or turn a completed mutation into an uncommitted result. Health remains available throughout cleanup.
+Concurrent close/dispose calls share completion, rather than letting a second disposer return early.
+
+An iterator holds admission for its entire active enumeration, including between advances. Finish or
+dispose enumerators before awaiting shutdown; snapshots/transactions cannot be used after their MVCC
+store starts shutdown. Never invoke or synchronously wait for disposal from a storage callback: shutdown
+would wait for that callback itself. Borrowed read callbacks must remain short and must not reenter storage.
+Shutdown can wait indefinitely for a caller that does not release a borrow or enumerator.
+
+`CloseAsync` cancellation is admission-only: a token already canceled before shutdown starts leaves the
+store open. Once shutdown starts it drains and cleans up without cancellation; concurrent callers await
+that same shutdown regardless of their tokens. A shutdown failure is propagated, faults the instance,
+and retains directory ownership and recovery evidence. Call disposal again to perform faulted cleanup
+without flushing; operations remain rejected in the meantime. MVCC disposal performs that cleanup itself
+before propagating a shutdown failure.
 
 ## Configuration
 
