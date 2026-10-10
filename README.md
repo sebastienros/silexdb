@@ -105,7 +105,7 @@ as the original store when opening either normally or for salvage.
 
 Use `LsmWriteBatch` when several byte-oriented mutations can share one durability boundary. The batch is
 written as one checksum-protected WAL frame, reducing write and `fsync` calls while preserving the default
-process-crash and optional power-loss guarantees:
+process-crash recovery and optional file-content synchronization boundaries:
 
 ```csharp
 var batch = new LsmWriteBatch();
@@ -113,6 +113,56 @@ batch.Put("user:1"u8, "active"u8);
 batch.Delete("user:2"u8);
 db.Write(batch);
 ```
+
+### Durability boundaries and explicit synchronization
+
+**Applied/visible**, **written to the operating system**, and **synchronized** are different boundaries.
+Writes are serialized under the mutable-table lock. With WAL enabled, the complete checksummed recovery
+frame is written first, then optionally synchronized, then applied in memory. Readers cannot observe a
+partially applied successful batch. MVCC additionally publishes its sequence after applying the frame;
+only published sequences are visible to new snapshots.
+
+| Configuration | Successful `Put`, `Delete`, `Write`, or MVCC commit guarantees |
+|---|---|
+| `UseWriteAheadLog = false` (`SyncWriteAheadLogToDisk` ignored) | Entire mutation applied/visible; no recoverable file for unflushed memory, so no process-crash or stable-storage guarantee. |
+| WAL enabled, `SyncWriteAheadLogToDisk = false` (default) | Entire mutation applied/visible and complete WAL frame submitted to the OS. Supports process-crash recovery with the OS still running; stable-storage synchronization is not promised. |
+| WAL enabled, `SyncWriteAheadLogToDisk = true` | The preceding guarantees, plus successful OS file-content synchronization (`FileStream.Flush(true)`) of the WAL before in-memory application and acknowledgment. |
+
+For a precise explicit boundary without synchronizing every append:
+
+```csharp
+db.Put("user:1"u8, "active"u8); // applied/visible and written to the OS
+await db.SynchronizeAsync();   // synchronize through this successfully completed write
+```
+
+`LsmStorage.SynchronizeAsync` and `MvccStorage.SynchronizeAsync` cover **all writes/commits completed before
+the call** (and any racing writes serialized before the barrier acquires the write lock). No guarantee
+is made for writes serialized afterward. This is a whole-store barrier, not a write receipt, transaction,
+checkpoint, or group-commit API; it does not stage, apply, or publish new mutations. Await a successful
+MVCC commit first; pending transaction buffers are excluded.
+
+The barrier blocks writes/rotation and serializes with flush/compaction while requesting disk
+synchronization for the current WAL, every rotated or recovered WAL, every live L0/leveled SST, and
+finally the manifest. Thus a write is still covered after its original WAL has been flushed/deleted or
+its SST compacted. It does not flush memtables or run compaction. Repeated barriers are supported and
+may be expensive: they synchronize the live file set, not just a tracked unsynchronized suffix.
+WAL-disabled stores throw `NotSupportedException` without faulting, rather than falsely acknowledging
+unflushed memory. Read-only salvage stores reject it like other writable-only operations.
+
+Cancellation is honored while asynchronously waiting for the maintenance/MVCC commit gate and once more
+after acquiring the synchronous mutable-table lock, before the first file I/O. Waiting for that synchronous
+lock cannot be interrupted; file synchronization may run synchronously on the calling thread, and after
+file I/O begins cancellation is not polled. Successful completion reports the actual boundary, even if
+the token was canceled during synchronization. An admitted barrier is drained by shutdown; new barriers are rejected
+once shutdown starts. Do not invoke it from a borrowed-read callback (it requires the write lock).
+
+Flush/compaction synchronize each replacement SST's contents and the new manifest's contents before
+retiring the old recovery files, preserving the file-content boundary across maintenance and reopen.
+**These are OS file-content synchronization requests, not power-loss certification.** Silex does not
+explicitly synchronize directory entries for WAL creation, SST/manifest renames, or file deletion.
+Their persistence, the OS/filesystem's synchronization semantics, and device/controller caches still
+matter. No configuration or barrier promises survival of every power loss, hardware/media failure, or
+filesystem failure. Source inspection and process-crash tests are not power-loss tests.
 
 ### Operation failures and instance health
 
@@ -132,6 +182,14 @@ the original exception in `InnerException`. Inspect `Outcome` and `Health`, not 
 | WAL write starts and fails (including disk full or a torn write), or synchronization fails | `Indeterminate` | Faulted |
 | In-memory mutation/batch application fails after WAL persistence, or while applying with WAL disabled | `Indeterminate`; memory may contain only part of the batch | Faulted |
 | The entire mutation reaches its boundary, but subsequent publication or automatic memtable rotation fails | `Committed`; for MVCC, the persisted sequence may not yet be published to readers in this instance | Faulted |
+
+An explicit barrier's I/O failure throws `StorageSynchronizationException` with the original cause in
+`InnerException`. The requested synchronization boundary is **unconfirmed** (some or all files may
+already have synchronized), and the instance becomes faulted. Previously successful mutations remain
+committed to their original acknowledgment boundary; the barrier does not undo them and its exception
+is not a mutation's `NotCommitted`/`Indeterminate` outcome. Dispose and reopen, do not retry writes merely
+because synchronization failed. Cancellation before file I/O, unsupported WAL configuration, and
+read-only rejection leave health unchanged.
 
 `Indeterminate` is deliberately conservative: recovery may apply the entire WAL frame, or discard an
 incomplete trailing frame. It never means "nothing committed." A complete checksummed batch frame is
@@ -425,7 +483,7 @@ is a valid starting point. The most commonly used options:
 | `FlushPeriod`              | 50 ms              | Interval between background flushes. `TimeSpan.Zero` disables the thread.|
 | `BlockCacheSizeLimit`      | 1 MiB              | Size of the in-memory cache of decoded blocks.                           |
 | `UseWriteAheadLog`         | `true`             | Maintain a WAL so unflushed data is recovered after a crash.             |
-| `SyncWriteAheadLogToDisk`  | `false`            | `fsync` every WAL frame (slower, survives power loss).                   |
+| `SyncWriteAheadLogToDisk`  | `false`            | Request OS file-content synchronization for every WAL frame before applying/acknowledging it; see durability limitations above. |
 | `CompactionStrategy`       | `Tiered`           | `None`, `Tiered` (write-optimized), or `Leveled` (read-optimized).       |
 
 Convenient size helpers are available as extension methods: `64.MiB()`, `4.KiB()`, `1.GiB()`,

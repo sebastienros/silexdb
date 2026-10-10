@@ -1169,6 +1169,75 @@ internal sealed class LsmStorageInner : IDisposable
         WriteCore(default, default, false, batch);
     }
 
+    public async Task SynchronizeAsync(CancellationToken cancellationToken)
+    {
+        using var operation = Lifetime.Enter();
+        CheckHealthy();
+        if (!_useWriteAheadLog)
+        {
+            throw new NotSupportedException("Synchronization requires UseWriteAheadLog because unflushed memory has no recoverable file.");
+        }
+        await _maintenanceLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            _currentMemTableLock.EnterWriteLock();
+            try
+            {
+                CheckHealthy();
+                cancellationToken.ThrowIfCancellationRequested();
+                // Maintenance cannot replace/delete files, and writes cannot append or rotate WALs.
+                // Recovered memtables have no writer handle, so synchronize by path, not by memtable WAL.
+                try
+                {
+                    SynchronizeFile(GetWalPath(_state.CurrentMemTable.Id),
+                        StorageFaultPoint.SynchronizationBeforeWal, StorageFaultPoint.SynchronizationAfterWal);
+                    foreach (var memTable in _state.ImmutableMemTables)
+                    {
+                        SynchronizeFile(GetWalPath(memTable.Id),
+                            StorageFaultPoint.SynchronizationBeforeWal, StorageFaultPoint.SynchronizationAfterWal);
+                    }
+                    foreach (var table in _state.LevelZeroTables)
+                    {
+                        SynchronizeFile(table.Filename,
+                            StorageFaultPoint.SynchronizationBeforeSst, StorageFaultPoint.SynchronizationAfterSst);
+                    }
+                    foreach (var level in _state.LeveledSsTables)
+                    {
+                        foreach (var table in level)
+                        {
+                            SynchronizeFile(table.Filename,
+                                StorageFaultPoint.SynchronizationBeforeSst, StorageFaultPoint.SynchronizationAfterSst);
+                        }
+                    }
+                    SynchronizeFile(Manifest.GetPath(StoragePath),
+                        StorageFaultPoint.SynchronizationBeforeManifest, StorageFaultPoint.SynchronizationAfterManifest);
+                }
+                catch (Exception exception)
+                {
+                    var failure = new StorageSynchronizationException(exception);
+                    MarkFaulted(failure);
+                    throw failure;
+                }
+            }
+            finally
+            {
+                _currentMemTableLock.ExitWriteLock();
+            }
+        }
+        finally
+        {
+            _maintenanceLock.Release();
+        }
+    }
+
+    private void SynchronizeFile(string path, StorageFaultPoint before, StorageFaultPoint after)
+    {
+        FaultInjector?.Invoke(before);
+        using var handle = File.OpenHandle(path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete);
+        RandomAccess.FlushToDisk(handle);
+        FaultInjector?.Invoke(after);
+    }
+
     private void WriteCore(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool isTombstone, LsmWriteBatch? batch)
     {
         using var operation = Lifetime.Enter();
@@ -2515,8 +2584,21 @@ internal sealed class LsmStorageInner : IDisposable
 
     private void WriteManifest(Manifest manifest)
     {
+        // Preserve synchronized data when replacing WALs or compaction inputs, even if a barrier was
+        // requested in an earlier instance. Only new outputs need synchronization, not every live SST.
+        if (_pendingTable is { } table)
+        {
+            SynchronizeFile(table.Filename, StorageFaultPoint.SynchronizationBeforeSst, StorageFaultPoint.SynchronizationAfterSst);
+        }
+        if (_pendingCompactionOutputs is { } outputs)
+        {
+            foreach (var output in outputs)
+            {
+                SynchronizeFile(output.Filename, StorageFaultPoint.SynchronizationBeforeSst, StorageFaultPoint.SynchronizationAfterSst);
+            }
+        }
         FaultInjector?.Invoke(StorageFaultPoint.ManifestBeforePublish);
-        manifest.Write(StoragePath);
+        manifest.Write(StoragePath, FaultInjector);
         FaultInjector?.Invoke(StorageFaultPoint.ManifestAfterPublish);
     }
 

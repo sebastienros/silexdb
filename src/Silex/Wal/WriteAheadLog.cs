@@ -19,8 +19,9 @@ namespace Silex.Wal;
 /// other code is the value's byte length.
 ///
 /// A frame is written to the operating system before its mutations are applied in memory, which is
-/// sufficient to survive a process crash. Enabling <c>syncToDisk</c> additionally <c>fsync</c>s each
-/// frame to survive power loss. Multiple mutations may share one frame through <see cref="AppendBatch"/>.
+/// supports recovery after a process crash. Enabling <c>syncToDisk</c> additionally requests OS
+/// file-content synchronization for each frame; this is not directory synchronization or certification
+/// against power loss on every filesystem/device. Multiple mutations may share one frame through <see cref="AppendBatch"/>.
 ///
 /// A single instance is only ever written from one thread at a time: appends happen while the owning
 /// <see cref="LsmStorageInner"/> holds the current-memtable write lock, so no internal
@@ -53,8 +54,9 @@ internal sealed class WriteAheadLog : IDisposable
     public WriteAheadLog(string path, bool syncToDisk, Action<StorageFaultPoint>? faultInjector = null)
     {
         // FileShare.Delete lets the file be deleted while this writer handle is still open (used on
-        // clean flush). FileShare.Read lets recovery read the file concurrently if needed.
-        _stream = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.Read | FileShare.Delete, bufferSize: 1, FileOptions.SequentialScan);
+        // clean flush). Write sharing allows a synchronization-only handle under the storage locks;
+        // directory ownership still excludes other storage instances.
+        _stream = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete, bufferSize: 1, FileOptions.SequentialScan);
         _syncToDisk = syncToDisk;
         _faultInjector = faultInjector;
         try

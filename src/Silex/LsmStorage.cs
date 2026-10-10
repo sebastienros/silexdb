@@ -113,6 +113,8 @@ public sealed partial class LsmStorage : IDisposable, IAsyncDisposable
 
         public Task FlushAndCompactAsync(CancellationToken cancellationToken = default) => _storage.FlushAndCompactAsync(cancellationToken);
 
+        public Task SynchronizeAsync(CancellationToken cancellationToken = default) => _storage.SynchronizeAsync(cancellationToken);
+
         public ValueTask DisposeAsync() => _storage.DisposeAsync();
 
         public void Dispose() => _storage.Dispose();
@@ -491,8 +493,9 @@ public sealed partial class LsmStorage : IDisposable, IAsyncDisposable
     /// Applies every mutation in <paramref name="batch"/> under one storage lock and one WAL frame.
     /// </summary>
     /// <remarks>
-    /// The call returns only after the frame has reached the operating system, or stable storage when
-    /// <see cref="StorageOptions.SyncWriteAheadLogToDisk"/> is enabled.
+    /// With WAL enabled, the call returns after the frame has reached the operating system and, when
+    /// <see cref="StorageOptions.SyncWriteAheadLogToDisk"/> is enabled, file-content synchronization
+    /// has succeeded. With WAL disabled, success guarantees in-memory visibility only.
     /// A failure does not imply that nothing committed: inspect <see cref="StorageOperationException.Outcome"/>.
     /// Faulted instances reject further operations and must be disposed and reopened.
     /// </remarks>
@@ -501,6 +504,24 @@ public sealed partial class LsmStorage : IDisposable, IAsyncDisposable
         CheckWritable();
         ArgumentNullException.ThrowIfNull(batch);
         _inner.WriteBatch(batch);
+    }
+
+    /// <summary>Synchronizes the recoverable file contents through all previously completed writes.</summary>
+    /// <remarks>
+    /// Call after a successful Put, Delete, or Write to include that mutation. The boundary is acquired
+    /// under the write lock; racing writes acquired before it are included, later writes are not promised.
+    /// Current and recovered/rotated WALs, live SSTs, and the manifest are synchronized without flushing
+    /// memtables or compacting. WAL-disabled and read-only stores reject this operation.
+    /// Cancellation is honored before file I/O begins, not after; synchronous write-lock waiting
+    /// cannot be interrupted. File synchronization may run synchronously on the calling thread. I/O failure throws
+    /// <see cref="StorageSynchronizationException"/> and faults the instance without undoing prior writes.
+    /// This requests OS file-content synchronization, not directory synchronization or power-loss
+    /// certification. Do not reenter this operation from a borrowed-read callback.
+    /// </remarks>
+    public Task SynchronizeAsync(CancellationToken cancellationToken = default)
+    {
+        CheckWritable();
+        return _inner.SynchronizeAsync(cancellationToken);
     }
 
     public ValueTask<bool> TryGetRawAsync(ReadOnlySpan<byte> key, IBufferWriter<byte> destination, CancellationToken cancellationToken = default)

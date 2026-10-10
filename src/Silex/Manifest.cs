@@ -7,7 +7,7 @@ namespace Silex;
 /// alone cannot encode this once compaction rewrites data into fresh files, so the manifest is the
 /// authoritative source for recovery under every compaction strategy. The manifest is rewritten
 /// atomically (temp file + rename) after every structural change and is the single commit point that makes
-/// flush and compaction crash-safe: a crash before the rewrite leaves the previous structure intact, and
+/// flush and compaction process-crash-safe: a crash before the rewrite leaves the previous structure intact, and
 /// any SST not referenced by the committed manifest is an orphan that recovery deletes.
 /// </summary>
 /// <remarks>
@@ -81,15 +81,20 @@ internal sealed class Manifest
     /// Atomically replaces the manifest on disk with this instance: the content is written to a temporary
     /// file and renamed over the previous manifest, so a reader never observes a partially written file.
     /// </summary>
-    public void Write(string storagePath)
+    public void Write(string storagePath, Action<StorageFaultPoint>? faultInjector = null)
     {
         var tempPath = Path.Combine(storagePath, TempFileName);
         var path = GetPath(storagePath);
 
-        var json = JsonSerializer.Serialize(this, _jsonOptions);
-        File.WriteAllText(tempPath, json);
+        using (var stream = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
+        {
+            JsonSerializer.Serialize(stream, this, _jsonOptions);
+            faultInjector?.Invoke(StorageFaultPoint.ManifestBeforeSync);
+            stream.Flush(flushToDisk: true);
+            faultInjector?.Invoke(StorageFaultPoint.ManifestAfterSync);
+        }
 
-        // Atomic publish: the rename is the commit point for the structural change.
+        // Synchronizes contents before atomic publication; directory-entry persistence is OS/filesystem-dependent.
         File.Move(tempPath, path, overwrite: true);
     }
 
