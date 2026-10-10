@@ -92,8 +92,9 @@ internal sealed class BufferedSsTableBuilder : ISsTableBuilder
         // Disable dotnet buffer as we are handling it
         var bufferSize = 0;
 
+        // No write-through: the flush/compaction commit synchronizes each new SST once before the manifest
+        // publishes it, whereas write-through paid a device flush on every write (~10 ms per small SST on Windows).
         var options =
-            FileOptions.WriteThrough | // Skip OS cache
             FileOptions.Asynchronous // All operation are async
             ;
 

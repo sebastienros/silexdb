@@ -20,6 +20,7 @@ internal sealed class SsTable : IDisposable
     private readonly FileStream _stream;
     private readonly SafeFileHandle _handle;
     private bool _disposed;
+    private long _fileId = -1;
 
     public SsTable(long id, FileStream stream, string filename, BlockMetadataStore blockMetadata, long metadataBlockOffset, BlockBuilder blockBuilder, IBloomFilter bloomFilter)
     {
@@ -52,6 +53,18 @@ internal sealed class SsTable : IDisposable
     // Write sharing permits a synchronization-only handle while this immutable file is being read.
     internal static FileStream OpenRead(string filename) =>
         new(filename, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+
+    /// <summary>
+    /// The numeric id parsed from the <c>{id}.sst</c> filename, computed once. This is the id recorded in
+    /// the manifest, as opposed to the transient runtime <see cref="Id"/>.
+    /// </summary>
+    public long FileId => _fileId >= 0 ? _fileId : (_fileId = ParseFileId(_filename));
+
+    private static long ParseFileId(string filename)
+    {
+        var name = Path.GetFileNameWithoutExtension(filename.AsSpan());
+        return long.Parse(name, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture);
+    }
 
     /// <summary>
     /// The numeric id of this table. For tables loaded from disk this matches the on-disk filename id;

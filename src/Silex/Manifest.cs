@@ -1,3 +1,5 @@
+using System.Buffers.Binary;
+using System.IO.Hashing;
 using System.Text.Json;
 
 namespace Silex;
@@ -25,6 +27,13 @@ internal sealed class Manifest
     /// The manifest schema version.
     /// </summary>
     public int Version { get; set; } = 1;
+
+    /// <summary>
+    /// Identifies this snapshot generation. Flush commits are appended to the sidecar log
+    /// <c>manifest.{Epoch}.log</c> instead of rewriting the snapshot; every full snapshot write advances the
+    /// epoch, which atomically retires the previous log (a log is only replayed onto the snapshot of its own epoch).
+    /// </summary>
+    public long Epoch { get; set; }
 
     /// <summary>
     /// The L0 SST filename ids, oldest-first (the order in which they were flushed). The newest L0 SST is
@@ -65,6 +74,8 @@ internal sealed class Manifest
             throw new InvalidDataException($"The manifest at '{path}' has an invalid or unsupported schema.");
         }
 
+        ManifestLog.Replay(storagePath, manifest);
+
         var ids = new HashSet<long>();
         foreach (var id in manifest.AllSstIds())
         {
@@ -80,15 +91,33 @@ internal sealed class Manifest
     /// <summary>
     /// Atomically replaces the manifest on disk with this instance: the content is written to a temporary
     /// file and renamed over the previous manifest, so a reader never observes a partially written file.
+    /// Advances <see cref="Epoch"/>, which retires the previous incremental log.
     /// </summary>
     public void Write(string storagePath, Action<StorageFaultPoint>? faultInjector = null)
     {
+        Epoch++;
         var tempPath = Path.Combine(storagePath, TempFileName);
         var path = GetPath(storagePath);
 
-        using (var stream = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
+        using (var stream = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize: 1, FileOptions.None))
+        using (var writer = new Utf8JsonWriter(stream))
         {
-            JsonSerializer.Serialize(stream, this, _jsonOptions);
+            writer.WriteStartObject();
+            writer.WriteNumber("Version", Version);
+            writer.WriteNumber("Epoch", Epoch);
+            WriteIds(writer, "L0", L0);
+            writer.WriteStartArray("Levels");
+
+            foreach (var level in Levels)
+            {
+                writer.WriteStartArray();
+                WriteIdValues(writer, level);
+                writer.WriteEndArray();
+            }
+
+            writer.WriteEndArray();
+            writer.WriteEndObject();
+            writer.Flush();
             faultInjector?.Invoke(StorageFaultPoint.ManifestBeforeSync);
             stream.Flush(flushToDisk: true);
             faultInjector?.Invoke(StorageFaultPoint.ManifestAfterSync);
@@ -96,6 +125,23 @@ internal sealed class Manifest
 
         // Synchronizes contents before atomic publication; directory-entry persistence is OS/filesystem-dependent.
         File.Move(tempPath, path, overwrite: true);
+
+        ManifestLog.DeleteStaleLogs(storagePath);
+    }
+
+    private static void WriteIds(Utf8JsonWriter writer, string name, List<long> ids)
+    {
+        writer.WriteStartArray(name);
+        WriteIdValues(writer, ids);
+        writer.WriteEndArray();
+    }
+
+    private static void WriteIdValues(Utf8JsonWriter writer, List<long> ids)
+    {
+        foreach (var id in ids)
+        {
+            writer.WriteNumberValue(id);
+        }
     }
 
     /// <summary>
@@ -113,6 +159,104 @@ internal sealed class Manifest
             foreach (var id in level)
             {
                 yield return id;
+            }
+        }
+    }
+}
+
+/// <summary>
+/// Append-only sidecar to the manifest snapshot that records L0 flush commits as fixed-size, checksummed
+/// records, so a flush costs one small append to an already-open file instead of a temp-file create plus
+/// an overwriting rename (the dominant per-flush cost on NTFS). A record is the commit point: a torn final
+/// record is ignored on replay (the flush is treated as uncommitted and its SST as an orphan), while a bad
+/// record anywhere else is corruption.
+/// </summary>
+internal sealed class ManifestLog : IDisposable
+{
+    private const int RecordSize = 13;
+    private const byte AppendL0Record = 1;
+
+    private readonly string _path;
+    private FileStream? _stream;
+
+    public ManifestLog(string storagePath, long epoch)
+    {
+        _path = GetPath(storagePath, epoch);
+    }
+
+    private static string GetPath(string storagePath, long epoch)
+    {
+        return Path.Combine(storagePath, $"manifest.{epoch}.log");
+    }
+
+    /// <summary>
+    /// Records, and synchronizes to disk like the snapshot write, that <paramref name="id"/> was appended to L0.
+    /// </summary>
+    public void AppendL0(long id, Action<StorageFaultPoint>? faultInjector = null)
+    {
+        _stream ??= new FileStream(_path, FileMode.Append, FileAccess.Write, FileShare.Read | FileShare.Delete, bufferSize: 1);
+
+        Span<byte> record = stackalloc byte[RecordSize];
+        record[0] = AppendL0Record;
+        BinaryPrimitives.WriteInt64LittleEndian(record[1..], id);
+        BinaryPrimitives.WriteUInt32LittleEndian(record[9..], Crc32.HashToUInt32(record[..9]));
+        _stream.Write(record);
+        faultInjector?.Invoke(StorageFaultPoint.ManifestBeforeSync);
+        _stream.Flush(flushToDisk: true);
+        faultInjector?.Invoke(StorageFaultPoint.ManifestAfterSync);
+    }
+
+    public void Dispose()
+    {
+        _stream?.Dispose();
+        _stream = null;
+    }
+
+    public static void Replay(string storagePath, Manifest manifest)
+    {
+        var path = GetPath(storagePath, manifest.Epoch);
+
+        if (!File.Exists(path))
+        {
+            return;
+        }
+
+        var bytes = File.ReadAllBytes(path);
+        var count = bytes.Length / RecordSize;
+
+        for (var i = 0; i < count; i++)
+        {
+            var record = bytes.AsSpan(i * RecordSize, RecordSize);
+            var valid = record[0] == AppendL0Record
+                && BinaryPrimitives.ReadUInt32LittleEndian(record[9..]) == Crc32.HashToUInt32(record[..9]);
+
+            if (!valid)
+            {
+                if (i == count - 1 && bytes.Length == count * RecordSize)
+                {
+                    return;
+                }
+
+                throw new InvalidDataException($"The manifest log '{path}' is corrupt at record {i}.");
+            }
+
+            manifest.L0.Add(BinaryPrimitives.ReadInt64LittleEndian(record[1..]));
+        }
+    }
+
+    public static void DeleteStaleLogs(string storagePath)
+    {
+        foreach (var file in Directory.EnumerateFiles(storagePath, "manifest.*.log"))
+        {
+            try
+            {
+                File.Delete(file);
+            }
+            catch (IOException)
+            {
+            }
+            catch (UnauthorizedAccessException)
+            {
             }
         }
     }
