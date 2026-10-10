@@ -1397,7 +1397,7 @@ internal sealed class LsmStorageInner : IDisposable
     /// </summary>
     private static long GetSstFileId(SsTable table)
     {
-        return long.Parse(Path.GetFileNameWithoutExtension(table.Filename), CultureInfo.InvariantCulture);
+        return table.FileId;
     }
 
     /// <summary>

@@ -86,11 +86,42 @@ internal sealed class Manifest
         var tempPath = Path.Combine(storagePath, TempFileName);
         var path = GetPath(storagePath);
 
-        var json = JsonSerializer.Serialize(this, _jsonOptions);
-        File.WriteAllText(tempPath, json);
+        using (var stream = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize: 1, FileOptions.None))
+        using (var writer = new Utf8JsonWriter(stream))
+        {
+            writer.WriteStartObject();
+            writer.WriteNumber("Version", Version);
+            WriteIds(writer, "L0", L0);
+            writer.WriteStartArray("Levels");
+
+            foreach (var level in Levels)
+            {
+                writer.WriteStartArray();
+                WriteIdValues(writer, level);
+                writer.WriteEndArray();
+            }
+
+            writer.WriteEndArray();
+            writer.WriteEndObject();
+        }
 
         // Atomic publish: the rename is the commit point for the structural change.
         File.Move(tempPath, path, overwrite: true);
+    }
+
+    private static void WriteIds(Utf8JsonWriter writer, string name, List<long> ids)
+    {
+        writer.WriteStartArray(name);
+        WriteIdValues(writer, ids);
+        writer.WriteEndArray();
+    }
+
+    private static void WriteIdValues(Utf8JsonWriter writer, List<long> ids)
+    {
+        foreach (var id in ids)
+        {
+            writer.WriteNumberValue(id);
+        }
     }
 
     /// <summary>
