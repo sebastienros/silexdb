@@ -408,6 +408,181 @@ public class OrderedReadTests
         await Assert.That(emptyBatch.IsExhausted).IsTrue();
     }
 
+    [Test]
+    [Arguments(false, false)]
+    [Arguments(false, true)]
+    [Arguments(true, false)]
+    [Arguments(true, true)]
+    public async Task WaitingMutableSourceRejectsPartialFailedBatchAndKeepsContinuation(bool mvcc, bool next)
+    {
+        using var folder = TempFolder.Create();
+        using var readerReached = new ManualResetEventSlim();
+        using var applying = new ManualResetEventSlim();
+        using var releaseWriter = new ManualResetEventSlim();
+        var options = Options();
+        var armed = false;
+        var advances = 0;
+        var mutations = 0;
+        options.FaultInjector = point =>
+        {
+            if (!armed) return;
+            if (point == StorageFaultPoint.OrderedReadBeforeMemTableRead &&
+                Interlocked.Increment(ref advances) == (next ? 2 : 1))
+            {
+                readerReached.Set();
+                if (!applying.Wait(TimeSpan.FromSeconds(10))) throw new TimeoutException("Writer did not enter application.");
+            }
+            if (point == StorageFaultPoint.BatchAfterApplyEntry &&
+                Interlocked.Increment(ref mutations) == (mvcc ? 2 : 1))
+            {
+                applying.Set();
+                if (!releaseWriter.Wait(TimeSpan.FromSeconds(10))) throw new TimeoutException("Waiting reader was not released.");
+                throw new IOException("Injected partial batch application.");
+            }
+        };
+        await using var lsm = mvcc ? null : await LsmStorage.OpenAsync(folder, options);
+        await using var versioned = mvcc ? await MvccStorage.OpenAsync(folder, options) : null;
+        for (byte key = 1; key <= 3; key++)
+        {
+            if (mvcc) versioned!.Put([key], [key]);
+            else lsm!.Put([key], [key]);
+        }
+        var engine = lsm ?? PrivateField<LsmStorage>(versioned!, "_storage");
+        var inner = PrivateField<LsmStorageInner>(engine, "_inner");
+        var tableLock = PrivateField<ReaderWriterLockSlim>(inner, "_currentMemTableLock");
+        using var cursor = mvcc ? versioned!.CreateOrderedReadCursor() : lsm!.CreateOrderedReadCursor();
+        using var previous = await cursor.ReadBatchAsync(1, 2);
+        var continuation = PrivateField<byte[]>(cursor, "_resume").ToArray();
+        armed = true;
+        var read = Task.Run(async () => await cursor.ReadBatchAsync(10, 100));
+        Task? write = null;
+        try
+        {
+            await Assert.That(readerReached.Wait(TimeSpan.FromSeconds(10))).IsTrue();
+            write = Task.Run(async () =>
+            {
+                if (mvcc)
+                {
+                    using var transaction = versioned!.BeginTransaction();
+                    transaction.Put([3], [99]);
+                    transaction.Put([2], [99]);
+                    await transaction.CommitAsync();
+                }
+                else
+                {
+                    var batch = new LsmWriteBatch();
+                    batch.Put([3], [99]);
+                    batch.Put([2], [99]);
+                    lsm!.Write(batch);
+                }
+            });
+            await Assert.That(applying.Wait(TimeSpan.FromSeconds(10))).IsTrue();
+            await Assert.That(SpinWait.SpinUntil(() => tableLock.WaitingReadCount > 0, TimeSpan.FromSeconds(10))).IsTrue();
+            releaseWriter.Set();
+            await Assert.That(async () => await write).Throws<StorageOperationException>();
+            await Assert.That(async () => await read).Throws<StorageFaultedException>();
+            await Assert.That(engine.Health).IsEqualTo(StorageHealth.Faulted);
+            await Assert.That(PrivateField<byte[]>(cursor, "_resume")).IsEquivalentTo(continuation, CollectionOrdering.Matching);
+            await Assert.That(previous[0].Value.Span[0]).IsEqualTo((byte)1);
+            await Assert.That(async () => await cursor.ReadBatchAsync(10, 100)).Throws<StorageFaultedException>();
+        }
+        finally
+        {
+            releaseWriter.Set();
+            applying.Set();
+            try { using var unexpected = await read; } catch (StorageFaultedException) { }
+            if (write is not null)
+            {
+                try { await write; } catch (StorageOperationException) { }
+            }
+        }
+    }
+
+    [Test]
+    public async Task AlreadyInFlightSstReadRemainsSafeWhenWriterFaults()
+    {
+        using var folder = TempFolder.Create();
+        var encoder = new CountingEncoder();
+        var options = Options();
+        options.BlockEncoderFactory = new CountingFactory(encoder);
+        var armed = false;
+        options.FaultInjector = point =>
+        {
+            if (armed && point == StorageFaultPoint.BatchAfterApplyEntry) throw new IOException("Partial writer failure.");
+        };
+        await using var db = await LsmStorage.OpenAsync(folder, options);
+        db.Put([1], [42]);
+        await db.FlushAndCompactAsync();
+        using var decoding = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        encoder.OnRead = () =>
+        {
+            decoding.Set();
+            if (!release.Wait(TimeSpan.FromSeconds(10))) throw new TimeoutException("SST read was not released.");
+        };
+        using var cursor = db.CreateOrderedReadCursor();
+        var read = Task.Run(async () => await cursor.ReadBatchAsync(10, 100));
+        try
+        {
+            await Assert.That(decoding.Wait(TimeSpan.FromSeconds(10))).IsTrue();
+            armed = true;
+            await Assert.That(() => db.Put([1], [99])).Throws<StorageOperationException>();
+            release.Set();
+            using var batch = await read;
+            await Assert.That(batch.Count).IsEqualTo(1);
+            await Assert.That(batch[0].Value.Span[0]).IsEqualTo((byte)42);
+            await Assert.That(async () => await cursor.ReadBatchAsync(10, 100)).Throws<StorageFaultedException>();
+        }
+        finally
+        {
+            release.Set();
+            encoder.OnRead = null;
+            using var batch = await read;
+        }
+    }
+
+    private static T PrivateField<T>(object instance, string name) =>
+        (T)instance.GetType().GetField(name, System.Reflection.BindingFlags.Instance |
+            System.Reflection.BindingFlags.NonPublic)!.GetValue(instance)!;
+
+    [Test]
+    public async Task AlreadyInFlightImmutableReadsRemainSafeWhenWriterFaults()
+    {
+        using var folder = TempFolder.Create();
+        var options = Options();
+        var armed = false;
+        options.FaultInjector = point =>
+        {
+            if (armed && point == StorageFaultPoint.BatchAfterApplyEntry) throw new IOException("Partial writer failure.");
+        };
+        await using var db = await LsmStorage.OpenAsync(folder, options);
+        db.Put([1], [41]);
+        db.Put([2], [42]);
+        PrivateField<LsmStorageInner>(db, "_inner").ForceFreezeMemTable();
+        using var batch = new OrderedReadBatch(10, 100);
+        var injected = false;
+        var exhausted = await db.ScanOrderedAsync(new OrderedReadRange(), OrderedReadDirection.Forward, batch,
+            (b, key, value) =>
+            {
+                if (!injected)
+                {
+                    injected = true;
+                    armed = true;
+                    try
+                    {
+                        db.Put([2], [99]);
+                        throw new InvalidOperationException("Injected writer unexpectedly succeeded.");
+                    }
+                    catch (StorageOperationException) { }
+                }
+                return b.Add(key, value);
+            }, CancellationToken.None);
+        await Assert.That(exhausted).IsTrue();
+        await Assert.That(batch.Count).IsEqualTo(2);
+        await Assert.That(batch[1].Value.Span[0]).IsEqualTo((byte)42);
+        await Assert.That(db.Health).IsEqualTo(StorageHealth.Faulted);
+    }
+
     private sealed class CountingFactory(CountingEncoder encoder) : IBlockEncoderFactory
     {
         public IBlockEncoder Create() => encoder;

@@ -82,5 +82,6 @@ internal enum StorageFaultPoint
     ManifestAfterSync,
     BackupBeforeCopy,
     BackupAfterCopy,
-    BackupBeforePublish
+    BackupBeforePublish,
+    OrderedReadBeforeMemTableRead
 }

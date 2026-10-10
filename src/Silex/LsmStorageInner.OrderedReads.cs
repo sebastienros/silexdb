@@ -30,7 +30,7 @@ internal sealed partial class LsmStorageInner
                 // The structural read lock retains this table if a writer rotates it during the batch.
                 if (_state.CurrentMemTable.Count != 0)
                 {
-                    inputs.Add(MergeIterator.Input.FromMemTable((MemTable)_state.CurrentMemTable, _currentMemTableLock));
+                    inputs.Add(MergeIterator.Input.FromMemTable((MemTable)_state.CurrentMemTable, _currentMemTableLock, this));
                 }
                 for (var i = _state.ImmutableMemTables.Length - 1; i >= 0; i--)
                 {

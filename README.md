@@ -120,6 +120,8 @@ group before returning its newest visible value.
 Cursor advance/disposal must not overlap; overlapping operations throw `InvalidOperationException`.
 Cancellation, oversized-entry errors and read faults dispose partial batches and leave continuation
 unchanged. Existing health/fault contracts still apply. Closing storage does not wait for idle cursors;
+mutable-source reads recheck health while holding the memory-table lock, so readers waiting behind a
+failed batch cannot return its partial application. Already admitted immutable/SST reads remain safe.
 new advances (even on exhausted cursors) reject a closed/faulted store. Returned batches remain valid
 after later advances, cursor disposal, maintenance, or storage closure, until **their own disposal**.
 Do not dispose a batch while another operation still uses its memory. Dispose snapshot cursors promptly

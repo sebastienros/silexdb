@@ -453,6 +453,7 @@ internal sealed class MergeIterator : IStorageIterator
         public OrderedReadRange? Range;
         public MemTable? MemTable;
         public ReaderWriterLockSlim? MemTableLock;
+        public LsmStorageInner? MemTableStorage;
         public byte[]? MemKey;
         public byte[]? MemValue;
         public int MemKeyLength;
@@ -517,6 +518,7 @@ internal sealed class MergeIterator : IStorageIterator
                 {
                     MemTable = input.MemTable,
                     MemTableLock = input.MemTableLock,
+                    MemTableStorage = input.MemTableStorage,
                     From = from,
                     SeekPending = hasFrom,
                     Step = backwards ? -1 : 1,
@@ -643,9 +645,11 @@ internal sealed class MergeIterator : IStorageIterator
 
         public bool MoveNextMemTable()
         {
+            MemTableStorage?.FaultInjector?.Invoke(StorageFaultPoint.OrderedReadBeforeMemTableRead);
             MemTableLock!.EnterReadLock();
             try
             {
+                MemTableStorage?.CheckHealthy();
                 var from = MemStarted ? MemKey.AsSpan(0, MemKeyLength) : From.Span;
                 var inclusive = !MemStarted && (Range is null || (Step < 0 ? Range.UpperInclusive : Range.LowerInclusive));
                 if (!MemTable!.TryGetNextRaw(from, MemStarted || SeekPending, inclusive, Step < 0,
@@ -726,10 +730,11 @@ internal sealed class MergeIterator : IStorageIterator
 
     internal readonly struct Input
     {
-        private Input(MemTable memTable, ReaderWriterLockSlim memTableLock)
+        private Input(MemTable memTable, ReaderWriterLockSlim memTableLock, LsmStorageInner? storage)
         {
             MemTable = memTable;
             MemTableLock = memTableLock;
+            MemTableStorage = storage;
         }
         private Input(
             SsTable? table,
@@ -744,13 +749,15 @@ internal sealed class MergeIterator : IStorageIterator
         public SsTable? Table { get; }
         public MemTable? MemTable { get; }
         public ReaderWriterLockSlim? MemTableLock { get; }
+        public LsmStorageInner? MemTableStorage { get; }
 
         public List<KeyValuePair<ByteSlice, ByteSlice>>? Entries { get; }
 
         public IStorageIterator? Iterator { get; }
 
         public static Input FromTable(SsTable table) => new(table, null, null);
-        public static Input FromMemTable(MemTable table, ReaderWriterLockSlim tableLock) => new(table, tableLock);
+        public static Input FromMemTable(MemTable table, ReaderWriterLockSlim tableLock, LsmStorageInner? storage = null) =>
+            new(table, tableLock, storage);
 
         public static Input FromEntries(List<KeyValuePair<ByteSlice, ByteSlice>> entries) => new(null, entries, null);
 
