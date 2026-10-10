@@ -958,6 +958,7 @@ public class StorageTests
         using var wal = new WriteAheadLog(walPath, syncToDisk: false);
         wal.AppendRaw([1], [2]);
         wal.Flush();
+        wal.Synchronize();
 
         using var memTable = new MemTable(1);
         WriteAheadLog.Replay(walPath, memTable);

@@ -330,6 +330,27 @@ public sealed class MvccStorage : IAsyncDisposable
         return _storage.FlushAndCompactAsync(cancellationToken);
     }
 
+    /// <summary>Synchronizes recoverable file contents through all previously completed commits.</summary>
+    /// <remarks>
+    /// Uses the same boundary, cancellation, WAL requirement, and failure contract as
+    /// <see cref="LsmStorage.SynchronizeAsync"/>. Serializes with commit publication and shutdown.
+    /// Await a successful commit before calling to include that commit; staged transactions are excluded.
+    /// </remarks>
+    public async Task SynchronizeAsync(CancellationToken cancellationToken = default)
+    {
+        CheckDisposed();
+        await _commitGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            CheckDisposed();
+            await _storage.SynchronizeAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _commitGate.Release();
+        }
+    }
+
     /// <summary>
     /// Flushes pending data and closes the database.
     /// </summary>

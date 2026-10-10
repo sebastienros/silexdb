@@ -200,10 +200,15 @@ public class StorageOptions
 
     /// <summary>
     /// Gets or sets whether each write-ahead log frame is flushed all the way to disk (<c>fsync</c>).
-    /// When <c>false</c> the frame is only written to the operating system, which still survives a
-    /// process crash but not a power loss. Enabling this is slower but survives power loss.
+    /// When <c>false</c> the frame is written to the operating system before in-memory application,
+    /// supporting process-crash recovery but not promising synchronization to stable storage.
+    /// When <c>true</c>, OS file-content synchronization must succeed before application/acknowledgment.
     /// </summary>
-    /// <remarks>This has no effect when <see cref="UseWriteAheadLog"/> is <c>false</c>.</remarks>
+    /// <remarks>
+    /// This has no effect when <see cref="UseWriteAheadLog"/> is <c>false</c>.
+    /// Alternatively, call <see cref="LsmStorage.SynchronizeAsync"/> after a completed write.
+    /// Neither option synchronizes directory entries or certifies power-loss safety on every OS/device.
+    /// </remarks>
     /// <value>
     /// The default value is <c>false</c>.
     /// </value>

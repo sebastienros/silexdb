@@ -19,8 +19,9 @@ namespace Silex.Wal;
 /// other code is the value's byte length.
 ///
 /// A frame is written to the operating system before its mutations are applied in memory, which is
-/// sufficient to survive a process crash. Enabling <c>syncToDisk</c> additionally <c>fsync</c>s each
-/// frame to survive power loss. Multiple mutations may share one frame through <see cref="AppendBatch"/>.
+/// supports recovery after a process crash. Enabling <c>syncToDisk</c> additionally requests OS
+/// file-content synchronization for each frame; this is not directory synchronization or certification
+/// against power loss on every filesystem/device. Multiple mutations may share one frame through <see cref="AppendBatch"/>.
 ///
 /// A single instance is only ever written from one thread at a time: appends happen while the owning
 /// <see cref="LsmStorageInner"/> holds the current-memtable write lock, so no internal
@@ -149,6 +150,14 @@ internal sealed class WriteAheadLog : IDisposable
         }
 
         _stream.Flush(_syncToDisk);
+    }
+
+    /// <summary>Requests file-content synchronization independently of the per-append configuration.</summary>
+    internal void Synchronize()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        _stream.Flush(flushToDisk: true);
+        DiskFlushCount++;
     }
 
     /// <summary>

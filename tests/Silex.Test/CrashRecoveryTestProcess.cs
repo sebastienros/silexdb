@@ -107,7 +107,7 @@ internal static class CrashRecoveryTestProcess
         else
         {
             var storage = LsmStorage.OpenAsync(path, options).GetAwaiter().GetResult();
-            if (mode is "write" or "flush")
+            if (mode is "write" or "flush" or "synchronize")
             {
                 var batch = new LsmWriteBatch();
                 batch.Put([1], [11]);
@@ -117,6 +117,10 @@ internal static class CrashRecoveryTestProcess
             if (mode is "flush" or "tiered" or "leveled")
             {
                 storage.FlushAndCompactAsync().GetAwaiter().GetResult();
+            }
+            if (mode == "synchronize")
+            {
+                storage.SynchronizeAsync().GetAwaiter().GetResult();
             }
             GC.KeepAlive(storage);
         }

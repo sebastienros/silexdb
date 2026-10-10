@@ -235,7 +235,7 @@ internal sealed class BufferedSsTableBuilder : ISsTableBuilder
         File.Move(_tempFilename, _filename, overwrite: true);
 
         var flattenedMetadata = _flattenedMetadata!;
-        var readStream = File.OpenRead(_filename);
+        var readStream = SsTable.OpenRead(_filename);
         SsTable table;
 
         try

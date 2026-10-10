@@ -28,6 +28,18 @@ public sealed class StorageOperationException : IOException
         : base($"Storage mutation failed with outcome {outcome}.", cause) => Outcome = outcome;
 }
 
+/// <summary>
+/// File synchronization failed. Prior writes are not undone, but synchronization through the requested
+/// boundary is unconfirmed. Dispose the faulted instance without flushing and reopen for recovery.
+/// </summary>
+public sealed class StorageSynchronizationException : IOException
+{
+    internal StorageSynchronizationException(Exception cause)
+        : base("Storage synchronization failed; the requested durability boundary is unconfirmed.", cause)
+    {
+    }
+}
+
 /// <summary>The instance is unsafe to use. Dispose it without flushing and reopen for recovery.</summary>
 public sealed class StorageFaultedException : InvalidOperationException
 {
@@ -59,5 +71,13 @@ internal enum StorageFaultPoint
     CompactionAfterInstall,
     ManifestBeforePublish,
     ManifestAfterPublish,
-    WalDuringHeaderWrite
+    WalDuringHeaderWrite,
+    SynchronizationBeforeWal,
+    SynchronizationAfterWal,
+    SynchronizationBeforeSst,
+    SynchronizationAfterSst,
+    SynchronizationBeforeManifest,
+    SynchronizationAfterManifest,
+    ManifestBeforeSync,
+    ManifestAfterSync
 }
