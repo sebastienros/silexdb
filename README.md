@@ -58,6 +58,50 @@ await db.CloseAsync();
 `LsmStorage.OpenAsync` reopens an existing store at the same path, replaying the WAL and loading existing
 SSTs, so persisted data survives process restarts.
 
+### Recovery, integrity, and salvage
+
+Normal opening refuses a database with a missing manifest-referenced SST, even when a WAL with
+the same id survives: that WAL alone does not prove that all committed contents can be recovered.
+`StorageRecoveryException.Report` identifies the missing files and recommends restoring a consistent
+backup. A failed recovery leaves the committed manifest and source files intact.
+
+Inspect a database **offline**, with no open writer or maintenance operation:
+
+```csharp
+var report = await LsmStorage.VerifyIntegrityAsync("my-db", options);
+foreach (var issue in report.Issues)
+    Console.WriteLine($"{issue.Kind}: {issue.Path}: {issue.Message}");
+```
+
+Verification reads live SST metadata and every data block (including checksums, decoding, entry
+extents, and index/key ordering), and validates WAL frames needed for recovery. It does not modify
+files. Orphan SSTs and stale WALs superseded by verified SSTs are ignored. An incomplete trailing WAL
+frame is reported as `IncompleteWalTail`, not an error: earlier committed frames still recover normally.
+Missing committed SSTs and corrupt committed WAL frames instead make `IsRecoveryComplete` false.
+Checksums cannot detect every possible alteration of legacy formats or unchecksummed metadata;
+completeness is relative to the manifest and surviving WALs, not a substitute for backups.
+Legacy stores without a manifest remain supported, but missing files in those stores cannot be detected.
+
+For explicit best-effort extraction, open a **read-only** salvage handle:
+
+```csharp
+await using var salvage = await LsmStorage.OpenSalvageAsync("my-db", options);
+Console.WriteLine($"Complete: {salvage.RecoveryReport!.IsRecoveryComplete}");
+await salvage.ScanRawAsync(destination, static (db, key, value) =>
+{
+    db.Put(key, value);
+    return true;
+});
+```
+
+Here `destination` is a different, normally opened database. Salvage skips missing/corrupt SSTs and
+retains valid prefixes of damaged WALs. It never deletes evidence, creates WALs, rewrites the manifest,
+flushes, or compacts, even on disposal; writes and manual maintenance throw. A corrupt manifest must
+be restored before salvage because guessing which SSTs are live can resurrect deleted or obsolete data.
+Salvaged results can omit committed data or expose older values/tombstones hidden by a lost newer SST;
+review the report and extracted data before replacing the original database. Use the same WAL setting
+as the original store when opening either normally or for salvage.
+
 Use `LsmWriteBatch` when several byte-oriented mutations can share one durability boundary. The batch is
 written as one checksum-protected WAL frame, reducing write and `fsync` calls while preserving the default
 process-crash and optional power-loss guarantees:

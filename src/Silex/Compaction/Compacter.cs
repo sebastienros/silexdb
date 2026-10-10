@@ -13,10 +13,10 @@ internal class Compacter : IAsyncDisposable
     private CancellationTokenSource? _flushTaskCts;
     private readonly ushort _memTableTableMaxCount;
 
-    public Compacter(LsmStorageInner storage, TimeProvider timeProvider, StorageOptions options)
+    public Compacter(LsmStorageInner storage, TimeProvider timeProvider, StorageOptions options, bool enableBackgroundFlush = true)
     {
         _storage = storage;
-        _flushTimer = options.FlushPeriod == TimeSpan.Zero ? null : new PeriodicTimer(options.FlushPeriod, timeProvider);
+        _flushTimer = !enableBackgroundFlush || options.FlushPeriod == TimeSpan.Zero ? null : new PeriodicTimer(options.FlushPeriod, timeProvider);
         _memTableTableMaxCount = options.MemTableMaxCount;
     }
 

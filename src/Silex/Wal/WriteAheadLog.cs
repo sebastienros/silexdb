@@ -138,6 +138,14 @@ internal sealed class WriteAheadLog : IDisposable
     /// </summary>
     public static void Replay(string path, IMemTable target)
     {
+        ReplayCore(path, target);
+    }
+
+    // Returns true only when replay stopped at an incomplete, uncommitted tail.
+    internal static bool Verify(string path) => ReplayCore(path, target: null);
+
+    private static bool ReplayCore(string path, IMemTable? target)
+    {
         // Windows sharing is symmetric: the reader must grant write sharing to an open WAL writer.
         using var stream = new FileStream(
             path,
@@ -150,13 +158,13 @@ internal sealed class WriteAheadLog : IDisposable
         var length = checked((int)stream.Length);
         if (length == 0)
         {
-            return;
+            return false;
         }
 
         var bytes = GC.AllocateUninitializedArray<byte>(length);
         stream.ReadExactly(bytes);
 
-        ReplayFramed(path, bytes.AsMemory(), target);
+        return ReplayFramed(path, bytes.AsMemory(), target);
     }
 
     private EncoderBinaryWriter StartFrame(int recordCount)
@@ -206,7 +214,7 @@ internal sealed class WriteAheadLog : IDisposable
         writer.WriteRaw(value);
     }
 
-    private static void ReplayFramed(string path, ReadOnlyMemory<byte> content, IMemTable target)
+    private static bool ReplayFramed(string path, ReadOnlyMemory<byte> content, IMemTable? target)
     {
         var bytes = content.Span;
         if (bytes.Length < FileHeaderSize)
@@ -217,7 +225,7 @@ internal sealed class WriteAheadLog : IDisposable
                 throw new InvalidDataException($"WAL '{path}' has a corrupt file header.");
             }
 
-            return;
+            return true;
         }
 
         var fileHeader = bytes[..FileHeaderSize];
@@ -244,7 +252,7 @@ internal sealed class WriteAheadLog : IDisposable
             var remaining = bytes.Length - offset;
             if (remaining < FrameHeaderSize + FrameFooterSize)
             {
-                return;
+                return true;
             }
 
             var header = bytes.Slice(offset, FrameHeaderSize);
@@ -258,7 +266,7 @@ internal sealed class WriteAheadLog : IDisposable
             var payloadOffset = offset + FrameHeaderSize;
             if ((int)payloadLength > bytes.Length - payloadOffset - FrameFooterSize)
             {
-                return;
+                return true;
             }
 
             var expectedCrc = BinaryPrimitives.ReadUInt32LittleEndian(header[(2 * sizeof(uint))..]);
@@ -271,7 +279,7 @@ internal sealed class WriteAheadLog : IDisposable
             {
                 if (footerOffset + FrameFooterSize == bytes.Length)
                 {
-                    return;
+                    return true;
                 }
 
                 throw new InvalidDataException($"WAL '{path}' has a corrupt frame footer at offset {offset}.");
@@ -290,9 +298,11 @@ internal sealed class WriteAheadLog : IDisposable
             ReplayFrame(path, offset, payload, target);
             offset = footerOffset + FrameFooterSize;
         }
+
+        return false;
     }
 
-    private static void ReplayFrame(string path, int frameOffset, ReadOnlyMemory<byte> payload, IMemTable target)
+    private static void ReplayFrame(string path, int frameOffset, ReadOnlyMemory<byte> payload, IMemTable? target)
     {
         try
         {
@@ -313,10 +323,13 @@ internal sealed class WriteAheadLog : IDisposable
                 throw new InvalidDataException($"WAL '{path}' has trailing bytes in the frame at offset {frameOffset}.");
             }
 
-            reader = new EncoderBinaryReader(payload, sizeof(uint));
-            for (var i = 0; i < (int)recordCount; i++)
+            if (target != null)
             {
-                ReplayRecord(ref reader, target);
+                reader = new EncoderBinaryReader(payload, sizeof(uint));
+                for (var i = 0; i < (int)recordCount; i++)
+                {
+                    ReplayRecord(ref reader, target);
+                }
             }
         }
         catch (InvalidDataException)
