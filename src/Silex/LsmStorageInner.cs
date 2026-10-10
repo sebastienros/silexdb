@@ -1314,7 +1314,7 @@ internal sealed class LsmStorageInner : IDisposable
             var ssTable = await builder.BuildAsync(cancellationToken);
             _pendingTable = ssTable;
 
-            Manifest manifest;
+            Manifest? manifest;
             var removed = false;
 
             FaultInjector?.Invoke(StorageFaultPoint.FlushBeforeInstall);
@@ -1345,7 +1345,8 @@ internal sealed class LsmStorageInner : IDisposable
 
                 // Snapshot the new structure while the lock is held so the persisted manifest exactly matches
                 // the installed state. The (small) JSON is written to disk after releasing the lock.
-                manifest = BuildManifestSnapshot();
+                // While a snapshot for the current epoch is on disk, a flush only appends to the manifest log.
+                manifest = _manifestLogReady ? null : BuildManifestSnapshot();
                 FaultInjector?.Invoke(StorageFaultPoint.FlushAfterInstall);
             }
             catch (Exception exception)
@@ -1366,7 +1367,7 @@ internal sealed class LsmStorageInner : IDisposable
             // The manifest rewrite is the durable commit point and must happen before the WAL is deleted: a
             // crash before it leaves the WAL to be replayed on open (the not-yet-committed SST is cleaned up
             // as an orphan), and a crash after it leaves a committed SST whose WAL recovery correctly drops.
-            WriteManifest(manifest);
+            WriteManifest(manifest, ssTable.FileId);
 
             // The data is now durable in an SST and visible in L0, and the memtable (and its WAL handle)
             // is disposed: the write-ahead log is obsolete and can be removed. If a crash happens before
@@ -2509,17 +2510,64 @@ internal sealed class LsmStorageInner : IDisposable
             }
         }
 
+        _manifestLog?.Dispose();
         _blockCache?.Dispose();
         Ownership?.Dispose();
     }
 
+    private long _manifestEpoch;
+    private bool _manifestLogReady;
+    private ManifestLog? _manifestLog;
+
     private void WriteManifest(Manifest manifest)
     {
         FaultInjector?.Invoke(StorageFaultPoint.ManifestBeforePublish);
-        manifest.Write(StoragePath);
+        WriteManifestSnapshot(manifest);
         FaultInjector?.Invoke(StorageFaultPoint.ManifestAfterPublish);
     }
 
+    /// <summary>
+    /// Commits a flush: appends to the manifest log when a snapshot for the current epoch is on disk, otherwise
+    /// writes a full snapshot (<paramref name="snapshot"/> is then non-null).
+    /// </summary>
+    private void WriteManifest(Manifest? snapshot, long appendedL0Id)
+    {
+        FaultInjector?.Invoke(StorageFaultPoint.ManifestBeforePublish);
+
+        if (snapshot != null)
+        {
+            WriteManifestSnapshot(snapshot);
+        }
+        else
+        {
+            try
+            {
+                _manifestLog!.AppendL0(appendedL0Id);
+            }
+            catch
+            {
+                // A failed append may leave a torn record; the next commit takes a snapshot, which retires the log.
+                _manifestLog!.Dispose();
+                _manifestLogReady = false;
+                throw;
+            }
+        }
+
+        FaultInjector?.Invoke(StorageFaultPoint.ManifestAfterPublish);
+    }
+
+    private void WriteManifestSnapshot(Manifest manifest)
+    {
+        _manifestLog?.Dispose();
+        _manifestLog = null;
+        _manifestLogReady = false;
+
+        manifest.Epoch = _manifestEpoch;
+        manifest.Write(StoragePath);
+        _manifestEpoch = manifest.Epoch;
+        _manifestLog = new ManifestLog(StoragePath, _manifestEpoch);
+        _manifestLogReady = true;
+    }
     private void ClearMaintenanceOwnership()
     {
         _pendingTable = null;
