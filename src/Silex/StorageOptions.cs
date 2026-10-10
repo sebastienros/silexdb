@@ -6,6 +6,8 @@ namespace Silex;
 
 public class StorageOptions
 {
+    internal Action<StorageFaultPoint>? FaultInjector { get; set; }
+
     /// <value>64MiB</value>
     private static readonly long _defaultTableSizeLimit = 64.MiB();
 

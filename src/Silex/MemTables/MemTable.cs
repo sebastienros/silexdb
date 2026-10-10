@@ -32,11 +32,14 @@ internal sealed class MemTable : IMemTable, IRawBytesMemTable
     private long _size;
     private volatile bool _sortDirty;
     private bool _disposed;
+    private readonly Action<StorageFaultPoint>? _faultInjector;
+    internal StorageCommitOutcome WriteOutcome { get; private set; }
 
-    public MemTable(long id, WriteAheadLog? wal = null, int arenaBlockSize = 32 * 1024)
+    public MemTable(long id, WriteAheadLog? wal = null, int arenaBlockSize = 32 * 1024, Action<StorageFaultPoint>? faultInjector = null)
     {
         _id = id;
         _wal = wal;
+        _faultInjector = faultInjector;
         _arena = new MemTableArena(arenaBlockSize);
         _records = ArrayPool<MemTableRecord>.Shared.Rent(InitialRecordCapacity);
         _buckets = ArrayPool<int>.Shared.Rent(InitialBucketCapacity);
@@ -104,28 +107,54 @@ internal sealed class MemTable : IMemTable, IRawBytesMemTable
             return;
         }
 
-        _wal?.AppendBatch(batch);
+        WriteOutcome = StorageCommitOutcome.NotCommitted;
+        try
+        {
+            _wal?.AppendBatch(batch);
+        }
+        catch
+        {
+            WriteOutcome = _wal!.AppendOutcome;
+            throw;
+        }
+        WriteOutcome = StorageCommitOutcome.Indeterminate;
+        _faultInjector?.Invoke(StorageFaultPoint.BatchBeforeApply);
         for (var i = 0; i < batch.Count; i++)
         {
             batch.GetEntry(i, out var key, out var value, out var isTombstone);
             ApplyRaw(key, value, isTombstone);
+            _faultInjector?.Invoke(StorageFaultPoint.BatchAfterApplyEntry);
         }
+        WriteOutcome = StorageCommitOutcome.Committed;
     }
 
     private void PutRawCore(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool isTombstone)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
-        if (isTombstone)
+        WriteOutcome = StorageCommitOutcome.NotCommitted;
+        try
         {
-            _wal?.AppendDeleteRaw(key);
+            if (isTombstone)
+            {
+                _wal?.AppendDeleteRaw(key);
+            }
+            else
+            {
+                _wal?.AppendRaw(key, value);
+            }
         }
-        else
+        catch
         {
-            _wal?.AppendRaw(key, value);
+            WriteOutcome = _wal!.AppendOutcome;
+            throw;
         }
 
+        WriteOutcome = StorageCommitOutcome.Indeterminate;
+        _faultInjector?.Invoke(StorageFaultPoint.BatchBeforeApply);
         ApplyRaw(key, value, isTombstone);
+        _faultInjector?.Invoke(StorageFaultPoint.BatchAfterApplyEntry);
+        WriteOutcome = StorageCommitOutcome.Committed;
     }
 
     private void ApplyRaw(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool isTombstone)
@@ -374,15 +403,21 @@ internal sealed class MemTable : IMemTable, IRawBytesMemTable
 
     private void DisposeInternal()
     {
-        _arena.Dispose();
+        _arena?.Dispose();
 
         var records = _records;
         _records = [];
-        ArrayPool<MemTableRecord>.Shared.Return(records);
+        if (records is not null)
+        {
+            ArrayPool<MemTableRecord>.Shared.Return(records);
+        }
 
         var buckets = _buckets;
         _buckets = [];
-        ArrayPool<int>.Shared.Return(buckets);
+        if (buckets is not null)
+        {
+            ArrayPool<int>.Shared.Return(buckets);
+        }
 
         if (_sortedIndices is not null)
         {

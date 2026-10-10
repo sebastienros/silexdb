@@ -22,7 +22,7 @@ internal class Compacter : IAsyncDisposable
 
     public void StartBackgroundFlush()
     {
-        if (_flushTimer == null || _flushTask != null)
+        if (_flushTimer == null || _flushTask != null || _storage.Health != StorageHealth.Healthy)
         {
             return;
         }
@@ -55,12 +55,17 @@ internal class Compacter : IAsyncDisposable
         {
             while (await _flushTimer.WaitForNextTickAsync(cancellationToken))
             {
-                await RunMaintenanceAsync(cancellationToken);
+                // Stop cancels the timer, but drains an already-started structural change.
+                await RunMaintenanceAsync(CancellationToken.None);
             }
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             // Ignore as this is thrown when the LsmStorage is closed.
+        }
+        catch (Exception exception)
+        {
+            _storage.MarkFaulted(exception);
         }
     }
 
