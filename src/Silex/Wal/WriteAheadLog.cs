@@ -44,24 +44,44 @@ internal sealed class WriteAheadLog : IDisposable
     private readonly bool _syncToDisk;
     private readonly PooledArrayBufferWriter<byte> _buffer;
     private bool _disposed;
+    private readonly Action<StorageFaultPoint>? _faultInjector;
+    internal StorageCommitOutcome AppendOutcome { get; private set; }
 
     internal int RecordWriteCount { get; private set; }
     internal int DiskFlushCount { get; private set; }
 
-    public WriteAheadLog(string path, bool syncToDisk)
+    public WriteAheadLog(string path, bool syncToDisk, Action<StorageFaultPoint>? faultInjector = null)
     {
         // FileShare.Delete lets the file be deleted while this writer handle is still open (used on
         // clean flush). FileShare.Read lets recovery read the file concurrently if needed.
         _stream = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.Read | FileShare.Delete, bufferSize: 1, FileOptions.SequentialScan);
         _syncToDisk = syncToDisk;
-        _buffer = new PooledArrayBufferWriter<byte>(256);
-
-        Span<byte> header = stackalloc byte[FileHeaderSize];
-        header.Clear();
-        FileSignature.CopyTo(header);
-        header[VersionOffset] = CurrentVersion;
-        BinaryPrimitives.WriteUInt32LittleEndian(header[HeaderCrcOffset..], Crc32C.Compute(header[..HeaderCrcOffset]));
-        _stream.Write(header);
+        _faultInjector = faultInjector;
+        try
+        {
+            _buffer = new PooledArrayBufferWriter<byte>(256);
+            Span<byte> header = stackalloc byte[FileHeaderSize];
+            header.Clear();
+            FileSignature.CopyTo(header);
+            header[VersionOffset] = CurrentVersion;
+            BinaryPrimitives.WriteUInt32LittleEndian(header[HeaderCrcOffset..], Crc32C.Compute(header[..HeaderCrcOffset]));
+            if (_faultInjector is null)
+            {
+                _stream.Write(header);
+            }
+            else
+            {
+                _stream.Write(header[..FileSignature.Length]);
+                _faultInjector.Invoke(StorageFaultPoint.WalDuringHeaderWrite);
+                _stream.Write(header[FileSignature.Length..]);
+            }
+        }
+        catch
+        {
+            _buffer?.Dispose();
+            _stream.Dispose();
+            throw;
+        }
     }
 
     /// <summary>
@@ -136,15 +156,15 @@ internal sealed class WriteAheadLog : IDisposable
     /// A torn trailing frame (from a crash in the middle of an append) is tolerated and stops replay.
     /// An intact frame with a bad checksum or malformed contents throws <see cref="InvalidDataException"/>.
     /// </summary>
-    public static void Replay(string path, IMemTable target)
+    public static void Replay(string path, IMemTable target, Action<StorageFaultPoint>? faultInjector = null)
     {
-        ReplayCore(path, target);
+        ReplayCore(path, target, faultInjector);
     }
 
     // Returns true only when replay stopped at an incomplete, uncommitted tail.
     internal static bool Verify(string path) => ReplayCore(path, target: null);
 
-    private static bool ReplayCore(string path, IMemTable? target)
+    private static bool ReplayCore(string path, IMemTable? target, Action<StorageFaultPoint>? faultInjector = null)
     {
         // Windows sharing is symmetric: the reader must grant write sharing to an open WAL writer.
         using var stream = new FileStream(
@@ -164,11 +184,12 @@ internal sealed class WriteAheadLog : IDisposable
         var bytes = GC.AllocateUninitializedArray<byte>(length);
         stream.ReadExactly(bytes);
 
-        return ReplayFramed(path, bytes.AsMemory(), target);
+        return ReplayFramed(path, bytes.AsMemory(), target, faultInjector);
     }
 
     private EncoderBinaryWriter StartFrame(int recordCount)
     {
+        AppendOutcome = StorageCommitOutcome.NotCommitted;
         _buffer.Reset();
         _buffer.Advance(FrameHeaderSize);
 
@@ -193,13 +214,29 @@ internal sealed class WriteAheadLog : IDisposable
         BinaryPrimitives.WriteUInt32LittleEndian(frame[sizeof(uint)..], ~payloadLength);
         BinaryPrimitives.WriteUInt32LittleEndian(frame[(2 * sizeof(uint))..], Crc32C.Compute(payload));
 
-        _stream.Write(frame);
+        _faultInjector?.Invoke(StorageFaultPoint.WalBeforeWrite);
+        AppendOutcome = StorageCommitOutcome.Indeterminate;
+        if (_faultInjector is null)
+        {
+            _stream.Write(frame);
+        }
+        else
+        {
+            var midpoint = frame.Length / 2;
+            _stream.Write(frame[..midpoint]);
+            _faultInjector.Invoke(StorageFaultPoint.WalDuringWrite);
+            _stream.Write(frame[midpoint..]);
+        }
+        _faultInjector?.Invoke(StorageFaultPoint.WalAfterWrite);
         RecordWriteCount++;
         if (_syncToDisk)
         {
+            _faultInjector?.Invoke(StorageFaultPoint.WalBeforeSync);
             _stream.Flush(flushToDisk: true);
+            _faultInjector?.Invoke(StorageFaultPoint.WalAfterSync);
             DiskFlushCount++;
         }
+        AppendOutcome = StorageCommitOutcome.Committed;
     }
 
     private static void WriteRawRecord(
@@ -214,7 +251,7 @@ internal sealed class WriteAheadLog : IDisposable
         writer.WriteRaw(value);
     }
 
-    private static bool ReplayFramed(string path, ReadOnlyMemory<byte> content, IMemTable? target)
+    private static bool ReplayFramed(string path, ReadOnlyMemory<byte> content, IMemTable? target, Action<StorageFaultPoint>? faultInjector)
     {
         var bytes = content.Span;
         if (bytes.Length < FileHeaderSize)
@@ -295,14 +332,14 @@ internal sealed class WriteAheadLog : IDisposable
                 throw new InvalidDataException($"WAL '{path}' has a checksum mismatch at offset {offset}.");
             }
 
-            ReplayFrame(path, offset, payload, target);
+            ReplayFrame(path, offset, payload, target, faultInjector);
             offset = footerOffset + FrameFooterSize;
         }
 
         return false;
     }
 
-    private static void ReplayFrame(string path, int frameOffset, ReadOnlyMemory<byte> payload, IMemTable? target)
+    private static void ReplayFrame(string path, int frameOffset, ReadOnlyMemory<byte> payload, IMemTable? target, Action<StorageFaultPoint>? faultInjector)
     {
         try
         {
@@ -329,6 +366,7 @@ internal sealed class WriteAheadLog : IDisposable
                 for (var i = 0; i < (int)recordCount; i++)
                 {
                     ReplayRecord(ref reader, target);
+                    faultInjector?.Invoke(StorageFaultPoint.RecoveryAfterApplyEntry);
                 }
             }
         }
@@ -385,8 +423,15 @@ internal sealed class WriteAheadLog : IDisposable
 
         // Close the handle but keep the file: deletion is the caller's responsibility and only happens
         // once the data is durable elsewhere (flushed to an SST) or on a clean shutdown.
-        _stream.Flush(_syncToDisk);
-        _stream.Dispose();
-        _buffer.Dispose();
+        // Appends are unbuffered and have already reached their requested synchronization boundary.
+        // In particular, cleanup of a faulted writer must not retry a failed disk synchronization.
+        try
+        {
+            _stream.Dispose();
+        }
+        finally
+        {
+            _buffer.Dispose();
+        }
     }
 }

@@ -160,6 +160,11 @@ public sealed partial class LsmStorage : IDisposable, IAsyncDisposable
         {
             cancellationToken.ThrowIfCancellationRequested();
             await _compacter.CloseAsync(cancellationToken);
+            if (_inner.Health == StorageHealth.Faulted)
+            {
+                _inner.Dispose();
+                return;
+            }
             _inner.ForceFreezeMemTable();
 
             while (!_inner._state.ImmutableMemTables.IsEmpty)
@@ -180,6 +185,7 @@ public sealed partial class LsmStorage : IDisposable, IAsyncDisposable
         private void CheckDisposed()
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
+            _inner.CheckHealthy();
         }
     }
 
@@ -342,6 +348,7 @@ public sealed partial class LsmStorage : IDisposable, IAsyncDisposable
             // Recover memtables that hadn't been flushed when the previous process exited. Memtables are
             // flushed oldest-id-first, so any WAL without a matching committed SST is newer than every loaded
             // SST; enqueuing them oldest-first (reads reverse the queue) preserves recency above L0.
+            HashSet<long>? emptyWalIds = null;
             if (options.UseWriteAheadLog && walFiles.Count > 0)
             {
                 var recovered = new List<IMemTable>();
@@ -361,7 +368,8 @@ public sealed partial class LsmStorage : IDisposable, IAsyncDisposable
                         {
                             try
                             {
-                                WriteAheadLog.Replay(filename, memTable);
+                                options.FaultInjector?.Invoke(StorageFaultPoint.RecoveryBeforeReplay);
+                                WriteAheadLog.Replay(filename, memTable, options.FaultInjector);
                             }
                             catch (Exception exception) when (salvageReport != null && IsCorruption(exception)
                                 && salvageReport.Issues.Any(issue => issue.Path == filename && issue.Kind == StorageIntegrityIssueKind.CorruptWal))
@@ -369,7 +377,16 @@ public sealed partial class LsmStorage : IDisposable, IAsyncDisposable
                                 // Verification reports this corruption; retain only the valid prefix.
                             }
 
-                            recovered.Add(memTable);
+                            if (memTable.Count == 0)
+                            {
+                                // A header-only or torn first frame has no data to flush into an SST.
+                                (emptyWalIds ??= []).Add(id.Value);
+                                memTable.Dispose();
+                            }
+                            else
+                            {
+                                recovered.Add(memTable);
+                            }
                         }
                         catch
                         {
@@ -413,7 +430,7 @@ public sealed partial class LsmStorage : IDisposable, IAsyncDisposable
 
                 foreach (var (filename, id) in walFiles)
                 {
-                    if (committedSstIds.Contains(id!.Value))
+                    if (committedSstIds.Contains(id!.Value) || emptyWalIds?.Contains(id.Value) == true)
                     {
                         TryDeleteFile(filename);
                     }
@@ -470,6 +487,28 @@ public sealed partial class LsmStorage : IDisposable, IAsyncDisposable
     private readonly Compacter _compacter;
     private bool _disposed;
 
+    /// <summary>The health of this instance. A faulted instance must be disposed and reopened.</summary>
+    public StorageHealth Health => _disposed ? StorageHealth.Disposed : _inner.Health;
+
+    /// <summary>The first unsafe failure, or null if no failure has faulted the instance.</summary>
+    public Exception? Fault => _inner.Fault;
+
+    internal void CheckHealthy() => CheckDisposed();
+
+    internal void BeforeMvccPublication()
+    {
+        try
+        {
+            _inner.FaultInjector?.Invoke(StorageFaultPoint.MvccBeforePublication);
+        }
+        catch (Exception exception)
+        {
+            var failure = new StorageOperationException(StorageCommitOutcome.Committed, exception);
+            _inner.MarkFaulted(failure);
+            throw failure;
+        }
+    }
+
     private LsmStorage(LsmStorageInner inner, Compacter compacter)
     {
         _inner = inner;
@@ -494,6 +533,8 @@ public sealed partial class LsmStorage : IDisposable, IAsyncDisposable
     /// <remarks>
     /// The call returns only after the frame has reached the operating system, or stable storage when
     /// <see cref="StorageOptions.SyncWriteAheadLogToDisk"/> is enabled.
+    /// A failure does not imply that nothing committed: inspect <see cref="StorageOperationException.Outcome"/>.
+    /// Faulted instances reject further operations and must be disposed and reopened.
     /// </remarks>
     public void Write(LsmWriteBatch batch)
     {
@@ -690,6 +731,12 @@ public sealed partial class LsmStorage : IDisposable, IAsyncDisposable
 
         await _compacter.CloseAsync(cancellationToken);
 
+        if (_inner.Health == StorageHealth.Faulted)
+        {
+            _inner.Dispose();
+            return;
+        }
+
         _inner.ForceFreezeMemTable();
 
         while (!_inner._state.ImmutableMemTables.IsEmpty)
@@ -704,5 +751,6 @@ public sealed partial class LsmStorage : IDisposable, IAsyncDisposable
     private void CheckDisposed()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        _inner.CheckHealthy();
     }
 }

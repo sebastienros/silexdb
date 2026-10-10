@@ -113,6 +113,68 @@ batch.Delete("user:2"u8);
 db.Write(batch);
 ```
 
+### Operation failures and instance health
+
+Successful `Put`, `Delete`, `Write`, and MVCC commits apply the entire mutation and reach the
+configured WAL boundary. `UseWriteAheadLog = true` writes a complete recovery frame to the operating
+system; `SyncWriteAheadLogToDisk = true` additionally requests disk synchronization. With WAL disabled,
+success guarantees visibility, not crash durability. These are not guarantees against hardware,
+filesystem, or media failure, and process-crash tests do not certify power-loss safety.
+
+Mutation failures originating inside the write engine throw `StorageOperationException`, preserving
+the original exception in `InnerException`. Inspect `Outcome` and `Health`, not just the exception type:
+
+| Failure boundary | Outcome | Instance |
+|---|---|---|
+| Argument validation, caller-side encoding/batch preparation, MVCC conflict, or cancellation before committing starts | Definitely not committed; original validation/cancellation exception, or `false` for `TryCommitAsync` conflicts | Healthy |
+| WAL frame preparation fails before any frame bytes are submitted | `NotCommitted` | Healthy |
+| WAL write starts and fails (including disk full or a torn write), or synchronization fails | `Indeterminate` | Faulted |
+| In-memory mutation/batch application fails after WAL persistence, or while applying with WAL disabled | `Indeterminate`; memory may contain only part of the batch | Faulted |
+| The entire mutation reaches its boundary, but subsequent publication or automatic memtable rotation fails | `Committed`; for MVCC, the persisted sequence may not yet be published to readers in this instance | Faulted |
+
+`Indeterminate` is deliberately conservative: recovery may apply the entire WAL frame, or discard an
+incomplete trailing frame. It never means "nothing committed." A complete checksummed batch frame is
+replayed as a whole when recovery succeeds; failed recovery returns no usable instance. With WAL
+disabled, unflushed changes can be lost on reopening. Batches must not be mutated concurrently with
+`Write`. Deduplication, retry safety, and request identity belong to callers; never blindly retry an
+indeterminate mutation.
+
+`LsmStorage.Health` and `MvccStorage.Health` report `Healthy`, `Faulted`, or `Disposed`; `Fault` retains
+the first unsafe failure. Faulting is permanent for that instance. New reads, writes, snapshots,
+transactions, scans, and maintenance reject it with `StorageFaultedException`. Operations already in
+flight may finish; readers waiting for mutable-table access check health before reading, so they cannot
+observe a failed batch's partial application. Health inspection and disposal remain available. Health is
+an operational state, not an integrity certification: an explicitly salvaged store is usable only for
+read-only extraction and still requires inspection of its incomplete `RecoveryReport`.
+
+Cancellation before an MVCC commit's final write begins throws `OperationCanceledException` and does
+not commit. Once writing starts, cancellation is not polled: completion reports the actual write
+result rather than a misleading cancellation. The synchronous byte-store mutations do not accept a
+cancellation token.
+
+Flush/compaction failures do not undo previously acknowledged writes. Cancellation before maintenance
+starts (including while waiting for its serialization lock) leaves the instance healthy. Once maintenance
+starts, any exception, including cancellation, conservatively faults the instance and requires reopening;
+the exception itself is propagated to the caller. Background maintenance records failures in `Fault` and
+stops instead of silently continuing. Stopping the background loop drains an already-started maintenance
+operation rather than canceling it halfway through.
+
+Read cancellation or an exception in a caller's read callback makes no mutations and does not fault the
+instance. `CollectGarbageAsync` performs individual deletions, not one atomic transaction: cancellation
+can leave a successfully committed prefix of its work while the instance remains healthy. Its optional
+flush/compaction phase follows the structural-maintenance contract above.
+
+Dispose a faulted instance before reopening the same directory. Faulted disposal stops background work
+and releases resources **without flushing partial memory, retrying WAL synchronization, publishing a new
+manifest, or deleting recovery files**. Reopening resolves recoverable WAL/manifest state; if it fails,
+restore or use explicit integrity/salvage tooling instead of treating the instance as healthy. A failed
+`CloseAsync` can fault the instance; subsequent disposal performs this recovery-preserving cleanup.
+If creation of the next WAL fails during its header write, the valid header prefix contains no mutations:
+strict recovery treats it as an incomplete tail, retains earlier committed WAL frames, and removes the
+empty WAL only after opening succeeds. Invalid signatures or corrupt complete headers remain errors.
+Lifecycle races and multi-process directory ownership are not strengthened by this contract: applications
+must stop accepting work and drain operations before disposal.
+
 ## Supported key and value helpers
 
 The core store accepts `ReadOnlySpan<byte>` and copies keys and values into memtable-owned arena blocks.
@@ -289,7 +351,7 @@ call `CollectGarbageAsync` periodically to remove versions that no active view c
 
 ## Closing the store
 
-Always close the store to flush in-memory data to disk and stop the background compaction/flush threads.
+Always close the store to flush healthy in-memory data to disk and stop background maintenance.
 `CloseAsync`, `DisposeAsync`, and `Dispose` are equivalent — call one:
 
 ```csharp
@@ -300,8 +362,10 @@ await db.DisposeAsync();
 await using var db = await LsmStorage.OpenAsync("my-db", options);
 ```
 
-There is no finalizer: durability is provided solely by deterministic disposal. An undisposed store
-leaks no native handles, but any data still buffered in memory is not flushed.
+WAL-enabled writes reach their configured durability boundary before returning, independently of clean
+shutdown. Deterministic disposal is still required to release resources and flush healthy memtables into
+SSTs; with WAL disabled, unflushed memory is not crash-durable. Faulted instances are closed without
+flushing, preserving their recovery evidence as described above.
 
 ## Configuration
 

@@ -44,6 +44,10 @@ public sealed class MvccStorage : IAsyncDisposable
     /// </summary>
     public long PublishedSequence => Volatile.Read(ref _publishedSequence);
 
+    public StorageHealth Health => Volatile.Read(ref _disposeState) != 0 ? StorageHealth.Disposed : _storage.Health;
+
+    public Exception? Fault => _storage.Fault;
+
     /// <summary>
     /// Opens or creates an MVCC database.
     /// </summary>
@@ -340,6 +344,12 @@ public sealed class MvccStorage : IAsyncDisposable
         {
             await _storage.DisposeAsync().ConfigureAwait(false);
         }
+        catch when (_storage.Health == StorageHealth.Faulted)
+        {
+            // Shutdown itself can fault the store; the facade cannot be disposed a second time.
+            await _storage.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
         finally
         {
             _commitGate.Release();
@@ -442,7 +452,9 @@ public sealed class MvccStorage : IAsyncDisposable
             }
 
             WriteSequence(batch, _publishedSequenceKey, sequence);
+            cancellationToken.ThrowIfCancellationRequested();
             _storage.Write(batch);
+            _storage.BeforeMvccPublication();
             _allocatedSequence = sequence;
             Volatile.Write(ref _publishedSequence, sequence);
             return true;
@@ -481,6 +493,7 @@ public sealed class MvccStorage : IAsyncDisposable
         WriteVersion(batch, key, value, isTombstone, sequence);
         WriteSequence(batch, _publishedSequenceKey, sequence);
         _storage.Write(batch);
+        _storage.BeforeMvccPublication();
         _allocatedSequence = sequence;
         Volatile.Write(ref _publishedSequence, sequence);
     }
@@ -868,6 +881,7 @@ public sealed class MvccStorage : IAsyncDisposable
     private void CheckDisposed()
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposeState) != 0, this);
+        _storage.CheckHealthy();
     }
 
     private interface IValueSink

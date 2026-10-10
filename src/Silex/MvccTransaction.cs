@@ -93,6 +93,11 @@ public sealed class MvccTransaction : IDisposable
     /// Attempts to commit all buffered writes atomically.
     /// </summary>
     /// <returns><c>false</c> when a tracked or written key changed after this transaction started.</returns>
+    /// <remarks>
+    /// Cancellation is observed before the final write starts. Once writing starts, it completes without
+    /// polling cancellation. A <see cref="StorageOperationException"/> can report an indeterminate or
+    /// committed outcome even though this call throws; inspect the owning store's health before retrying.
+    /// </remarks>
     public async ValueTask<bool> TryCommitAsync(CancellationToken cancellationToken = default)
     {
         var storage = GetStorage();

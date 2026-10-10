@@ -36,6 +36,22 @@ internal sealed class LsmStorageInner : IDisposable
 
     internal StorageState _state;
     private bool _disposed;
+    private Exception? _fault;
+    internal Action<StorageFaultPoint>? FaultInjector { get; }
+    internal StorageHealth Health => _disposed ? StorageHealth.Disposed
+        : Volatile.Read(ref _fault) is null ? StorageHealth.Healthy : StorageHealth.Faulted;
+    internal Exception? Fault => Volatile.Read(ref _fault);
+
+    internal void CheckHealthy()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (Volatile.Read(ref _fault) is { } fault)
+        {
+            throw new StorageFaultedException(fault);
+        }
+    }
+
+    internal void MarkFaulted(Exception cause) => Interlocked.CompareExchange(ref _fault, cause, null);
     private readonly IBlockEncoder _blockEncoder;
     private readonly ISsTableEncoder _ssTableEncoder;
     private readonly ISsTableBuilderFactory _ssTableBuilderFactory;
@@ -63,6 +79,9 @@ internal sealed class LsmStorageInner : IDisposable
     private readonly IBlockEncoderFactory _blockEncoderFactory;
     private readonly ISsTableEncoderFactory _ssTableEncoderFactory;
     private SsTable[]? _sortedSsTableRun;
+    private SsTable? _pendingTable;
+    private List<SsTable>? _pendingCompactionInputs;
+    private List<SsTable>? _pendingCompactionOutputs;
 
     // Below this many overlapping L0 SSTs a point lookup probes them sequentially newest-first (the
     // short-circuit is optimal when the key lives in a recent table). Past it, and when read parallelism is
@@ -81,6 +100,7 @@ internal sealed class LsmStorageInner : IDisposable
     internal LsmStorageInner(string path, StorageOptions options, bool readOnly = false)
     {
         StoragePath = path;
+        FaultInjector = options.FaultInjector;
         _useWriteAheadLog = options.UseWriteAheadLog && !readOnly;
         _syncWriteAheadLogToDisk = options.SyncWriteAheadLogToDisk;
         _compactionStrategy = options.CompactionStrategy;
@@ -135,6 +155,7 @@ internal sealed class LsmStorageInner : IDisposable
 
         try
         {
+            CheckHealthy();
             currentMemTable = _state.CurrentMemTable;
             immutableMemTables = _state.ImmutableMemTables;
 
@@ -474,6 +495,7 @@ internal sealed class LsmStorageInner : IDisposable
     /// </remarks>
     public async ValueTask<long> ScanRawAsync<TArg>(TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries = long.MaxValue, CancellationToken cancellationToken = default)
     {
+        CheckHealthy();
         ArgumentNullException.ThrowIfNull(reader);
         ArgumentOutOfRangeException.ThrowIfNegative(maxEntries);
 
@@ -544,6 +566,7 @@ internal sealed class LsmStorageInner : IDisposable
 
     public async ValueTask<long> SeekRawAsync<TArg>(ReadOnlyMemory<byte> from, TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries = long.MaxValue, CancellationToken cancellationToken = default)
     {
+        CheckHealthy();
         ArgumentNullException.ThrowIfNull(reader);
         ArgumentOutOfRangeException.ThrowIfNegative(maxEntries);
 
@@ -709,6 +732,7 @@ internal sealed class LsmStorageInner : IDisposable
 
     private bool TryGetGloballySortedSsTableRun(out IReadOnlyList<SsTable> tables)
     {
+        CheckHealthy();
         var cached = Volatile.Read(ref _sortedSsTableRun);
         if (cached != null)
         {
@@ -720,6 +744,7 @@ internal sealed class LsmStorageInner : IDisposable
 
         try
         {
+            CheckHealthy();
             var state = _state;
 
             if (state.CurrentMemTable.Count != 0 || !state.ImmutableMemTables.IsEmpty)
@@ -793,6 +818,7 @@ internal sealed class LsmStorageInner : IDisposable
 
         try
         {
+            CheckHealthy();
             var state = _state;
             immutableMemTables = state.ImmutableMemTables;
             var tableCount = state.LevelZeroTables.Count;
@@ -908,6 +934,7 @@ internal sealed class LsmStorageInner : IDisposable
 
         try
         {
+            CheckHealthy();
             currentMemTable = _state.CurrentMemTable;
             immutableMemTables = _state.ImmutableMemTables;
 
@@ -1102,47 +1129,12 @@ internal sealed class LsmStorageInner : IDisposable
 
     public void Put(ByteSlice key, ByteSlice value)
     {
-        _currentMemTableLock.EnterWriteLock();
-
-        try
-        {
-            _state.CurrentMemTable.Put(key, value);
-            InvalidateSortedSsTableRun();
-
-            if (_state.CurrentMemTable.Size >= _memTableSizeLimit)
-            {
-                FreezeMemTable();
-            }
-        }
-        finally
-        {
-            _currentMemTableLock.ExitWriteLock();
-        }
+        WriteCore(key.Span, value.Span, value.IsTombstone, null);
     }
 
     public void PutRaw(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
     {
-        if (typeof(ByteSlice) != typeof(ByteSlice) || typeof(ByteSlice) != typeof(ByteSlice))
-        {
-            throw new InvalidOperationException("Raw byte inserts are only supported by byte-oriented stores.");
-        }
-
-        _currentMemTableLock.EnterWriteLock();
-
-        try
-        {
-            ((IRawBytesMemTable)_state.CurrentMemTable).PutRaw(key, value);
-            InvalidateSortedSsTableRun();
-
-            if (_state.CurrentMemTable.Size >= _memTableSizeLimit)
-            {
-                FreezeMemTable();
-            }
-        }
-        finally
-        {
-            _currentMemTableLock.ExitWriteLock();
-        }
+        WriteCore(key, value, false, null);
     }
 
     /// <summary>
@@ -1151,62 +1143,63 @@ internal sealed class LsmStorageInner : IDisposable
     /// <param name="key"></param>
     public void Delete(ByteSlice key)
     {
-        _currentMemTableLock.EnterWriteLock();
-
-        try
-        {
-            _state.CurrentMemTable.Put(key, ByteSlice.Tombstone);
-            InvalidateSortedSsTableRun();
-
-            if (_state.CurrentMemTable.Size >= _memTableSizeLimit)
-            {
-                FreezeMemTable();
-            }
-        }
-        finally
-        {
-            _currentMemTableLock.ExitWriteLock();
-        }
+        WriteCore(key.Span, default, true, null);
     }
 
     public void DeleteRaw(ReadOnlySpan<byte> key)
     {
-        _currentMemTableLock.EnterWriteLock();
-
-        try
-        {
-            ((IRawBytesMemTable)_state.CurrentMemTable).DeleteRaw(key);
-            InvalidateSortedSsTableRun();
-
-            if (_state.CurrentMemTable.Size >= _memTableSizeLimit)
-            {
-                FreezeMemTable();
-            }
-        }
-        finally
-        {
-            _currentMemTableLock.ExitWriteLock();
-        }
+        WriteCore(key, default, true, null);
     }
 
     public void WriteBatch(LsmWriteBatch batch)
     {
         ArgumentNullException.ThrowIfNull(batch);
+        CheckHealthy();
         if (batch.Count == 0)
         {
             return;
         }
 
+        WriteCore(default, default, false, batch);
+    }
+
+    private void WriteCore(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool isTombstone, LsmWriteBatch? batch)
+    {
         _currentMemTableLock.EnterWriteLock();
 
         try
         {
-            ((MemTable)_state.CurrentMemTable).WriteBatch(batch);
-            InvalidateSortedSsTableRun();
-
-            if (_state.CurrentMemTable.Size >= _memTableSizeLimit)
+            CheckHealthy();
+            var memTable = (MemTable)_state.CurrentMemTable;
+            try
             {
-                FreezeMemTable();
+                if (batch is not null)
+                {
+                    memTable.WriteBatch(batch);
+                }
+                else if (isTombstone)
+                {
+                    memTable.DeleteRaw(key);
+                }
+                else
+                {
+                    memTable.PutRaw(key, value);
+                }
+                FaultInjector?.Invoke(StorageFaultPoint.WriteBeforePublication);
+                InvalidateSortedSsTableRun();
+                if (memTable.Size >= _memTableSizeLimit)
+                {
+                    FreezeMemTable();
+                }
+            }
+            catch (Exception exception)
+            {
+                var failure = new StorageOperationException(memTable.WriteOutcome, exception);
+                if (failure.Outcome != StorageCommitOutcome.NotCommitted)
+                {
+                    MarkFaulted(failure);
+                }
+                throw failure;
             }
         }
         finally
@@ -1241,7 +1234,17 @@ internal sealed class LsmStorageInner : IDisposable
 
         try
         {
+            CheckHealthy();
+            if (_state.CurrentMemTable.Size == 0)
+            {
+                return;
+            }
             FreezeMemTable();
+        }
+        catch (Exception exception) when (exception is not StorageFaultedException)
+        {
+            MarkFaulted(exception);
+            throw;
         }
         finally
         {
@@ -1254,6 +1257,8 @@ internal sealed class LsmStorageInner : IDisposable
     /// </summary>
     public async Task ForceFlushNextImmutableMemTableAsync(CancellationToken cancellationToken = default)
     {
+        CheckHealthy();
+        cancellationToken.ThrowIfCancellationRequested();
         if (_state.ImmutableMemTables.IsEmpty)
         {
             return;
@@ -1264,6 +1269,7 @@ internal sealed class LsmStorageInner : IDisposable
 
         try
         {
+            CheckHealthy();
             IMemTable memTableToFlush;
 
             _immutableMemTablesLock.EnterReadLock();
@@ -1286,6 +1292,7 @@ internal sealed class LsmStorageInner : IDisposable
             }
 
             var sstFilename = GetSstPath(memTableToFlush.Id);
+            FaultInjector?.Invoke(StorageFaultPoint.FlushBeforeBuild);
             using var builder = _ssTableBuilderFactory.CreateSsTableBuilder(
                 sstFilename,
                 _ssTableEncoder,
@@ -1298,13 +1305,17 @@ internal sealed class LsmStorageInner : IDisposable
             await memTableToFlush.FlushAsync(builder, cancellationToken);
 
             var ssTable = await builder.BuildAsync(cancellationToken);
+            _pendingTable = ssTable;
 
             Manifest manifest;
+            var removed = false;
 
+            FaultInjector?.Invoke(StorageFaultPoint.FlushBeforeInstall);
             await _level0Lock.EnterWriteLockAsync(cancellationToken);
 
             try
             {
+                CheckHealthy();
                 // Atomic, scan-visible transition: drop the MemTable from the immutable array and publish its
                 // SST into L0 under the same level0 write lock. A scan holding the level0 read lock therefore
                 // always sees the data in exactly one place (the immutable MemTable or the L0 SST), never neither.
@@ -1314,6 +1325,7 @@ internal sealed class LsmStorageInner : IDisposable
                 {
                     var dequeued = _state.ImmutableMemTables[0];
                     _state.ImmutableMemTables = _state.ImmutableMemTables.RemoveAt(0);
+                    removed = true;
                     Debug.Assert(ReferenceEquals(dequeued, memTableToFlush));
                 }
                 finally
@@ -1327,18 +1339,27 @@ internal sealed class LsmStorageInner : IDisposable
                 // Snapshot the new structure while the lock is held so the persisted manifest exactly matches
                 // the installed state. The (small) JSON is written to disk after releasing the lock.
                 manifest = BuildManifestSnapshot();
+                FaultInjector?.Invoke(StorageFaultPoint.FlushAfterInstall);
+            }
+            catch (Exception exception)
+            {
+                MarkFaulted(exception);
+                throw;
             }
             finally
             {
                 _level0Lock.ExitWriteLock();
 
-                memTableToFlush.Dispose();
+                if (removed)
+                {
+                    memTableToFlush.Dispose();
+                }
             }
 
             // The manifest rewrite is the durable commit point and must happen before the WAL is deleted: a
             // crash before it leaves the WAL to be replayed on open (the not-yet-committed SST is cleaned up
             // as an orphan), and a crash after it leaves a committed SST whose WAL recovery correctly drops.
-            manifest.Write(StoragePath);
+            WriteManifest(manifest);
 
             // The data is now durable in an SST and visible in L0, and the memtable (and its WAL handle)
             // is disposed: the write-ahead log is obsolete and can be removed. If a crash happens before
@@ -1346,6 +1367,12 @@ internal sealed class LsmStorageInner : IDisposable
             // durable and committed to the manifest but before the delete, recovery sees the
             // matching SST and drops the stale WAL.
             DeleteWal(memTableToFlush.Id);
+            ClearMaintenanceOwnership();
+        }
+        catch (Exception exception)
+        {
+            MarkFaulted(exception);
+            throw;
         }
         finally
         {
@@ -1412,6 +1439,8 @@ internal sealed class LsmStorageInner : IDisposable
     /// </remarks>
     public async Task<bool> TryTieredCompactionAsync(CancellationToken cancellationToken = default)
     {
+        CheckHealthy();
+        cancellationToken.ThrowIfCancellationRequested();
         if (_compactionStrategy != CompactionStrategy.Tiered)
         {
             return false;
@@ -1423,6 +1452,7 @@ internal sealed class LsmStorageInner : IDisposable
 
         try
         {
+            CheckHealthy();
             // Snapshot the tier list while briefly holding the read lock. The maintenance lock already
             // excludes flush/compaction, so the snapshot stays valid through the merge below.
             List<SsTable> tiers;
@@ -1479,6 +1509,7 @@ internal sealed class LsmStorageInner : IDisposable
             SsTable? output = null;
             var addedEntries = 0;
 
+            FaultInjector?.Invoke(StorageFaultPoint.CompactionBeforeBuild);
             using (var builder = _ssTableBuilderFactory.CreateSsTableBuilder(
                 outputPath,
                 _ssTableEncoder,
@@ -1513,6 +1544,7 @@ internal sealed class LsmStorageInner : IDisposable
                 if (addedEntries > 0)
                 {
                     output = await builder.BuildAsync(cancellationToken);
+                    _pendingTable = output;
                 }
             }
 
@@ -1522,10 +1554,13 @@ internal sealed class LsmStorageInner : IDisposable
             var installed = false;
             Manifest? manifest = null;
 
+            _pendingCompactionInputs = inputs;
+            FaultInjector?.Invoke(StorageFaultPoint.CompactionBeforeInstall);
             await _level0Lock.EnterWriteLockAsync(cancellationToken);
 
             try
             {
+                CheckHealthy();
                 var live = _state.LevelZeroTables;
 
                 // The maintenance lock guarantees the selected suffix is still the live tail; verify it at
@@ -1542,7 +1577,13 @@ internal sealed class LsmStorageInner : IDisposable
                     InvalidateSortedSsTableRun();
                     installed = true;
                     manifest = BuildManifestSnapshot();
+                    FaultInjector?.Invoke(StorageFaultPoint.CompactionAfterInstall);
                 }
+            }
+            catch (Exception exception)
+            {
+                MarkFaulted(exception);
+                throw;
             }
             finally
             {
@@ -1554,13 +1595,14 @@ internal sealed class LsmStorageInner : IDisposable
                 // The list changed unexpectedly: discard the output we built and leave the inputs in place.
                 output?.Dispose();
                 TryDeleteSstFile(outputPath);
+                ClearMaintenanceOwnership();
                 return false;
             }
 
             // The manifest is the durable commit point for the new tier list. Replaced inputs are only
             // disposed/deleted after it succeeds, so a crash before this write keeps the old manifest intact
             // and treats the uncommitted output as an orphan on recovery.
-            manifest!.Write(StoragePath);
+            WriteManifest(manifest!);
 
             // The inputs are no longer reachable by new readers and any in-flight reader finished before the
             // write lock was granted, so their handles can be closed.
@@ -1580,7 +1622,13 @@ internal sealed class LsmStorageInner : IDisposable
                 }
             }
 
+            ClearMaintenanceOwnership();
             return true;
+        }
+        catch (Exception exception)
+        {
+            MarkFaulted(exception);
+            throw;
         }
         finally
         {
@@ -1614,6 +1662,8 @@ internal sealed class LsmStorageInner : IDisposable
     /// </remarks>
     public async Task<bool> TryLeveledCompactionAsync(CancellationToken cancellationToken = default)
     {
+        CheckHealthy();
+        cancellationToken.ThrowIfCancellationRequested();
         if (_compactionStrategy != CompactionStrategy.Leveled)
         {
             return false;
@@ -1625,6 +1675,7 @@ internal sealed class LsmStorageInner : IDisposable
 
         try
         {
+            CheckHealthy();
             // Snapshot the structure while briefly holding the read lock. The maintenance lock already
             // excludes flush/compaction, so the snapshot stays valid through the merge below.
             List<SsTable> level0;
@@ -1657,6 +1708,11 @@ internal sealed class LsmStorageInner : IDisposable
             }
 
             return false;
+        }
+        catch (Exception exception)
+        {
+            MarkFaulted(exception);
+            throw;
         }
         finally
         {
@@ -1818,7 +1874,10 @@ internal sealed class LsmStorageInner : IDisposable
         mergeInputs.AddRange(sourceTables);
         mergeInputs.AddRange(overlapTargets);
 
+        FaultInjector?.Invoke(StorageFaultPoint.CompactionBeforeBuild);
         var outputs = await MergeIntoSplitSsTablesAsync(mergeInputs, dropTombstones, cancellationToken);
+        _pendingCompactionOutputs = outputs;
+        _pendingCompactionInputs = mergeInputs;
 
         // The new destination level: kept-before ++ freshly merged outputs ++ kept-after. This stays sorted
         // and non-overlapping because the consumed targets were a contiguous run and the outputs cover only
@@ -1842,10 +1901,12 @@ internal sealed class LsmStorageInner : IDisposable
         // references observes consistent collections.
         Manifest manifest;
 
+        FaultInjector?.Invoke(StorageFaultPoint.CompactionBeforeInstall);
         await _level0Lock.EnterWriteLockAsync(cancellationToken);
 
         try
         {
+            CheckHealthy();
             if (clearLevel0)
             {
                 // The maintenance lock guarantees L0 is unchanged since the snapshot; the whole of L0 was
@@ -1869,6 +1930,12 @@ internal sealed class LsmStorageInner : IDisposable
             Debug.Assert(IsSortedNonOverlapping(newTargetLevel), "leveled compaction produced an overlapping destination level");
 
             manifest = BuildManifestSnapshot();
+            FaultInjector?.Invoke(StorageFaultPoint.CompactionAfterInstall);
+        }
+        catch (Exception exception)
+        {
+            MarkFaulted(exception);
+            throw;
         }
         finally
         {
@@ -1880,7 +1947,7 @@ internal sealed class LsmStorageInner : IDisposable
         // as orphans on recovery), and a crash after it leaves committed outputs whose now-unreferenced
         // inputs recovery deletes as orphans. Because the manifest is authoritative, a failed delete here is
         // self-healing (the leftover file is an orphan on the next open), so no ordering guard is needed.
-        manifest.Write(StoragePath);
+        WriteManifest(manifest);
 
         var consumed = mergeInputs;
 
@@ -1890,6 +1957,7 @@ internal sealed class LsmStorageInner : IDisposable
             TryDeleteSstFile(input.Filename);
         }
 
+        ClearMaintenanceOwnership();
         return true;
     }
 
@@ -2259,13 +2327,22 @@ internal sealed class LsmStorageInner : IDisposable
     /// </summary>
     private MemTable CreateCurrentMemTable(long id)
     {
+        FaultInjector?.Invoke(StorageFaultPoint.MemTableBeforeCreate);
         if (!_useWriteAheadLog)
         {
-            return new MemTable(id, arenaBlockSize: _memTableArenaBlockSize);
+            return new MemTable(id, arenaBlockSize: _memTableArenaBlockSize, faultInjector: FaultInjector);
         }
 
-        var wal = new WriteAheadLog(GetWalPath(id), _syncWriteAheadLogToDisk);
-        return new MemTable(id, wal, _memTableArenaBlockSize);
+        var wal = new WriteAheadLog(GetWalPath(id), _syncWriteAheadLogToDisk, FaultInjector);
+        try
+        {
+            return new MemTable(id, wal, _memTableArenaBlockSize, FaultInjector);
+        }
+        catch
+        {
+            wal.Dispose();
+            throw;
+        }
     }
 
     /// <summary>
@@ -2316,11 +2393,14 @@ internal sealed class LsmStorageInner : IDisposable
 
     public IStorageIterator CreateIterator()
     {
+        CheckHealthy();
         return new LsmStorageIterator(this);
     }
 
     public async Task FlushAndCompactAsync(CancellationToken cancellationToken = default)
     {
+        CheckHealthy();
+        cancellationToken.ThrowIfCancellationRequested();
         ForceFreezeMemTable();
 
         while (!_state.ImmutableMemTables.IsEmpty)
@@ -2354,13 +2434,10 @@ internal sealed class LsmStorageInner : IDisposable
         {
             var _previousMemTable = _state.CurrentMemTable;
 
-            _state = new StorageState
-            {
-                CurrentMemTable = CreateCurrentMemTable(IdGenerator.GetNextId()),
-                ImmutableMemTables = _state.ImmutableMemTables.Add(_previousMemTable),
-                LevelZeroTables = _state.LevelZeroTables,
-                LeveledSsTables = _state.LeveledSsTables
-            };
+            var immutable = _state.ImmutableMemTables.Add(_previousMemTable);
+            var current = CreateCurrentMemTable(IdGenerator.GetNextId());
+            _state.CurrentMemTable = current;
+            _state.ImmutableMemTables = immutable;
         }
         finally
         {
@@ -2383,6 +2460,22 @@ internal sealed class LsmStorageInner : IDisposable
 
     public void DisposeInternal()
     {
+        _pendingTable?.Dispose();
+        if (_pendingCompactionInputs is not null)
+        {
+            foreach (var table in _pendingCompactionInputs)
+            {
+                table.Dispose();
+            }
+        }
+        if (_pendingCompactionOutputs is not null)
+        {
+            foreach (var table in _pendingCompactionOutputs)
+            {
+                table.Dispose();
+            }
+        }
+        ClearMaintenanceOwnership();
         _state.CurrentMemTable?.Dispose();
 
         if (!_state.ImmutableMemTables.IsDefaultOrEmpty)
@@ -2410,6 +2503,20 @@ internal sealed class LsmStorageInner : IDisposable
         }
 
         _blockCache?.Dispose();
+    }
+
+    private void WriteManifest(Manifest manifest)
+    {
+        FaultInjector?.Invoke(StorageFaultPoint.ManifestBeforePublish);
+        manifest.Write(StoragePath);
+        FaultInjector?.Invoke(StorageFaultPoint.ManifestAfterPublish);
+    }
+
+    private void ClearMaintenanceOwnership()
+    {
+        _pendingTable = null;
+        _pendingCompactionInputs = null;
+        _pendingCompactionOutputs = null;
     }
 
     ~LsmStorageInner()
@@ -2462,6 +2569,7 @@ internal sealed class LsmStorageInner : IDisposable
 
             try
             {
+                _storage.CheckHealthy();
                 // Fast path: when the memtables are empty and the on-disk SSTables form a single globally
                 // sorted, non-overlapping run, the data is already in final key order with exactly one version
                 // per key. We can stream directly from the relevant tables instead of building one iterator per
