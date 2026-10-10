@@ -681,6 +681,69 @@ public class StorageBackupTests
         await Assert.That(Directory.GetFiles(backup).Length).IsEqualTo(0);
     }
 
+    [Test]
+    [Arguments(-1)]
+    [Arguments((int)StorageFaultPoint.SynchronizationBeforeSst)]
+    [Arguments((int)StorageFaultPoint.SynchronizationAfterSst)]
+    public async Task GeneratedBackupSstsSynchronizeBeforePublicationAndSyncFailureDoesNotFaultSource(int faultPoint)
+    {
+        using var source = TempFolder.Create();
+        using var backup = TempFolder.Create();
+        using var destination = TempFolder.Create();
+        var options = Options;
+        options.UseWriteAheadLog = false;
+        options.MemTableSizeLimit = 1;
+        var points = new List<StorageFaultPoint>();
+        var armed = false;
+        var cause = new IOException("Injected backup-only SST synchronization failure.");
+        options.FaultInjector = point =>
+        {
+            points.Add(point);
+            if (armed && (int)point == faultPoint)
+            {
+                throw cause;
+            }
+        };
+        await using var storage = await LsmStorage.OpenAsync(source, options);
+        storage.Put([1], [11]);
+        storage.Put([2], [22]);
+        var before = RecoveryFiles(source);
+        points.Clear();
+        armed = true;
+        if (faultPoint >= 0)
+        {
+            Exception? failure = null;
+            try
+            {
+                await storage.CreateBackupAsync(backup);
+            }
+            catch (IOException exception)
+            {
+                failure = exception;
+            }
+            await Assert.That(ReferenceEquals(failure, cause)).IsTrue();
+            await Assert.That(points.Contains(StorageFaultPoint.BackupBeforePublish)).IsFalse();
+            await AssertEmptyAsync(backup);
+            await Assert.That(storage.Health).IsEqualTo(StorageHealth.Healthy);
+            await AssertValueAsync(storage, 1, 11);
+            await AssertValueAsync(storage, 2, 22);
+            armed = false;
+            points.Clear();
+        }
+        await storage.CreateBackupAsync(backup);
+        await Assert.That(points.SequenceEqual(new[]
+        {
+            StorageFaultPoint.SynchronizationBeforeSst, StorageFaultPoint.SynchronizationAfterSst,
+            StorageFaultPoint.SynchronizationBeforeSst, StorageFaultPoint.SynchronizationAfterSst,
+            StorageFaultPoint.BackupBeforePublish
+        })).IsTrue();
+        await AssertUnchangedAsync(before, source);
+        await LsmStorage.RestoreBackupAsync(backup, destination, Options);
+        await using var restored = await LsmStorage.OpenAsync(destination, Options);
+        await AssertValueAsync(restored, 1, 11);
+        await AssertValueAsync(restored, 2, 22);
+    }
+
     private static async Task AssertEmptyAsync(string path) =>
         await Assert.That(Directory.GetFileSystemEntries(path).All(entry => Path.GetFileName(entry) == DirectoryOwnership.FileName)).IsTrue();
 

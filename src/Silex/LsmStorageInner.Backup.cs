@@ -71,6 +71,8 @@ internal sealed partial class LsmStorageInner
                             memTable.Count, _compression, _compressionLevel, _minimumCompressionSavingsPercent);
                         memTable.FlushAsync(builder, cancellationToken).GetAwaiter().GetResult();
                         using var table = builder.BuildAsync(cancellationToken).GetAwaiter().GetResult();
+                        cancellationToken.ThrowIfCancellationRequested();
+                        SynchronizeFile(path, StorageFaultPoint.SynchronizationBeforeSst, StorageFaultPoint.SynchronizationAfterSst);
                         manifest.L0.Add(memTable.Id);
                     }
                 }
