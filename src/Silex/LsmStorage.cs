@@ -21,6 +21,10 @@ public sealed partial class LsmStorage : IDisposable, IAsyncDisposable
     /// <param name="options">The storage options.</param>
     /// <param name="cancellationToken">The cancellation token.</param>
     /// <returns></returns>
+    /// <remarks>
+    /// Exclusively owns the directory until shutdown completes. A competing owner causes an
+    /// <see cref="IOException"/>; do not delete the persistent LOCK file to bypass ownership.
+    /// </remarks>
     public static Task<LsmStorage> OpenAsync(string path, StorageOptions options, CancellationToken cancellationToken = default)
     {
         return OpenCoreAsync(path, options, cancellationToken);
@@ -33,12 +37,13 @@ public sealed partial class LsmStorage : IDisposable, IAsyncDisposable
 
         internal readonly LsmStorageInner _inner;
         internal readonly Compacter _compacter;
-        private bool _disposed;
+        private readonly LsmStorage _storage;
 
-        internal LsmStorageTyped(LsmStorageInner inner, Compacter compacter)
+        internal LsmStorageTyped(LsmStorage storage)
         {
-            _inner = inner;
-            _compacter = compacter;
+            _storage = storage;
+            _inner = storage._inner;
+            _compacter = storage._compacter;
         }
 
         public async ValueTask<TValue> GetAsync(TKey key, CancellationToken cancellationToken = default)
@@ -104,77 +109,13 @@ public sealed partial class LsmStorage : IDisposable, IAsyncDisposable
             return _inner.CreateIterator();
         }
 
-        public async Task CloseAsync(CancellationToken cancellationToken = default)
-        {
-            if (_disposed)
-            {
-                return;
-            }
+        public Task CloseAsync(CancellationToken cancellationToken = default) => _storage.CloseAsync(cancellationToken);
 
-            cancellationToken.ThrowIfCancellationRequested();
-            GC.SuppressFinalize(this);
-            await DisposeInternalAsync(cancellationToken);
-            _disposed = true;
-        }
+        public Task FlushAndCompactAsync(CancellationToken cancellationToken = default) => _storage.FlushAndCompactAsync(cancellationToken);
 
-        public async Task FlushAndCompactAsync(CancellationToken cancellationToken = default)
-        {
-            CheckDisposed();
-            await _compacter.StopBackgroundFlushAsync();
+        public ValueTask DisposeAsync() => _storage.DisposeAsync();
 
-            try
-            {
-                await _inner.FlushAndCompactAsync(cancellationToken);
-            }
-            finally
-            {
-                _compacter.StartBackgroundFlush();
-            }
-        }
-
-        public async ValueTask DisposeAsync()
-        {
-            if (_disposed)
-            {
-                return;
-            }
-
-            GC.SuppressFinalize(this);
-            await DisposeInternalAsync();
-            _disposed = true;
-        }
-
-        public void Dispose()
-        {
-            if (_disposed)
-            {
-                return;
-            }
-
-            GC.SuppressFinalize(this);
-            DisposeInternalAsync().GetAwaiter().GetResult();
-            _disposed = true;
-        }
-
-        public async Task DisposeInternalAsync(CancellationToken cancellationToken = default)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            await _compacter.CloseAsync(cancellationToken);
-            if (_inner.Health == StorageHealth.Faulted)
-            {
-                _inner.Dispose();
-                return;
-            }
-            _inner.ForceFreezeMemTable();
-
-            while (!_inner._state.ImmutableMemTables.IsEmpty)
-            {
-                await _inner.ForceFlushNextImmutableMemTableAsync(cancellationToken);
-            }
-
-            _inner.DeleteCurrentMemTableWal();
-            _inner.Dispose();
-        }
+        public void Dispose() => _storage.Dispose();
 
         private static OwnedByteSlice Encode<T>(IBinaryEncoder<T> encoder, T value)
         {
@@ -184,18 +125,17 @@ public sealed partial class LsmStorage : IDisposable, IAsyncDisposable
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void CheckDisposed()
         {
-            ObjectDisposedException.ThrowIf(_disposed, this);
-            _inner.CheckHealthy();
+            _storage.CheckDisposed();
         }
     }
 
     internal static async Task<LsmStorageTyped<TKey, TValue>> OpenAsync<TKey, TValue>(string path, StorageOptions options, CancellationToken cancellationToken = default) where TKey : notnull
     {
         var storage = await OpenCoreAsync(path, options, cancellationToken);
-        return new LsmStorageTyped<TKey, TValue>(storage._inner, storage._compacter);
+        return new LsmStorageTyped<TKey, TValue>(storage);
     }
 
-    private static async Task<LsmStorage> OpenCoreAsync(string path, StorageOptions options, CancellationToken cancellationToken = default, StorageIntegrityReport? salvageReport = null)
+    private static async Task<LsmStorage> OpenCoreAsync(string path, StorageOptions options, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(options);
         cancellationToken.ThrowIfCancellationRequested();
@@ -204,6 +144,21 @@ public sealed partial class LsmStorage : IDisposable, IAsyncDisposable
             Directory.CreateDirectory(path);
         }
 
+        var ownership = DirectoryOwnership.Acquire(path);
+        try
+        {
+            return await OpenOwnedAsync(path, options, ownership, cancellationToken);
+        }
+        catch
+        {
+            ownership.Dispose();
+            throw;
+        }
+    }
+
+    private static async Task<LsmStorage> OpenOwnedAsync(string path, StorageOptions options,
+        DirectoryOwnership ownership, CancellationToken cancellationToken, StorageIntegrityReport? salvageReport = null)
+    {
         // Capture the WAL files that exist *before* the inner is constructed: the inner immediately
         // creates a fresh WAL for its initial current memtable, and that one must not be replayed.
         var walFiles = options.UseWriteAheadLog
@@ -438,14 +393,16 @@ public sealed partial class LsmStorage : IDisposable, IAsyncDisposable
             }
 
             var compacter = new Compacter(storageInner, TimeProvider.System, options, enableBackgroundFlush: salvageReport == null);
+            var storage = new LsmStorage(storageInner, compacter) { RecoveryReport = salvageReport };
 
             if (salvageReport == null)
             {
                 compacter.StartBackgroundFlush();
             }
 
+            storageInner.Ownership = ownership;
             opened = true;
-            return new LsmStorage(storageInner, compacter) { RecoveryReport = salvageReport };
+            return storage;
 
             bool IsDamagedSst(string filename) => salvageReport?.Issues.Any(
                 issue => issue.Path == filename && issue.Kind == StorageIntegrityIssueKind.CorruptSst) == true;
@@ -485,7 +442,10 @@ public sealed partial class LsmStorage : IDisposable, IAsyncDisposable
 
     private readonly LsmStorageInner _inner;
     private readonly Compacter _compacter;
-    private bool _disposed;
+    private readonly object _closeLock = new();
+    private readonly SemaphoreSlim _manualMaintenance = new(1, 1);
+    private Task? _closeTask;
+    private volatile bool _disposed;
 
     /// <summary>The health of this instance. A faulted instance must be disposed and reopened.</summary>
     public StorageHealth Health => _disposed ? StorageHealth.Disposed : _inner.Health;
@@ -663,93 +623,84 @@ public sealed partial class LsmStorage : IDisposable, IAsyncDisposable
         return _inner.SeekRawAsync(from.AsMemory(), arg, reader, maxEntries, cancellationToken);
     }
 
-    public async Task CloseAsync(CancellationToken cancellationToken = default)
+    /// <summary>Rejects new work, drains admitted operations, and closes the store.</summary>
+    /// <remarks>
+    /// Cancellation is checked only before shutdown starts. Concurrent disposers share completion.
+    /// Finish or dispose active enumerators first; never wait for shutdown inside a storage callback.
+    /// If shutdown fails, dispose again to release the faulted store without flushing recovery evidence.
+    /// </remarks>
+    public Task CloseAsync(CancellationToken cancellationToken = default)
     {
-        if (_disposed)
+        lock (_closeLock)
         {
-            return;
+            if (_disposed)
+            {
+                return Task.CompletedTask;
+            }
+            if (_closeTask is { IsCompleted: false })
+            {
+                return _closeTask;
+            }
+            cancellationToken.ThrowIfCancellationRequested();
+            return _closeTask = DisposeInternalAsync();
         }
-
-        cancellationToken.ThrowIfCancellationRequested();
-
-        GC.SuppressFinalize(this);
-        await DisposeInternalAsync(cancellationToken);
-
-        _disposed = true;
     }
 
     public async Task FlushAndCompactAsync(CancellationToken cancellationToken = default)
     {
+        using var operation = _inner.Lifetime.Enter();
         CheckWritable();
-        await _compacter.StopBackgroundFlushAsync();
-
+        await _manualMaintenance.WaitAsync(cancellationToken);
         try
         {
-            await _inner.FlushAndCompactAsync(cancellationToken);
+            await _compacter.StopBackgroundFlushAsync();
+            try
+            {
+                await _inner.FlushAndCompactAsync(cancellationToken);
+            }
+            finally
+            {
+                _compacter.StartBackgroundFlush();
+            }
         }
         finally
         {
-            _compacter.StartBackgroundFlush();
+            _manualMaintenance.Release();
         }
     }
 
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync() => new(CloseAsync());
+
+    public void Dispose() => CloseAsync().GetAwaiter().GetResult();
+
+    private async Task DisposeInternalAsync()
     {
-        if (_disposed)
+        await _inner.Lifetime.CloseAsync().ConfigureAwait(false);
+        await _compacter.DisposeAsync().ConfigureAwait(false);
+        try
         {
-            return;
-        }
-
-        GC.SuppressFinalize(this);
-        await DisposeInternalAsync();
-
-        _disposed = true;
-    }
-
-    public void Dispose()
-    {
-        if (_disposed)
-        {
-            return;
-        }
-
-        GC.SuppressFinalize(this);
-        DisposeInternalAsync().GetAwaiter().GetResult();
-
-        _disposed = true;
-    }
-
-    private async Task DisposeInternalAsync(CancellationToken cancellationToken = default)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-
-        if (IsReadOnly)
-        {
+            if (!IsReadOnly && _inner.Health != StorageHealth.Faulted)
+            {
+                _inner.ForceFreezeMemTable();
+                while (!_inner._state.ImmutableMemTables.IsEmpty)
+                {
+                    await _inner.ForceFlushNextImmutableMemTableAsync().ConfigureAwait(false);
+                }
+                _inner.DeleteCurrentMemTableWal();
+            }
             _inner.Dispose();
-            return;
+            _disposed = true;
         }
-
-        await _compacter.CloseAsync(cancellationToken);
-
-        if (_inner.Health == StorageHealth.Faulted)
+        catch (Exception exception)
         {
-            _inner.Dispose();
-            return;
+            _inner.MarkFaulted(exception);
+            throw;
         }
-
-        _inner.ForceFreezeMemTable();
-
-        while (!_inner._state.ImmutableMemTables.IsEmpty)
-        {
-            await _inner.ForceFlushNextImmutableMemTableAsync(cancellationToken);
-        }
-
-        _inner.DeleteCurrentMemTableWal();
-        _inner.Dispose();
     }
 
     private void CheckDisposed()
     {
+        _inner.Lifetime.CheckOpen();
         ObjectDisposedException.ThrowIf(_disposed, this);
         _inner.CheckHealthy();
     }

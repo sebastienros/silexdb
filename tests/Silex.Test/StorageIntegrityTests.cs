@@ -261,7 +261,8 @@ public class StorageIntegrityTests
     }
 
     private static Dictionary<string, byte[]> Snapshot(string path) =>
-        Directory.GetFiles(path).ToDictionary(filename => Path.GetFileName(filename), File.ReadAllBytes);
+        Directory.GetFiles(path).Where(filename => Path.GetFileName(filename) != DirectoryOwnership.FileName)
+            .ToDictionary(filename => Path.GetFileName(filename), File.ReadAllBytes);
 
     private static async Task AssertUnchangedAsync(string path, Dictionary<string, byte[]> before)
     {

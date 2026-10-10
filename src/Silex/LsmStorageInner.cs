@@ -35,7 +35,9 @@ internal sealed class LsmStorageInner : IDisposable
     private readonly SemaphoreSlim _maintenanceLock = new(1, 1);
 
     internal StorageState _state;
-    private bool _disposed;
+    internal StorageLifetime Lifetime { get; } = new();
+    internal DirectoryOwnership? Ownership { get; set; }
+    private volatile bool _disposed;
     private Exception? _fault;
     internal Action<StorageFaultPoint>? FaultInjector { get; }
     internal StorageHealth Health => _disposed ? StorageHealth.Disposed
@@ -137,6 +139,7 @@ internal sealed class LsmStorageInner : IDisposable
     /// <returns><see cref="OwnedByteSlice"/> if the key was found; otherwise <see langword="null"/>.</returns>
     public async ValueTask<OwnedByteSlice?> GetAsync(ByteSlice key, CancellationToken cancellationToken = default)
     {
+        using var operation = Lifetime.Enter();
         // The immutable MemTables can be accessed without lock since they are frozen (read-only),
         // and the collection won't be changed FreezeMemTable substitute the collection when it's altered.
 
@@ -495,6 +498,7 @@ internal sealed class LsmStorageInner : IDisposable
     /// </remarks>
     public async ValueTask<long> ScanRawAsync<TArg>(TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries = long.MaxValue, CancellationToken cancellationToken = default)
     {
+        using var operation = Lifetime.Enter();
         CheckHealthy();
         ArgumentNullException.ThrowIfNull(reader);
         ArgumentOutOfRangeException.ThrowIfNegative(maxEntries);
@@ -566,6 +570,7 @@ internal sealed class LsmStorageInner : IDisposable
 
     public async ValueTask<long> SeekRawAsync<TArg>(ReadOnlyMemory<byte> from, TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries = long.MaxValue, CancellationToken cancellationToken = default)
     {
+        using var operation = Lifetime.Enter();
         CheckHealthy();
         ArgumentNullException.ThrowIfNull(reader);
         ArgumentOutOfRangeException.ThrowIfNegative(maxEntries);
@@ -926,6 +931,7 @@ internal sealed class LsmStorageInner : IDisposable
     private async ValueTask<int> TryReadRawCoreAsync<TSink>(ReadOnlyMemory<byte> keyMemory, TSink sink, CancellationToken cancellationToken)
         where TSink : struct, IValueByteSink
     {
+        using var operation = Lifetime.Enter();
         // Current and immutable memtables: see GetAsync for the locking rationale.
         _currentMemTableLock.EnterReadLock();
 
@@ -1165,6 +1171,7 @@ internal sealed class LsmStorageInner : IDisposable
 
     private void WriteCore(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool isTombstone, LsmWriteBatch? batch)
     {
+        using var operation = Lifetime.Enter();
         _currentMemTableLock.EnterWriteLock();
 
         try
@@ -2503,6 +2510,7 @@ internal sealed class LsmStorageInner : IDisposable
         }
 
         _blockCache?.Dispose();
+        Ownership?.Dispose();
     }
 
     private void WriteManifest(Manifest manifest)
@@ -2562,6 +2570,7 @@ internal sealed class LsmStorageInner : IDisposable
 
         private async IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateAsync(bool hasFrom, ByteSlice from, bool backwards, [EnumeratorCancellation] CancellationToken cancellationToken = default)
         {
+            using var operation = _storage.Lifetime.Enter();
             // Hold the level0 read lock for the whole scan: it freezes the L0 tier list (no flush append or
             // compaction swap) and, because flush only disposes a flushed immutable MemTable after its own
             // level0 write-lock section, it also keeps the immutable MemTables we iterate alive throughout.

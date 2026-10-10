@@ -8,8 +8,8 @@ namespace Silex;
 public sealed partial class LsmStorage
 {
     /// <summary>
-    /// Checks live SST metadata and every data block, plus WAL frames, without changing any files.
-    /// Run offline, with no writer or maintenance operation using this directory.
+    /// Exclusively owns the directory while checking live SST metadata, data blocks, and WAL frames.
+    /// Does not change recovery files; may create the persistent ownership file.
     /// </summary>
     /// <remarks>Orphan SSTs and WALs superseded by verified committed SSTs are not needed for recovery and are skipped.</remarks>
     public static async Task<StorageIntegrityReport> VerifyIntegrityAsync(
@@ -22,6 +22,13 @@ public sealed partial class LsmStorage
             throw new DirectoryNotFoundException($"Storage directory '{path}' does not exist.");
         }
 
+        using var ownership = DirectoryOwnership.Acquire(path);
+        return await VerifyIntegrityOwnedAsync(path, options, cancellationToken);
+    }
+
+    private static async Task<StorageIntegrityReport> VerifyIntegrityOwnedAsync(
+        string path, StorageOptions options, CancellationToken cancellationToken)
+    {
         var issues = new List<StorageIntegrityIssue>();
         Manifest? manifest = null;
         try
@@ -111,18 +118,33 @@ public sealed partial class LsmStorage
 
     /// <summary>
     /// Opens surviving live SSTs and valid WAL prefixes for read-only, best-effort extraction.
-    /// Does not create, delete, flush, compact, or rewrite files. A corrupt manifest must be restored first.
+    /// Does not change recovery files; may create the persistent ownership file.
+    /// A corrupt manifest must be restored first.
     /// </summary>
     public static async Task<LsmStorage> OpenSalvageAsync(
         string path, StorageOptions options, CancellationToken cancellationToken = default)
     {
-        var report = await VerifyIntegrityAsync(path, options, cancellationToken);
-        if (report.Issues.Any(issue => issue.Kind == StorageIntegrityIssueKind.CorruptManifest))
+        ArgumentNullException.ThrowIfNull(options);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!Directory.Exists(path))
         {
-            throw new StorageRecoveryException(report);
+            throw new DirectoryNotFoundException($"Storage directory '{path}' does not exist.");
         }
-
-        return await OpenCoreAsync(path, options, cancellationToken, report);
+        var ownership = DirectoryOwnership.Acquire(path);
+        try
+        {
+            var report = await VerifyIntegrityOwnedAsync(path, options, cancellationToken);
+            if (report.Issues.Any(issue => issue.Kind == StorageIntegrityIssueKind.CorruptManifest))
+            {
+                throw new StorageRecoveryException(report);
+            }
+            return await OpenOwnedAsync(path, options, ownership, cancellationToken, report);
+        }
+        catch
+        {
+            ownership.Dispose();
+            throw;
+        }
     }
 
     /// <summary>True for a salvage handle, which cannot mutate the source database.</summary>
