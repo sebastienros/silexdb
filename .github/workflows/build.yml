@@ -24,6 +24,7 @@ jobs:
     env:
       DOTNET_NOLOGO: true
       DOTNET_CLI_TELEMETRY_OPTOUT: 1
+      TEST_RESULTS_DIRECTORY: ${{ github.workspace }}/TestResults/${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v7
@@ -34,10 +35,45 @@ jobs:
             10.0.x
           global-json-file: global.json
 
+      - name: Runner diagnostics
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:TEST_RESULTS_DIRECTORY | Out-Null
+          & {
+            "Runner: $env:RUNNER_NAME ($env:RUNNER_OS / $env:RUNNER_ARCH)"
+            "Image: $env:ImageOS / $env:ImageVersion"
+            "Commit: $env:GITHUB_SHA"
+            "Run: $env:GITHUB_RUN_ID, attempt: $env:GITHUB_RUN_ATTEMPT"
+            "OS: $([System.Runtime.InteropServices.RuntimeInformation]::OSDescription)"
+            "Logical processors: $([Environment]::ProcessorCount)"
+            "Temporary directory: $([System.IO.Path]::GetTempPath())"
+            if ($IsWindows) {
+              Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, NumberOfLogicalProcessors | Format-List
+              Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize, FreePhysicalMemory | Format-List
+            } else {
+              uname -a
+            }
+            Get-PSDrive -PSProvider FileSystem | Select-Object Name, Root, Used, Free | Format-Table -AutoSize
+            dotnet --info
+            if ($LASTEXITCODE -ne 0) { throw "dotnet --info failed with exit code $LASTEXITCODE" }
+          } | Tee-Object -FilePath "$env:TEST_RESULTS_DIRECTORY/runner.txt"
+
       - name: Build
         run: |
           dotnet build src/Silex/Silex.csproj --configuration Release
           dotnet build tests/Silex.Test/Silex.Test.csproj --configuration Release
 
       - name: Test
-        run: dotnet test tests/Silex.Test/Silex.Test.csproj --configuration Release --no-build
+        shell: pwsh
+        run: |
+          dotnet test --project tests/Silex.Test/Silex.Test.csproj --configuration Release --no-build --output Detailed --report-trx --report-trx-filename tests.trx --results-directory "$env:TEST_RESULTS_DIRECTORY" --diagnostic --diagnostic-output-directory "$env:TEST_RESULTS_DIRECTORY/diagnostics" 2>&1 | Tee-Object -FilePath "$env:TEST_RESULTS_DIRECTORY/test-output.txt"
+          exit $LASTEXITCODE
+
+      - name: Upload test diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results-${{ matrix.os }}-${{ github.run_attempt }}
+          path: ${{ env.TEST_RESULTS_DIRECTORY }}
+          if-no-files-found: warn
+          retention-days: 14
