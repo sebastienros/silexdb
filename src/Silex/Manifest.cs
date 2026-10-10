@@ -59,7 +59,22 @@ internal sealed class Manifest
         var json = File.ReadAllText(path);
         var manifest = JsonSerializer.Deserialize<Manifest>(json, _jsonOptions);
 
-        return manifest ?? throw new InvalidDataException($"The manifest at '{path}' could not be parsed.");
+        if (manifest == null || manifest.Version != 1 || manifest.L0 == null
+            || manifest.Levels == null || manifest.Levels.Any(level => level == null))
+        {
+            throw new InvalidDataException($"The manifest at '{path}' has an invalid or unsupported schema.");
+        }
+
+        var ids = new HashSet<long>();
+        foreach (var id in manifest.AllSstIds())
+        {
+            if (id < 0 || !ids.Add(id))
+            {
+                throw new InvalidDataException($"The manifest at '{path}' contains an invalid or duplicate SST id {id}.");
+            }
+        }
+
+        return manifest;
     }
 
     /// <summary>

@@ -12,7 +12,7 @@ using System.Runtime.CompilerServices;
 
 namespace Silex;
 
-public sealed class LsmStorage : IDisposable, IAsyncDisposable
+public sealed partial class LsmStorage : IDisposable, IAsyncDisposable
 {
     /// <summary>
     /// Opens or create a store at the specified location.
@@ -189,18 +189,13 @@ public sealed class LsmStorage : IDisposable, IAsyncDisposable
         return new LsmStorageTyped<TKey, TValue>(storage._inner, storage._compacter);
     }
 
-    private static async Task<LsmStorage> OpenCoreAsync(string path, StorageOptions options, CancellationToken cancellationToken = default)
+    private static async Task<LsmStorage> OpenCoreAsync(string path, StorageOptions options, CancellationToken cancellationToken = default, StorageIntegrityReport? salvageReport = null)
     {
+        ArgumentNullException.ThrowIfNull(options);
+        cancellationToken.ThrowIfCancellationRequested();
         if (!Directory.Exists(path))
         {
             Directory.CreateDirectory(path);
-        }
-
-        // Remove any leftover temporary SST files from a build that crashed before its atomic rename.
-        // These are never valid tables and must not be loaded.
-        foreach (var tmp in Directory.EnumerateFiles(path, "*.sst.tmp"))
-        {
-            TryDeleteFile(tmp);
         }
 
         // Capture the WAL files that exist *before* the inner is constructed: the inner immediately
@@ -230,152 +225,226 @@ public sealed class LsmStorage : IDisposable, IAsyncDisposable
             IdGenerator.EnsureGreaterThan(id);
         }
 
-        var storageInner = new LsmStorageInner(path, options);
-
         // The manifest is the authoritative record of which SSTs are live and how they map to levels. It is
         // read for every strategy so changing CompactionStrategy on reopen only changes future compactions,
         // not how existing files are interpreted. Older stores without a manifest fall back to id-ordered L0
         // recovery once and are migrated by the manifest write near the end of OpenAsync.
         var manifest = Manifest.TryRead(path);
 
-        // Ids of the SSTs whose data is actually present in the recovered state. Used below to decide
-        // whether a surviving WAL is stale (its data was already flushed and committed and is loaded) or
-        // must be replayed. Only successfully loaded SSTs count: if a referenced SST is missing (fail open),
-        // its WAL must still be replayed rather than discarded.
-        HashSet<long> committedSstIds;
-
-        var loadParallelism = Math.Max(1, options.MaxReadParallelism);
-
-        // Loads the given SST files concurrently (bounded by MaxReadParallelism) into a position-indexed
-        // array, preserving the requested order. On any failure every already-loaded table is disposed so a
-        // failed open never leaks file handles.
-        async Task<SsTable[]> LoadManyAsync((string filename, long id)[] items)
+        if (manifest != null && salvageReport == null)
         {
-            var loaded = new SsTable[items.Length];
-
-            try
+            var presentIds = new HashSet<long>(sstFiles.Select(item => item.id!.Value));
+            var missing = manifest.AllSstIds()
+                .Where(id => !presentIds.Contains(id))
+                .Select(id => MissingSstIssue(path, id))
+                .ToArray();
+            if (missing.Length > 0)
             {
-                await Parallel.ForEachAsync(
-                    Enumerable.Range(0, items.Length),
-                    new ParallelOptions { MaxDegreeOfParallelism = loadParallelism, CancellationToken = cancellationToken },
-                    async (index, ct) =>
+                throw new StorageRecoveryException(new StorageIntegrityReport(missing));
+            }
+        }
+
+        var storageInner = new LsmStorageInner(path, options, readOnly: salvageReport != null);
+        var opened = false;
+        try
+        {
+            // Ids of the SSTs whose data is actually present in the recovered state. Used below to decide
+            // whether a surviving WAL is stale (its data was already flushed and committed and is loaded) or
+            // must be replayed. Only successfully loaded SSTs count: if a referenced SST is missing in salvage,
+            // its WAL must still be replayed rather than discarded.
+            HashSet<long> committedSstIds;
+
+            var loadParallelism = Math.Max(1, options.MaxReadParallelism);
+
+            // Loads the given SST files concurrently (bounded by MaxReadParallelism) into a position-indexed
+            // array, preserving the requested order. On any failure every already-loaded table is disposed so a
+            // failed open never leaks file handles.
+            async Task<SsTable[]> LoadManyAsync((string filename, long id)[] items)
+            {
+                var loaded = new SsTable[items.Length];
+
+                try
+                {
+                    await Parallel.ForEachAsync(
+                        Enumerable.Range(0, items.Length),
+                        new ParallelOptions { MaxDegreeOfParallelism = loadParallelism, CancellationToken = cancellationToken },
+                        async (index, ct) =>
+                        {
+                            var (filename, id) = items[index];
+                            var blockBuilder = new BlockBuilder(options.BlockEncoderFactory.Create());
+                            try
+                            {
+                                loaded[index] = await SsTable.LoadSsTableAsync(filename, options.SsTableEncoderFactory.Create(), blockBuilder, options.BloomFilterFactory, id, ct);
+                            }
+                            catch
+                            {
+                                blockBuilder.Dispose();
+                                throw;
+                            }
+                        });
+                }
+                catch
+                {
+                    foreach (var table in loaded)
                     {
-                        var (filename, id) = items[index];
-                        var blockBuilder = new BlockBuilder(options.BlockEncoderFactory.Create());
-                        loaded[index] = await SsTable.LoadSsTableAsync(filename, options.SsTableEncoderFactory.Create(), blockBuilder, options.BloomFilterFactory, id, ct);
-                    });
-            }
-            catch
-            {
-                foreach (var table in loaded)
-                {
-                    table?.Dispose();
+                        table?.Dispose();
+                    }
+
+                    throw;
                 }
 
-                throw;
+                return loaded;
             }
 
-            return loaded;
-        }
+            if (manifest != null)
+            {
+                var fileById = sstFiles.ToDictionary(x => x.id!.Value, x => x.filename);
+                committedSstIds = new HashSet<long>();
 
-        if (manifest != null)
+                // Strict opens have checked all references; salvage keeps only verified surviving tables.
+                async Task<List<SsTable>> LoadLevelAsync(IEnumerable<long> ids)
+                {
+                    var items = ids
+                        .Where(id => fileById.ContainsKey(id) && !IsDamagedSst(fileById[id]))
+                        .Select(id => (filename: fileById[id], id))
+                        .ToArray();
+
+                    var tables = await LoadManyAsync(items);
+
+                    foreach (var (_, id) in items)
+                    {
+                        committedSstIds.Add(id);
+                    }
+
+                    return tables.ToList();
+                }
+
+                storageInner._state.LevelZeroTables = await LoadLevelAsync(manifest.L0);
+
+                var levels = new List<List<SsTable>>();
+                storageInner._state.LeveledSsTables = levels;
+
+                foreach (var levelIds in manifest.Levels)
+                {
+                    levels.Add(await LoadLevelAsync(levelIds));
+                }
+            }
+            else
+            {
+                // Load every "{id}.sst" (already ordered by id, which encodes L0 recency) in parallel.
+                var items = sstFiles.Where(x => !IsDamagedSst(x.filename)).Select(x => (x.filename, id: x.id!.Value)).ToArray();
+                var ssTables = await LoadManyAsync(items);
+
+                storageInner._state.LevelZeroTables = ssTables.ToList();
+                committedSstIds = new HashSet<long>(items.Select(x => x.id));
+            }
+
+            // Recover memtables that hadn't been flushed when the previous process exited. Memtables are
+            // flushed oldest-id-first, so any WAL without a matching committed SST is newer than every loaded
+            // SST; enqueuing them oldest-first (reads reverse the queue) preserves recency above L0.
+            if (options.UseWriteAheadLog && walFiles.Count > 0)
+            {
+                var recovered = new List<IMemTable>();
+                try
+                {
+                    foreach (var (filename, id) in walFiles)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        // A loaded committed SST supersedes its stale WAL, deleted only after recovery succeeds.
+                        if (committedSstIds.Contains(id!.Value))
+                        {
+                            continue;
+                        }
+
+                        var memTable = new MemTable(id!.Value, arenaBlockSize: options.MemTableArenaBlockSize);
+                        try
+                        {
+                            try
+                            {
+                                WriteAheadLog.Replay(filename, memTable);
+                            }
+                            catch (Exception exception) when (salvageReport != null && IsCorruption(exception)
+                                && salvageReport.Issues.Any(issue => issue.Path == filename && issue.Kind == StorageIntegrityIssueKind.CorruptWal))
+                            {
+                                // Verification reports this corruption; retain only the valid prefix.
+                            }
+
+                            recovered.Add(memTable);
+                        }
+                        catch
+                        {
+                            memTable.Dispose();
+                            throw;
+                        }
+                    }
+
+                    storageInner._state.ImmutableMemTables = ImmutableArray.CreateRange(recovered);
+                }
+                catch
+                {
+                    foreach (var memTable in recovered)
+                    {
+                        memTable.Dispose();
+                    }
+
+                    throw;
+                }
+            }
+
+            // Ensure every successfully opened store has a manifest, including manifest-less stores created by
+            // older versions or by strategies that used to infer L0 from filenames.
+            if (salvageReport == null)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                storageInner.BuildManifestSnapshot().Write(path);
+                foreach (var tmp in Directory.EnumerateFiles(path, "*.sst.tmp"))
+                {
+                    TryDeleteFile(tmp);
+                }
+
+                var referencedSstIds = manifest == null ? committedSstIds : new HashSet<long>(manifest.AllSstIds());
+                foreach (var (filename, id) in sstFiles)
+                {
+                    if (!referencedSstIds.Contains(id!.Value))
+                    {
+                        TryDeleteFile(filename);
+                    }
+                }
+
+                foreach (var (filename, id) in walFiles)
+                {
+                    if (committedSstIds.Contains(id!.Value))
+                    {
+                        TryDeleteFile(filename);
+                    }
+                }
+            }
+
+            var compacter = new Compacter(storageInner, TimeProvider.System, options, enableBackgroundFlush: salvageReport == null);
+
+            if (salvageReport == null)
+            {
+                compacter.StartBackgroundFlush();
+            }
+
+            opened = true;
+            return new LsmStorage(storageInner, compacter) { RecoveryReport = salvageReport };
+
+            bool IsDamagedSst(string filename) => salvageReport?.Issues.Any(
+                issue => issue.Path == filename && issue.Kind == StorageIntegrityIssueKind.CorruptSst) == true;
+        }
+        finally
         {
-            var fileById = sstFiles.ToDictionary(x => x.id!.Value, x => x.filename);
-            committedSstIds = new HashSet<long>();
-
-            // Resolves a level's manifest ids to on-disk files, preserving order. Fail open: an id whose
-            // file is missing is skipped (the store loses that SST's data but stays usable). The surviving
-            // ids are loaded in parallel and recorded as committed.
-            async Task<List<SsTable>> LoadLevelAsync(IEnumerable<long> ids)
+            if (!opened)
             {
-                var items = ids
-                    .Where(id => fileById.ContainsKey(id))
-                    .Select(id => (filename: fileById[id], id))
-                    .ToArray();
-
-                var tables = await LoadManyAsync(items);
-
-                foreach (var (_, id) in items)
+                var currentWalPath = Path.Combine(path, $"{storageInner._state.CurrentMemTable.Id}.wal");
+                storageInner.Dispose();
+                if (salvageReport == null && options.UseWriteAheadLog)
                 {
-                    committedSstIds.Add(id);
-                }
-
-                return tables.ToList();
-            }
-
-            storageInner._state.LevelZeroTables = await LoadLevelAsync(manifest.L0);
-
-            var levels = new List<List<SsTable>>();
-
-            foreach (var levelIds in manifest.Levels)
-            {
-                levels.Add(await LoadLevelAsync(levelIds));
-            }
-
-            storageInner._state.LeveledSsTables = levels;
-
-            // Any SST on disk that the committed manifest does not reference is an orphan (a flush or
-            // compaction output that crashed before the manifest commit) and is deleted. This uses the
-            // full referenced set, not just the loaded ids, so a referenced-but-missing SST does not cause
-            // an unrelated file to be treated as an orphan.
-            var referencedSstIds = new HashSet<long>(manifest.AllSstIds());
-
-            foreach (var (filename, id) in sstFiles)
-            {
-                if (!referencedSstIds.Contains(id!.Value))
-                {
-                    TryDeleteFile(filename);
+                    TryDeleteFile(currentWalPath);
                 }
             }
         }
-        else
-        {
-            // Load every "{id}.sst" (already ordered by id, which encodes L0 recency) in parallel.
-            var items = sstFiles.Select(x => (x.filename, id: x.id!.Value)).ToArray();
-            var ssTables = await LoadManyAsync(items);
-
-            storageInner._state.LevelZeroTables = ssTables.ToList();
-            committedSstIds = new HashSet<long>(items.Select(x => x.id));
-        }
-
-        // Recover memtables that hadn't been flushed when the previous process exited. Memtables are
-        // flushed oldest-id-first, so any WAL without a matching committed SST is newer than every loaded
-        // SST; enqueuing them oldest-first (reads reverse the queue) preserves recency above L0.
-        if (options.UseWriteAheadLog && walFiles.Count > 0)
-        {
-            var recovered = new List<IMemTable>();
-
-            foreach (var (filename, id) in walFiles)
-            {
-                // If a committed SST with this id exists the memtable was flushed and committed to the
-                // manifest before the crash and this WAL is stale; remove it and skip replay. This makes
-                // the flush/delete sequence idempotent.
-                if (committedSstIds.Contains(id!.Value))
-                {
-                    TryDeleteFile(filename);
-                    continue;
-                }
-
-                var memTable = new MemTable(id!.Value, arenaBlockSize: options.MemTableArenaBlockSize);
-                WriteAheadLog.Replay(filename, memTable);
-                recovered.Add(memTable);
-            }
-
-            if (recovered.Count > 0)
-            {
-                storageInner._state.ImmutableMemTables = ImmutableArray.CreateRange(recovered);
-            }
-        }
-
-        // Ensure every successfully opened store has a manifest, including manifest-less stores created by
-        // older versions or by strategies that used to infer L0 from filenames.
-        storageInner.BuildManifestSnapshot().Write(path);
-
-        var compacter = new Compacter(storageInner, TimeProvider.System, options);
-
-        compacter.StartBackgroundFlush();
-
-        return new LsmStorage(storageInner, compacter);
     }
 
     private static long? TryParseId(string filename)
@@ -409,13 +478,13 @@ public sealed class LsmStorage : IDisposable, IAsyncDisposable
 
     public void Put(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
     {
-        CheckDisposed();
+        CheckWritable();
         _inner.PutRaw(key, value);
     }
 
     public void Delete(ReadOnlySpan<byte> key)
     {
-        CheckDisposed();
+        CheckWritable();
         _inner.DeleteRaw(key);
     }
 
@@ -428,7 +497,7 @@ public sealed class LsmStorage : IDisposable, IAsyncDisposable
     /// </remarks>
     public void Write(LsmWriteBatch batch)
     {
-        CheckDisposed();
+        CheckWritable();
         ArgumentNullException.ThrowIfNull(batch);
         _inner.WriteBatch(batch);
     }
@@ -570,8 +639,7 @@ public sealed class LsmStorage : IDisposable, IAsyncDisposable
 
     public async Task FlushAndCompactAsync(CancellationToken cancellationToken = default)
     {
-        CheckDisposed();
-
+        CheckWritable();
         await _compacter.StopBackgroundFlushAsync();
 
         try
@@ -613,6 +681,12 @@ public sealed class LsmStorage : IDisposable, IAsyncDisposable
     private async Task DisposeInternalAsync(CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
+
+        if (IsReadOnly)
+        {
+            _inner.Dispose();
+            return;
+        }
 
         await _compacter.CloseAsync(cancellationToken);
 

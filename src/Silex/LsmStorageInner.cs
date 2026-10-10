@@ -78,10 +78,10 @@ internal sealed class LsmStorageInner : IDisposable
     /// </summary>
     /// <param name="path"></param>
     /// <param name="options"></param>
-    internal LsmStorageInner(string path, StorageOptions options)
+    internal LsmStorageInner(string path, StorageOptions options, bool readOnly = false)
     {
         StoragePath = path;
-        _useWriteAheadLog = options.UseWriteAheadLog;
+        _useWriteAheadLog = options.UseWriteAheadLog && !readOnly;
         _syncWriteAheadLogToDisk = options.SyncWriteAheadLogToDisk;
         _compactionStrategy = options.CompactionStrategy;
         _maxCompactionTiers = options.MaxCompactionTiers;
