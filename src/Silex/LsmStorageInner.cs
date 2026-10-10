@@ -658,7 +658,7 @@ internal sealed class LsmStorageInner : IDisposable
                     }
                 }
 
-                return state!.Count;
+                return state?.Count ?? 0;
             }
 
             var merge = new MergeIterator(BuildMergeInputs(
@@ -1167,6 +1167,153 @@ internal sealed class LsmStorageInner : IDisposable
         }
 
         WriteCore(default, default, false, batch);
+    }
+
+    public async Task SynchronizeAsync(CancellationToken cancellationToken)
+    {
+        using var operation = Lifetime.Enter();
+        CheckHealthy();
+        if (!_useWriteAheadLog)
+        {
+            throw new NotSupportedException("Synchronization requires UseWriteAheadLog because unflushed memory has no recoverable file.");
+        }
+        await _maintenanceLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            _currentMemTableLock.EnterWriteLock();
+            try
+            {
+                CheckHealthy();
+                cancellationToken.ThrowIfCancellationRequested();
+                // Maintenance cannot replace/delete files, and writes cannot append or rotate WALs.
+                // Active WALs retain writer exclusion; recovered memtables have no writer handle.
+                try
+                {
+                    SynchronizeFile(GetWalPath(_state.CurrentMemTable.Id),
+                        StorageFaultPoint.SynchronizationBeforeWal, StorageFaultPoint.SynchronizationAfterWal,
+                        ((MemTable)_state.CurrentMemTable).Wal);
+                    foreach (var memTable in _state.ImmutableMemTables)
+                    {
+                        SynchronizeFile(GetWalPath(memTable.Id),
+                            StorageFaultPoint.SynchronizationBeforeWal, StorageFaultPoint.SynchronizationAfterWal,
+                            ((MemTable)memTable).Wal);
+                    }
+                    foreach (var table in _state.LevelZeroTables)
+                    {
+                        SynchronizeFile(table.Filename,
+                            StorageFaultPoint.SynchronizationBeforeSst, StorageFaultPoint.SynchronizationAfterSst);
+                    }
+                    foreach (var level in _state.LeveledSsTables)
+                    {
+                        foreach (var table in level)
+                        {
+                            SynchronizeFile(table.Filename,
+                                StorageFaultPoint.SynchronizationBeforeSst, StorageFaultPoint.SynchronizationAfterSst);
+                        }
+                    }
+                    SynchronizeFile(Manifest.GetPath(StoragePath),
+                        StorageFaultPoint.SynchronizationBeforeManifest, StorageFaultPoint.SynchronizationAfterManifest);
+                }
+                catch (Exception exception)
+                {
+                    var failure = new StorageSynchronizationException(exception);
+                    MarkFaulted(failure);
+                    throw failure;
+                }
+            }
+            finally
+            {
+                _currentMemTableLock.ExitWriteLock();
+            }
+        }
+        finally
+        {
+            _maintenanceLock.Release();
+        }
+    }
+
+    internal void WriteGroup(LsmWriteBatch[] batches, StorageCommitOutcome[] outcomes, int count)
+    {
+        using var operation = Lifetime.Enter();
+        _currentMemTableLock.EnterWriteLock();
+        try
+        {
+            CheckHealthy();
+            var memTable = (MemTable)_state.CurrentMemTable;
+            var wal = memTable.Wal ?? throw new InvalidOperationException("Group commit requires an active WAL.");
+            var submitted = false;
+            try
+            {
+                for (var i = 0; i < count; i++)
+                {
+                    try
+                    {
+                        wal.AppendBatch(batches[i], synchronize: false);
+                    }
+                    catch
+                    {
+                        outcomes[i] = wal.AppendOutcome;
+                        submitted |= wal.AppendOutcome != StorageCommitOutcome.NotCommitted;
+                        throw;
+                    }
+                    outcomes[i] = StorageCommitOutcome.Indeterminate;
+                    submitted = true;
+                }
+                wal.SynchronizeGroup();
+                for (var i = 0; i < count; i++)
+                {
+                    memTable.ApplyBatch(batches[i]);
+                    outcomes[i] = StorageCommitOutcome.Committed;
+                    FaultInjector?.Invoke(StorageFaultPoint.WriteBeforePublication);
+                }
+                InvalidateSortedSsTableRun();
+                if (memTable.Size >= _memTableSizeLimit)
+                {
+                    FreezeMemTable();
+                }
+            }
+            catch (Exception exception)
+            {
+                var outcome = StorageCommitOutcome.NotCommitted;
+                if (submitted)
+                {
+                    outcome = StorageCommitOutcome.Committed;
+                    for (var i = 0; i < count; i++)
+                    {
+                        if (outcomes[i] != StorageCommitOutcome.Committed)
+                        {
+                            outcome = StorageCommitOutcome.Indeterminate;
+                            break;
+                        }
+                    }
+                }
+                var failure = new StorageOperationException(outcome, exception);
+                if (outcome != StorageCommitOutcome.NotCommitted)
+                {
+                    MarkFaulted(failure);
+                }
+                throw failure;
+            }
+        }
+        finally
+        {
+            _currentMemTableLock.ExitWriteLock();
+        }
+    }
+
+    private void SynchronizeFile(string path, StorageFaultPoint before, StorageFaultPoint after, WriteAheadLog? wal = null)
+    {
+        FaultInjector?.Invoke(before);
+        if (wal is not null)
+        {
+            wal.Synchronize();
+        }
+        else
+        {
+            using var handle = File.OpenHandle(path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete);
+            RandomAccess.FlushToDisk(handle);
+        }
+        FaultInjector?.Invoke(after);
     }
 
     private void WriteCore(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool isTombstone, LsmWriteBatch? batch)
@@ -2519,8 +2666,26 @@ internal sealed class LsmStorageInner : IDisposable
     private bool _manifestLogReady;
     private ManifestLog? _manifestLog;
 
+    private void SynchronizePendingOutputs()
+    {
+        // Preserve synchronized data when replacing WALs or compaction inputs, even if a barrier was
+        // requested in an earlier instance. Only new outputs need synchronization, not every live SST.
+        if (_pendingTable is { } table)
+        {
+            SynchronizeFile(table.Filename, StorageFaultPoint.SynchronizationBeforeSst, StorageFaultPoint.SynchronizationAfterSst);
+        }
+        if (_pendingCompactionOutputs is { } outputs)
+        {
+            foreach (var output in outputs)
+            {
+                SynchronizeFile(output.Filename, StorageFaultPoint.SynchronizationBeforeSst, StorageFaultPoint.SynchronizationAfterSst);
+            }
+        }
+    }
+
     private void WriteManifest(Manifest manifest)
     {
+        SynchronizePendingOutputs();
         FaultInjector?.Invoke(StorageFaultPoint.ManifestBeforePublish);
         WriteManifestSnapshot(manifest);
         FaultInjector?.Invoke(StorageFaultPoint.ManifestAfterPublish);
@@ -2532,6 +2697,7 @@ internal sealed class LsmStorageInner : IDisposable
     /// </summary>
     private void WriteManifest(Manifest? snapshot, long appendedL0Id)
     {
+        SynchronizePendingOutputs();
         FaultInjector?.Invoke(StorageFaultPoint.ManifestBeforePublish);
 
         if (snapshot != null)
@@ -2542,7 +2708,7 @@ internal sealed class LsmStorageInner : IDisposable
         {
             try
             {
-                _manifestLog!.AppendL0(appendedL0Id);
+                _manifestLog!.AppendL0(appendedL0Id, FaultInjector);
             }
             catch
             {
@@ -2563,7 +2729,7 @@ internal sealed class LsmStorageInner : IDisposable
         _manifestLogReady = false;
 
         manifest.Epoch = _manifestEpoch;
-        manifest.Write(StoragePath);
+        manifest.Write(StoragePath, FaultInjector);
         _manifestEpoch = manifest.Epoch;
         _manifestLog = new ManifestLog(StoragePath, _manifestEpoch);
         _manifestLogReady = true;

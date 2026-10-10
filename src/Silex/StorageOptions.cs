@@ -200,14 +200,30 @@ public class StorageOptions
 
     /// <summary>
     /// Gets or sets whether each write-ahead log frame is flushed all the way to disk (<c>fsync</c>).
-    /// When <c>false</c> the frame is only written to the operating system, which still survives a
-    /// process crash but not a power loss. Enabling this is slower but survives power loss.
+    /// When <c>false</c> the frame is written to the operating system before in-memory application,
+    /// supporting process-crash recovery but not promising synchronization to stable storage.
+    /// When <c>true</c>, OS file-content synchronization must succeed before application/acknowledgment.
     /// </summary>
-    /// <remarks>This has no effect when <see cref="UseWriteAheadLog"/> is <c>false</c>.</remarks>
+    /// <remarks>
+    /// This has no effect when <see cref="UseWriteAheadLog"/> is <c>false</c>.
+    /// Alternatively, call <see cref="LsmStorage.SynchronizeAsync"/> after a completed write.
+    /// Neither option synchronizes directory entries or certifies power-loss safety on every OS/device.
+    /// </remarks>
     /// <value>
     /// The default value is <c>false</c>.
     /// </value>
     public bool SyncWriteAheadLogToDisk { get; set; } = false;
+
+    /// <summary>
+    /// Maximum number of ready MVCC transactions sharing one WAL synchronization. One disables grouping.
+    /// </summary>
+    /// <remarks>
+    /// Only used by <see cref="MvccStorage"/>; values from 1 through 64 are supported. Grouping requires
+    /// WAL and synchronous durability. At most twice this number of commits are admitted at once;
+    /// further callers wait with cancellation. Ready commits are validated in admission order, without
+    /// an intentional collection delay. Ordinary LSM writes and MVCC Put/Delete remain unchanged.
+    /// </remarks>
+    public int MvccCommitGroupSize { get; set; } = 1;
 
     /// <summary>
     /// Gets or sets the compaction strategy used to merge on-disk SSTs in the background.

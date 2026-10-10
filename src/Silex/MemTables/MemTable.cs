@@ -50,6 +50,8 @@ internal sealed class MemTable : IMemTable, IRawBytesMemTable
 
     public long Id => _id;
 
+    internal WriteAheadLog? Wal => _wal;
+
     public long Size => _size;
 
     public int Count => _count;
@@ -117,6 +119,11 @@ internal sealed class MemTable : IMemTable, IRawBytesMemTable
             WriteOutcome = _wal!.AppendOutcome;
             throw;
         }
+        ApplyBatch(batch);
+    }
+
+    internal void ApplyBatch(LsmWriteBatch batch)
+    {
         WriteOutcome = StorageCommitOutcome.Indeterminate;
         _faultInjector?.Invoke(StorageFaultPoint.BatchBeforeApply);
         for (var i = 0; i < batch.Count; i++)

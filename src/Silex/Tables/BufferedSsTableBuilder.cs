@@ -57,8 +57,6 @@ internal sealed class BufferedSsTableBuilder : ISsTableBuilder
     private BlockMetadataStore? _flattenedMetadata;
     private bool _disposed;
     private bool _ownsBuiltResources = true;
-    private static readonly bool SyncOnceBeforePublish = OperatingSystem.IsWindows();
-
     private readonly FileStream _stream;
 
     private static readonly int _flushBufferSize = (int)32.KiB();
@@ -94,16 +92,11 @@ internal sealed class BufferedSsTableBuilder : ISsTableBuilder
         // Disable dotnet buffer as we are handling it
         var bufferSize = 0;
 
+        // No write-through: the flush/compaction commit synchronizes each new SST once before the manifest
+        // publishes it, whereas write-through paid a device flush on every write (~10 ms per small SST on Windows).
         var options =
             FileOptions.Asynchronous // All operation are async
             ;
-
-        // Windows pays a full device flush per write-through write, so it syncs once in BuildAsync instead.
-        // Elsewhere write-through is cheap, and Flush(true) is F_FULLFSYNC on macOS (far slower).
-        if (!SyncOnceBeforePublish)
-        {
-            options |= FileOptions.WriteThrough;
-        }
 
         _stream = File.Create(_tempFilename, bufferSize, options);
     }
@@ -236,16 +229,6 @@ internal sealed class BufferedSsTableBuilder : ISsTableBuilder
         binaryWriter.Flush();
 
         await FLushBufferToDiskAsync(cancellationToken);
-
-        // A single durability barrier for the whole file instead of write-through on every write: a
-        // write-through write costs a full device flush (~5 ms on Windows runners), and a small SST paid
-        // it once for the blocks and again for the metadata. The SST must be durable before the manifest
-        // commits it, and the rename below only publishes it after this point.
-        if (SyncOnceBeforePublish)
-        {
-            _stream.Flush(flushToDisk: true);
-        }
-
         await _stream.DisposeAsync();
 
         // The temporary file is now complete and closed; publish it under the final name atomically so
@@ -253,7 +236,7 @@ internal sealed class BufferedSsTableBuilder : ISsTableBuilder
         File.Move(_tempFilename, _filename, overwrite: true);
 
         var flattenedMetadata = _flattenedMetadata!;
-        var readStream = File.OpenRead(_filename);
+        var readStream = SsTable.OpenRead(_filename);
         SsTable table;
 
         try

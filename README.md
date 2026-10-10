@@ -105,7 +105,7 @@ as the original store when opening either normally or for salvage.
 
 Use `LsmWriteBatch` when several byte-oriented mutations can share one durability boundary. The batch is
 written as one checksum-protected WAL frame, reducing write and `fsync` calls while preserving the default
-process-crash and optional power-loss guarantees:
+process-crash recovery and optional file-content synchronization boundaries:
 
 ```csharp
 var batch = new LsmWriteBatch();
@@ -113,6 +113,56 @@ batch.Put("user:1"u8, "active"u8);
 batch.Delete("user:2"u8);
 db.Write(batch);
 ```
+
+### Durability boundaries and explicit synchronization
+
+**Applied/visible**, **written to the operating system**, and **synchronized** are different boundaries.
+Writes are serialized under the mutable-table lock. With WAL enabled, the complete checksummed recovery
+frame is written first, then optionally synchronized, then applied in memory. Readers cannot observe a
+partially applied successful batch. MVCC additionally publishes its sequence after applying the frame;
+only published sequences are visible to new snapshots.
+
+| Configuration | Successful `Put`, `Delete`, `Write`, or MVCC commit guarantees |
+|---|---|
+| `UseWriteAheadLog = false` (`SyncWriteAheadLogToDisk` ignored) | Entire mutation applied/visible; no recoverable file for unflushed memory, so no process-crash or stable-storage guarantee. |
+| WAL enabled, `SyncWriteAheadLogToDisk = false` (default) | Entire mutation applied/visible and complete WAL frame submitted to the OS. Supports process-crash recovery with the OS still running; stable-storage synchronization is not promised. |
+| WAL enabled, `SyncWriteAheadLogToDisk = true` | The preceding guarantees, plus successful OS file-content synchronization (`FileStream.Flush(true)`) of the WAL before in-memory application and acknowledgment. |
+
+For a precise explicit boundary without synchronizing every append:
+
+```csharp
+db.Put("user:1"u8, "active"u8); // applied/visible and written to the OS
+await db.SynchronizeAsync();   // synchronize through this successfully completed write
+```
+
+`LsmStorage.SynchronizeAsync` and `MvccStorage.SynchronizeAsync` cover **all writes/commits completed before
+the call** (and any racing writes serialized before the barrier acquires the write lock). No guarantee
+is made for writes serialized afterward. This is a whole-store barrier, not a write receipt, transaction,
+checkpoint, or group-commit API; it does not stage, apply, or publish new mutations. Await a successful
+MVCC commit first; pending transaction buffers are excluded.
+
+The barrier blocks writes/rotation and serializes with flush/compaction while requesting disk
+synchronization for the current WAL, every rotated or recovered WAL, every live L0/leveled SST, and
+finally the manifest. Thus a write is still covered after its original WAL has been flushed/deleted or
+its SST compacted. It does not flush memtables or run compaction. Repeated barriers are supported and
+may be expensive: they synchronize the live file set, not just a tracked unsynchronized suffix.
+WAL-disabled stores throw `NotSupportedException` without faulting, rather than falsely acknowledging
+unflushed memory. Read-only salvage stores reject it like other writable-only operations.
+
+Cancellation is honored while asynchronously waiting for the maintenance/MVCC commit gate and once more
+after acquiring the synchronous mutable-table lock, before the first file I/O. Waiting for that synchronous
+lock cannot be interrupted; file synchronization may run synchronously on the calling thread, and after
+file I/O begins cancellation is not polled. Successful completion reports the actual boundary, even if
+the token was canceled during synchronization. An admitted barrier is drained by shutdown; new barriers are rejected
+once shutdown starts. Do not invoke it from a borrowed-read callback (it requires the write lock).
+
+Flush/compaction synchronize each replacement SST's contents and the new manifest's contents before
+retiring the old recovery files, preserving the file-content boundary across maintenance and reopen.
+**These are OS file-content synchronization requests, not power-loss certification.** Silex does not
+explicitly synchronize directory entries for WAL creation, SST/manifest renames, or file deletion.
+Their persistence, the OS/filesystem's synchronization semantics, and device/controller caches still
+matter. No configuration or barrier promises survival of every power loss, hardware/media failure, or
+filesystem failure. Source inspection and process-crash tests are not power-loss tests.
 
 ### Operation failures and instance health
 
@@ -133,6 +183,14 @@ the original exception in `InnerException`. Inspect `Outcome` and `Health`, not 
 | In-memory mutation/batch application fails after WAL persistence, or while applying with WAL disabled | `Indeterminate`; memory may contain only part of the batch | Faulted |
 | The entire mutation reaches its boundary, but subsequent publication or automatic memtable rotation fails | `Committed`; for MVCC, the persisted sequence may not yet be published to readers in this instance | Faulted |
 
+An explicit barrier's I/O failure throws `StorageSynchronizationException` with the original cause in
+`InnerException`. The requested synchronization boundary is **unconfirmed** (some or all files may
+already have synchronized), and the instance becomes faulted. Previously successful mutations remain
+committed to their original acknowledgment boundary; the barrier does not undo them and its exception
+is not a mutation's `NotCommitted`/`Indeterminate` outcome. Dispose and reopen, do not retry writes merely
+because synchronization failed. Cancellation before file I/O, unsupported WAL configuration, and
+read-only rejection leave health unchanged.
+
 `Indeterminate` is deliberately conservative: recovery may apply the entire WAL frame, or discard an
 incomplete trailing frame. It never means "nothing committed." A complete checksummed batch frame is
 replayed as a whole when recovery succeeds; failed recovery returns no usable instance. With WAL
@@ -148,9 +206,10 @@ observe a failed batch's partial application. Health inspection and disposal rem
 an operational state, not an integrity certification: an explicitly salvaged store is usable only for
 read-only extraction and still requires inspection of its incomplete `RecoveryReport`.
 
-Cancellation before an MVCC commit's final write begins throws `OperationCanceledException` and does
+Cancellation before an ordinary MVCC commit's final write begins throws `OperationCanceledException` and does
 not commit. Once writing starts, cancellation is not polled: completion reports the actual write
-result rather than a misleading cancellation. The synchronous byte-store mutations do not accept a
+result rather than a misleading cancellation. With optional group commit, cancellation instead ends at
+acceptance after validation and batch preparation (see below). The synchronous byte-store mutations do not accept a
 cancellation token.
 
 Flush/compaction failures do not undo previously acknowledged writes. Cancellation before maintenance
@@ -349,6 +408,51 @@ versions, transaction buffers, and sequence metadata writes. Dispose snapshots a
 call `CollectGarbageAsync` periodically to remove versions that no active view can observe. Pass
 `compact: true` when the call should also flush and compact the resulting physical tombstones.
 
+### Durable transaction group commit
+
+Set `MvccCommitGroupSize` to a value from 2 through 64 to let concurrent transaction commits share WAL
+file-content synchronization; the default of 1 preserves the ordinary commit path. Grouping requires
+both `UseWriteAheadLog = true` and `SyncWriteAheadLogToDisk = true`. It does not change plain LSM writes,
+MVCC `Put`/`Delete`, or the WAL format.
+
+The engine admits at most twice the configured group size, with further commit callers waiting on
+cancelable admission. A worker takes up to the configured number of **already ready** transactions in
+queue-admission order after acquiring the MVCC commit gate. There is no timer, minimum group size,
+or deliberate latency window; a single ready transaction can proceed immediately. Scheduler, gate,
+validation, and I/O contention can still delay completion; this is not a bounded wall-clock latency
+promise. Transaction buffers must not be changed or disposed during a commit.
+
+Validation and publication remain serialized. Each transaction checks both changes published since
+its starting snapshot and the written keys of earlier accepted transactions in its group, including
+tracked point-read dependencies. Conflicts return `false` and contribute no frame or sequence.
+Cancellation is checked during admission, validation, and once more after preparing the transaction's
+frame data. Acceptance ends cancellation: canceling an accepted transaction does not interrupt the
+group or return a misleading cancellation result. Read-only transactions require no WAL boundary.
+
+Each accepted writing transaction retains its **own atomic recovery frame**, including its sequence
+metadata. All frames in the group are written under one mutable-table lock, synchronized once, then
+applied and published in order. Successful writing commits are acknowledged only after synchronization
+and publication succeed; readers still capture an atomic transaction snapshot. Memtable rotation happens
+after the group, so the size threshold can be exceeded by one group before rotation.
+
+If frame submission fails, an unsubmitted transaction reports `NotCommitted`; submitted transactions
+report `Indeterminate`, including complete earlier frames whose synchronization was not confirmed.
+Synchronization or application failure faults the instance and does not acknowledge any writing
+transaction as successful. Transactions fully applied after successful synchronization report
+`Committed` if later application, publication, or rotation fails; remaining submitted transactions
+report `Indeterminate`. A completed frame may recover even when its caller received an exception.
+The store retains the first unsafe failure, rejects further work, and preserves WAL evidence on disposal,
+as on the ordinary path. A failure before any frame submission leaves the instance healthy.
+
+Explicit `SynchronizeAsync` barriers still serialize with commit publication and cover previously
+completed commits; await the commit first to require its inclusion. Shutdown rejects new admission,
+drains an already accepted group, completes queued but unaccepted commits with disposal errors, and
+then closes the underlying store. The existing file-content (not directory or universal power-loss)
+durability limitations apply unchanged.
+
+Local throughput and latency measurements, commands, and limitations are recorded in
+[`tests/Silex.WalBenchmarks/group-commit.md`](tests/Silex.WalBenchmarks/group-commit.md).
+
 ## Closing the store
 
 ### Exclusive directory ownership
@@ -425,7 +529,8 @@ is a valid starting point. The most commonly used options:
 | `FlushPeriod`              | 50 ms              | Interval between background flushes. `TimeSpan.Zero` disables the thread.|
 | `BlockCacheSizeLimit`      | 1 MiB              | Size of the in-memory cache of decoded blocks.                           |
 | `UseWriteAheadLog`         | `true`             | Maintain a WAL so unflushed data is recovered after a crash.             |
-| `SyncWriteAheadLogToDisk`  | `false`            | `fsync` every WAL frame (slower, survives power loss).                   |
+| `SyncWriteAheadLogToDisk`  | `false`            | Request OS file-content synchronization for every WAL frame before applying/acknowledging it; see durability limitations above. |
+| `MvccCommitGroupSize`      | `1`                | Maximum ready MVCC transactions sharing one synchronization (1 disables; 2-64 require synchronous WAL durability). |
 | `CompactionStrategy`       | `Tiered`           | `None`, `Tiered` (write-optimized), or `Leveled` (read-optimized).       |
 
 Convenient size helpers are available as extension methods: `64.MiB()`, `4.KiB()`, `1.GiB()`,

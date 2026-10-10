@@ -9,7 +9,7 @@ namespace Silex;
 /// alone cannot encode this once compaction rewrites data into fresh files, so the manifest is the
 /// authoritative source for recovery under every compaction strategy. The manifest is rewritten
 /// atomically (temp file + rename) after every structural change and is the single commit point that makes
-/// flush and compaction crash-safe: a crash before the rewrite leaves the previous structure intact, and
+/// flush and compaction process-crash-safe: a crash before the rewrite leaves the previous structure intact, and
 /// any SST not referenced by the committed manifest is an orphan that recovery deletes.
 /// </summary>
 /// <remarks>
@@ -93,7 +93,7 @@ internal sealed class Manifest
     /// file and renamed over the previous manifest, so a reader never observes a partially written file.
     /// Advances <see cref="Epoch"/>, which retires the previous incremental log.
     /// </summary>
-    public void Write(string storagePath)
+    public void Write(string storagePath, Action<StorageFaultPoint>? faultInjector = null)
     {
         Epoch++;
         var tempPath = Path.Combine(storagePath, TempFileName);
@@ -117,9 +117,13 @@ internal sealed class Manifest
 
             writer.WriteEndArray();
             writer.WriteEndObject();
+            writer.Flush();
+            faultInjector?.Invoke(StorageFaultPoint.ManifestBeforeSync);
+            stream.Flush(flushToDisk: true);
+            faultInjector?.Invoke(StorageFaultPoint.ManifestAfterSync);
         }
 
-        // Atomic publish: the rename is the commit point for the structural change.
+        // Synchronizes contents before atomic publication; directory-entry persistence is OS/filesystem-dependent.
         File.Move(tempPath, path, overwrite: true);
 
         ManifestLog.DeleteStaleLogs(storagePath);
@@ -186,9 +190,9 @@ internal sealed class ManifestLog : IDisposable
     }
 
     /// <summary>
-    /// Durably (to the OS, matching the snapshot write) records that <paramref name="id"/> was appended to L0.
+    /// Records, and synchronizes to disk like the snapshot write, that <paramref name="id"/> was appended to L0.
     /// </summary>
-    public void AppendL0(long id)
+    public void AppendL0(long id, Action<StorageFaultPoint>? faultInjector = null)
     {
         _stream ??= new FileStream(_path, FileMode.Append, FileAccess.Write, FileShare.Read | FileShare.Delete, bufferSize: 1);
 
@@ -197,6 +201,9 @@ internal sealed class ManifestLog : IDisposable
         BinaryPrimitives.WriteInt64LittleEndian(record[1..], id);
         BinaryPrimitives.WriteUInt32LittleEndian(record[9..], Crc32.HashToUInt32(record[..9]));
         _stream.Write(record);
+        faultInjector?.Invoke(StorageFaultPoint.ManifestBeforeSync);
+        _stream.Flush(flushToDisk: true);
+        faultInjector?.Invoke(StorageFaultPoint.ManifestAfterSync);
     }
 
     public void Dispose()

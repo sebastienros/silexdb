@@ -50,6 +50,10 @@ internal sealed class SsTable : IDisposable
 
     public string Filename => _filename;
 
+    // Write sharing permits a synchronization-only handle while this immutable file is being read.
+    internal static FileStream OpenRead(string filename) =>
+        new(filename, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+
     /// <summary>
     /// The numeric id parsed from the <c>{id}.sst</c> filename, computed once. This is the id recorded in
     /// the manifest, as opposed to the transient runtime <see cref="Id"/>.
@@ -281,7 +285,7 @@ internal sealed class SsTable : IDisposable
                 table._filename,
                 FileMode.Open,
                 FileAccess.Read,
-                FileShare.Read | FileShare.Delete,
+                FileShare.ReadWrite | FileShare.Delete,
                 SequentialReadBufferSize,
                 FileOptions.SequentialScan);
         }
@@ -354,7 +358,7 @@ internal sealed class SsTable : IDisposable
     public static async Task<SsTable> LoadSsTableAsync(string filename, ISsTableEncoder tableEncoder, BlockBuilder blockBuilder, IBloomFilterFactory bloomFilterFactory, long? id = null, CancellationToken cancellationToken = default)
     {
         byte[] footerBuffer = ArrayPool<byte>.Shared.Rent(SsTableFormat.FooterLength);
-        var stream = File.OpenRead(filename);
+        var stream = OpenRead(filename);
         var success = false;
 
         try
