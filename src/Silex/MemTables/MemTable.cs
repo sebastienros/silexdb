@@ -400,6 +400,41 @@ internal sealed class MemTable : IMemTable, IRawBytesMemTable
         return low;
     }
 
+    internal bool TryGetNextRaw(ReadOnlySpan<byte> from, bool hasFrom, bool inclusive, bool backwards,
+        out ReadOnlySpan<byte> key, out ReadOnlySpan<byte> value, out bool tombstone)
+    {
+        EnsureSortedIndex();
+        var index = backwards ? _count - 1 : 0;
+        if (hasFrom)
+        {
+            index = FindFirstAtOrAfter(from);
+            var equal = index < _count &&
+                _arena.GetSpan(_records[_sortedIndices![index]].Key).SequenceEqual(from);
+            if (backwards)
+            {
+                if (!equal || !inclusive)
+                {
+                    index--;
+                }
+            }
+            else if (equal && !inclusive)
+            {
+                index++;
+            }
+        }
+        if ((uint)index >= (uint)_count)
+        {
+            key = value = default;
+            tombstone = false;
+            return false;
+        }
+        var record = _records[_sortedIndices![index]];
+        key = _arena.GetSpan(record.Key);
+        tombstone = record.IsTombstone;
+        value = tombstone ? default : _arena.GetSpan(record.Value);
+        return true;
+    }
+
     private KeyValuePair<ByteSlice, ByteSlice> Materialize(int sortedIndex)
     {
         var record = _records[_sortedIndices![sortedIndex]];

@@ -1,5 +1,6 @@
 using Silex.Blocks;
 using Silex.Tables;
+using Silex.MemTables;
 using System.Buffers;
 using System.Runtime.CompilerServices;
 
@@ -51,6 +52,68 @@ internal sealed class MergeIterator : IStorageIterator
         return EnumerateCore(hasFrom: true, from.Memory, backwards: true, cancellationToken);
     }
 
+    internal async ValueTask<bool> ScanBoundedRawAsync<TArg>(OrderedReadRange range, bool backwards,
+        TArg arg, ReadRawEntryAction<TArg> reader, CancellationToken cancellationToken)
+    {
+        if (range.IsEmpty)
+        {
+            return true;
+        }
+        var start = backwards ? range.Upper : range.Lower;
+        var sourceCount = _inputs.Count;
+        var sources = ArrayPool<Source>.Shared.Rent(Math.Max(1, sourceCount));
+        var heap = ArrayPool<int>.Shared.Rent(Math.Max(1, sourceCount));
+        var initialized = 0;
+        var heapCount = 0;
+        try
+        {
+            for (var i = 0; i < sourceCount; i++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                sources[i] = Source.Create(_inputs[i], start.HasValue, start.GetValueOrDefault(), backwards, cancellationToken);
+                sources[i].Range = range;
+                initialized++;
+                if (await MoveNextSourceAsync(sources, i, cancellationToken).ConfigureAwait(false))
+                {
+                    Push(sources, heap, ref heapCount, i, backwards);
+                }
+            }
+            while (heapCount != 0)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var winner = Pop(sources, heap, ref heapCount, backwards);
+                while (heapCount != 0 && KeysEqual(sources[winner], sources[heap[0]]))
+                {
+                    var duplicate = Pop(sources, heap, ref heapCount, backwards);
+                    if (await MoveNextSourceAsync(sources, duplicate, cancellationToken).ConfigureAwait(false))
+                    {
+                        Push(sources, heap, ref heapCount, duplicate, backwards);
+                    }
+                }
+                if (!sources[winner].IsTombstone &&
+                    !reader(arg, sources[winner].KeySpan, sources[winner].ValueSpan))
+                {
+                    return false;
+                }
+                if (await MoveNextSourceAsync(sources, winner, cancellationToken).ConfigureAwait(false))
+                {
+                    Push(sources, heap, ref heapCount, winner, backwards);
+                }
+            }
+            return true;
+        }
+        finally
+        {
+            for (var i = 0; i < initialized; i++)
+            {
+                await sources[i].DisposeAsync().ConfigureAwait(false);
+                sources[i] = default;
+            }
+            ArrayPool<Source>.Shared.Return(sources);
+            ArrayPool<int>.Shared.Return(heap);
+        }
+    }
+
     internal async ValueTask<long> ScanRawAsync<TArg>(
         bool hasFrom,
         ReadOnlyMemory<byte> from,
@@ -64,7 +127,6 @@ internal sealed class MergeIterator : IStorageIterator
         {
             return 0;
         }
-
         var sources = ArrayPool<Source>.Shared.Rent(sourceCount);
         var heap = ArrayPool<int>.Shared.Rent(sourceCount);
         var heapCount = 0;
@@ -100,7 +162,7 @@ internal sealed class MergeIterator : IStorageIterator
                 if (!sources[winner].IsTombstone)
                 {
                     count++;
-                    keepGoing =                     reader(arg, sources[winner].KeySpan, sources[winner].ValueSpan);
+                    keepGoing = reader(arg, sources[winner].KeySpan, sources[winner].ValueSpan);
                 }
 
                 if (!keepGoing || count >= maxEntries)
@@ -200,8 +262,46 @@ internal sealed class MergeIterator : IStorageIterator
         }
     }
 
-    private async ValueTask<bool> MoveNextSourceAsync(Source[] sources, int sourceIndex, CancellationToken cancellationToken)
+    private ValueTask<bool> MoveNextSourceAsync(Source[] sources, int sourceIndex, CancellationToken cancellationToken)
     {
+        return sources[sourceIndex].Range is null
+            ? MoveNextSourceCoreAsync(sources, sourceIndex, cancellationToken)
+            : MoveNextBoundedSourceAsync(sources, sourceIndex, cancellationToken);
+    }
+
+    private async ValueTask<bool> MoveNextBoundedSourceAsync(Source[] sources, int sourceIndex, CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!await MoveNextSourceCoreAsync(sources, sourceIndex, cancellationToken).ConfigureAwait(false))
+            {
+                return false;
+            }
+            var range = sources[sourceIndex].Range;
+            if (range is null)
+            {
+                return true;
+            }
+            var before = range.Before(sources[sourceIndex].KeySpan);
+            var after = range.After(sources[sourceIndex].KeySpan);
+            if (sources[sourceIndex].Step < 0 ? before : after)
+            {
+                return false;
+            }
+            if (!before && !after)
+            {
+                return true;
+            }
+        }
+    }
+
+    private async ValueTask<bool> MoveNextSourceCoreAsync(Source[] sources, int sourceIndex, CancellationToken cancellationToken)
+    {
+        if (sources[sourceIndex].MemTable is not null)
+        {
+            return sources[sourceIndex].MoveNextMemTable();
+        }
         if (sources[sourceIndex].Entries != null)
         {
             return sources[sourceIndex].MoveNextList();
@@ -228,6 +328,15 @@ internal sealed class MergeIterator : IStorageIterator
         while ((uint)sources[sourceIndex].BlockIndex < (uint)table.BlockMetadataArray.Length)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            var range = sources[sourceIndex].Range;
+            var metadata = table.BlockMetadataArray;
+            var blockIndex = sources[sourceIndex].BlockIndex;
+            if (range is not null && (sources[sourceIndex].Step < 0
+                ? range.Before(metadata.GetLastKeySpan(blockIndex))
+                : range.After(metadata.GetFirstKeySpan(blockIndex))))
+            {
+                return false;
+            }
 
             Block? block;
             if (_blockCache == null)
@@ -250,11 +359,12 @@ internal sealed class MergeIterator : IStorageIterator
                 continue;
             }
 
-            var seek = sources[sourceIndex].SeekPending ? sources[sourceIndex].From.Span : default;
+            var hasSeek = sources[sourceIndex].SeekPending;
+            var seek = hasSeek ? sources[sourceIndex].From.Span : default;
             sources[sourceIndex].SeekPending = false;
             sources[sourceIndex].Block = block;
             sources[sourceIndex].HasBlock = true;
-            sources[sourceIndex].Cursor = new BlockIterator.Cursor(block, sources[sourceIndex].Step < 0, seek);
+            sources[sourceIndex].Cursor = new BlockIterator.Cursor(block, sources[sourceIndex].Step < 0, seek, hasSeek);
 
             if (sources[sourceIndex].Cursor.MoveNext())
             {
@@ -340,6 +450,15 @@ internal sealed class MergeIterator : IStorageIterator
 
     private struct Source
     {
+        public OrderedReadRange? Range;
+        public MemTable? MemTable;
+        public ReaderWriterLockSlim? MemTableLock;
+        public byte[]? MemKey;
+        public byte[]? MemValue;
+        public int MemKeyLength;
+        public int MemValueLength;
+        public bool MemStarted;
+        public bool MemTombstone;
         public SsTable? Table;
         public List<KeyValuePair<ByteSlice, ByteSlice>>? Entries;
         public IAsyncEnumerator<KeyValuePair<ByteSlice, ByteSlice>>? Enumerator;
@@ -355,28 +474,31 @@ internal sealed class MergeIterator : IStorageIterator
         public bool HasBlock;
 
         public readonly ReadOnlySpan<byte> KeySpan =>
-            Entries != null
+            MemTable != null ? MemKey.AsSpan(0, MemKeyLength) : Entries != null
                 ? Entries[EntryIndex].Key.Span
                 : Enumerator != null
                     ? Enumerator.Current.Key.Span
                     : Cursor.KeySpan;
 
         public readonly ReadOnlySpan<byte> ValueSpan =>
-            Entries != null
+            MemTable != null ? MemValue.AsSpan(0, MemValueLength) : Entries != null
                 ? Entries[EntryIndex].Value.Span
                 : Enumerator != null
                     ? Enumerator.Current.Value.Span
                     : Cursor.ValueSpan;
 
         public readonly bool IsTombstone =>
-            Entries != null
+            MemTable != null ? MemTombstone : Entries != null
                 ? Entries[EntryIndex].Value.IsTombstone
                 : Enumerator != null
                     ? Enumerator.Current.Value.IsTombstone
                     : Cursor.IsTombstone;
 
         public readonly KeyValuePair<ByteSlice, ByteSlice> Current =>
-            Entries != null
+            MemTable != null
+                ? new(ByteSlice.FromMemory(MemKey.AsMemory(0, MemKeyLength)),
+                    MemTombstone ? ByteSlice.Tombstone : ByteSlice.FromMemory(MemValue.AsMemory(0, MemValueLength)))
+                : Entries != null
                 ? Entries[EntryIndex]
                 : Enumerator != null
                     ? Enumerator.Current
@@ -389,6 +511,17 @@ internal sealed class MergeIterator : IStorageIterator
             bool backwards,
             CancellationToken cancellationToken)
         {
+            if (input.MemTable is not null)
+            {
+                return new Source
+                {
+                    MemTable = input.MemTable,
+                    MemTableLock = input.MemTableLock,
+                    From = from,
+                    SeekPending = hasFrom,
+                    Step = backwards ? -1 : 1,
+                };
+            }
             if (input.Entries != null)
             {
                 var entries = input.Entries;
@@ -508,6 +641,50 @@ internal sealed class MergeIterator : IStorageIterator
             return (uint)EntryIndex < (uint)Entries!.Count;
         }
 
+        public bool MoveNextMemTable()
+        {
+            MemTableLock!.EnterReadLock();
+            try
+            {
+                var from = MemStarted ? MemKey.AsSpan(0, MemKeyLength) : From.Span;
+                var inclusive = !MemStarted && (Range is null || (Step < 0 ? Range.UpperInclusive : Range.LowerInclusive));
+                if (!MemTable!.TryGetNextRaw(from, MemStarted || SeekPending, inclusive, Step < 0,
+                    out var key, out var value, out var tombstone))
+                {
+                    return false;
+                }
+                if (Range is not null && (Step < 0 ? Range.Before(key) : Range.After(key)))
+                {
+                    return false;
+                }
+                Copy(ref MemKey, key);
+                Copy(ref MemValue, value);
+                MemKeyLength = key.Length;
+                MemValueLength = value.Length;
+                MemTombstone = tombstone;
+                MemStarted = true;
+                return true;
+            }
+            finally
+            {
+                MemTableLock.ExitReadLock();
+            }
+        }
+
+        private static void Copy(ref byte[]? buffer, ReadOnlySpan<byte> bytes)
+        {
+            if (buffer is null || buffer.Length < bytes.Length)
+            {
+                var replacement = ArrayPool<byte>.Shared.Rent(Math.Max(1, bytes.Length));
+                if (buffer is not null)
+                {
+                    ArrayPool<byte>.Shared.Return(buffer);
+                }
+                buffer = replacement;
+            }
+            bytes.CopyTo(buffer);
+        }
+
         public void DisposeBlock()
         {
             if (OwnsBlock)
@@ -528,6 +705,16 @@ internal sealed class MergeIterator : IStorageIterator
 
         public async ValueTask DisposeAsync()
         {
+            if (MemKey is not null)
+            {
+                ArrayPool<byte>.Shared.Return(MemKey);
+                MemKey = null;
+            }
+            if (MemValue is not null)
+            {
+                ArrayPool<byte>.Shared.Return(MemValue);
+                MemValue = null;
+            }
             DisposeBlock();
             if (Enumerator != null)
             {
@@ -539,6 +726,11 @@ internal sealed class MergeIterator : IStorageIterator
 
     internal readonly struct Input
     {
+        private Input(MemTable memTable, ReaderWriterLockSlim memTableLock)
+        {
+            MemTable = memTable;
+            MemTableLock = memTableLock;
+        }
         private Input(
             SsTable? table,
             List<KeyValuePair<ByteSlice, ByteSlice>>? entries,
@@ -550,12 +742,15 @@ internal sealed class MergeIterator : IStorageIterator
         }
 
         public SsTable? Table { get; }
+        public MemTable? MemTable { get; }
+        public ReaderWriterLockSlim? MemTableLock { get; }
 
         public List<KeyValuePair<ByteSlice, ByteSlice>>? Entries { get; }
 
         public IStorageIterator? Iterator { get; }
 
         public static Input FromTable(SsTable table) => new(table, null, null);
+        public static Input FromMemTable(MemTable table, ReaderWriterLockSlim tableLock) => new(table, tableLock);
 
         public static Input FromEntries(List<KeyValuePair<ByteSlice, ByteSlice>> entries) => new(null, entries, null);
 
