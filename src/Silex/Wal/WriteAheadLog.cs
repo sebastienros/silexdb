@@ -54,9 +54,8 @@ internal sealed class WriteAheadLog : IDisposable
     public WriteAheadLog(string path, bool syncToDisk, Action<StorageFaultPoint>? faultInjector = null)
     {
         // FileShare.Delete lets the file be deleted while this writer handle is still open (used on
-        // clean flush). Write sharing allows a synchronization-only handle under the storage locks;
-        // directory ownership still excludes other storage instances.
-        _stream = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete, bufferSize: 1, FileOptions.SequentialScan);
+        // clean flush). FileShare.Read lets recovery read the file concurrently if needed.
+        _stream = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.Read | FileShare.Delete, bufferSize: 1, FileOptions.SequentialScan);
         _syncToDisk = syncToDisk;
         _faultInjector = faultInjector;
         try
@@ -151,6 +150,14 @@ internal sealed class WriteAheadLog : IDisposable
         }
 
         _stream.Flush(_syncToDisk);
+    }
+
+    /// <summary>Requests file-content synchronization independently of the per-append configuration.</summary>
+    internal void Synchronize()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        _stream.Flush(flushToDisk: true);
+        DiskFlushCount++;
     }
 
     /// <summary>

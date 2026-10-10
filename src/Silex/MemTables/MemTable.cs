@@ -50,6 +50,8 @@ internal sealed class MemTable : IMemTable, IRawBytesMemTable
 
     public long Id => _id;
 
+    internal WriteAheadLog? Wal => _wal;
+
     public long Size => _size;
 
     public int Count => _count;

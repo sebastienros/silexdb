@@ -1186,15 +1186,17 @@ internal sealed class LsmStorageInner : IDisposable
                 CheckHealthy();
                 cancellationToken.ThrowIfCancellationRequested();
                 // Maintenance cannot replace/delete files, and writes cannot append or rotate WALs.
-                // Recovered memtables have no writer handle, so synchronize by path, not by memtable WAL.
+                // Active WALs retain writer exclusion; recovered memtables have no writer handle.
                 try
                 {
                     SynchronizeFile(GetWalPath(_state.CurrentMemTable.Id),
-                        StorageFaultPoint.SynchronizationBeforeWal, StorageFaultPoint.SynchronizationAfterWal);
+                        StorageFaultPoint.SynchronizationBeforeWal, StorageFaultPoint.SynchronizationAfterWal,
+                        ((MemTable)_state.CurrentMemTable).Wal);
                     foreach (var memTable in _state.ImmutableMemTables)
                     {
                         SynchronizeFile(GetWalPath(memTable.Id),
-                            StorageFaultPoint.SynchronizationBeforeWal, StorageFaultPoint.SynchronizationAfterWal);
+                            StorageFaultPoint.SynchronizationBeforeWal, StorageFaultPoint.SynchronizationAfterWal,
+                            ((MemTable)memTable).Wal);
                     }
                     foreach (var table in _state.LevelZeroTables)
                     {
@@ -1230,11 +1232,18 @@ internal sealed class LsmStorageInner : IDisposable
         }
     }
 
-    private void SynchronizeFile(string path, StorageFaultPoint before, StorageFaultPoint after)
+    private void SynchronizeFile(string path, StorageFaultPoint before, StorageFaultPoint after, WriteAheadLog? wal = null)
     {
         FaultInjector?.Invoke(before);
-        using var handle = File.OpenHandle(path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete);
-        RandomAccess.FlushToDisk(handle);
+        if (wal is not null)
+        {
+            wal.Synchronize();
+        }
+        else
+        {
+            using var handle = File.OpenHandle(path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete);
+            RandomAccess.FlushToDisk(handle);
+        }
         FaultInjector?.Invoke(after);
     }
 
