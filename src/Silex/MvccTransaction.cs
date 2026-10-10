@@ -97,6 +97,10 @@ public sealed class MvccTransaction : IDisposable
     /// Cancellation is observed before the final write starts. Once writing starts, it completes without
     /// polling cancellation. A <see cref="StorageOperationException"/> can report an indeterminate or
     /// committed outcome even though this call throws; inspect the owning store's health before retrying.
+    /// With group commit enabled, cancellation ends at acceptance after ordered validation and batch
+    /// preparation. Accepted transactions wait for their group's WAL synchronization and serialized
+    /// publication, even if cancellation is subsequently requested. Transactions are single-consumer;
+    /// do not mutate or dispose one while its commit is in flight.
     /// </remarks>
     public async ValueTask<bool> TryCommitAsync(CancellationToken cancellationToken = default)
     {

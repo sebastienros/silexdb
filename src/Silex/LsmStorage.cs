@@ -506,6 +506,12 @@ public sealed partial class LsmStorage : IDisposable, IAsyncDisposable
         _inner.WriteBatch(batch);
     }
 
+    internal void WriteGroup(LsmWriteBatch[] batches, StorageCommitOutcome[] outcomes, int count)
+    {
+        CheckWritable();
+        _inner.WriteGroup(batches, outcomes, count);
+    }
+
     /// <summary>Synchronizes the recoverable file contents through all previously completed writes.</summary>
     /// <remarks>
     /// Call after a successful Put, Delete, or Write to include that mutation. The boundary is acquired
