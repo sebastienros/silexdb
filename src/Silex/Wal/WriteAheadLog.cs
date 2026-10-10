@@ -20,7 +20,7 @@ namespace Silex.Wal;
 ///
 /// A frame is written to the operating system before its mutations are applied in memory, which is
 /// supports recovery after a process crash. Enabling <c>syncToDisk</c> additionally requests OS
-/// file-content synchronization for each frame; this is not directory synchronization or certification
+/// file-content synchronization for each frame (or a group of independent transaction frames); this is not directory synchronization or certification
 /// against power loss on every filesystem/device. Multiple mutations may share one frame through <see cref="AppendBatch"/>.
 ///
 /// A single instance is only ever written from one thread at a time: appends happen while the owning
@@ -120,7 +120,7 @@ internal sealed class WriteAheadLog : IDisposable
         CommitFrame(ref writer);
     }
 
-    public void AppendBatch(LsmWriteBatch batch)
+    public void AppendBatch(LsmWriteBatch batch, bool synchronize = true)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
@@ -136,7 +136,7 @@ internal sealed class WriteAheadLog : IDisposable
             WriteRawRecord(ref writer, key, value, isTombstone);
         }
 
-        CommitFrame(ref writer);
+        CommitFrame(ref writer, synchronize);
     }
 
     /// <summary>
@@ -158,6 +158,13 @@ internal sealed class WriteAheadLog : IDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         _stream.Flush(flushToDisk: true);
         DiskFlushCount++;
+    }
+
+    internal void SynchronizeGroup()
+    {
+        _faultInjector?.Invoke(StorageFaultPoint.WalBeforeSync);
+        Synchronize();
+        _faultInjector?.Invoke(StorageFaultPoint.WalAfterSync);
     }
 
     /// <summary>
@@ -207,7 +214,7 @@ internal sealed class WriteAheadLog : IDisposable
         return writer;
     }
 
-    private void CommitFrame(ref EncoderBinaryWriter writer)
+    private void CommitFrame(ref EncoderBinaryWriter writer, bool synchronize = true)
     {
         writer.Flush();
 
@@ -238,7 +245,7 @@ internal sealed class WriteAheadLog : IDisposable
         }
         _faultInjector?.Invoke(StorageFaultPoint.WalAfterWrite);
         RecordWriteCount++;
-        if (_syncToDisk)
+        if (_syncToDisk && synchronize)
         {
             _faultInjector?.Invoke(StorageFaultPoint.WalBeforeSync);
             _stream.Flush(flushToDisk: true);

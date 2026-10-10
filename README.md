@@ -206,9 +206,10 @@ observe a failed batch's partial application. Health inspection and disposal rem
 an operational state, not an integrity certification: an explicitly salvaged store is usable only for
 read-only extraction and still requires inspection of its incomplete `RecoveryReport`.
 
-Cancellation before an MVCC commit's final write begins throws `OperationCanceledException` and does
+Cancellation before an ordinary MVCC commit's final write begins throws `OperationCanceledException` and does
 not commit. Once writing starts, cancellation is not polled: completion reports the actual write
-result rather than a misleading cancellation. The synchronous byte-store mutations do not accept a
+result rather than a misleading cancellation. With optional group commit, cancellation instead ends at
+acceptance after validation and batch preparation (see below). The synchronous byte-store mutations do not accept a
 cancellation token.
 
 Flush/compaction failures do not undo previously acknowledged writes. Cancellation before maintenance
@@ -407,6 +408,51 @@ versions, transaction buffers, and sequence metadata writes. Dispose snapshots a
 call `CollectGarbageAsync` periodically to remove versions that no active view can observe. Pass
 `compact: true` when the call should also flush and compact the resulting physical tombstones.
 
+### Durable transaction group commit
+
+Set `MvccCommitGroupSize` to a value from 2 through 64 to let concurrent transaction commits share WAL
+file-content synchronization; the default of 1 preserves the ordinary commit path. Grouping requires
+both `UseWriteAheadLog = true` and `SyncWriteAheadLogToDisk = true`. It does not change plain LSM writes,
+MVCC `Put`/`Delete`, or the WAL format.
+
+The engine admits at most twice the configured group size, with further commit callers waiting on
+cancelable admission. A worker takes up to the configured number of **already ready** transactions in
+queue-admission order after acquiring the MVCC commit gate. There is no timer, minimum group size,
+or deliberate latency window; a single ready transaction can proceed immediately. Scheduler, gate,
+validation, and I/O contention can still delay completion; this is not a bounded wall-clock latency
+promise. Transaction buffers must not be changed or disposed during a commit.
+
+Validation and publication remain serialized. Each transaction checks both changes published since
+its starting snapshot and the written keys of earlier accepted transactions in its group, including
+tracked point-read dependencies. Conflicts return `false` and contribute no frame or sequence.
+Cancellation is checked during admission, validation, and once more after preparing the transaction's
+frame data. Acceptance ends cancellation: canceling an accepted transaction does not interrupt the
+group or return a misleading cancellation result. Read-only transactions require no WAL boundary.
+
+Each accepted writing transaction retains its **own atomic recovery frame**, including its sequence
+metadata. All frames in the group are written under one mutable-table lock, synchronized once, then
+applied and published in order. Successful writing commits are acknowledged only after synchronization
+and publication succeed; readers still capture an atomic transaction snapshot. Memtable rotation happens
+after the group, so the size threshold can be exceeded by one group before rotation.
+
+If frame submission fails, an unsubmitted transaction reports `NotCommitted`; submitted transactions
+report `Indeterminate`, including complete earlier frames whose synchronization was not confirmed.
+Synchronization or application failure faults the instance and does not acknowledge any writing
+transaction as successful. Transactions fully applied after successful synchronization report
+`Committed` if later application, publication, or rotation fails; remaining submitted transactions
+report `Indeterminate`. A completed frame may recover even when its caller received an exception.
+The store retains the first unsafe failure, rejects further work, and preserves WAL evidence on disposal,
+as on the ordinary path. A failure before any frame submission leaves the instance healthy.
+
+Explicit `SynchronizeAsync` barriers still serialize with commit publication and cover previously
+completed commits; await the commit first to require its inclusion. Shutdown rejects new admission,
+drains an already accepted group, completes queued but unaccepted commits with disposal errors, and
+then closes the underlying store. The existing file-content (not directory or universal power-loss)
+durability limitations apply unchanged.
+
+Local throughput and latency measurements, commands, and limitations are recorded in
+[`tests/Silex.WalBenchmarks/group-commit.md`](tests/Silex.WalBenchmarks/group-commit.md).
+
 ## Closing the store
 
 ### Exclusive directory ownership
@@ -484,6 +530,7 @@ is a valid starting point. The most commonly used options:
 | `BlockCacheSizeLimit`      | 1 MiB              | Size of the in-memory cache of decoded blocks.                           |
 | `UseWriteAheadLog`         | `true`             | Maintain a WAL so unflushed data is recovered after a crash.             |
 | `SyncWriteAheadLogToDisk`  | `false`            | Request OS file-content synchronization for every WAL frame before applying/acknowledging it; see durability limitations above. |
+| `MvccCommitGroupSize`      | `1`                | Maximum ready MVCC transactions sharing one synchronization (1 disables; 2-64 require synchronous WAL durability). |
 | `CompactionStrategy`       | `Tiered`           | `None`, `Tiered` (write-optimized), or `Leveled` (read-optimized).       |
 
 Convenient size helpers are available as extension methods: `64.MiB()`, `4.KiB()`, `1.GiB()`,

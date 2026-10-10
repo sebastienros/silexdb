@@ -12,7 +12,7 @@ namespace Silex;
 /// that database. The regular <see cref="LsmStorage"/> path has no MVCC branches, key expansion, or sequence
 /// bookkeeping.
 /// </remarks>
-public sealed class MvccStorage : IAsyncDisposable
+public sealed partial class MvccStorage : IAsyncDisposable
 {
     private const byte MetadataPrefix = 0;
     private const byte DataPrefix = 1;
@@ -33,12 +33,17 @@ public sealed class MvccStorage : IAsyncDisposable
     private int _disposeState;
     private readonly object _disposeLock = new();
     private Task? _disposeTask;
+    private readonly CommitCoordinator? _commitCoordinator;
 
-    private MvccStorage(LsmStorage storage, long allocatedSequence, long publishedSequence)
+    private MvccStorage(LsmStorage storage, long allocatedSequence, long publishedSequence, int groupSize)
     {
         _storage = storage;
         _allocatedSequence = allocatedSequence;
         _publishedSequence = publishedSequence;
+        if (groupSize > 1)
+        {
+            _commitCoordinator = new CommitCoordinator(this, groupSize);
+        }
     }
 
     /// <summary>
@@ -61,6 +66,14 @@ public sealed class MvccStorage : IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(path);
         ArgumentNullException.ThrowIfNull(options);
+        if (options.MvccCommitGroupSize is < 1 or > 64)
+        {
+            throw new ArgumentOutOfRangeException(nameof(options), "MvccCommitGroupSize must be between 1 and 64.");
+        }
+        if (options.MvccCommitGroupSize > 1 && (!options.UseWriteAheadLog || !options.SyncWriteAheadLogToDisk))
+        {
+            throw new ArgumentException("MVCC group commit requires WAL and SyncWriteAheadLogToDisk.", nameof(options));
+        }
 
         var storage = await LsmStorage.OpenAsync(path, options, cancellationToken).ConfigureAwait(false);
 
@@ -87,7 +100,7 @@ public sealed class MvccStorage : IAsyncDisposable
                 WriteSequence(initialization, _allocatedSequenceKey, 0);
                 WriteSequence(initialization, _publishedSequenceKey, 0);
                 storage.Write(initialization);
-                return new MvccStorage(storage, 0, 0);
+                return new MvccStorage(storage, 0, 0, options.MvccCommitGroupSize);
             }
 
             if (formatLength != _formatValue.Length || !format.AsSpan().SequenceEqual(_formatValue))
@@ -103,7 +116,7 @@ public sealed class MvccStorage : IAsyncDisposable
                 throw new InvalidDataException("The MVCC allocated sequence is older than its published sequence.");
             }
 
-            return new MvccStorage(storage, allocated, published);
+            return new MvccStorage(storage, allocated, published, options.MvccCommitGroupSize);
         }
         catch
         {
@@ -369,6 +382,10 @@ public sealed class MvccStorage : IAsyncDisposable
 
     private async Task DisposeInternalAsync()
     {
+        if (_commitCoordinator is not null)
+        {
+            await _commitCoordinator.StopAsync().ConfigureAwait(false);
+        }
         await _commitGate.WaitAsync().ConfigureAwait(false);
 
         try
@@ -433,33 +450,18 @@ public sealed class MvccStorage : IAsyncDisposable
         CancellationToken cancellationToken)
     {
         CheckDisposed();
+        if (_commitCoordinator is not null)
+        {
+            return await _commitCoordinator.CommitAsync(snapshotSequence, writes, cancellationToken).ConfigureAwait(false);
+        }
         await _commitGate.WaitAsync(cancellationToken).ConfigureAwait(false);
 
         try
         {
             CheckDisposed();
-            var published = Volatile.Read(ref _publishedSequence);
-
-            for (var i = 0; i < writes.MutationCount; i++)
+            if (!await ValidateAsync(snapshotSequence, writes, cancellationToken).ConfigureAwait(false))
             {
-                if (await WasModifiedAfterAsync(writes.GetMutationKey(i), snapshotSequence, published, cancellationToken).ConfigureAwait(false))
-                {
-                    return false;
-                }
-            }
-
-            for (var i = 0; i < writes.TrackedReadCount; i++)
-            {
-                var key = writes.GetTrackedRead(i);
-                if (writes.FindMutation(key.Span) >= 0)
-                {
-                    continue;
-                }
-
-                if (await WasModifiedAfterAsync(key, snapshotSequence, published, cancellationToken).ConfigureAwait(false))
-                {
-                    return false;
-                }
+                return false;
             }
 
             if (writes.MutationCount == 0)
@@ -469,20 +471,7 @@ public sealed class MvccStorage : IAsyncDisposable
 
             var sequence = AllocateSequence();
             var batch = new LsmWriteBatch();
-            WriteSequence(batch, _allocatedSequenceKey, sequence);
-
-            for (var i = 0; i < writes.MutationCount; i++)
-            {
-                var mutation = writes.GetMutation(i);
-                WriteVersion(
-                    batch,
-                    writes.GetKey(mutation).Span,
-                    writes.GetValue(mutation).Span,
-                    mutation.IsTombstone,
-                    sequence);
-            }
-
-            WriteSequence(batch, _publishedSequenceKey, sequence);
+            PrepareBatch(writes, batch, sequence);
             cancellationToken.ThrowIfCancellationRequested();
             _storage.Write(batch);
             _storage.BeforeMvccPublication();
@@ -494,6 +483,40 @@ public sealed class MvccStorage : IAsyncDisposable
         {
             _commitGate.Release();
         }
+    }
+
+    private async ValueTask<bool> ValidateAsync(long snapshotSequence, MvccWriteBuffer writes, CancellationToken cancellationToken)
+    {
+        var published = Volatile.Read(ref _publishedSequence);
+        for (var i = 0; i < writes.MutationCount; i++)
+        {
+            if (await WasModifiedAfterAsync(writes.GetMutationKey(i), snapshotSequence, published, cancellationToken).ConfigureAwait(false))
+            {
+                return false;
+            }
+        }
+        for (var i = 0; i < writes.TrackedReadCount; i++)
+        {
+            var key = writes.GetTrackedRead(i);
+            if (writes.FindMutation(key.Span) < 0 &&
+                await WasModifiedAfterAsync(key, snapshotSequence, published, cancellationToken).ConfigureAwait(false))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static void PrepareBatch(MvccWriteBuffer writes, LsmWriteBatch batch, long sequence)
+    {
+        batch.Clear();
+        WriteSequence(batch, _allocatedSequenceKey, sequence);
+        for (var i = 0; i < writes.MutationCount; i++)
+        {
+            var mutation = writes.GetMutation(i);
+            WriteVersion(batch, writes.GetKey(mutation).Span, writes.GetValue(mutation).Span, mutation.IsTombstone, sequence);
+        }
+        WriteSequence(batch, _publishedSequenceKey, sequence);
     }
 
     internal void ReleaseSnapshot(long sequence)

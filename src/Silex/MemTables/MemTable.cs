@@ -119,6 +119,11 @@ internal sealed class MemTable : IMemTable, IRawBytesMemTable
             WriteOutcome = _wal!.AppendOutcome;
             throw;
         }
+        ApplyBatch(batch);
+    }
+
+    internal void ApplyBatch(LsmWriteBatch batch)
+    {
         WriteOutcome = StorageCommitOutcome.Indeterminate;
         _faultInjector?.Invoke(StorageFaultPoint.BatchBeforeApply);
         for (var i = 0; i < batch.Count; i++)

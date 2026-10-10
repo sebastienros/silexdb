@@ -322,10 +322,14 @@ public class StorageSynchronizationTests
     }
 
     [Test]
-    public async Task MvccBarrierIncludesPublishedCommitButNotStagedTransactionsAndPropagatesFailure()
+    [Arguments(1)]
+    [Arguments(8)]
+    public async Task MvccBarrierIncludesPublishedCommitButNotStagedTransactionsAndPropagatesFailure(int groupSize)
     {
         using var folder = TempFolder.Create();
         var options = Options;
+        options.MvccCommitGroupSize = groupSize;
+        options.SyncWriteAheadLogToDisk = groupSize > 1;
         var fail = false;
         options.FaultInjector = point =>
         {

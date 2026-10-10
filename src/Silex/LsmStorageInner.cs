@@ -658,7 +658,7 @@ internal sealed class LsmStorageInner : IDisposable
                     }
                 }
 
-                return state!.Count;
+                return state?.Count ?? 0;
             }
 
             var merge = new MergeIterator(BuildMergeInputs(
@@ -1229,6 +1229,75 @@ internal sealed class LsmStorageInner : IDisposable
         finally
         {
             _maintenanceLock.Release();
+        }
+    }
+
+    internal void WriteGroup(LsmWriteBatch[] batches, StorageCommitOutcome[] outcomes, int count)
+    {
+        using var operation = Lifetime.Enter();
+        _currentMemTableLock.EnterWriteLock();
+        try
+        {
+            CheckHealthy();
+            var memTable = (MemTable)_state.CurrentMemTable;
+            var wal = memTable.Wal ?? throw new InvalidOperationException("Group commit requires an active WAL.");
+            var submitted = false;
+            try
+            {
+                for (var i = 0; i < count; i++)
+                {
+                    try
+                    {
+                        wal.AppendBatch(batches[i], synchronize: false);
+                    }
+                    catch
+                    {
+                        outcomes[i] = wal.AppendOutcome;
+                        submitted |= wal.AppendOutcome != StorageCommitOutcome.NotCommitted;
+                        throw;
+                    }
+                    outcomes[i] = StorageCommitOutcome.Indeterminate;
+                    submitted = true;
+                }
+                wal.SynchronizeGroup();
+                for (var i = 0; i < count; i++)
+                {
+                    memTable.ApplyBatch(batches[i]);
+                    outcomes[i] = StorageCommitOutcome.Committed;
+                    FaultInjector?.Invoke(StorageFaultPoint.WriteBeforePublication);
+                }
+                InvalidateSortedSsTableRun();
+                if (memTable.Size >= _memTableSizeLimit)
+                {
+                    FreezeMemTable();
+                }
+            }
+            catch (Exception exception)
+            {
+                var outcome = StorageCommitOutcome.NotCommitted;
+                if (submitted)
+                {
+                    outcome = StorageCommitOutcome.Committed;
+                    for (var i = 0; i < count; i++)
+                    {
+                        if (outcomes[i] != StorageCommitOutcome.Committed)
+                        {
+                            outcome = StorageCommitOutcome.Indeterminate;
+                            break;
+                        }
+                    }
+                }
+                var failure = new StorageOperationException(outcome, exception);
+                if (outcome != StorageCommitOutcome.NotCommitted)
+                {
+                    MarkFaulted(failure);
+                }
+                throw failure;
+            }
+        }
+        finally
+        {
+            _currentMemTableLock.ExitWriteLock();
         }
     }
 
