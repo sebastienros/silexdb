@@ -225,6 +225,24 @@ public class StorageOptions
     /// </remarks>
     public int MvccCommitGroupSize { get; set; } = 1;
 
+    /// <summary>Maximum accounted bytes per MVCC transaction; defaults to no configured limit.</summary>
+    /// <remarks>
+    /// Counts retained key/value arena bytes, including obsolete and savepoint-protected values, plus
+    /// active mutation (20), tracked-read (8), undo (24), and savepoint (24) descriptors.
+    /// Pool rounding, spare capacity, lookup/sort indexes, commit batches and independent cursor copies
+    /// are excluded. Captured at store open; zero is permitted. No disk spilling is performed.
+    /// </remarks>
+    public long MvccTransactionMaxBytes { get; set; } = long.MaxValue;
+
+    /// <summary>Maximum distinct staged keys per MVCC transaction, including tombstones.</summary>
+    public int MvccTransactionMaxMutations { get; set; } = int.MaxValue;
+
+    /// <summary>Maximum distinct tracked point-read keys per MVCC transaction.</summary>
+    public int MvccTransactionMaxTrackedReads { get; set; } = int.MaxValue;
+
+    /// <summary>Maximum simultaneously active savepoints per MVCC transaction.</summary>
+    public int MvccTransactionMaxSavepoints { get; set; } = int.MaxValue;
+
     /// <summary>
     /// Gets or sets the compaction strategy used to merge on-disk SSTs in the background.
     /// </summary>

@@ -1,11 +1,8 @@
-using System.Buffers;
-
 namespace Silex;
 
-internal sealed class OrderedWriteSnapshot : IDisposable, IComparer<int>
+internal sealed class OrderedWriteSnapshot : IDisposable
 {
-    private readonly MvccWriteBuffer _writes = new();
-    private int[] _order = [];
+    private readonly MvccWriteBuffer _writes = new(indexThreshold: int.MaxValue);
 
     private OrderedWriteSnapshot() { }
 
@@ -20,25 +17,22 @@ internal sealed class OrderedWriteSnapshot : IDisposable, IComparer<int>
             {
                 return null;
             }
-            for (var i = 0; i < writes.MutationCount; i++)
+            var order = writes.OrderedMutations();
+            var low = 0;
+            var high = order.Length;
+            while (low < high)
             {
-                var mutation = writes.GetMutation(i);
+                var mid = low + (high - low) / 2;
+                if (range.Before(writes.GetMutationKey(order[mid]).Span)) low = mid + 1;
+                else high = mid;
+            }
+            for (var i = low; i < order.Length; i++)
+            {
+                var mutation = writes.GetMutation(order[i]);
                 var key = writes.GetKey(mutation).Span;
-                if (range.Before(key) || range.After(key))
-                {
-                    continue;
-                }
+                if (range.After(key)) break;
                 snapshot ??= new OrderedWriteSnapshot();
                 snapshot._writes.AddMutation(key, writes.GetValue(mutation).Span, mutation.IsTombstone);
-            }
-            if (snapshot is not null)
-            {
-                snapshot._order = ArrayPool<int>.Shared.Rent(snapshot.Count);
-                for (var i = 0; i < snapshot.Count; i++)
-                {
-                    snapshot._order[i] = i;
-                }
-                Array.Sort(snapshot._order, 0, snapshot.Count, snapshot);
             }
             return snapshot;
         }
@@ -49,9 +43,9 @@ internal sealed class OrderedWriteSnapshot : IDisposable, IComparer<int>
         }
     }
 
-    public ReadOnlySpan<byte> Key(int index) => _writes.GetMutationKey(_order[index]).Span;
-    public bool IsTombstone(int index) => _writes.GetMutation(_order[index]).IsTombstone;
-    public ReadOnlySpan<byte> Value(int index) => _writes.GetValue(_writes.GetMutation(_order[index])).Span;
+    public ReadOnlySpan<byte> Key(int index) => _writes.GetMutationKey(index).Span;
+    public bool IsTombstone(int index) => _writes.GetMutation(index).IsTombstone;
+    public ReadOnlySpan<byte> Value(int index) => _writes.GetValue(_writes.GetMutation(index)).Span;
 
     public int Seek(byte[]? resume, bool backwards)
     {
@@ -77,16 +71,5 @@ internal sealed class OrderedWriteSnapshot : IDisposable, IComparer<int>
         return backwards ? low - 1 : low;
     }
 
-    public int Compare(int x, int y) =>
-        _writes.GetMutationKey(x).Span.SequenceCompareTo(_writes.GetMutationKey(y).Span);
-
-    public void Dispose()
-    {
-        _writes.Dispose();
-        if (_order.Length != 0)
-        {
-            ArrayPool<int>.Shared.Return(_order);
-            _order = [];
-        }
-    }
+    public void Dispose() => _writes.Dispose();
 }

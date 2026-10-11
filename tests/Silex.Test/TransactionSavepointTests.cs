@@ -209,16 +209,31 @@ public class TransactionSavepointTests
     }
 
     [Test]
-    public async Task RandomizedCheckpointsMatchCopiedWriteAndReadModel()
+    [Arguments(20)]
+    [Arguments(200)]
+    public async Task RandomizedCheckpointsMatchCopiedWriteAndReadModel(int keyCount)
     {
         using var buffer = new MvccWriteBuffer();
         var random = new Random(9);
         var writes = new Dictionary<byte, byte[]?>();
         var reads = new HashSet<byte>();
+        for (var i = 0; i < keyCount / 2; i++)
+        {
+            var key = (byte)i;
+            buffer.AddMutation([key], [key], false);
+            buffer.TrackRead([key]);
+            writes.Add(key, [key]);
+            reads.Add(key);
+        }
         var checkpoints = new List<(MvccSavepoint Handle, Dictionary<byte, byte[]?> Writes, HashSet<byte> Reads)>();
         for (var step = 0; step < 1500; step++)
         {
-            var key = (byte)random.Next(20);
+            var range = new OrderedReadRange(new byte[] { (byte)(keyCount / 4) }, step % 2 == 0,
+                new byte[] { (byte)(keyCount * 3 / 4) }, step % 3 == 0);
+            using var frozen = OrderedWriteSnapshot.Create(buffer, range);
+            var frozenModel = writes.Where(pair => !range.Before([pair.Key]) && !range.After([pair.Key]))
+                .OrderBy(pair => pair.Key).ToArray();
+            var key = (byte)random.Next(keyCount);
             var operation = random.Next(6);
             if (operation == 0 || checkpoints.Count == 0)
             {
@@ -268,6 +283,17 @@ public class TransactionSavepointTests
             await Assert.That(buffer.TrackedReadCount).IsEqualTo(reads.Count);
             for (var i = 0; i < buffer.TrackedReadCount; i++)
                 await Assert.That(reads.Contains(buffer.GetTrackedRead(i).Span[0])).IsTrue();
+            var ordered = buffer.OrderedMutations().ToArray()
+                .Select(i => buffer.GetMutationKey(i).Span[0]);
+            await Assert.That(ordered).IsEquivalentTo(writes.Keys.Order(), CollectionOrdering.Matching);
+            await Assert.That(frozen?.Count ?? 0).IsEqualTo(frozenModel.Length);
+            for (var i = 0; i < frozenModel.Length; i++)
+            {
+                await Assert.That(frozen!.Key(i)[0]).IsEqualTo(frozenModel[i].Key);
+                await Assert.That(frozen.IsTombstone(i)).IsEqualTo(frozenModel[i].Value is null);
+                if (frozenModel[i].Value is { } value)
+                    await Assert.That(frozen.Value(i).ToArray()).IsEquivalentTo(value, CollectionOrdering.Matching);
+            }
         }
     }
 

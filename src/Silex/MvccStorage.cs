@@ -1,5 +1,7 @@
 using System.Buffers;
 using System.Buffers.Binary;
+using System.IO.Hashing;
+using System.Numerics;
 using Silex.Buffers;
 
 namespace Silex;
@@ -34,12 +36,15 @@ public sealed partial class MvccStorage : IAsyncDisposable
     private readonly object _disposeLock = new();
     private Task? _disposeTask;
     private readonly CommitCoordinator? _commitCoordinator;
+    private readonly TransactionLimits _transactionLimits;
 
-    private MvccStorage(LsmStorage storage, long allocatedSequence, long publishedSequence, int groupSize)
+    private MvccStorage(LsmStorage storage, long allocatedSequence, long publishedSequence, int groupSize,
+        TransactionLimits transactionLimits)
     {
         _storage = storage;
         _allocatedSequence = allocatedSequence;
         _publishedSequence = publishedSequence;
+        _transactionLimits = transactionLimits;
         if (groupSize > 1)
         {
             _commitCoordinator = new CommitCoordinator(this, groupSize);
@@ -66,6 +71,7 @@ public sealed partial class MvccStorage : IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(path);
         ArgumentNullException.ThrowIfNull(options);
+        var transactionLimits = TransactionLimits.FromOptions(options);
         if (options.MvccCommitGroupSize is < 1 or > 64)
         {
             throw new ArgumentOutOfRangeException(nameof(options), "MvccCommitGroupSize must be between 1 and 64.");
@@ -100,7 +106,7 @@ public sealed partial class MvccStorage : IAsyncDisposable
                 WriteSequence(initialization, _allocatedSequenceKey, 0);
                 WriteSequence(initialization, _publishedSequenceKey, 0);
                 storage.Write(initialization);
-                return new MvccStorage(storage, 0, 0, options.MvccCommitGroupSize);
+                return new MvccStorage(storage, 0, 0, options.MvccCommitGroupSize, transactionLimits);
             }
 
             if (formatLength != _formatValue.Length || !format.AsSpan().SequenceEqual(_formatValue))
@@ -116,7 +122,7 @@ public sealed partial class MvccStorage : IAsyncDisposable
                 throw new InvalidDataException("The MVCC allocated sequence is older than its published sequence.");
             }
 
-            return new MvccStorage(storage, allocated, published, options.MvccCommitGroupSize);
+            return new MvccStorage(storage, allocated, published, options.MvccCommitGroupSize, transactionLimits);
         }
         catch
         {
@@ -149,7 +155,7 @@ public sealed partial class MvccStorage : IAsyncDisposable
             CheckDisposed();
             var sequence = Volatile.Read(ref _publishedSequence);
             AddSnapshot(sequence);
-            return new MvccTransaction(this, sequence);
+            return new MvccTransaction(this, sequence, _transactionLimits);
         }
     }
 
@@ -1126,6 +1132,14 @@ internal sealed class MvccWriteBuffer : IDisposable
 {
     private const int InitialByteCapacity = 256;
     private const int InitialDescriptorCapacity = 8;
+    internal const int DefaultIndexThreshold = 8;
+    private readonly int _indexThreshold;
+    private readonly TransactionLimits _limits;
+    private MvccIndexSlot[] _mutationIndex = [];
+    private MvccIndexSlot[] _readIndex = [];
+    private int[] _order = [];
+    private Comparison<int>? _comparison;
+    private bool _orderDirty = true;
 
     private byte[] _bytes = [];
     private MvccMutation[] _mutations = [];
@@ -1142,9 +1156,20 @@ internal sealed class MvccWriteBuffer : IDisposable
 
     public int TrackedReadCount { get; private set; }
 
+    public long BufferedBytes => (long)_byteCount + 20L * MutationCount + 8L * TrackedReadCount
+        + 24L * _undoCount + 24L * _savepointCount;
+
+    internal MvccWriteBuffer(int indexThreshold = DefaultIndexThreshold, TransactionLimits? limits = null)
+    {
+        _indexThreshold = indexThreshold;
+        _limits = limits ?? TransactionLimits.Unlimited;
+    }
+
     public MvccSavepoint CreateSavepoint()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        CheckCount("savepoints", _limits.Savepoints, (long)_savepointCount + 1);
+        CheckBytes(24);
         var id = checked(_nextSavepointId + 1);
         if (_savepointCount == _savepoints.Length)
         {
@@ -1169,10 +1194,13 @@ internal sealed class MvccWriteBuffer : IDisposable
             var undo = _undo[--_undoCount];
             _mutations[undo.Index] = undo.Mutation;
         }
+        _orderDirty |= MutationCount != checkpoint.MutationCount;
         MutationCount = checkpoint.MutationCount;
         TrackedReadCount = checkpoint.TrackedReadCount;
         _byteCount = checkpoint.ByteCount;
         _savepointCount = index + 1;
+        RebuildIndex(_mutationIndex, reads: false);
+        RebuildIndex(_readIndex, reads: true);
     }
 
     public void ReleaseSavepoint(MvccSavepoint savepoint)
@@ -1197,6 +1225,7 @@ internal sealed class MvccWriteBuffer : IDisposable
     public int FindMutation(ReadOnlySpan<byte> key)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_mutationIndex.Length != 0) return FindIndexed(key, _mutationIndex, reads: false);
         for (var i = MutationCount - 1; i >= 0; i--)
         {
             if (key.SequenceEqual(GetKey(_mutations[i]).Span))
@@ -1211,7 +1240,12 @@ internal sealed class MvccWriteBuffer : IDisposable
     public void AddMutation(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool isTombstone)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        CheckCount("mutations", _limits.Mutations, (long)MutationCount + 1);
+        var additional = (long)key.Length + (isTombstone ? 0 : value.Length);
+        CheckBytes(additional + 20);
+        EnsureByteCapacity(additional);
         EnsureMutationCapacity();
+        EnsureIndexCapacity(ref _mutationIndex, MutationCount, reads: false);
         var keyOffset = Append(key);
         var valueOffset = isTombstone ? 0 : Append(value);
         _mutations[MutationCount++] = new MvccMutation(
@@ -1220,6 +1254,8 @@ internal sealed class MvccWriteBuffer : IDisposable
             valueOffset,
             isTombstone ? -1 : value.Length,
             isTombstone ? 0 : value.Length);
+        if (_mutationIndex.Length != 0) InsertIndex(_mutationIndex, MutationCount - 1, key);
+        _orderDirty = true;
     }
 
     public void SetValue(int index, ReadOnlySpan<byte> value, bool isTombstone)
@@ -1234,6 +1270,7 @@ internal sealed class MvccWriteBuffer : IDisposable
         ref var mutation = ref _mutations[index];
         if (_savepointCount != 0)
         {
+            CheckBytes(24L + (isTombstone ? 0 : value.Length));
             if (_undoCount == _undo.Length)
             {
                 var replacement = ArrayPool<MvccUndo>.Shared.Rent(
@@ -1267,6 +1304,7 @@ internal sealed class MvccWriteBuffer : IDisposable
 
         if (mutation.ValueOffset + mutation.ValueCapacity == _byteCount)
         {
+            CheckBytes(value.Length - mutation.ValueCapacity);
             EnsureByteCapacity(value.Length - mutation.ValueCapacity);
             value.CopyTo(_bytes.AsSpan(mutation.ValueOffset));
             _byteCount = mutation.ValueOffset + value.Length;
@@ -1275,6 +1313,7 @@ internal sealed class MvccWriteBuffer : IDisposable
             return;
         }
 
+        CheckBytes(value.Length);
         mutation.ValueOffset = Append(value);
         mutation.ValueLength = value.Length;
         mutation.ValueCapacity = value.Length;
@@ -1283,16 +1322,105 @@ internal sealed class MvccWriteBuffer : IDisposable
     public void TrackRead(ReadOnlySpan<byte> key)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        if (FindTrackedRead(key) >= 0) return;
+        CheckCount("tracked reads", _limits.TrackedReads, (long)TrackedReadCount + 1);
+        CheckBytes((long)key.Length + 8);
+        EnsureByteCapacity(key.Length);
+        EnsureTrackedReadCapacity();
+        EnsureIndexCapacity(ref _readIndex, TrackedReadCount, reads: true);
+        _trackedReads[TrackedReadCount++] = new MvccKey(Append(key), key.Length);
+        if (_readIndex.Length != 0) InsertIndex(_readIndex, TrackedReadCount - 1, key);
+    }
+
+    public int FindTrackedRead(ReadOnlySpan<byte> key)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_readIndex.Length != 0) return FindIndexed(key, _readIndex, reads: true);
         for (var i = 0; i < TrackedReadCount; i++)
         {
             if (key.SequenceEqual(GetTrackedRead(i).Span))
             {
-                return;
+                return i;
             }
         }
 
-        EnsureTrackedReadCapacity();
-        _trackedReads[TrackedReadCount++] = new MvccKey(Append(key), key.Length);
+        return -1;
+    }
+
+    public ReadOnlySpan<int> OrderedMutations()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_order.Length < MutationCount)
+        {
+            var replacement = ArrayPool<int>.Shared.Rent(MutationCount);
+            if (_order.Length != 0) ArrayPool<int>.Shared.Return(_order);
+            _order = replacement;
+        }
+        if (_orderDirty)
+        {
+            for (var i = 0; i < MutationCount; i++) _order[i] = i;
+            _order.AsSpan(0, MutationCount).Sort(_comparison ??= Compare);
+            _orderDirty = false;
+        }
+        return _order.AsSpan(0, MutationCount);
+    }
+
+    private int Compare(int x, int y) => GetMutationKey(x).Span.SequenceCompareTo(GetMutationKey(y).Span);
+
+    private void CheckBytes(long additional)
+    {
+        CheckCount("bytes", _limits.Bytes, BufferedBytes + additional);
+    }
+
+    private static void CheckCount(string resource, long limit, long requested)
+    {
+        if (requested > limit) throw new TransactionLimitException(resource, limit, requested);
+    }
+
+    private int FindIndexed(ReadOnlySpan<byte> key, MvccIndexSlot[] slots, bool reads)
+    {
+        var hash = XxHash3.HashToUInt64(key);
+        var bucket = (int)(hash & (uint)(slots.Length - 1));
+        while (slots[bucket].Position != 0)
+        {
+            var slot = slots[bucket];
+            var position = slot.Position - 1;
+            if (slot.Hash == hash && key.SequenceEqual(
+                reads ? GetTrackedRead(position).Span : GetMutationKey(position).Span))
+                return position;
+            bucket = (bucket + 1) & (slots.Length - 1);
+        }
+        return -1;
+    }
+
+    private static void InsertIndex(MvccIndexSlot[] slots, int position, ReadOnlySpan<byte> key)
+    {
+        var hash = XxHash3.HashToUInt64(key);
+        var bucket = (int)(hash & (uint)(slots.Length - 1));
+        while (slots[bucket].Position != 0) bucket = (bucket + 1) & (slots.Length - 1);
+        slots[bucket] = new MvccIndexSlot(hash, position + 1);
+    }
+
+    private void EnsureIndexCapacity(ref MvccIndexSlot[] slots, int count, bool reads)
+    {
+        if (count < _indexThreshold && slots.Length == 0) return;
+        if (slots.Length != 0 && count < slots.Length / 2) return;
+        var required = slots.Length == 0 ? ((long)count + 1) * 2 : (long)slots.Length * 2;
+        CheckCount("index slots", 1 << 30, required);
+        var replacement = ArrayPool<MvccIndexSlot>.Shared.Rent(
+            (int)BitOperations.RoundUpToPowerOf2((uint)required));
+        RebuildIndex(replacement, reads);
+        if (slots.Length != 0) ArrayPool<MvccIndexSlot>.Shared.Return(slots);
+        slots = replacement;
+    }
+
+    private void RebuildIndex(MvccIndexSlot[] slots, bool reads)
+    {
+        if (slots.Length == 0) return;
+        Array.Clear(slots);
+        var count = reads ? TrackedReadCount : MutationCount;
+        for (var i = 0; i < count; i++)
+            InsertIndex(slots, i, reads ? GetTrackedRead(i).Span : GetMutationKey(i).Span);
     }
 
     public MvccMutation GetMutation(int index) => _mutations[index];
@@ -1321,6 +1449,12 @@ internal sealed class MvccWriteBuffer : IDisposable
         }
 
         _disposed = true;
+        if (_mutationIndex.Length != 0) ArrayPool<MvccIndexSlot>.Shared.Return(_mutationIndex);
+        if (_readIndex.Length != 0) ArrayPool<MvccIndexSlot>.Shared.Return(_readIndex);
+        if (_order.Length != 0) ArrayPool<int>.Shared.Return(_order);
+        _mutationIndex = [];
+        _readIndex = [];
+        _order = [];
         if (_savepoints.Length != 0)
         {
             ArrayPool<MvccCheckpoint>.Shared.Return(_savepoints);
@@ -1364,9 +1498,10 @@ internal sealed class MvccWriteBuffer : IDisposable
         return offset;
     }
 
-    private void EnsureByteCapacity(int additionalLength)
+    private void EnsureByteCapacity(long additionalLength)
     {
-        var required = checked(_byteCount + additionalLength);
+        CheckCount("arena bytes", Array.MaxLength, _byteCount + additionalLength);
+        var required = checked((int)(_byteCount + additionalLength));
         if (required <= _bytes.Length)
         {
             return;
@@ -1375,7 +1510,7 @@ internal sealed class MvccWriteBuffer : IDisposable
         var newSize = Math.Max(InitialByteCapacity, _bytes.Length);
         while (newSize < required)
         {
-            newSize = checked(newSize * 2);
+            newSize = (int)Math.Min(Array.MaxLength, (long)newSize * 2);
         }
 
         var replacement = ArrayPool<byte>.Shared.Rent(newSize);
@@ -1441,3 +1576,5 @@ internal readonly record struct MvccCheckpoint(
     long Id, int MutationCount, int TrackedReadCount, int ByteCount, int UndoCount);
 
 internal readonly record struct MvccUndo(int Index, MvccMutation Mutation);
+
+internal readonly record struct MvccIndexSlot(ulong Hash, int Position);

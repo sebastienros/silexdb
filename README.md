@@ -585,7 +585,57 @@ overlay. New cursors and point reads see the restored buffer over the original s
 Savepoint operations are single-consumer and must not overlap reads, writes, commit, or disposal.
 Checkpoint/undo arrays are rented lazily and reused; ordinary transactions retain their existing
 in-place overwrite path. While any marker is active, replacements append bytes and undo descriptors;
-rollback rewinds their storage without allocating. Savepoints add no resource limits or buffer indexing.
+rollback rewinds their storage without allocating.
+
+### Transaction buffers and resource limits
+
+Transaction objects are **single-consumer**: do not overlap reads, staging, cursor creation, savepoint
+operations, commit, or disposal. Shared-instance storage concurrency does not make one transaction safe
+for concurrent use.
+
+```csharp
+var options = new StorageOptions
+{
+    MvccTransactionMaxBytes = 16 * 1024 * 1024,
+    MvccTransactionMaxMutations = 100_000,
+    MvccTransactionMaxTrackedReads = 100_000,
+    MvccTransactionMaxSavepoints = 64,
+};
+await using var db = await MvccStorage.OpenAsync("bounded-db", options);
+using var transaction = db.BeginTransaction();
+transaction.Put("key"u8, "value"u8);
+Console.WriteLine($"{transaction.MutationCount} keys, {transaction.BufferedBytes} accounted bytes");
+```
+
+Limits are nonnegative, captured at store open, and apply to every transaction on that instance.
+Defaults preserve compatibility (no configured byte limit, `int.MaxValue` count limits); zero is valid.
+Mutation count means **distinct staged keys**, including deletions, not the number of `Put` calls.
+Repeated tracked reads are deduplicated; reads of pending writes need no extra dependency.
+`MutationCount`, `TrackedReadCount`, and `BufferedBytes` expose the current accounting.
+
+`BufferedBytes` counts retained arena bytes plus active mutation (20 bytes), tracked-read (8), undo
+(24), and savepoint (24) descriptors. It includes obsolete replacement bytes and checkpoint-protected
+values, not just live key/value sizes. In-place overwrites reuse capacity. Savepoint replacements append
+bytes and undo records; rollback restores both accounting and state. Release removes checkpoint charges
+and, when the last marker is released, undo charges, but does not compact the byte arena.
+
+An operation exceeding a budget throws `TransactionLimitException` with `Resource`, `Limit`, and
+`Requested`. The rejected operation changes no staged writes, tracked reads, or savepoints and does
+not consume the transaction or fault storage. The caller may roll back, release a marker, or commit the
+accepted work. A **commit attempt** still consumes the transaction on every outcome.
+
+These are per-transaction **accounting budgets**, not process-memory or peak-allocation caps. Pool
+rounding/spare capacity, lookup/sort indexes, object headers, commit/WAL batches, retained snapshots, and
+independently owned frozen cursor overlays are excluded. Index and descriptor storage is proportional
+to the transaction's peak key counts; rollback retains rented capacity until disposal. Limit the number
+of concurrent transactions/cursors separately. No disk spilling is provided.
+
+Up to 8 mutations or tracked reads use linear lookup with no key index. Beyond that, each set lazily
+creates its own pooled, open-addressed hash index using arena offsets rather than allocated key objects.
+Expected point lookup/deduplication is constant-time; rollback rebuilds indexes in linear time in their
+retained capacity. Ordered scans lazily sort and cache mutation positions, binary-search the lower bound,
+then copy only the matching frozen overlay. Value changes do not invalidate key order; newly staged or
+rolled-back keys do. Frozen cursors remain independent of later mutations, rollback, release, and commit.
 
 ### Durable transaction group commit
 
