@@ -23,6 +23,8 @@ public sealed class LsmWriteBatch
     /// </summary>
     public int Count => _count;
 
+    internal int ByteCount => _byteCount;
+
     /// <summary>
     /// Adds or replaces a value.
     /// </summary>
