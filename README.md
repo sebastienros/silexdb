@@ -11,7 +11,8 @@ bound read and space amplification.
 - **Durable** – an optional write-ahead log (WAL) recovers unflushed data after a crash.
 - **Zero-copy reads** – values served from memory are returned as read-only borrows of engine-owned
   memory rather than defensive copies.
-- **Ordered range scans** – iterate the whole key space, or from a given key, in ascending key order.
+- **Bounded ordered reads** – owned batches, inclusive/exclusive bounds, forward/reverse traversal,
+  live LSM cursors and independently retained MVCC snapshot cursors.
 - **Optional MVCC** – stable snapshots and optimistic transactions are available through a separate facade,
   without adding sequence checks or larger internal keys to the default store.
 - **Pluggable compaction** – choose `Tiered` (write-optimized), `Leveled` (read-optimized), or `None`.
@@ -57,6 +58,76 @@ await db.CloseAsync();
 
 `LsmStorage.OpenAsync` reopens an existing store at the same path, replaying the WAL and loading existing
 SSTs, so persisted data survives process restarts.
+
+### Bounded, lifetime-safe ordered reads
+
+Use an owned cursor/batch instead of borrowed callbacks when processing may await or reenter storage:
+
+```csharp
+var range = new OrderedReadRange("user:"u8.ToArray(), lowerInclusive: true,
+    "user;"u8.ToArray(), upperInclusive: false);
+using var cursor = db.CreateOrderedReadCursor(range, OrderedReadDirection.Forward);
+while (true)
+{
+    using var batch = await cursor.ReadBatchAsync(maxEntries: 128, maxBytes: 64 * 1024, cancellationToken);
+    for (var i = 0; i < batch.Count; i++)
+    {
+        var entry = batch[i]; // ReadOnlyMemory<byte> key and value, owned by this batch
+        await ProcessAsync(entry.Key, entry.Value);
+    }
+    if (batch.IsExhausted) break;
+}
+```
+
+Bounds use lexicographic **encoded byte order**, not a typed comparer. `OrderedReadRange` copies its
+inputs; null is unbounded and empty memory is a bound on the empty key. Reversed endpoints and equal
+endpoints with either endpoint exclusive form an empty range. Plain SST encoding still requires
+nonempty stored keys; MVCC supports empty logical keys. `Reverse` uses the same ascending indexes.
+Tables/blocks outside the interval are pruned, and memory sources seek into the interval without
+materializing the range. Each successful advance resumes strictly beyond the last returned logical
+key in its direction. Full batches conservatively report `IsExhausted == false`; the next advance may
+return an empty exhausted batch. Once exhaustion is observed the cursor stays exhausted.
+
+`maxEntries` and `maxBytes` must both be positive. `PayloadBytes` is exactly the sum of returned key
+and value lengths, excluding descriptors, pool slack, MVCC encoding and internal block buffers.
+Entries are never split. If the next entry does not fit the remaining byte budget, the batch stops
+before it. If that entry alone exceeds `maxBytes`, the advance throws `ArgumentException` without
+moving the cursor; retry with a larger budget. The limits bound **returned payload**, not all engine
+working memory: one source record per overlapping table, decoded SST blocks, the memtable's sorted
+index, and (for reverse MVCC) one candidate version are additionally retained during an advance.
+Large individual entries can therefore require internal memory even when rejected by the batch limit.
+
+The consistency model is explicit on `cursor.Consistency`:
+
+- **`Live`** (`LsmStorage.CreateOrderedReadCursor`): no historical or atomic snapshot, even within
+  an advance. Concurrent replacements/deletions may affect unread entries; inserts ahead of the
+  continuation may appear, while changes behind it are not revisited. Do not use this as a stable
+  export under concurrent writes.
+- **`Snapshot`** (`MvccStorage.CreateOrderedReadCursor` or `MvccSnapshot.CreateOrderedReadCursor`):
+  every batch reads `cursor.Sequence`. A snapshot-created cursor retains that exact sequence
+  independently, including after disposing the originating snapshot. Later mutations remain invisible,
+  and garbage collection preserves required versions until the cursor is disposed.
+
+No blocking storage lock or borrowed engine memory survives an advance. Independent lookups,
+mutations, maintenance, and network awaits are allowed between advances. Internal traversal holds a
+structural read lock only while building a batch, briefly locks memory-source reads, and checks
+cancellation per physical entry (including tombstones/invisible versions) and block load. Synchronous
+lock acquisition, index sorting, individual decode/copy operations and OS reads are not interruptible.
+Paging reseeks indexes rather than retaining physical iterators or rescanning from the range start;
+very small batches pay repeated source/index setup, and reverse MVCC must resolve a key's version
+group before returning its newest visible value.
+
+Cursor advance/disposal must not overlap; overlapping operations throw `InvalidOperationException`.
+Cancellation, oversized-entry errors and read faults dispose partial batches and leave continuation
+unchanged. Existing health/fault contracts still apply. Closing storage does not wait for idle cursors;
+mutable-source reads recheck health while holding the memory-table lock, so readers waiting behind a
+failed batch cannot return its partial application. Already admitted immutable/SST reads remain safe.
+new advances (even on exhausted cursors) reject a closed/faulted store. Returned batches remain valid
+after later advances, cursor disposal, maintenance, or storage closure, until **their own disposal**.
+Do not dispose a batch while another operation still uses its memory. Dispose snapshot cursors promptly
+to avoid indefinite version retention; there is no engine expiry. Continuation tokens across process
+restarts, token expiry, projections and transactional read-your-writes ranges are not part of this API.
+Existing callback APIs retain their borrowed-span and callback lock-lifetime contracts unchanged.
 
 ### Recovery, integrity, and salvage
 

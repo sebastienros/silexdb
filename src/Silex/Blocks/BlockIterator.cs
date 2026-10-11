@@ -60,13 +60,13 @@ internal sealed class BlockIterator : IStorageIterator
         private ReadOnlyMemory<byte> _value;
         private bool _isTombstone;
 
-        public Cursor(Block block, bool backwards, ReadOnlySpan<byte> from = default)
+        public Cursor(Block block, bool backwards, ReadOnlySpan<byte> from = default, bool hasFrom = false)
         {
             _block = block;
             _step = backwards ? -1 : 1;
             _index = backwards
-                ? (from.IsEmpty ? block.Offsets.Count : block.UpperBound(from))
-                : (from.IsEmpty ? -1 : block.LowerBound(from) - 1);
+                ? (!hasFrom && from.IsEmpty ? block.Offsets.Count : block.UpperBound(from))
+                : (!hasFrom && from.IsEmpty ? -1 : block.LowerBound(from) - 1);
             _key = default;
             _value = default;
             _isTombstone = false;

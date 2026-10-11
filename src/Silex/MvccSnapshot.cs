@@ -6,6 +6,7 @@ namespace Silex;
 public sealed class MvccSnapshot : IDisposable
 {
     private MvccStorage? _storage;
+    private readonly object _cursorLock = new();
 
     internal MvccSnapshot(MvccStorage storage, long sequence)
     {
@@ -17,6 +18,16 @@ public sealed class MvccSnapshot : IDisposable
     /// Gets the published sequence captured by this snapshot.
     /// </summary>
     public long Sequence { get; }
+
+    /// <summary>Creates an independently retained cursor at this snapshot's exact sequence.</summary>
+    public OrderedReadCursor CreateOrderedReadCursor(OrderedReadRange? range = null,
+        OrderedReadDirection direction = OrderedReadDirection.Forward)
+    {
+        lock (_cursorLock)
+        {
+            return GetStorage().CreateOrderedReadCursorAt(Sequence, range, direction);
+        }
+    }
 
     public ValueTask<int> GetRawAsync(ReadOnlySpan<byte> key, Memory<byte> destination, CancellationToken cancellationToken = default)
     {
@@ -55,8 +66,11 @@ public sealed class MvccSnapshot : IDisposable
 
     public void Dispose()
     {
-        var storage = Interlocked.Exchange(ref _storage, null);
-        storage?.ReleaseSnapshot(Sequence);
+        lock (_cursorLock)
+        {
+            var storage = Interlocked.Exchange(ref _storage, null);
+            storage?.ReleaseSnapshot(Sequence);
+        }
     }
 
     private MvccStorage GetStorage()
