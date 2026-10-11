@@ -196,6 +196,59 @@ limits, group commit, conflict diagnostics, snapshot/cursor/batch lifetimes, can
 health and shutdown contracts apply unchanged. No callback scan wrapper is added: use the lifetime-safe
 bounded cursor API rather than filtering an unbounded borrowed scan.
 
+### Order-preserving composite keys (`Silex.Keys`)
+
+`Silex.Keys` is an optional companion library (it does not reference or change the storage engine, and
+no on-disk format changes) that builds byte-ordered composite keys: unsigned byte-wise comparison of two
+keys equals component-by-component comparison of their tuples. It is shared encoding machinery, not a
+definition of any database's value ordering: SQL coercions, collations and NULL ordering, and
+JSON/document comparison stay in the layer using it.
+
+```csharp
+using Silex.Keys;
+
+Span<byte> buffer = stackalloc byte[64];
+var writer = new OrderedKeyWriter(buffer);
+if (!writer.TryWriteString("orders") ||
+    !writer.TryWriteInt64(customerId) ||
+    !writer.TryWriteUInt64(timestamp, OrderedKeyOrder.Descending))
+{
+    // buffer too small: size it with OrderedKey.GetStringLength / Int64Length / UInt64Length
+}
+db.Put(writer.WrittenSpan, value);
+
+var reader = new OrderedKeyReader(key);
+reader.TryReadString(chars, out var charCount);
+reader.TryReadInt64(out var id);
+reader.TryReadUInt64(out var ts, OrderedKeyOrder.Descending);
+```
+
+Everything is span based and allocation free; the caller owns all buffers.
+
+* **Components** (each with `Ascending` or `Descending` order): `Boolean`, `Bytes`, `String`, `Int64`,
+  `UInt64`, `Double`.
+* **Format.** Each component begins with a tag (`04`/`05` boolean false/true, `10` bytes, `11` string,
+  `20` int64, `21` uint64, `22` double); a descending component uses the bitwise complement of its entire
+  encoding, including the tag. Integers are big-endian (int64 with the sign bit flipped). Doubles use the
+  IEEE-754 bit transform giving `-Infinity < negatives < -0.0 < +0.0 < positives < +Infinity < NaN`; every NaN
+  is written as one canonical NaN, so NaN payloads are not preserved. Bytes and strings escape each `00`
+  as `00 FF` and end with `00 01`. Strings are strict UTF-8 ordered by code point (unpaired surrogates throw
+  `ArgumentException`); no case folding or collation is applied.
+* **Boundaries.** No component encoding is a byte prefix of another, so tuple boundaries are
+  unambiguous and the raw key bytes of a tuple prefix (for example `writer.WrittenSpan`) are exactly the byte
+  prefix of every longer tuple that starts with it, which composes with `PrefixKeyspace`. Different kinds
+  order by tag (Boolean < Bytes < String < Int64 < UInt64 < Double, then descending kinds); integers and
+  doubles are never interleaved numerically, and position-wise consistent schemas are the caller's concern.
+* **Buffers.** `TryWrite*` returns `false` when the exact encoded size does not fit, leaving
+  `Written` unchanged; sizes are `OrderedKey.BooleanLength` (1), `Int64Length`/`UInt64Length`/`DoubleLength` (9),
+  and `GetBytesLength`/`GetStringLength`. Readers return an `OrderedKeyDecodeStatus`
+  (`EndOfData`, `UnexpectedComponent`, `Malformed`, `DestinationTooSmall` with the exact required length) and
+  do not advance on failure. Decoding is strict, so each key has exactly one decoding.
+* **Limits.** Sizes are `int`-bounded, and keys remain subject to the storage engine's own key limits.
+  No NULL, decimal, date/time, GUID, or case-insensitive components are defined; layers can compose them from
+  these building blocks (for example a leading boolean or `UInt64` marker for NULL placement). The format is
+  versionless and its encodings are fixed; future component kinds would use new tags.
+
 ### Batched point reads
 
 `MvccSnapshot`, `MvccStorage` and `MvccTransaction` expose `ReadManyRawAsync(keys, maxBytes)`, a generic
@@ -1292,6 +1345,7 @@ leftover MemTables. `readseq` uses Silex's raw scan path for the `byte[]` benchm
 | Project                  | Description                                      |
 |--------------------------|--------------------------------------------------|
 | `src/Silex`              | The storage engine library.                      |
+| `src/Silex.Keys`         | Companion order-preserving composite key encoder.|
 | `Silex.Playground`       | A small runnable usage sample.                   |
 | `Silex.DbBench`          | Database benchmarking harness.                   |
 | `tests/Silex.Test`       | Unit tests (TUnit).                              |

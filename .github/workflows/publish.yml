@@ -33,6 +33,7 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           echo "$VERSION"
           dotnet pack src/Silex/Silex.csproj --output artifacts --configuration Release -p:Version="$VERSION" -p:ContinuousIntegrationBuild=True
+          dotnet pack src/Silex.Keys/Silex.Keys.csproj --output artifacts --configuration Release -p:Version="$VERSION" -p:ContinuousIntegrationBuild=True
 
       - name: NuGet login
         id: nuget-login
