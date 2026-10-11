@@ -252,7 +252,7 @@ public class MvccGarbageCollectionTests
         }
 
         using var stop = new CancellationTokenSource();
-        var writer = Task.Run(() =>
+        var writer = Task.Run(async () =>
         {
             var version = 0;
             while (!stop.IsCancellationRequested)
@@ -262,6 +262,8 @@ public class MvccGarbageCollectionTests
                 {
                     storage.Put([key], BitConverter.GetBytes(version));
                 }
+                // Keep this unbounded load cooperative so write-lock reacquisition cannot starve GC readers.
+                await Task.Yield();
             }
         });
         var reader = Task.Run(async () =>

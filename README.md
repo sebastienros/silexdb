@@ -303,12 +303,7 @@ Cancellation, health/shutdown and disposal behave like individual point reads, a
 held after the call returns. This does not make reads inside scan callbacks safe, and there are no joins or
 record hydration.
 
-Measured (`PointReadBatchBenchmarks`, 65,536 × 100 B values, random keys, Apple M-series, .NET 8 ShortRun):
-batching is within about ±10% of looping `GetRawAsync` for 1–512 keys, for both SST-resident data (≈1.0 µs/key
-at 512 keys) and memtable-resident data, with equal allocations. The cost is dominated by per-key seek setup
-(memtable-resident seeks build merge inputs per call, roughly 2–4 ms and 3–5 MB per key at this size), which batching
-does not amortize; so the API deliberately adds no specialized execution path. Its value is a single snapshot
-registration, bounded owned results and one call per page, not throughput.
+Batching provides one consistent view and bounded owned results; it does not imply higher throughput.
 
 ### Recovery, integrity, and salvage
 
@@ -835,45 +830,9 @@ mutation); rollback to a prior savepoint removes it if the caller continues othe
 consumes the transaction on every outcome. A conflict needs a new transaction and a caller decision about
 replay safety; a storage exception is not a false condition or a conflict.
 
-**Scope decision (catalog item 14):** defer public convenience APIs; neither pattern needs a new primitive,
-and no demonstrated caller requirement justifies a wrapper over these composable operations.
-The recipes allow caller-owned scratch memory, compose with multi-key work and avoid a second transaction
-implementation. The catalog supplies no concrete plain-LSM-only consumer or latency target. Plain
-`LsmStorage.GetRawAsync` followed by `Write(LsmWriteBatch)` is **not** atomic conditional mutation, and a
+Plain `LsmStorage.GetRawAsync` followed by `Write(LsmWriteBatch)` is **not** atomic conditional mutation, and a
 plain batch supplies neither a snapshot nor a validated read dependency. Do not use that sequence under
 concurrent writers, or open an MVCC path through the plain facade.
-
-`ConditionalMutationBenchmarks` compares the existing validated MVCC recipe, an unconditional MVCC
-transaction, and an **unchecked** plain read/batch cost baseline. Each iteration starts from 8,192 SST-resident
-100-byte values and measures 1,024 uncontended two-key replacements, with WAL enabled both with and without
-file synchronization; setup, flush and cleanup are excluded. This bounds version growth and keeps samples
-comparable, but is not a sustained compaction, contention, group-commit or power-loss experiment. A faster
-unchecked baseline alone would not justify weakening coordination or adding a new plain-LSM conditional
-batch API: that requires a demonstrated consumer without snapshots and representative sustained measurements.
-
-Measured on Apple M4 Pro, .NET 8.0.30, BenchmarkDotNet ShortRun (three measured iterations); means and
-managed allocations are **per two-key operation**, not per iteration:
-
-| Operation | WAL, no file sync | WAL + file sync | Allocated, no file sync |
-|---|---:|---:|---:|
-| Unchecked plain read/batch | 3.78 us | 4.28 ms | 404 B |
-| Unconditional MVCC transaction | 12.44 us | 4.29 ms | 36,446 B |
-| Conditional MVCC transaction | 19.10 us | 4.32 ms | 53,783 B |
-
-MVCC overhead is material in this unsynchronized workload (about 5x time and 133x allocation versus the
-unchecked baseline); it is not hidden by calling the same operations through a convenience helper. With
-file synchronization, these means are within about 1%, and do not establish an ordering. The growing active
-memtable's per-seek setup contributes to MVCC allocation; these numbers are not constant per-transaction
-buffer costs. Unsynchronized iterations remain below BenchmarkDotNet's recommended 100 ms, and ShortRun
-confidence intervals are wide: treat timings as exploratory, not a performance guarantee. This is evidence
-to investigate for a concrete plain-only workload, **not** evidence of that workload's demand or of a safe,
-faster conditional implementation. No production hot path or persistent format changes here.
-
-Reproduce with:
-
-```bash
-dotnet run --project tests/Silex.Benchmarks -c Release -- --filter '*ConditionalMutationBenchmarks*'
-```
 
 ### Conflict diagnostics
 
@@ -1054,55 +1013,6 @@ rounding/spare capacity, lookup/sort indexes, object headers, commit/WAL batches
 independently owned frozen cursor overlays are excluded. Index and descriptor storage is proportional
 to the transaction's peak key counts; rollback retains rented capacity until disposal. Limit the number
 of concurrent transactions/cursors separately. No disk spilling is provided.
-
-Up to 8 mutations or tracked reads use linear lookup with no key index. Beyond that, each set lazily
-creates its own pooled, open-addressed hash index using arena offsets rather than allocated key objects.
-Expected point lookup/deduplication is constant-time; rollback that removes keys rebuilds the affected
-indexes in linear time in their retained capacity. Ordered scans lazily sort and cache mutation positions,
-binary-search the lower bound, then copy only the matching frozen overlay. Value changes do not invalidate key order; newly staged or
-rolled-back keys do. Frozen cursors remain independent of later mutations, rollback, release, and commit.
-
-#### Buffer measurements
-
-Reproduce the data-structure comparison with:
-
-```sh
-dotnet run --project tests/Silex.Benchmarks -c Release -- \
-  --filter '*TransactionBufferBenchmarks*' '*TransactionBufferOrderedBenchmarks*'
-```
-
-BenchmarkDotNet 0.14.0 ShortRun (3 warmups/3 measured iterations), Apple M4 Pro, macOS 15.8.1,
-.NET 8.0.30 ARM64; eight-byte keys and sixteen-byte values. These are in-memory buffer microbenchmarks,
-not disk throughput or commit-validation measurements. Linear-only and forced-index cases use the same
-buffer/accounting implementation, isolating lookup structure costs.
-
-| Distinct keys | Stage all keys, linear-only | Stage all keys, forced index | Stage all keys, eight-key hybrid |
-|---|---:|---:|---:|
-| 1 | 35.9 ns | 48.3 ns | 36.1 ns |
-| 4 | 70.6 ns | 89.2 ns | 68.6 ns |
-| 8 | 144.1 ns | 139.1 ns | 144.2 ns |
-| 16 | 428.6 ns | 299.0 ns | 336.2 ns |
-
-The eight-key cutoff preserves cheaper tiny-transaction staging without renting indexes; indexing
-is already worthwhile by sixteen keys. Eight-key staging is near parity, not a universal crossover.
-Read-heavy tiny transactions can favor earlier indexing, so this threshold is a staging/memory tradeoff,
-not a claim that linear lookup always wins below it.
-
-| Workload | Reference | Production hybrid/cached order |
-|---|---:|---:|
-| 64 mixed point probes over 4,096 writes | 409.7 us | 0.257 us |
-| Deduplicate 4,096 already-tracked reads | 16,842.5 us | 27.1 us |
-| Stage 4,096 distinct writes | 16,826.7 us | 102.4 us |
-| Freeze a 32-key range among 65,536 writes, warmed ordering | 443.3 us | 0.676 us |
-
-Indexed point probes and duplicate reads report zero managed allocation. Tests additionally verify
-warmed indexed savepoint/staging cycles and order invalidation/re-sorting allocate zero managed bytes.
-Creating a new buffer still allocates its owner object; frozen overlay copies intentionally own data
-(176 managed bytes per warmed range freeze here, with payload/descriptors rented from pools).
-The ordered reference scans every pending key and sorts the matching copy, omitting its wrapper object
-to conservatively favor the old algorithm. The cached measurement excludes the initial full-key sort:
-first scans and scans after key membership changes still pay `O(n log n)` sorting. Short-run timing and
-pool behavior are machine/workload-dependent; sustained disk/compaction and commit-gate costs are unchanged.
 
 ### Commit-time versionstamps
 
@@ -1320,93 +1230,43 @@ foreach (var x in Enumerable.Range(0, 1_000_000))
 await db.CloseAsync(); // flush everything to disk
 ```
 
-## db_bench comparisons with RocksDB
+## Comparisons with RocksDB
 
-`Silex.DbBench` accepts the RocksDB-style options that affect the main LSM shape so comparisons can use
-the same strategy instead of comparing RocksDB's default leveled compaction with Silex's default tiered
-compaction. It accepts `--compression_type=none|lz4|zstd`, `--compression_level`, and
-`--compression_ratio`. For fair runs, use matching compression settings and the same values for
-`--num`, `--key_size`, `--value_size`,
-`--write_buffer_size`, `--block_size`, `--bloom_bits`, `--threads`, `--seed`, and the compaction knobs.
+### Plain LSM: 200,000 entries, operations/s
 
-Current single-thread snapshot (2026-08-02, Apple M4 Pro, median of three alternating runs):
+| Workload | Silex | RocksDB | Silex/RocksDB |
+|---|---:|---:|---:|
+| Sequential writes | 839,985 | 738,688 | 1.14x |
+| Random writes | 825,584 | 526,684 | 1.57x |
+| Overwrites | 853,069 | 417,377 | 2.04x |
+| Random reads, first pass | 1,711,034 | 1,378,644 | 1.24x |
+| Random reads, warm | 2,335,006 | 1,477,279 | 1.58x |
+| Sequential scan | 15,660,113 | 15,204,500 | 1.03x |
+| Random seeks, first pass | 2,240,914 | 926,676 | 2.42x |
+| Random seeks, warm | 2,537,044 | 966,080 | 2.63x |
 
-| Workload | Relative result |
-| --- | ---: |
-| Sequential, random, and overwrite writes | **Silex 1.19-1.52x faster** |
-| First random-read pass | **RocksDB 1.07x faster** |
-| Warm random reads | **Silex 1.12x faster** |
-| Sequential scans | **Silex 1.15x faster** |
-| Random seeks | **Silex 1.74x faster** |
-| WAL fsync per write | **Tie at about 4.14 ms/op** |
+### MVCC: 8,192 keys
 
-These 200,000-entry, uncompressed runs fit in memory and measure warm-page/cache behavior rather
-than device throughput. See the
-[full comparison](Silex.DbBench/benchmarks/2026-05-30-rocksdb-comparison.md) for exact revisions,
-settings, absolute measurements, corrected concurrency methodology, and durability caveats.
-
-Tiered/universal comparison:
-
-```bash
-dotnet run --project Silex.DbBench -c Release -- \
-  --benchmarks=fillseq,readrandom,readseq \
-  --num=1000000 --key_size=16 --value_size=100 --threads=1 --seed=42 \
-  --write_buffer_size=67108864 --max_write_buffer_number=50 \
-  --block_size=4096 --cache_size=8388608 --bloom_bits=10 \
-  --compaction_style=1 \
-  --universal_max_read_amp=8 \
-  --universal_max_size_amplification_percent=200 \
-  --universal_size_ratio=1 \
-  --universal_min_merge_width=2 \
-  --compression_type=none --compression_ratio=1 --db=/tmp/silex-universal
-
-db_bench \
-  --benchmarks=fillseq,readrandom,readseq \
-  --num=1000000 --key_size=16 --value_size=100 --threads=1 --seed=42 \
-  --write_buffer_size=67108864 --max_write_buffer_number=50 \
-  --block_size=4096 --cache_size=8388608 --bloom_bits=10 \
-  --compaction_style=1 \
-  --universal_max_read_amp=8 \
-  --universal_max_size_amplification_percent=200 \
-  --universal_size_ratio=1 \
-  --universal_min_merge_width=2 \
-  --compression_type=none --compression_ratio=1 --db=/tmp/rocksdb-universal
-```
-
-Leveled comparison:
-
-```bash
-dotnet run --project Silex.DbBench -c Release -- \
-  --benchmarks=fillseq,readrandom,readseq \
-  --num=1000000 --key_size=16 --value_size=100 --threads=1 --seed=42 \
-  --write_buffer_size=67108864 --max_write_buffer_number=50 \
-  --block_size=4096 --cache_size=8388608 --bloom_bits=10 \
-  --compaction_style=0 \
-  --level0_file_num_compaction_trigger=4 \
-  --num_levels=7 \
-  --max_bytes_for_level_base=262144 \
-  --max_bytes_for_level_multiplier=10 \
-  --target_file_size_base=2097152 \
-  --compression_type=none --compression_ratio=1 --db=/tmp/silex-leveled
-
-db_bench \
-  --benchmarks=fillseq,readrandom,readseq \
-  --num=1000000 --key_size=16 --value_size=100 --threads=1 --seed=42 \
-  --write_buffer_size=67108864 --max_write_buffer_number=50 \
-  --block_size=4096 --cache_size=8388608 --bloom_bits=10 \
-  --compaction_style=0 \
-  --level0_file_num_compaction_trigger=4 \
-  --num_levels=7 \
-  --max_bytes_for_level_base=262144 \
-  --max_bytes_for_level_multiplier=10 \
-  --target_file_size_base=2097152 \
-  --compression_type=none --compression_ratio=1 --db=/tmp/rocksdb-leveled
-```
-
-The mappings are intentionally close but not identical to RocksDB internals: Silex runs one background
-compaction loop, maps `--bloom_bits` to an equivalent false-positive probability, and `Silex.DbBench`
-forces a flush/compaction barrier before read phases so reads measure on-disk SST state rather than
-leftover MemTables. `readseq` uses Silex's raw scan path for the `byte[]` benchmark workload.
+| Workload | Residency | Retained versions | Unit | Silex | RocksDB | Silex/RocksDB |
+|---|---|---:|---|---:|---:|---:|
+| Latest snapshot hit | Memtable | 1 | reads/s | 2,545,535 | 2,713,266 | 0.94x |
+| Oldest snapshot hit | Memtable | 1 | reads/s | 2,484,386 | 2,760,171 | 0.90x |
+| Snapshot miss | Memtable | 1 | reads/s | 2,477,493 | 2,696,617 | 0.92x |
+| 64-key tracked transaction | Memtable | 1 | tx/s | 42,971 | 19,047 | 2.26x |
+| Latest snapshot hit | SST | 1 | reads/s | 2,412,825 | 1,855,769 | 1.30x |
+| Oldest snapshot hit | SST | 1 | reads/s | 2,448,293 | 1,852,022 | 1.32x |
+| Snapshot miss | SST | 1 | reads/s | 5,915,721 | 8,349,423 | 0.71x |
+| 64-key tracked transaction | SST | 1 | tx/s | 40,048 | 15,736 | 2.54x |
+| Latest snapshot hit | Memtable | 8 | reads/s | 2,173,932 | 1,835,103 | 1.18x |
+| Oldest snapshot hit | Memtable | 8 | reads/s | 2,185,682 | 1,981,393 | 1.10x |
+| Snapshot miss | Memtable | 8 | reads/s | 2,197,155 | 1,893,142 | 1.16x |
+| 64-key tracked transaction | Memtable | 8 | tx/s | 38,194 | 15,335 | 2.49x |
+| Latest snapshot hit | SST | 8 | reads/s | 2,159,803 | 1,465,573 | 1.47x |
+| Oldest snapshot hit | SST | 8 | reads/s | 2,150,659 | 1,520,056 | 1.41x |
+| Snapshot miss | SST | 8 | reads/s | 5,985,092 | 8,191,670 | 0.73x |
+| 64-key tracked transaction | SST | 8 | tx/s | 35,683 | 12,727 | 2.80x |
+| Document + two indexes | Memtable | Pinned initial snapshot | tx/s | 156,120 | 100,031 | 1.56x |
+| Document + two indexes | Initially SST, then mixed | Pinned initial snapshot | tx/s | 136,818 | 97,660 | 1.40x |
 
 ## Project layout
 

@@ -24,7 +24,7 @@ it directly:
 dotnet build Silex.DbBench -c Release
 
 # Then run the compiled binary directly
-./Silex.DbBench/bin/Release/net8.0/dbbench --benchmarks=fillrandom,readrandom --num=1000000
+./Silex.DbBench/bin/Release/net10.0/dbbench --benchmarks=fillrandom,readrandom --num=1000000
 ```
 
 To type just `dbbench` from anywhere, put it on your `PATH` for the session or add a
@@ -32,11 +32,11 @@ shell alias:
 
 ```bash
 # Option A: prepend the build output to PATH (current shell only)
-export PATH="$PWD/Silex.DbBench/bin/Release/net8.0:$PATH"
+export PATH="$PWD/Silex.DbBench/bin/Release/net10.0:$PATH"
 dbbench --benchmarks=fillseq,readrandom --num=1000000
 
 # Option B: a persistent alias (add to ~/.zshrc or ~/.bashrc)
-alias dbbench="$PWD/Silex.DbBench/bin/Release/net8.0/dbbench"
+alias dbbench="$PWD/Silex.DbBench/bin/Release/net10.0/dbbench"
 ```
 
 For a self-contained, framework-independent binary you can copy elsewhere, publish it:
@@ -240,6 +240,74 @@ Silex supports `none`, `lz4`, and `zstd` compression. For a fair comparison, use
 `--batch_size=1` when comparing individual writes. Keys are generated
 exactly like `db_bench`'s `GenerateKeyFromInt` (the integer is written big-endian in the first
 `min(8, key_size)` bytes, the rest padded with `'0'`).
+
+### Matched comparison commands
+
+Run from the repository root in Bash. Build once and use fresh database paths for each repetition.
+Set `ROCKSDB_BENCH` if the native executable is not at `~/github/rocksdb/db_bench`.
+
+```bash
+dotnet build Silex.DbBench/Silex.DbBench.csproj -c Release
+
+silex="$PWD/Silex.DbBench/bin/Release/net10.0/dbbench"
+rocksdb="${ROCKSDB_BENCH:-$HOME/github/rocksdb/db_bench}"
+comparison_dir="$(mktemp -d "${TMPDIR:-/tmp}/silex-rocksdb.XXXXXX")"
+
+common=(
+  --num=200000 --reads=200000 --key_size=16 --value_size=100
+  --threads=1 --seed=570123434 --batch_size=1
+  --write_buffer_size=67108864 --block_size=4096 --cache_size=134217728
+  --bloom_bits=10 --compression_type=none --compression_level=0 --compression_ratio=1
+)
+compaction=(--compaction_style=1)
+
+# Sequential writes, two random-read passes, scan, and two random-seek passes.
+DOTNET_TieredCompilation=0 "$silex" "${common[@]}" "${compaction[@]}" \
+  --wal=true --wal_sync=false --db="$comparison_dir/silex-read" \
+  --benchmarks=fillseq,readrandom,readrandom,readseq,seekrandom,seekrandom
+
+"$rocksdb" "${common[@]}" "${compaction[@]}" \
+  --disable_wal=false --sync=false --db="$comparison_dir/rocksdb-read" \
+  --benchmarks=fillseq,flush,readrandom,readrandom,readseq,seekrandom,seekrandom
+
+# Random writes and overwrites use separate databases from the read suite.
+DOTNET_TieredCompilation=0 "$silex" "${common[@]}" "${compaction[@]}" \
+  --wal=true --wal_sync=false --db="$comparison_dir/silex-write" \
+  --benchmarks=fillrandom,overwrite
+
+"$rocksdb" "${common[@]}" "${compaction[@]}" \
+  --disable_wal=false --sync=false --db="$comparison_dir/rocksdb-write" \
+  --benchmarks=fillrandom,overwrite
+```
+
+Use three repetitions, creating a new `comparison_dir` each time, and alternate engine order:
+Silex/RocksDB, RocksDB/Silex, Silex/RocksDB. Report per-workload medians. Both engines have WAL enabled
+without per-write synchronization. The 200,000-entry dataset fits in memory; the first read pass is not
+a guaranteed cold OS-cache measurement.
+
+RocksDB's explicit `flush` makes the read phases SST-backed, matching Silex's automatic read barrier.
+Verify every read/seek reports all requested keys found; random writes alone do not guarantee full
+key coverage. These commands exercise the plain LSM API, not the MVCC transaction comparison.
+
+For explicitly matched tiered/universal tuning, replace the `compaction` assignment above with:
+
+```bash
+compaction=(
+  --compaction_style=1 --universal_max_read_amp=8
+  --universal_max_size_amplification_percent=200 --universal_size_ratio=1
+  --universal_min_merge_width=2
+)
+```
+
+For a leveled comparison, instead use the following assignment and fresh database paths:
+
+```bash
+compaction=(
+  --compaction_style=0 --level0_file_num_compaction_trigger=4 --num_levels=7
+  --max_bytes_for_level_base=262144 --max_bytes_for_level_multiplier=10
+  --target_file_size_base=2097152
+)
+```
 
 Recorded comparison runs (with methodology notes) live in
 [`benchmarks/`](benchmarks/) — e.g. [`2026-05-30-rocksdb-comparison.md`](benchmarks/2026-05-30-rocksdb-comparison.md).

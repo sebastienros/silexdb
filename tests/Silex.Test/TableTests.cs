@@ -304,7 +304,9 @@ public class TableTests
     }
 
     [Test]
-    public async Task ShouldLoadDisabledBloomFilter()
+    [Arguments(false)]
+    [Arguments(true)]
+    public async Task ShouldLoadDisabledBloomFilter(bool versionKey)
     {
         using var tempFolder = TempFolder.Create();
         var tempFilename = tempFolder.GetRandomFileName();
@@ -312,7 +314,11 @@ public class TableTests
 
         using (var builder = new BufferedSsTableBuilder(tempFilename, new DefaultSsTableEncoder(), new DefaultBlockEncoder(), bloomFilterFactory, 100))
         {
-            await builder.AddAsync(7, "hello");
+            if (versionKey)
+                await builder.AddAsync(ByteSlice.FromMemory(new byte[] { 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }),
+                    ByteSlice.FromMemory("hello"u8.ToArray()));
+            else
+                await builder.AddAsync(7, "hello");
             var table = await builder.BuildAsync();
             table.Dispose();
         }
@@ -322,6 +328,8 @@ public class TableTests
 
         await Assert.That(loaded.BloomFilter.K).IsEqualTo(0);
         await Assert.That(loaded.BloomFilter.Probe("anything"u8)).IsTrue();
+        await Assert.That(loaded.MayContainVersionPrefix(new byte[] { 1, 0, 0 })).IsTrue();
+        await Assert.That(loaded.VersionPrefixBloomFilter is not null).IsEqualTo(versionKey);
         loaded.Dispose();
     }
 

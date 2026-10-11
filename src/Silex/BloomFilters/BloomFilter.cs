@@ -1,5 +1,9 @@
-﻿using System.IO.Hashing;
+﻿using System.Buffers.Binary;
+using System.IO.Hashing;
 using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.Arm;
+using System.Runtime.Intrinsics.X86;
 
 namespace Silex.BloomFilters;
 
@@ -11,12 +15,22 @@ public class BloomFilter : IBloomFilter
 {
     private const int CacheLineBytes = 64;
     private const int CacheLineBits = CacheLineBytes * 8;
+    private const int SplitBlockBytes = 32;
+    private const int SplitHashFunctions = 8;
     private const int MaxHashFunctions = 2_048;
     private const int MaxLocalHashFunctions = 64;
     private const int MaxByteLength = int.MaxValue / 8;
 
     public const int GlobalAlgorithmVersion = 1;
-    public const int CurrentAlgorithmVersion = 2;
+    public const int CacheLocalAlgorithmVersion = 2;
+    public const int CurrentAlgorithmVersion = 3;
+
+    // One bit per 32-bit lane; these multipliers define the persisted v3 layout.
+    private static readonly Vector128<uint> SplitSaltsLow = Vector128.Create(
+        0x47b6137bu, 0x44974d91u, 0x8824ad5bu, 0xa2b7289du);
+    private static readonly Vector128<uint> SplitSaltsHigh = Vector128.Create(
+        0x705495c7u, 0x2df1424bu, 0x9efc4947u, 0x5c6bfb31u);
+    private static readonly Vector256<uint> SplitSalts = Vector256.Create(SplitSaltsLow, SplitSaltsHigh);
 
     private readonly int _k; // Number of hashing iterations
     private readonly int _m; // Size of the bloom filter in bits
@@ -29,6 +43,11 @@ public class BloomFilter : IBloomFilter
     private readonly byte[] _bytes;
 
     public BloomFilter(int length, double p)
+        : this(length, p, CurrentAlgorithmVersion)
+    {
+    }
+
+    internal BloomFilter(int length, double p, int algorithmVersion)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(length);
 
@@ -37,12 +56,16 @@ public class BloomFilter : IBloomFilter
             throw new ArgumentOutOfRangeException(nameof(p), p, "The false positive probability must be in the range (0, 1).");
         }
 
-        var (byteLength, hashFunctions) = CalculateLocalConfiguration(length, p);
+        if (algorithmVersion is not (CacheLocalAlgorithmVersion or CurrentAlgorithmVersion))
+            throw new ArgumentOutOfRangeException(nameof(algorithmVersion));
+        var (byteLength, hashFunctions) = algorithmVersion == CacheLocalAlgorithmVersion
+            ? CalculateLocalConfiguration(length, p)
+            : CalculateSplitConfiguration(length, p);
         _bytes = AllocateCacheLineAligned(byteLength, out _offset);
         _length = byteLength;
         _m = checked(byteLength * 8);
         _k = hashFunctions;
-        _algorithm = Algorithm.CacheLocal;
+        _algorithm = (Algorithm)algorithmVersion;
     }
 
     public BloomFilter(byte[] bytes, int k)
@@ -69,12 +92,16 @@ public class BloomFilter : IBloomFilter
             throw new ArgumentOutOfRangeException(nameof(algorithmVersion), algorithmVersion, "The Bloom filter algorithm version is not supported.");
         }
 
-        if (algorithmVersion == CurrentAlgorithmVersion && bytes.Length % CacheLineBytes != 0)
+        var blockBytes = algorithmVersion == CurrentAlgorithmVersion ? SplitBlockBytes : CacheLineBytes;
+        if (algorithmVersion >= CacheLocalAlgorithmVersion && bytes.Length % blockBytes != 0)
         {
-            throw new ArgumentException($"Version {CurrentAlgorithmVersion} Bloom filters must contain whole cache-line blocks.", nameof(bytes));
+            throw new ArgumentException($"Version {algorithmVersion} Bloom filters must contain whole {blockBytes}-byte blocks.", nameof(bytes));
         }
 
-        if (algorithmVersion == CurrentAlgorithmVersion)
+        if (algorithmVersion == CurrentAlgorithmVersion && k != SplitHashFunctions)
+            throw new ArgumentOutOfRangeException(nameof(k), k, "Split-block filters require eight hash functions.");
+
+        if (algorithmVersion >= CacheLocalAlgorithmVersion)
         {
             _bytes = AllocateCacheLineAligned(bytes.Length, out _offset);
             bytes.CopyTo(_bytes.AsSpan(_offset, bytes.Length));
@@ -100,6 +127,9 @@ public class BloomFilter : IBloomFilter
     {
         switch (_algorithm)
         {
+            case Algorithm.SplitBlock:
+                AddSplitBlock(item);
+                break;
             case Algorithm.CacheLocal:
                 AddCacheLocal(item);
                 break;
@@ -113,6 +143,10 @@ public class BloomFilter : IBloomFilter
                 {
                     AddCacheLocal(item);
                 }
+                if (SupportsSplitBlock)
+                {
+                    AddSplitBlock(item);
+                }
 
                 AddGlobal(item);
                 AddLegacy(item);
@@ -124,13 +158,97 @@ public class BloomFilter : IBloomFilter
     {
         return _algorithm switch
         {
+            Algorithm.SplitBlock => ProbeSplitBlock(item),
             Algorithm.CacheLocal => ProbeCacheLocal(item),
             Algorithm.Global => ProbeGlobal(item),
-            _ => (SupportsCacheLocal && ProbeCacheLocal(item)) || ProbeGlobal(item) || ProbeLegacy(item)
+            _ => (SupportsSplitBlock && ProbeSplitBlock(item)) ||
+                (SupportsCacheLocal && ProbeCacheLocal(item)) || ProbeGlobal(item) || ProbeLegacy(item)
         };
     }
 
     private bool SupportsCacheLocal => _length % CacheLineBytes == 0;
+    private bool SupportsSplitBlock => _k == SplitHashFunctions && _length % SplitBlockBytes == 0;
+
+    private void AddSplitBlock(ReadOnlySpan<byte> item)
+    {
+        var hash = XxHash3.HashToUInt64(item);
+        var block = _bytes.AsSpan(SplitBlockOffset(hash), SplitBlockBytes);
+        var fingerprint = (uint)(hash >> 32);
+        if (BitConverter.IsLittleEndian && Avx2.IsSupported)
+        {
+            var mask = SplitMask256(fingerprint);
+            var stored = MemoryMarshal.Read<Vector256<uint>>(block) | mask;
+            MemoryMarshal.Write(block, in stored);
+        }
+        else if (BitConverter.IsLittleEndian && AdvSimd.IsSupported)
+        {
+            var low = MemoryMarshal.Read<Vector128<uint>>(block) | SplitMask128(fingerprint, SplitSaltsLow);
+            var high = MemoryMarshal.Read<Vector128<uint>>(block[16..]) | SplitMask128(fingerprint, SplitSaltsHigh);
+            MemoryMarshal.Write(block, in low);
+            MemoryMarshal.Write(block[16..], in high);
+        }
+        else
+        {
+            for (var lane = 0; lane < SplitHashFunctions; lane++)
+            {
+                var word = block[(lane * sizeof(uint))..];
+                BinaryPrimitives.WriteUInt32LittleEndian(word,
+                    BinaryPrimitives.ReadUInt32LittleEndian(word) | SplitMask(fingerprint, lane));
+            }
+        }
+    }
+
+    private bool ProbeSplitBlock(ReadOnlySpan<byte> item)
+    {
+        var hash = XxHash3.HashToUInt64(item);
+        var block = _bytes.AsSpan(SplitBlockOffset(hash), SplitBlockBytes);
+        var fingerprint = (uint)(hash >> 32);
+        if (BitConverter.IsLittleEndian && Avx2.IsSupported)
+        {
+            var mask = SplitMask256(fingerprint);
+            return Vector256.EqualsAll(MemoryMarshal.Read<Vector256<uint>>(block) & mask, mask);
+        }
+        if (BitConverter.IsLittleEndian && AdvSimd.IsSupported)
+        {
+            var low = SplitMask128(fingerprint, SplitSaltsLow);
+            var high = SplitMask128(fingerprint, SplitSaltsHigh);
+            var missingLow = (MemoryMarshal.Read<Vector128<uint>>(block) & low) ^ low;
+            var missingHigh = (MemoryMarshal.Read<Vector128<uint>>(block[16..]) & high) ^ high;
+            return Vector128.EqualsAll(missingLow | missingHigh, Vector128<uint>.Zero);
+        }
+        return ProbeSplitBlockScalar(block, fingerprint);
+    }
+
+    internal bool ProbeScalar(ReadOnlySpan<byte> item)
+    {
+        if (_algorithm != Algorithm.SplitBlock) return Probe(item);
+        var hash = XxHash3.HashToUInt64(item);
+        return ProbeSplitBlockScalar(_bytes.AsSpan(SplitBlockOffset(hash), SplitBlockBytes), (uint)(hash >> 32));
+    }
+
+    private int SplitBlockOffset(ulong hash) =>
+        _offset + (int)(((ulong)(uint)hash * (uint)(_length / SplitBlockBytes)) >> 32) * SplitBlockBytes;
+
+    private static Vector256<uint> SplitMask256(uint fingerprint) =>
+        Avx2.ShiftLeftLogicalVariable(Vector256.Create(1u),
+            Vector256.ShiftRightLogical(Vector256.Multiply(Vector256.Create(fingerprint), SplitSalts), 27));
+
+    private static Vector128<uint> SplitMask128(uint fingerprint, Vector128<uint> salts) =>
+        AdvSimd.ShiftLogical(Vector128.Create(1u),
+            Vector128.ShiftRightLogical(Vector128.Multiply(Vector128.Create(fingerprint), salts), 27).AsInt32());
+
+    private static uint SplitMask(uint fingerprint, int lane) =>
+        1u << (int)(unchecked(fingerprint * SplitSalts.GetElement(lane)) >> 27);
+
+    private static bool ProbeSplitBlockScalar(ReadOnlySpan<byte> block, uint fingerprint)
+    {
+        for (var lane = 0; lane < SplitHashFunctions; lane++)
+        {
+            if ((BinaryPrimitives.ReadUInt32LittleEndian(block[(lane * sizeof(uint))..]) & SplitMask(fingerprint, lane)) == 0)
+                return false;
+        }
+        return true;
+    }
 
     private void AddCacheLocal(ReadOnlySpan<byte> item)
     {
@@ -346,24 +464,40 @@ public class BloomFilter : IBloomFilter
         throw new ArgumentOutOfRangeException(nameof(p), p, "The requested false positive probability requires a Bloom filter larger than the supported maximum.");
     }
 
-    private static double EstimateLocalFalsePositive(int n, long blocks, double lambda, int k)
+    private static (int ByteLength, int HashFunctions) CalculateSplitConfiguration(int n, double p)
+    {
+        var blocks = Math.Max(1L, (CalculateM(n, p) + SplitBlockBytes * 8 - 1) / (SplitBlockBytes * 8));
+        var maxBlocks = MaxByteLength / SplitBlockBytes;
+        var target = p - Math.Min(p * 0.05, 0.001);
+        for (var attempt = 0; attempt < 64 && blocks <= maxBlocks; attempt++)
+        {
+            var probability = EstimateLocalFalsePositive(n, blocks, n / (double)blocks, SplitHashFunctions, split: true);
+            if (probability <= target)
+                return (checked((int)blocks * SplitBlockBytes), SplitHashFunctions);
+            var growth = Math.Clamp(Math.Pow(probability / target, 1d / SplitHashFunctions) * 1.05, 1.05, 2);
+            blocks = Math.Max(blocks + 1, checked((long)Math.Ceiling(blocks * growth)));
+        }
+        throw new ArgumentOutOfRangeException(nameof(p), p, "The requested false positive probability requires a Bloom filter larger than the supported maximum.");
+    }
+
+    private static double EstimateLocalFalsePositive(int n, long blocks, double lambda, int k, bool split = false)
     {
         double localProbability;
         if (blocks == 1)
         {
-            localProbability = ConditionalLocalFalsePositive(n, k);
+            localProbability = ConditionalLocalFalsePositive(n, k, split);
         }
         else
         {
             var mode = (int)Math.Floor(lambda);
-            var probabilitySum = ConditionalLocalFalsePositive(mode, k);
+            var probabilitySum = ConditionalLocalFalsePositive(mode, k, split);
             var weightSum = 1d;
             var weight = 1d;
 
             for (var count = mode - 1; count >= 0; count--)
             {
                 weight *= (count + 1) / lambda;
-                probabilitySum += weight * ConditionalLocalFalsePositive(count, k);
+                probabilitySum += weight * ConditionalLocalFalsePositive(count, k, split);
                 weightSum += weight;
 
                 if (weight < weightSum * 1e-15)
@@ -377,7 +511,7 @@ public class BloomFilter : IBloomFilter
             for (var count = mode + 1; count <= upperLimit; count++)
             {
                 weight *= lambda / count;
-                probabilitySum += weight * ConditionalLocalFalsePositive(count, k);
+                probabilitySum += weight * ConditionalLocalFalsePositive(count, k, split);
                 weightSum += weight;
 
                 if (count > mode + 8 && weight < weightSum * 1e-15)
@@ -397,14 +531,16 @@ public class BloomFilter : IBloomFilter
         return localProbability + fingerprintProbability - localProbability * fingerprintProbability;
     }
 
-    private static double ConditionalLocalFalsePositive(int entriesInBlock, int k)
+    private static double ConditionalLocalFalsePositive(int entriesInBlock, int k, bool split)
     {
         if (entriesInBlock == 0)
         {
             return 0;
         }
 
-        var occupied = 1 - Math.Exp(-(double)k * entriesInBlock / CacheLineBits);
+        var occupied = split
+            ? 1 - Math.Pow(31d / 32, entriesInBlock)
+            : 1 - Math.Exp(-(double)k * entriesInBlock / CacheLineBits);
         return Math.Pow(occupied, k);
     }
 
@@ -429,6 +565,7 @@ public class BloomFilter : IBloomFilter
     {
         Compatibility = 0,
         Global = GlobalAlgorithmVersion,
-        CacheLocal = CurrentAlgorithmVersion
+        CacheLocal = CacheLocalAlgorithmVersion,
+        SplitBlock = CurrentAlgorithmVersion
     }
 }

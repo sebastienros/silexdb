@@ -7,6 +7,125 @@ namespace Silex.Test;
 public class BloomFilterTests
 {
     [Test]
+    [Arguments(1, 0.01)]
+    [Arguments(17, 0.01)]
+    [Arguments(8192, 0.01)]
+    [Arguments(10_000, 0.0001)]
+    [Arguments(10_000, 0.5)]
+    public async Task SplitBlockVectorAndScalarMatchAndMeetTheRequestedProbability(int n, double p)
+    {
+        var bloom = new BloomFilter(n, p);
+        var key = new byte[16];
+        for (var i = 0; i < n; i++)
+        {
+            BinaryPrimitives.WriteInt32LittleEndian(key, i);
+            bloom.Add(key);
+        }
+        var restored = new BloomFilter(bloom.GetBytes().ToArray(), bloom.K, bloom.AlgorithmVersion);
+        var positives = 0;
+        const int samples = 1_000_000;
+        for (var i = 0; i < n + samples; i++)
+        {
+            BinaryPrimitives.WriteInt32LittleEndian(key, i);
+            var vector = restored.Probe(key);
+            var scalar = restored.ProbeScalar(key);
+            if (vector != scalar || i < n && !vector)
+                throw new InvalidOperationException("Scalar, SIMD or restored filter disagreed.");
+            if (i >= n && vector) positives++;
+        }
+        var threshold = p + 6 * Math.Sqrt(p * (1 - p) / samples);
+        await Assert.That((double)positives / samples).IsLessThanOrEqualTo(threshold);
+    }
+
+    [Test]
+    public async Task SplitBlockBytesMatchScalarLittleEndianEncoding()
+    {
+        var bloom = new BloomFilter(1000, 0.01);
+        var expected = new byte[bloom.GetBytes().Length];
+        uint[] salts = [0x47b6137b, 0x44974d91, 0x8824ad5b, 0xa2b7289d,
+            0x705495c7, 0x2df1424b, 0x9efc4947, 0x5c6bfb31];
+        var key = new byte[16];
+        for (var i = 0; i < 1000; i++)
+        {
+            BinaryPrimitives.WriteInt32LittleEndian(key, i);
+            bloom.Add(key);
+            var hash = XxHash3.HashToUInt64(key);
+            var offset = (int)(((ulong)(uint)hash * (uint)(expected.Length / 32)) >> 32) * 32;
+            for (var lane = 0; lane < salts.Length; lane++)
+            {
+                var word = expected.AsSpan(offset + lane * sizeof(uint), sizeof(uint));
+                var bit = 1u << (int)(unchecked((uint)(hash >> 32) * salts[lane]) >> 27);
+                BinaryPrimitives.WriteUInt32LittleEndian(word, BinaryPrimitives.ReadUInt32LittleEndian(word) | bit);
+            }
+        }
+        await Assert.That(bloom.GetBytes().SequenceEqual(expected)).IsTrue();
+    }
+
+    [Test]
+    public async Task PersistedCacheLocalFiltersRetainTheirOriginalAlgorithm()
+    {
+        var previous = new BloomFilter(1000, 0.01, BloomFilter.CacheLocalAlgorithmVersion);
+        previous.Add("member"u8);
+        var restored = new BloomFilter(previous.GetBytes().ToArray(), previous.K, previous.AlgorithmVersion);
+        restored.Add("second"u8);
+        await Assert.That(restored.AlgorithmVersion).IsEqualTo(BloomFilter.CacheLocalAlgorithmVersion);
+        await Assert.That(restored.Probe("member"u8)).IsTrue();
+        await Assert.That(restored.Probe("second"u8)).IsTrue();
+    }
+
+    [Test]
+    public async Task UnversionedSplitBlockRoundTripDoesNotIntroduceFalseNegatives()
+    {
+        var filter = new BloomFilter(1000, 0.01);
+        var key = new byte[16];
+        for (var i = 0; i < 1000; i++)
+        {
+            BinaryPrimitives.WriteInt32LittleEndian(key, i);
+            filter.Add(key);
+        }
+        var restored = new BloomFilter(filter.GetBytes().ToArray(), filter.K);
+        restored.Add("later"u8);
+        for (var i = 0; i < 1000; i++)
+        {
+            BinaryPrimitives.WriteInt32LittleEndian(key, i);
+            if (!restored.Probe(key)) throw new InvalidOperationException("Unversioned filter rejected a member.");
+        }
+        await Assert.That(restored.Probe("later"u8)).IsTrue();
+    }
+
+    [Test]
+    public async Task WarmSplitBlockAddsAndProbesDoNotAllocate()
+    {
+        var bloom = new BloomFilter(1000, 0.01);
+        for (var i = 0; i < 32; i++)
+        {
+            bloom.Add("member"u8);
+            bloom.Probe("member"u8);
+            bloom.Probe("missing"u8);
+        }
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        for (var i = 0; i < 1000; i++)
+        {
+            bloom.Add("member"u8);
+            bloom.Probe("member"u8);
+            bloom.Probe("missing"u8);
+        }
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+        await Assert.That(allocated).IsEqualTo(0);
+    }
+
+    [Test]
+    public async Task SplitBlockRejectsIncorrectWordCountsAndProbeCounts()
+    {
+        await Assert.That(() => new BloomFilter(new byte[31], 8, BloomFilter.CurrentAlgorithmVersion))
+            .Throws<ArgumentException>();
+        await Assert.That(() => new BloomFilter(new byte[32], 7, BloomFilter.CurrentAlgorithmVersion))
+            .Throws<ArgumentOutOfRangeException>();
+        await Assert.That(() => new BloomFilter(new byte[32], 8, BloomFilter.CurrentAlgorithmVersion + 1))
+            .Throws<ArgumentOutOfRangeException>();
+    }
+
+    [Test]
     [Arguments(1_000, 0.01)]
     [Arguments(1_000, 0.05)]
     [Arguments(1_000, 0.10)]
@@ -55,7 +174,7 @@ public class BloomFilterTests
         var observedRate = (double)falsePositiveCount / sampleCount;
 
         await Assert.That(bloom.AlgorithmVersion).IsEqualTo(BloomFilter.CurrentAlgorithmVersion);
-        await Assert.That(bloom.GetBytes().Length % 64).IsEqualTo(0);
+        await Assert.That(bloom.GetBytes().Length % 32).IsEqualTo(0);
         await Assert.That(observedRate).IsLessThanOrEqualTo(p + 6 * standardDeviation);
     }
 

@@ -28,6 +28,7 @@ public sealed partial class MvccStorage : IAsyncDisposable
 
     private readonly LsmStorage _storage;
     private readonly SemaphoreSlim _commitGate = new(1, 1);
+    private readonly LsmWriteBatch _commitBatch = new();
     private readonly SemaphoreSlim _garbageCollectionGate = new(1, 1);
     private readonly object _snapshotLock = new();
     private readonly Dictionary<long, SnapshotEntry> _activeSnapshots = [];
@@ -222,6 +223,10 @@ public sealed partial class MvccStorage : IAsyncDisposable
     /// <summary>
     /// Inspects the latest published value without copying it.
     /// </summary>
+    /// <remarks>
+    /// The callback borrows the value synchronously and may run while its source is locked.
+    /// It must not await, block, retain the span, or reenter storage.
+    /// </remarks>
     public ValueTask<bool> TryReadRawAsync<TArg>(
         ReadOnlySpan<byte> key,
         TArg arg,
@@ -435,7 +440,7 @@ public sealed partial class MvccStorage : IAsyncDisposable
             }
 
             var sequence = AllocateSequence();
-            var batch = new LsmWriteBatch();
+            var batch = _commitBatch;
             PrepareBatch(writes, batch, sequence);
             cancellationToken.ThrowIfCancellationRequested();
             _storage.Write(batch);
@@ -453,7 +458,12 @@ public sealed partial class MvccStorage : IAsyncDisposable
 
     private async ValueTask<MvccConflict?> ValidateAsync(long snapshotSequence, MvccWriteBuffer writes, CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var published = Volatile.Read(ref _publishedSequence);
+        if (published == snapshotSequence)
+        {
+            return null;
+        }
         for (var i = 0; i < writes.MutationCount; i++)
         {
             var key = writes.GetMutationKey(i);
@@ -575,7 +585,8 @@ public sealed partial class MvccStorage : IAsyncDisposable
     private void CommitSingle(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool isTombstone)
     {
         var sequence = AllocateSequence();
-        var batch = new LsmWriteBatch();
+        var batch = _commitBatch;
+        batch.Clear();
         WriteSequence(batch, _allocatedSequenceKey, sequence);
         WriteVersion(batch, key, value, isTombstone, sequence);
         WriteSequence(batch, _publishedSequenceKey, sequence);
@@ -602,58 +613,51 @@ public sealed partial class MvccStorage : IAsyncDisposable
         bool isTombstone,
         long sequence)
     {
-        using var internalKey = EncodeVersionKey(key, sequence);
-
-        if (isTombstone)
-        {
-            Span<byte> stored = stackalloc byte[1];
-            stored[0] = TombstoneValue;
-            batch.Put(internalKey.Span, stored);
-            return;
-        }
-
-        byte[]? rented = null;
-        Span<byte> encoded = value.Length < 256
-            ? stackalloc byte[value.Length + 1]
-            : (rented = ArrayPool<byte>.Shared.Rent(value.Length + 1)).AsSpan(0, value.Length + 1);
+        var keyLength = GetVersionKeyLength(key);
+        byte[]? rentedKey = null;
+        Span<byte> internalKey = keyLength <= 256
+            ? stackalloc byte[keyLength]
+            : (rentedKey = ArrayPool<byte>.Shared.Rent(keyLength)).AsSpan(0, keyLength);
+        EncodeVersionKey(key, sequence, internalKey);
 
         try
         {
-            encoded[0] = LiveValue;
-            value.CopyTo(encoded[1..]);
-            batch.Put(internalKey.Span, encoded);
+            if (isTombstone)
+            {
+                Span<byte> stored = stackalloc byte[1];
+                stored[0] = TombstoneValue;
+                batch.Put(internalKey, stored);
+                return;
+            }
+
+            byte[]? rented = null;
+            Span<byte> encoded = value.Length < 256
+                ? stackalloc byte[value.Length + 1]
+                : (rented = ArrayPool<byte>.Shared.Rent(value.Length + 1)).AsSpan(0, value.Length + 1);
+
+            try
+            {
+                encoded[0] = LiveValue;
+                value.CopyTo(encoded[1..]);
+                batch.Put(internalKey, encoded);
+            }
+            finally
+            {
+                if (rented is not null) ArrayPool<byte>.Shared.Return(rented);
+            }
         }
         finally
         {
-            if (rented is not null)
-            {
-                ArrayPool<byte>.Shared.Return(rented);
-            }
+            if (rentedKey is not null) ArrayPool<byte>.Shared.Return(rentedKey);
         }
     }
 
     private ValueTask<long> FindVisibleSequenceAsync(ReadOnlySpan<byte> key, long sequence, CancellationToken cancellationToken)
     {
-        var encodedKey = EncodeVersionKey(key, sequence);
-        var state = new PointReadState<NoOpSink>(encodedKey.Memory[..^sizeof(long)], sequence, default);
-        return FindSequenceAsync(encodedKey, state, cancellationToken);
+        return SequenceAsync(ReadPointAsync(key, sequence, default(NoOpSink), cancellationToken, 1));
 
-        async ValueTask<long> FindSequenceAsync(
-            OwnedByteSlice ownedKey,
-            PointReadState<NoOpSink> pointState,
-            CancellationToken ct)
-        {
-            using (ownedKey)
-            {
-                await _storage.SeekRawAsync(
-                    ownedKey.Span,
-                    pointState,
-                    static (s, internalKey, value) => s.Accept(internalKey, value),
-                    maxEntries: 1,
-                    ct).ConfigureAwait(false);
-                return pointState.Sequence;
-            }
-        }
+        static async ValueTask<long> SequenceAsync(ValueTask<PointReadState<NoOpSink>> read) =>
+            (await read.ConfigureAwait(false)).Sequence;
     }
 
     private ValueTask<int> ReadAtAsync<TSink>(
@@ -663,24 +667,36 @@ public sealed partial class MvccStorage : IAsyncDisposable
         CancellationToken cancellationToken)
         where TSink : struct, IValueSink
     {
-        var encodedKey = EncodeVersionKey(key, sequence);
-        var state = new PointReadState<TSink>(encodedKey.Memory[..^sizeof(long)], sequence, sink);
-        return ReadEncodedAsync(encodedKey, state, cancellationToken);
+        return LengthAsync(ReadPointAsync(key, sequence, sink, cancellationToken));
 
-        async ValueTask<int> ReadEncodedAsync(
-            OwnedByteSlice ownedKey,
-            PointReadState<TSink> pointState,
-            CancellationToken ct)
+        static async ValueTask<int> LengthAsync(ValueTask<PointReadState<TSink>> read) =>
+            (await read.ConfigureAwait(false)).Length;
+    }
+
+    private ValueTask<PointReadState<TSink>> ReadPointAsync<TSink>(
+        ReadOnlySpan<byte> key, long sequence, TSink sink, CancellationToken cancellationToken,
+        int valuePrefixLength = int.MaxValue)
+        where TSink : struct, IValueSink
+    {
+        var length = GetVersionKeyLength(key);
+        var encodedKey = ArrayPool<byte>.Shared.Rent(length);
+        EncodeVersionKey(key, sequence, encodedKey.AsSpan(0, length));
+        return ReadEncodedAsync(this, encodedKey, length, sequence, sink, cancellationToken, valuePrefixLength);
+
+        static async ValueTask<PointReadState<TSink>> ReadEncodedAsync(
+            MvccStorage storage, byte[] bytes, int count, long sequence, TSink valueSink, CancellationToken ct,
+            int valuePrefixLength)
         {
-            using (ownedKey)
+            try
             {
-                await _storage.SeekRawAsync(
-                    ownedKey.Span,
-                    pointState,
-                    static (s, internalKey, value) => s.Accept(internalKey, value),
-                    maxEntries: 1,
-                    ct).ConfigureAwait(false);
-                return pointState.Length;
+                var memory = bytes.AsMemory(0, count);
+                var state = new PointReadState<TSink>(memory[..^sizeof(long)], sequence, valueSink);
+                return await storage._storage.ReadFirstRawAsync(
+                    memory, memory[..^sizeof(long)], state, ct, valuePrefixLength).ConfigureAwait(false);
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(bytes);
             }
         }
     }
@@ -768,7 +784,7 @@ public sealed partial class MvccStorage : IAsyncDisposable
             : new SnapshotEntry(entry.Count + 1, entry.PinnedAt);
     }
 
-    private static OwnedByteSlice EncodeVersionKey(ReadOnlySpan<byte> userKey, long sequence)
+    private static int GetVersionKeyLength(ReadOnlySpan<byte> userKey)
     {
         var zeroCount = 0;
         for (var i = 0; i < userKey.Length; i++)
@@ -776,28 +792,17 @@ public sealed partial class MvccStorage : IAsyncDisposable
             zeroCount += userKey[i] == 0 ? 1 : 0;
         }
 
-        var length = checked(1 + userKey.Length + zeroCount + 2 + sizeof(long));
+        return checked(1 + userKey.Length + zeroCount + 2 + sizeof(long));
+    }
+
+    private static OwnedByteSlice EncodeVersionKey(ReadOnlySpan<byte> userKey, long sequence)
+    {
+        var length = GetVersionKeyLength(userKey);
         var owner = MemoryOwner<byte>.Rent(length);
 
         try
         {
-            var destination = owner.Memory.Span[..length];
-            var offset = 0;
-            destination[offset++] = DataPrefix;
-
-            for (var i = 0; i < userKey.Length; i++)
-            {
-                var value = userKey[i];
-                destination[offset++] = value;
-                if (value == 0)
-                {
-                    destination[offset++] = byte.MaxValue;
-                }
-            }
-
-            destination[offset++] = 0;
-            destination[offset++] = 0;
-            BinaryPrimitives.WriteUInt64BigEndian(destination[offset..], ~(ulong)sequence);
+            EncodeVersionKey(userKey, sequence, owner.Span);
             return OwnedByteSlice.TakeOwnership(owner, length);
         }
         catch
@@ -805,6 +810,23 @@ public sealed partial class MvccStorage : IAsyncDisposable
             owner.Dispose();
             throw;
         }
+    }
+
+    private static void EncodeVersionKey(ReadOnlySpan<byte> userKey, long sequence, Span<byte> destination)
+    {
+        var offset = 0;
+        destination[offset++] = DataPrefix;
+        foreach (var value in userKey)
+        {
+            destination[offset++] = value;
+            if (value == 0)
+            {
+                destination[offset++] = byte.MaxValue;
+            }
+        }
+        destination[offset++] = 0;
+        destination[offset++] = 0;
+        BinaryPrimitives.WriteUInt64BigEndian(destination[offset..], ~(ulong)sequence);
     }
 
     private static bool TryParseVersionKey(ReadOnlySpan<byte> key, out ReadOnlySpan<byte> encodedUserKey, out long sequence)
@@ -991,8 +1013,8 @@ public sealed partial class MvccStorage : IAsyncDisposable
         public void Accept(ReadOnlySpan<byte> value) => reader(arg, value);
     }
 
-    private sealed class PointReadState<TSink>(ReadOnlyMemory<byte> userPrefix, long snapshotSequence, TSink sink)
-        where TSink : struct, IValueSink
+    private struct PointReadState<TSink>(ReadOnlyMemory<byte> userPrefix, long snapshotSequence, TSink sink)
+        : IRawEntrySink where TSink : struct, IValueSink
     {
         private readonly ReadOnlyMemory<byte> _userPrefix = userPrefix;
         private readonly long _snapshotSequence = snapshotSequence;
@@ -1001,17 +1023,17 @@ public sealed partial class MvccStorage : IAsyncDisposable
         public int Length { get; private set; } = -1;
         public long Sequence { get; private set; } = -1;
 
-        public bool Accept(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
+        public void Accept(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
         {
             if (!TryParseVersionKey(key, out _, out var sequence))
             {
-                return false;
+                return;
             }
 
             var candidatePrefix = key[..^sizeof(long)];
             if (!candidatePrefix.SequenceEqual(_userPrefix.Span) || sequence > _snapshotSequence)
             {
-                return false;
+                return;
             }
 
             ValidateStoredValue(value);
@@ -1019,13 +1041,12 @@ public sealed partial class MvccStorage : IAsyncDisposable
 
             if (value[0] == TombstoneValue)
             {
-                return false;
+                return;
             }
 
             var userValue = value[1..];
             _sink.Accept(userValue);
             Length = userValue.Length;
-            return false;
         }
     }
 

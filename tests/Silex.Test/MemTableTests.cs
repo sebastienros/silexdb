@@ -2,10 +2,67 @@
 
 using Silex.Collections;
 using Silex.MemTables;
+using System.Buffers.Binary;
 using TUnit.Assertions.Enums;
 
 public class MemTableTests
 {
+    [Test]
+    [Arguments(0)]
+    [Arguments(1)]
+    [Arguments(255)]
+    [Arguments(256)]
+    [Arguments(257)]
+    [Arguments(8448)]
+    [Arguments(8449)]
+    [Arguments(32768)]
+    public async Task PagedIndexPreservesBoundsAndTraversalAfterBulkLoadAndRandomSplits(int count)
+    {
+        using var table = new MemTable(1);
+        var key = new byte[4];
+        for (var i = count; i > 0; i--)
+        {
+            BinaryPrimitives.WriteInt32BigEndian(key, i * 2);
+            table.PutRaw(key, key);
+        }
+        CheckBounds(0, false, false, count == 0 ? null : 2);
+        var order = Enumerable.Range(0, count).ToArray();
+        new Random(42).Shuffle(order);
+        foreach (var i in order)
+        {
+            BinaryPrimitives.WriteInt32BigEndian(key, i * 2 + 1);
+            table.PutRaw(key, key);
+            CheckBounds(i * 2 + 1, true, false, i * 2 + 1);
+        }
+        for (var i = 1; i <= count * 2; i++)
+        {
+            CheckBounds(i, true, false, i);
+            CheckBounds(i, true, true, i);
+            CheckBounds(i, false, false, i == count * 2 ? null : i + 1);
+            CheckBounds(i, false, true, i == 1 ? null : i - 1);
+        }
+        CheckBounds(0, true, true, null);
+        CheckBounds(count * 2 + 1, true, false, null);
+        var iterator = table.CreateIterator();
+        var forward = iterator.EnumerateAsync().ToBlockingEnumerable()
+            .Select(static entry => BinaryPrimitives.ReadInt32BigEndian(entry.Key.Span)).ToArray();
+        var reverse = iterator.EnumerateBackwardsAsync().ToBlockingEnumerable()
+            .Select(static entry => BinaryPrimitives.ReadInt32BigEndian(entry.Key.Span)).ToArray();
+        await Assert.That(forward).IsEquivalentTo(Enumerable.Range(1, count * 2), CollectionOrdering.Matching);
+        await Assert.That(reverse).IsEquivalentTo(Enumerable.Reverse(forward), CollectionOrdering.Matching);
+
+        void CheckBounds(int from, bool inclusive, bool backwards, int? expected)
+        {
+            BinaryPrimitives.WriteInt32BigEndian(key, from);
+            var found = table.TryGetNextRaw(key, true, inclusive, backwards,
+                out var actualKey, out var actualValue, out var tombstone);
+            if (found != expected.HasValue || found &&
+                (BinaryPrimitives.ReadInt32BigEndian(actualKey) != expected || tombstone ||
+                 !actualKey.SequenceEqual(actualValue)))
+                throw new InvalidOperationException($"Incorrect seek from {from}, inclusive={inclusive}, backwards={backwards}.");
+        }
+    }
+
     [Test]
     public async Task PackedTablePreservesLookupOverwriteTombstonesAndSortedSeeks()
     {
