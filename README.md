@@ -1011,8 +1011,8 @@ Mutation count means **distinct staged keys**, including deletions, not the numb
 Repeated tracked reads are deduplicated; reads of pending writes need no extra dependency.
 `MutationCount`, `TrackedReadCount`, and `BufferedBytes` expose the current accounting.
 
-`BufferedBytes` counts retained arena bytes plus active mutation (20 bytes), tracked-read (8), read-range (32), undo
-(24), and savepoint (24) descriptors. It includes obsolete replacement bytes and checkpoint-protected
+`BufferedBytes` counts retained arena bytes plus active mutation (28 bytes), tracked-read (8), read-range (32), undo
+(32), and savepoint (24) descriptors. It includes obsolete replacement bytes and checkpoint-protected
 values, not just live key/value sizes. In-place overwrites reuse capacity. Savepoint replacements append
 bytes and undo records; rollback restores both accounting and state. Release removes checkpoint charges
 and, when the last marker is released, undo charges, but does not compact the byte arena.
@@ -1077,6 +1077,45 @@ to conservatively favor the old algorithm. The cached measurement excludes the i
 first scans and scans after key membership changes still pay `O(n log n)` sorting. Short-run timing and
 pool behavior are machine/workload-dependent; sustained disk/compaction and commit-gate costs are unchanged.
 
+### Commit-time versionstamps
+
+`PutVersionstamped(key, value, keyOffset: -1, valueOffset: -1)` substitutes the transaction's
+commit sequence into an existing eight-byte region of the key, value, or both. Offsets are zero-based;
+`-1` disables that component and at least one must be enabled. Existing region bytes are replaced
+by a positive big-endian Int64, preserving sequence order in lexicographic keys. All entries in one
+transaction receive the same stamp; include an unstamped suffix to distinguish multiple entries.
+
+```csharp
+using var transaction = db.BeginTransaction();
+var globalKey = new byte[9];
+globalKey[0] = 0x47; // Application-owned global index prefix.
+transaction.PutVersionstamped(globalKey, "event"u8, keyOffset: 1);
+transaction.Put("stream/head"u8, "event"u8);
+await transaction.CommitAsync();
+Console.WriteLine(transaction.CommitSequence);
+```
+
+The engine resolves templates under the commit gate **before** conflict validation and batch
+preparation. Independent streams can therefore use identical global-index templates without a
+shared conflicting position counter, and the index and stream writes share one atomic recovery
+frame. Resolved keys still conflict with ordinary writes and tracked point/range reads. Two distinct
+templates resolving to the same key within one transaction throw `ArgumentException` before writing;
+repeated staging at the same unresolved template replaces its mutation.
+`PrefixKeyspace.PutVersionstamped` accepts fully encoded keys and offsets, but rejects substitution
+inside its prefix so resolved keys remain in the keyspace.
+
+Pending point reads, scans and frozen cursors show unresolved bytes. Savepoints restore values and
+substitution offsets together; ordinary `Put` or `Delete` at the template removes substitution.
+Resolution updates the pooled arena and rebuilds its key index without allocating per-stamp objects.
+Mutation and undo descriptors each include eight bytes for the two offsets, including ordinary writes.
+
+`CommitSequence` is retained after transaction consumption and is set only after a successful
+nonempty commit (including ordinary commits). Empty, conflicting, canceled and throwing commits
+leave it null, even if a storage exception reports a committed or indeterminate outcome. Sequences
+are database-local, not timestamps, and may have gaps; unrelated writes also consume positions.
+WAL configuration still determines durability. Restoring a backup creates a separate ordering
+history and does not make stamps globally unique across databases or restores.
+
 ### Durable transaction group commit
 
 Set `MvccCommitGroupSize` to a value from 2 through 64 to let concurrent transaction commits share WAL
@@ -1094,6 +1133,8 @@ promise. Transaction buffers must not be changed or disposed during a commit.
 Validation and publication remain serialized. Each transaction checks both changes published since
 its starting snapshot and the written keys of earlier accepted transactions in its group, including
 tracked point-read dependencies. Conflicts return `false` and contribute no frame or sequence.
+Sequentially awaiting each commit provides nothing to group. Concurrent transactions updating one
+shared position key still conflict; use application batching or versionstamped index keys instead.
 Cancellation is checked during admission, validation, and once more after preparing the transaction's
 frame data. Acceptance ends cancellation: canceling an accepted transaction does not interrupt the
 group or return a misleading cancellation result. Read-only transactions require no WAL boundary.

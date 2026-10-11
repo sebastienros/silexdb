@@ -15,6 +15,85 @@ public class MvccGroupCommitTests
     };
 
     [Test]
+    public async Task EightIdenticalVersionstampTemplatesShareOneSynchronization()
+    {
+        await using var harness = await Harness.OpenAsync();
+        var transactions = new MvccTransaction[8];
+        var commits = new Task[8];
+        await harness.BlockAsync();
+        var syncs = 0;
+        harness.Inject = point =>
+        {
+            if (point == StorageFaultPoint.WalBeforeSync) Interlocked.Increment(ref syncs);
+        };
+        try
+        {
+            for (var i = 0; i < transactions.Length; i++)
+            {
+                var tx = harness.Storage.BeginTransaction();
+                transactions[i] = tx;
+                tx.PutVersionstamped(new byte[8], [(byte)i], keyOffset: 0);
+                tx.Put([(byte)(i + 1)], [(byte)i]);
+                commits[i] = tx.CommitAsync().AsTask();
+            }
+        }
+        finally
+        {
+            harness.Release.Set();
+        }
+        await harness.BlockingTask.WaitAsync(Timeout);
+        await Task.WhenAll(commits).WaitAsync(Timeout);
+        await Assert.That(syncs).IsEqualTo(1);
+        for (var i = 0; i < transactions.Length; i++)
+        {
+            var sequence = i + 2L;
+            await Assert.That(transactions[i].CommitSequence).IsEqualTo(sequence);
+            var key = new byte[8];
+            BinaryPrimitives.WriteInt64BigEndian(key, sequence);
+            var value = new byte[1];
+            await Assert.That(await harness.Storage.GetRawAsync(key, value)).IsEqualTo(1);
+            await Assert.That(value[0]).IsEqualTo((byte)i);
+            await AssertValueAsync(harness.Storage, (byte)(i + 1), (byte)i);
+        }
+    }
+
+    [Test]
+    [Arguments(false)]
+    [Arguments(true)]
+    public async Task GroupDependenciesUseResolvedKeysAndRejectedMembersConsumeNoSequence(bool range)
+    {
+        await using var harness = await Harness.OpenAsync();
+        using var writer = harness.Storage.BeginTransaction();
+        using var reader = harness.Storage.BeginTransaction();
+        using var next = harness.Storage.BeginTransaction();
+        writer.PutVersionstamped(new byte[8], [42], keyOffset: 0);
+        var resolved = new byte[8];
+        BinaryPrimitives.WriteInt64BigEndian(resolved, 2);
+        if (range)
+        {
+            reader.TrackReadRange(new OrderedReadRange(resolved, true, resolved, true));
+        }
+        else
+        {
+            await reader.GetForUpdateRawAsync(resolved, Memory<byte>.Empty);
+        }
+        reader.PutVersionstamped([99], new byte[8], valueOffset: 0);
+        next.PutVersionstamped(new byte[8], [43], keyOffset: 0);
+        await harness.BlockAsync();
+        var commits = new[] { writer.TryCommitAsync().AsTask(), reader.TryCommitAsync().AsTask(),
+            next.TryCommitAsync().AsTask() };
+        harness.Release.Set();
+        await harness.BlockingTask.WaitAsync(Timeout);
+        var results = await Task.WhenAll(commits).WaitAsync(Timeout);
+        await Assert.That(results.SequenceEqual([true, false, true])).IsTrue();
+        await Assert.That(reader.Conflict!.Kind).IsEqualTo(range
+            ? MvccConflictKind.TrackedRange : MvccConflictKind.TrackedPointRead);
+        await Assert.That(reader.Conflict.Key.Span.SequenceEqual(resolved)).IsTrue();
+        await Assert.That(reader.CommitSequence).IsNull();
+        await Assert.That(next.CommitSequence).IsEqualTo(3L);
+    }
+
+    [Test]
     [Arguments(0)]
     [Arguments(256)]
     public async Task OrderedValidationIncludesAcceptedWritesAndTrackedReads(int indexedEntries)

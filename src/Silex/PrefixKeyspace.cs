@@ -82,6 +82,20 @@ public sealed class PrefixKeyspace
         transaction.Put(key, value);
     }
 
+    /// <summary>Stages a versionstamped put without allowing substitution inside the keyspace prefix.</summary>
+    /// <remarks>Offsets address the fully encoded key/value; the prefix is not added or stripped.</remarks>
+    public void PutVersionstamped(MvccTransaction transaction, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value,
+        int keyOffset = -1, int valueOffset = -1)
+    {
+        ArgumentNullException.ThrowIfNull(transaction);
+        ValidateKey(key);
+        if (keyOffset >= 0 && keyOffset < _prefix.Length)
+        {
+            throw new ArgumentOutOfRangeException(nameof(keyOffset), "Versionstamp substitution must not change the keyspace prefix.");
+        }
+        transaction.PutVersionstamped(key, value, keyOffset, valueOffset);
+    }
+
     /// <summary>Stages a validated key in a caller-owned batch; apply it with LsmStorage.Write.</summary>
     public void Put(LsmWriteBatch batch, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
     {
