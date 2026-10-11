@@ -65,6 +65,7 @@ internal class Compacter : IAsyncDisposable
         }
         catch (Exception exception)
         {
+            _storage.Metrics.RecordBackgroundFailure(exception);
             _storage.MarkFaulted(exception);
         }
     }

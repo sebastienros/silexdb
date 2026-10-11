@@ -30,7 +30,7 @@ public sealed partial class MvccStorage : IAsyncDisposable
     private readonly SemaphoreSlim _commitGate = new(1, 1);
     private readonly SemaphoreSlim _garbageCollectionGate = new(1, 1);
     private readonly object _snapshotLock = new();
-    private readonly Dictionary<long, int> _activeSnapshots = [];
+    private readonly Dictionary<long, SnapshotEntry> _activeSnapshots = [];
     private long _allocatedSequence;
     private long _publishedSequence;
     private int _disposeState;
@@ -45,6 +45,7 @@ public sealed partial class MvccStorage : IAsyncDisposable
         _storage = storage;
         _allocatedSequence = allocatedSequence;
         _publishedSequence = publishedSequence;
+        _openSequence = publishedSequence;
         _transactionLimits = transactionLimits;
         if (groupSize > 1)
         {
@@ -166,7 +167,7 @@ public sealed partial class MvccStorage : IAsyncDisposable
     public void Put(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
     {
         CheckDisposed();
-        _commitGate.Wait();
+        EnterCommitGate();
 
         try
         {
@@ -185,7 +186,7 @@ public sealed partial class MvccStorage : IAsyncDisposable
     public void Delete(ReadOnlySpan<byte> key)
     {
         CheckDisposed();
-        _commitGate.Wait();
+        EnterCommitGate();
 
         try
         {
@@ -308,7 +309,7 @@ public sealed partial class MvccStorage : IAsyncDisposable
     public async Task SynchronizeAsync(CancellationToken cancellationToken = default)
     {
         CheckDisposed();
-        await _commitGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await EnterCommitGateAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             CheckDisposed();
@@ -413,7 +414,7 @@ public sealed partial class MvccStorage : IAsyncDisposable
         {
             return await _commitCoordinator.CommitAsync(snapshotSequence, writes, cancellationToken).ConfigureAwait(false);
         }
-        await _commitGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await EnterCommitGateAsync(cancellationToken).ConfigureAwait(false);
 
         try
         {
@@ -550,18 +551,18 @@ public sealed partial class MvccStorage : IAsyncDisposable
     {
         lock (_snapshotLock)
         {
-            if (!_activeSnapshots.TryGetValue(sequence, out var count))
+            if (!_activeSnapshots.TryGetValue(sequence, out var entry))
             {
                 return;
             }
 
-            if (count == 1)
+            if (entry.Count == 1)
             {
                 _activeSnapshots.Remove(sequence);
             }
             else
             {
-                _activeSnapshots[sequence] = count - 1;
+                _activeSnapshots[sequence] = new SnapshotEntry(entry.Count - 1, entry.PinnedAt);
             }
         }
     }
@@ -756,8 +757,10 @@ public sealed partial class MvccStorage : IAsyncDisposable
 
     private void AddSnapshot(long sequence)
     {
-        _activeSnapshots.TryGetValue(sequence, out var count);
-        _activeSnapshots[sequence] = count + 1;
+        _activeSnapshots.TryGetValue(sequence, out var entry);
+        _activeSnapshots[sequence] = entry.Count == 0
+            ? new SnapshotEntry(1, System.Diagnostics.Stopwatch.GetTimestamp())
+            : new SnapshotEntry(entry.Count + 1, entry.PinnedAt);
     }
 
     private static OwnedByteSlice EncodeVersionKey(ReadOnlySpan<byte> userKey, long sequence)

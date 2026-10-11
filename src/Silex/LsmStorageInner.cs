@@ -59,6 +59,7 @@ internal sealed partial class LsmStorageInner : IDisposable
     private readonly ISsTableBuilderFactory _ssTableBuilderFactory;
     private readonly IBloomFilterFactory _bloomFilterFactory;
     private readonly long _memTableSizeLimit;
+    private readonly int _memTableMaxCount;
     private readonly int _memTableArenaBlockSize;
     private readonly BlockCache _blockCache;
     private readonly bool _useWriteAheadLog;
@@ -129,6 +130,7 @@ internal sealed partial class LsmStorageInner : IDisposable
         _ssTableBuilderFactory = options.SsTableBuilderFactory;
         _bloomFilterFactory = options.BloomFilterFactory;
         _memTableSizeLimit = options.MemTableSizeLimit;
+        _memTableMaxCount = options.MemTableMaxCount;
         _blockCache = new BlockCache(options.BlockCacheSizeLimit);
     }
 
@@ -1180,7 +1182,7 @@ internal sealed partial class LsmStorageInner : IDisposable
         await _maintenanceLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            _currentMemTableLock.EnterWriteLock();
+            EnterCurrentMemTableWriteLock();
             try
             {
                 CheckHealthy();
@@ -1232,10 +1234,24 @@ internal sealed partial class LsmStorageInner : IDisposable
         }
     }
 
+    internal StorageMetrics Metrics { get; } = new();
+
+    private void EnterCurrentMemTableWriteLock()
+    {
+        if (_currentMemTableLock.TryEnterWriteLock(0))
+        {
+            return;
+        }
+
+        var started = Stopwatch.GetTimestamp();
+        _currentMemTableLock.EnterWriteLock();
+        Metrics.RecordWriterWait(started);
+    }
+
     internal void WriteGroup(LsmWriteBatch[] batches, StorageCommitOutcome[] outcomes, int count)
     {
         using var operation = Lifetime.Enter();
-        _currentMemTableLock.EnterWriteLock();
+        EnterCurrentMemTableWriteLock();
         try
         {
             CheckHealthy();
@@ -1266,6 +1282,12 @@ internal sealed partial class LsmStorageInner : IDisposable
                     outcomes[i] = StorageCommitOutcome.Committed;
                     FaultInjector?.Invoke(StorageFaultPoint.WriteBeforePublication);
                 }
+                var groupBytes = 0L;
+                for (var i = 0; i < count; i++)
+                {
+                    groupBytes += batches[i].ByteCount;
+                }
+                Metrics.RecordWrite(groupBytes);
                 InvalidateSortedSsTableRun();
                 if (memTable.Size >= _memTableSizeLimit)
                 {
@@ -1319,7 +1341,7 @@ internal sealed partial class LsmStorageInner : IDisposable
     private void WriteCore(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool isTombstone, LsmWriteBatch? batch)
     {
         using var operation = Lifetime.Enter();
-        _currentMemTableLock.EnterWriteLock();
+        EnterCurrentMemTableWriteLock();
 
         try
         {
@@ -1340,6 +1362,7 @@ internal sealed partial class LsmStorageInner : IDisposable
                     memTable.PutRaw(key, value);
                 }
                 FaultInjector?.Invoke(StorageFaultPoint.WriteBeforePublication);
+                Metrics.RecordWrite(batch is not null ? batch.ByteCount : key.Length + value.Length);
                 InvalidateSortedSsTableRun();
                 if (memTable.Size >= _memTableSizeLimit)
                 {
@@ -1384,7 +1407,7 @@ internal sealed partial class LsmStorageInner : IDisposable
             _currentMemTableLock.ExitReadLock();
         }
 
-        _currentMemTableLock.EnterWriteLock();
+        EnterCurrentMemTableWriteLock();
 
         try
         {
@@ -1421,6 +1444,9 @@ internal sealed partial class LsmStorageInner : IDisposable
         // Hold the maintenance lock for the whole flush so it never interleaves with a compaction.
         await _maintenanceLock.WaitAsync(cancellationToken);
 
+        var flushRunning = false;
+        var flushStarted = 0L;
+        var flushInputBytes = 0L;
         try
         {
             CheckHealthy();
@@ -1445,6 +1471,10 @@ internal sealed partial class LsmStorageInner : IDisposable
                 _immutableMemTablesLock.ExitReadLock();
             }
 
+            flushRunning = true;
+            Metrics.Flush.Begin();
+            flushStarted = Stopwatch.GetTimestamp();
+            flushInputBytes = memTableToFlush.Size;
             var sstFilename = GetSstPath(memTableToFlush.Id);
             FaultInjector?.Invoke(StorageFaultPoint.FlushBeforeBuild);
             using var builder = _ssTableBuilderFactory.CreateSsTableBuilder(
@@ -1523,6 +1553,7 @@ internal sealed partial class LsmStorageInner : IDisposable
             // matching SST and drops the stale WAL.
             DeleteWal(memTableToFlush.Id);
             ClearMaintenanceOwnership();
+            Metrics.Flush.RecordCompleted(flushStarted, flushInputBytes, ssTable.Size);
         }
         catch (Exception exception)
         {
@@ -1531,6 +1562,11 @@ internal sealed partial class LsmStorageInner : IDisposable
         }
         finally
         {
+            if (flushRunning)
+            {
+                Metrics.Flush.End();
+            }
+
             _maintenanceLock.Release();
         }
     }
@@ -1605,6 +1641,7 @@ internal sealed partial class LsmStorageInner : IDisposable
         // second compaction shares (and disposes) the same input handles.
         await _maintenanceLock.WaitAsync(cancellationToken);
 
+        var compactionRunning = false;
         try
         {
             CheckHealthy();
@@ -1647,6 +1684,9 @@ internal sealed partial class LsmStorageInner : IDisposable
             // After a leveled store is reopened as tiered, existing leveled levels are still older sources.
             var dropTombstones = startIndex == 0 && !hasLeveledData;
 
+            compactionRunning = true;
+            Metrics.Compaction.Begin();
+            var compactionStarted = Stopwatch.GetTimestamp();
             var outputId = IdGenerator.GetNextId();
             var outputPath = GetSstPath(outputId);
 
@@ -1758,6 +1798,7 @@ internal sealed partial class LsmStorageInner : IDisposable
             // disposed/deleted after it succeeds, so a crash before this write keeps the old manifest intact
             // and treats the uncommitted output as an orphan on recovery.
             WriteManifest(manifest!);
+            var outputBytes = output?.Size ?? 0;
 
             // The inputs are no longer reachable by new readers and any in-flight reader finished before the
             // write lock was granted, so their handles can be closed.
@@ -1778,6 +1819,7 @@ internal sealed partial class LsmStorageInner : IDisposable
             }
 
             ClearMaintenanceOwnership();
+            Metrics.Compaction.RecordCompleted(compactionStarted, totalInputBytes, outputBytes);
             return true;
         }
         catch (Exception exception)
@@ -1787,6 +1829,11 @@ internal sealed partial class LsmStorageInner : IDisposable
         }
         finally
         {
+            if (compactionRunning)
+            {
+                Metrics.Compaction.End();
+            }
+
             _maintenanceLock.Release();
         }
     }
@@ -1950,6 +1997,19 @@ internal sealed partial class LsmStorageInner : IDisposable
     /// </summary>
     private async Task<bool> CompactLevelAsync(int sourceLevelIndex, List<SsTable> level0, List<List<SsTable>> levels, CancellationToken cancellationToken)
     {
+        Metrics.Compaction.Begin();
+        try
+        {
+            return await CompactLevelCoreAsync(sourceLevelIndex, level0, levels, Stopwatch.GetTimestamp(), cancellationToken);
+        }
+        finally
+        {
+            Metrics.Compaction.End();
+        }
+    }
+
+    private async Task<bool> CompactLevelCoreAsync(int sourceLevelIndex, List<SsTable> level0, List<List<SsTable>> levels, long compactionStarted, CancellationToken cancellationToken)
+    {
         // Destination level index (0-based, 0 == L1). L0 flushes into L1; level s pushes into s+1.
         var targetLevelIndex = sourceLevelIndex < 0 ? 0 : sourceLevelIndex + 1;
 
@@ -2105,6 +2165,17 @@ internal sealed partial class LsmStorageInner : IDisposable
         WriteManifest(manifest);
 
         var consumed = mergeInputs;
+        long consumedBytes = 0;
+        foreach (var input in consumed)
+        {
+            consumedBytes += input.Size;
+        }
+
+        long producedBytes = 0;
+        foreach (var output in outputs)
+        {
+            producedBytes += output.Size;
+        }
 
         foreach (var input in consumed)
         {
@@ -2113,6 +2184,7 @@ internal sealed partial class LsmStorageInner : IDisposable
         }
 
         ClearMaintenanceOwnership();
+        Metrics.Compaction.RecordCompleted(compactionStarted, consumedBytes, producedBytes);
         return true;
     }
 
@@ -2488,7 +2560,7 @@ internal sealed partial class LsmStorageInner : IDisposable
             return new MemTable(id, arenaBlockSize: _memTableArenaBlockSize, faultInjector: FaultInjector);
         }
 
-        var wal = new WriteAheadLog(GetWalPath(id), _syncWriteAheadLogToDisk, FaultInjector);
+        var wal = new WriteAheadLog(GetWalPath(id), _syncWriteAheadLogToDisk, FaultInjector) { Metrics = Metrics };
         try
         {
             return new MemTable(id, wal, _memTableArenaBlockSize, FaultInjector);

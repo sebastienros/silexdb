@@ -404,6 +404,7 @@ public sealed partial class LsmStorage : IDisposable, IAsyncDisposable
 
             var compacter = new Compacter(storageInner, TimeProvider.System, options, enableBackgroundFlush: salvageReport == null);
             var storage = new LsmStorage(storageInner, compacter) { RecoveryReport = salvageReport };
+            StorageMeter.Register(storageInner.Metrics, path);
 
             if (salvageReport == null)
             {
@@ -450,7 +451,7 @@ public sealed partial class LsmStorage : IDisposable, IAsyncDisposable
         }
     }
 
-    private readonly LsmStorageInner _inner;
+    internal readonly LsmStorageInner _inner;
     private readonly Compacter _compacter;
     private readonly object _closeLock = new();
     private readonly SemaphoreSlim _manualMaintenance = new(1, 1);
@@ -710,6 +711,7 @@ public sealed partial class LsmStorage : IDisposable, IAsyncDisposable
 
     private async Task DisposeInternalAsync()
     {
+        StorageMeter.Unregister(_inner.Metrics);
         await _inner.Lifetime.CloseAsync().ConfigureAwait(false);
         await _compacter.DisposeAsync().ConfigureAwait(false);
         try
