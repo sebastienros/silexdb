@@ -149,6 +149,53 @@ to avoid indefinite version retention; there is no engine expiry. Continuation t
 restarts, token expiry and projections are not part of this API.
 Existing callback APIs retain their borrowed-span and callback lock-lifetime contracts unchanged.
 
+### Prefix-bounded logical keyspaces
+
+`PrefixKeyspace` is an immutable, reusable helper over **fully encoded keys including the prefix**.
+It does not add table/collection semantics, key encoding, separate stores, column families, or another
+transaction implementation. Choose distinct, non-overlapping binary prefixes for independent namespaces:
+
+```csharp
+var records = new PrefixKeyspace([0x10]);
+var indexes = new PrefixKeyspace([0x20]);
+using var tx = mvcc.BeginTransaction();
+records.Put(tx, [0x10, 1], "record"u8);
+indexes.Put(tx, [0x20, 7], [1]);
+using var cursor = records.CreateOrderedReadCursor(tx); // starting snapshot plus frozen own writes
+await tx.CommitAsync(); // both namespaces publish atomically
+using var batch = await cursor.ReadBatchAsync(128, 64 * 1024);
+```
+
+The helper owns only its copied prefix. Supply a `LsmStorage`, `MvccStorage`, `MvccSnapshot`, or
+`MvccTransaction` to each supported operation. Use the **same transaction** across handles for atomicity,
+the same snapshot for a consistent cross-handle view, or one caller-owned `LsmWriteBatch` for plain-LSM
+batch staging (then call `storage.Write(batch)`). It neither creates nor disposes any of these objects.
+Sharing a helper is safe; transactions, batches and cursor operations retain their single-consumer rules.
+Reusing it with another store is allowed but provides no cross-store atomicity.
+
+Point reads/writes/deletions, tracked point reads, and all multi-get keys must begin with the prefix;
+out-of-prefix requests throw `ArgumentException` before forwarding or staging anything. Validated point
+and multi-get calls add no key-copy allocations. Inputs to multi-get must stay unchanged until completion.
+Ordered reads, range dependencies and transactional range deletion reuse existing bounded traversal.
+Omitted bounds are capped to the keyspace; explicit bounds must belong to it, except an exclusive upper
+bound exactly at the prefix successor. Escaping bounds throw rather than silently clipping a request.
+`BoundRange` exposes the same validation for composing other encoded-range operations.
+
+The full prefix interval is `[prefix, successor(prefix))`: increment the rightmost non-FF byte and
+truncate the trailing bytes to compute the successor. The prefix key itself belongs to the namespace.
+An all-FF prefix has no finite upper bound; every key at or above it begins with that prefix. An empty
+prefix covers the whole logical store, including MVCC's empty key (plain SST keys still must be nonempty).
+Overlapping prefixes intentionally overlap; this is convenience/isolation for helper-mediated operations,
+not a security boundary against direct access to storage.
+
+Cursor entries, range-deletion `Remaining` bounds, dependency diagnostics and payload budgets retain
+the **full encoded keys**, with no stripping or re-encoding. Pass `Remaining` back unchanged to
+`keyspace.DeleteRangeAsync(tx, maxEntries, remaining)` in a new transaction. Ordinary reads/cursors do
+not track dependencies; use `GetForUpdateRawAsync` or `TrackReadRange` when needed. Existing savepoints,
+limits, group commit, conflict diagnostics, snapshot/cursor/batch lifetimes, cancellation, failure outcomes,
+health and shutdown contracts apply unchanged. No callback scan wrapper is added: use the lifetime-safe
+bounded cursor API rather than filtering an unbounded borrowed scan.
+
 ### Batched point reads
 
 `MvccSnapshot`, `MvccStorage` and `MvccTransaction` expose `ReadManyRawAsync(keys, maxBytes)`, a generic
