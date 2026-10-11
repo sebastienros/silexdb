@@ -19,7 +19,7 @@ public enum OrderedKeyComponent : byte
     /// <summary>An arbitrary byte sequence, ordered lexicographically as unsigned bytes.</summary>
     Bytes = 0x10,
 
-    /// <summary>A UTF-16 string stored as UTF-8, ordered by Unicode code point (ordinal).</summary>
+    /// <summary>A string stored as strict UTF-8, ordered by Unicode code point, not UTF-16 ordinal order.</summary>
     String = 0x11,
 
     /// <summary>A signed 64-bit integer.</summary>

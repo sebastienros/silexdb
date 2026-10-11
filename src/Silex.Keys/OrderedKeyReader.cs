@@ -151,6 +151,33 @@ public ref struct OrderedKeyReader
         return status;
     }
 
+    /// <summary>Reads a string component as strict UTF-8 bytes.</summary>
+    /// <param name="destination">Receives the decoded string content as unescaped UTF-8 bytes, not a JSON token.</param>
+    /// <param name="length">The bytes written, or the exact bytes required if the destination is too small; zero for other failures.</param>
+    /// <param name="order">The expected order.</param>
+    /// <remarks>Malformed UTF-8 is rejected even when the destination is too small. Failed reads do not advance;
+    /// destination contents are unspecified on failure.</remarks>
+    public OrderedKeyDecodeStatus TryReadUtf8String(Span<byte> destination, out int length, OrderedKeyOrder order = OrderedKeyOrder.Ascending)
+    {
+        length = 0;
+        var status = Expect(OrderedKeyComponent.String, order, out var c);
+        if (status != OrderedKeyDecodeStatus.Success) return status;
+        var body = Remaining.Slice(1, c.Total - 3);
+        if (destination.Length < c.Payload)
+        {
+            // Validate into the existing decoder's scratch before reporting a required byte count.
+            if (DecodeUtf8(body, c.Mask, Span<char>.Empty, out _) == OrderedKeyDecodeStatus.Malformed)
+                return OrderedKeyDecodeStatus.Malformed;
+            length = c.Payload;
+            return OrderedKeyDecodeStatus.DestinationTooSmall;
+        }
+        Unescape(body, c.Mask, destination);
+        if (!Utf8.IsValid(destination.Slice(0, c.Payload))) return OrderedKeyDecodeStatus.Malformed;
+        length = c.Payload;
+        _position += c.Total;
+        return OrderedKeyDecodeStatus.Success;
+    }
+
     private OrderedKeyDecodeStatus ReadFixed(OrderedKeyComponent kind, OrderedKeyOrder order, out ulong bits, bool keepPosition = false)
     {
         bits = 0;

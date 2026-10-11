@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.Unicode;
 
 namespace Silex.Keys;
 
@@ -16,7 +17,8 @@ namespace Silex.Keys;
 /// <list type="bullet">
 /// <item><description>Boolean: tag <c>0x04</c> (false) or <c>0x05</c> (true), 1 byte.</description></item>
 /// <item><description>Bytes <c>0x10</c> and String <c>0x11</c>: tag, payload with every <c>0x00</c> written as
-/// <c>00 FF</c>, then terminator <c>00 01</c>. Strings are strict UTF-8; order is by Unicode code point.</description></item>
+/// <c>00 FF</c>, then terminator <c>00 01</c>. Strings use Unicode code-point order through strict UTF-8 byte
+/// ordering, which can differ from .NET's UTF-16 <see cref="StringComparer.Ordinal"/>.</description></item>
 /// <item><description>Int64 <c>0x20</c>: tag + big-endian value with the sign bit flipped (9 bytes).</description></item>
 /// <item><description>UInt64 <c>0x21</c>: tag + big-endian value (9 bytes).</description></item>
 /// <item><description>Double <c>0x22</c>: tag + big-endian IEEE-754 bits transformed to a total order (9 bytes):
@@ -71,6 +73,16 @@ public static class OrderedKey
     public static int GetStringLength(ReadOnlySpan<char> value)
     {
         return checked(3 + StrictUtf8.GetByteCount(value) + value.Count('\0'));
+    }
+
+    /// <summary>Exact encoded size of a UTF-8 string component (identical for both orders).</summary>
+    /// <param name="value">Decoded string content encoded as strict UTF-8, not a JSON token.</param>
+    /// <exception cref="ArgumentException">The value contains malformed UTF-8.</exception>
+    /// <exception cref="OverflowException">The size does not fit in <see cref="int"/>.</exception>
+    public static int GetUtf8StringLength(ReadOnlySpan<byte> value)
+    {
+        if (!Utf8.IsValid(value)) throw new ArgumentException("The value contains malformed UTF-8.", nameof(value));
+        return GetBytesLength(value);
     }
 
     internal static byte Tag(OrderedKeyComponent kind, bool boolValue, OrderedKeyOrder order)
