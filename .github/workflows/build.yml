@@ -1,5 +1,8 @@
 name: Build
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [ main ]
@@ -27,6 +30,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: |
@@ -36,12 +41,29 @@ jobs:
 
       - name: Build
         run: |
-          dotnet build src/Silex/Silex.csproj --configuration Release
-          dotnet build src/Silex.Keys/Silex.Keys.csproj --configuration Release
-          dotnet build tests/Silex.Test/Silex.Test.csproj --configuration Release
+          dotnet build src/Silex/Silex.csproj --configuration Release -p:VersionSuffix=preview-${{ github.run_number }} -p:ContinuousIntegrationBuild=True
+          dotnet build src/Silex.Keys/Silex.Keys.csproj --configuration Release -p:VersionSuffix=preview-${{ github.run_number }} -p:ContinuousIntegrationBuild=True
+          dotnet build tests/Silex.Test/Silex.Test.csproj --configuration Release -p:VersionSuffix=preview-${{ github.run_number }} -p:ContinuousIntegrationBuild=True
 
       - name: Test
         run: dotnet test tests/Silex.Test/Silex.Test.csproj --configuration Release --no-build
+
+      - name: Pack preview packages
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.os == 'ubuntu-latest'
+        run: |
+          dotnet pack src/Silex/Silex.csproj --output artifacts --configuration Release --no-build -p:VersionSuffix=preview-${{ github.run_number }} -p:ContinuousIntegrationBuild=True
+          dotnet pack src/Silex.Keys/Silex.Keys.csproj --output artifacts --configuration Release --no-build -p:VersionSuffix=preview-${{ github.run_number }} -p:ContinuousIntegrationBuild=True
+
+      - name: Push preview packages to Feedz
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.os == 'ubuntu-latest'
+        shell: bash
+        env:
+          FEEDZ_IO_API_KEY: ${{ secrets.FEEDZ_IO_API_KEY }}
+        run: |
+          set -euo pipefail
+          for package in artifacts/*.nupkg; do
+            dotnet nuget push "$package" --api-key "$FEEDZ_IO_API_KEY" --source https://f.feedz.io/sebastienros/silexdb/nuget/index.json --skip-duplicate
+          done
 
   jepsen:
     strategy:

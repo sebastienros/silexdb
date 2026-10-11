@@ -5,6 +5,24 @@ in-process key/value store designed for high write throughput and low allocation
 memory, persisted to immutable sorted-string tables (SSTs) on disk, and compacted in the background to
 bound read and space amplification.
 
+## Branches and NuGet feeds
+
+| Branch / tag | Purpose | Package feed |
+| --- | --- | --- |
+| [`v*.*.*` tags](https://github.com/sebastienros/silexdb/tags) | Stable Silex releases. | [![NuGet.org stable version](https://img.shields.io/nuget/v/Silex.svg?label=nuget.org)](https://www.nuget.org/packages/Silex) |
+| [`main`](https://github.com/sebastienros/silexdb/tree/main) | Latest Silex development changes. | [![Feedz preview version](https://img.shields.io/endpoint?url=https%3A%2F%2Ff.feedz.io%2Fsebastienros%2Fsilexdb%2Fshield%2FSilex%2Flatest)](https://f.feedz.io/sebastienros/silexdb/nuget/index.json) |
+
+Successful builds pushed to `main` publish preview packages for `Silex` and `Silex.Keys` to Feedz.
+Versions follow `1.0.0-preview-<run number>`, using the GitHub Actions build run number.
+Tagged releases publish both packages to NuGet.org.
+
+Add the preview feed alongside NuGet.org, then install the latest prerelease version:
+
+```shell
+dotnet nuget add source https://f.feedz.io/sebastienros/silexdb/nuget/index.json --name silex-preview
+dotnet add package Silex --prerelease
+```
+
 ## Features
 
 - **Byte-oriented key/value store** – core writes copy borrowed bytes into Silex-owned memtable memory.
