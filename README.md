@@ -527,7 +527,8 @@ transaction.Put("bob"u8, "10"u8);
 
 if (!await transaction.TryCommitAsync())
 {
-    // A tracked or written key changed after the transaction started; retry from a new transaction.
+    var conflict = transaction.Conflict!; // kind, key, snapshot/conflicting sequence, and optional range
+    // Decide whether replay is safe before retrying from a new transaction.
 }
 ```
 
@@ -554,6 +555,34 @@ MVCC users pay for larger physical keys (11 bytes plus one escape byte per zero 
 versions, transaction buffers, and sequence metadata writes. Dispose snapshots and transactions promptly, then
 call `CollectGarbageAsync` periodically to remove versions that no active view can observe. Pass
 `compact: true` when the call should also flush and compact the resulting physical tombstones.
+
+### Conflict diagnostics
+
+`TryCommitAsync` still returns `false` on conflict; inspect `transaction.Conflict` after the awaited
+call. `CommitAsync` still throws `MvccConflictException`, now with the same diagnostic object in
+`exception.Conflict`. The existing parameterless exception constructor remains available and has
+null diagnostics. No overload changes are required.
+
+`MvccConflict` contains `Kind` (`WrittenKey`, `TrackedPointRead`, or `TrackedRange`), the conflicting
+encoded user `Key`, `SnapshotSequence`, `ConflictingSequence`, and the registered `Range` for range
+conflicts (null otherwise). Keys/bounds are owned copies and remain valid after the transaction is
+consumed, disposed, or its buffers are reused. An empty key is distinct from an unbounded range bound.
+Success, cancellation, and storage failures leave `transaction.Conflict` null; these failures are
+not reclassified as contention.
+
+Only the first **detected** conflict is reported, not every conflicting key or the earliest write.
+Published-state validation checks writes, then tracked point reads, then ranges. Group validation first
+checks earlier accepted members in acceptance/mutation order; for a given key, a written dependency
+takes precedence over a tracked point read, then a range. The interval is the stored dependency,
+which can cover a later redundant registration. Rolled-back dependencies are not reported.
+Diagnostics allocate only on conflict paths; successful point validation adds no diagnostic allocation.
+
+An accepted earlier group member can invalidate a later member before the group's WAL sync/publication
+succeeds. Its `ConflictingSequence` is a reserved sequence and does **not** prove that the write became
+durable, or even committed. This preserves group rejection semantics even if that member later fails.
+Sequences are store-local diagnostics, not public event positions. These details change neither isolation
+nor failure outcomes and do not prescribe retries: callers must decide whether replay is safe, and must
+continue handling `StorageOperationException` outcomes and store health separately.
 
 ### Range-read dependencies
 
