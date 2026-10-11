@@ -830,6 +830,13 @@ space is reclaimed later by MVCC garbage collection and compaction once no snaps
 not physical file deletion (dropping stores/files is a separate operation) and not a catalog drop: higher layers
 should mark an object dropped, then delete its records in bounded batches like the loop above.
 
+Deletion uses an internal key-only projection of the shared MVCC ordered traversal, including its frozen
+pending-write overlay and tombstone/version resolution. It copies no user values, even for the exhaustion
+probe; memtable traversal retains only the MVCC kind byte. Temporary key batches contain at most 256 keys
+and 64 KiB of key payload, except that a single larger key is allowed alone. Pending-overlay key copies,
+resume bounds, staging/undo bytes and ordinary SST block loading/cache memory are additional to this
+batch bound; SST reads still load whole blocks. No public projection API or on-disk format is introduced.
+
 The scanned span (range lower bound through the last processed key, or the entire range when complete) is
 registered as a read dependency, so a concurrent commit that updates, deletes or inserts into it, including
 gaps, makes this commit conflict with normal diagnostics; keys in `Remaining` are not tracked. The call is

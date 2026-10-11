@@ -12,8 +12,9 @@ public sealed class OrderedReadBatch : IDisposable
     private readonly int _maxEntries;
     private readonly int _maxBytes;
 
-    internal OrderedReadBatch(int maxEntries, int maxBytes)
+    internal OrderedReadBatch(int maxEntries, int maxBytes, bool keysOnly = false)
     {
+        KeysOnly = keysOnly;
         _maxEntries = maxEntries;
         _maxBytes = maxBytes;
         _capacity = Math.Min(16, maxEntries);
@@ -44,11 +45,14 @@ public sealed class OrderedReadBatch : IDisposable
     }
 
     internal bool Full { get; private set; }
+    internal bool KeysOnly { get; }
 
     internal bool Add(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
     {
+        if (KeysOnly) value = default;
         var payloadLength = (long)key.Length + value.Length;
-        if (payloadLength > _maxBytes - PayloadBytes)
+        // Internal key batches allow one oversized key, but never append more payload to that batch.
+        if (payloadLength > _maxBytes - PayloadBytes && !(KeysOnly && Count == 0))
         {
             if (Count == 0)
             {
@@ -68,7 +72,8 @@ public sealed class OrderedReadBatch : IDisposable
         }
         if (length > _bytes!.Length - PayloadBytes)
         {
-            var size = (int)Math.Min(Math.Max((long)_bytes.Length * 2, (long)PayloadBytes + length), _maxBytes);
+            var size = (int)Math.Min(Math.Max((long)_bytes.Length * 2, (long)PayloadBytes + length),
+                Math.Max(_maxBytes, length));
             var bytes = ArrayPool<byte>.Shared.Rent(size);
             _bytes.AsSpan(0, PayloadBytes).CopyTo(bytes);
             ArrayPool<byte>.Shared.Return(_bytes);
@@ -78,7 +83,7 @@ public sealed class OrderedReadBatch : IDisposable
         value.CopyTo(_bytes.AsSpan(PayloadBytes + key.Length));
         _entries![Count++] = new Entry(PayloadBytes, key.Length, value.Length);
         PayloadBytes += length;
-        Full = Count == _maxEntries || PayloadBytes == _maxBytes;
+        Full = Count == _maxEntries || PayloadBytes >= _maxBytes;
         return !Full;
     }
 

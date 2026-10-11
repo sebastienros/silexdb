@@ -101,6 +101,10 @@ public sealed class MvccTransaction : IDisposable
     /// </remarks>
     public OrderedReadCursor CreateOrderedReadCursor(OrderedReadRange? range = null,
         OrderedReadDirection direction = OrderedReadDirection.Forward)
+        => CreateOrderedReadCursorCore(range, direction, false);
+
+    private OrderedReadCursor CreateOrderedReadCursorCore(OrderedReadRange? range,
+        OrderedReadDirection direction, bool keysOnly)
     {
         var storage = GetStorage();
         if (direction is not (OrderedReadDirection.Forward or OrderedReadDirection.Reverse))
@@ -108,7 +112,7 @@ public sealed class MvccTransaction : IDisposable
             throw new ArgumentOutOfRangeException(nameof(direction));
         }
         range ??= new OrderedReadRange();
-        var writes = OrderedWriteSnapshot.Create(_writes, range);
+        var writes = OrderedWriteSnapshot.Create(_writes, range, keysOnly);
         try
         {
             return storage.CreateOrderedReadCursorAt(Sequence, range, direction, writes);
@@ -133,7 +137,9 @@ public sealed class MvccTransaction : IDisposable
     /// transaction, with Remaining until complete; a retry after conflict simply resumes from the same range.
     /// The call is all-or-nothing: on cancellation, a <see cref="TransactionLimitException"/> or any other failure, staged
     /// writes and dependencies are restored. It temporarily uses one savepoint slot and cannot be combined with
-    /// overlapping transaction operations.
+    /// overlapping transaction operations. Traversal batches copy only keys (at most 256 keys and 64 KiB of key
+    /// payload, or one larger key alone); pending overlays copy keys and markers, not values. Ordinary SST block
+    /// loading, overlay keys, bounds and staged writes/undo are additional to the batch working set.
     /// </remarks>
     /// <exception cref="TransactionLimitException">Staging the deletions or tracking the range would exceed a budget.</exception>
     public async ValueTask<RangeDeleteResult> DeleteRangeAsync(OrderedReadRange range, int maxEntries,
@@ -167,15 +173,16 @@ public sealed class MvccTransaction : IDisposable
         CancellationToken cancellationToken)
     {
         const int ChunkEntries = 256;
-        using var cursor = CreateOrderedReadCursor(range);
+        const int ChunkKeyBytes = 64 * 1024;
+        using var cursor = CreateOrderedReadCursorCore(range, OrderedReadDirection.Forward, true);
         byte[]? last = null;
         var deleted = 0;
         var complete = false;
         while (true)
         {
             var remaining = maxEntries - deleted;
-            using var batch = await cursor.ReadBatchAsync(remaining == 0 ? 1 : Math.Min(remaining, ChunkEntries),
-                int.MaxValue, cancellationToken).ConfigureAwait(false);
+            using var batch = await cursor.ReadKeyBatchAsync(remaining == 0 ? 1 : Math.Min(remaining, ChunkEntries),
+                ChunkKeyBytes, cancellationToken).ConfigureAwait(false);
             if (remaining == 0)
             {
                 complete = batch.Count == 0;
@@ -183,6 +190,7 @@ public sealed class MvccTransaction : IDisposable
             }
             for (var i = 0; i < batch.Count; i++)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 Delete(batch[i].Key.Span);
                 deleted++;
             }
@@ -197,6 +205,7 @@ public sealed class MvccTransaction : IDisposable
             }
         }
 
+        cancellationToken.ThrowIfCancellationRequested();
         if (complete)
         {
             TrackReadRange(range);

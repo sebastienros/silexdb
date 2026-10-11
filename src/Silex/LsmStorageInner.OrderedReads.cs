@@ -6,7 +6,7 @@ internal sealed partial class LsmStorageInner
 {
     internal async ValueTask<bool> ReadOrderedAsync<TArg>(OrderedReadRange range, OrderedReadDirection direction,
         byte[]? resume, TArg arg, ReadRawEntryAction<TArg> reader, bool exhausted,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, int valuePrefixLength = int.MaxValue)
     {
         using var operation = Lifetime.Enter();
         CheckHealthy();
@@ -63,7 +63,7 @@ internal sealed partial class LsmStorageInner
                 _currentMemTableLock.ExitReadLock();
             }
             return await new MergeIterator(inputs, _blockCache).ScanBoundedRawAsync(
-                effective, backwards, arg, reader, cancellationToken).ConfigureAwait(false);
+                effective, backwards, arg, reader, cancellationToken, valuePrefixLength).ConfigureAwait(false);
         }
         finally
         {

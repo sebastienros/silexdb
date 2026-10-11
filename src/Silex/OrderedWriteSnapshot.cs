@@ -8,7 +8,7 @@ internal sealed class OrderedWriteSnapshot : IDisposable
 
     public int Count => _writes.MutationCount;
 
-    public static OrderedWriteSnapshot? Create(MvccWriteBuffer writes, OrderedReadRange range)
+    public static OrderedWriteSnapshot? Create(MvccWriteBuffer writes, OrderedReadRange range, bool keysOnly = false)
     {
         OrderedWriteSnapshot? snapshot = null;
         try
@@ -32,7 +32,7 @@ internal sealed class OrderedWriteSnapshot : IDisposable
                 var key = writes.GetKey(mutation).Span;
                 if (range.After(key)) break;
                 snapshot ??= new OrderedWriteSnapshot();
-                snapshot._writes.AddMutation(key, writes.GetValue(mutation).Span, mutation.IsTombstone);
+                snapshot._writes.AddMutation(key, keysOnly ? default : writes.GetValue(mutation).Span, mutation.IsTombstone);
             }
             return snapshot;
         }

@@ -53,7 +53,7 @@ internal sealed class MergeIterator : IStorageIterator
     }
 
     internal async ValueTask<bool> ScanBoundedRawAsync<TArg>(OrderedReadRange range, bool backwards,
-        TArg arg, ReadRawEntryAction<TArg> reader, CancellationToken cancellationToken)
+        TArg arg, ReadRawEntryAction<TArg> reader, CancellationToken cancellationToken, int valuePrefixLength = int.MaxValue)
     {
         if (range.IsEmpty)
         {
@@ -72,6 +72,7 @@ internal sealed class MergeIterator : IStorageIterator
                 cancellationToken.ThrowIfCancellationRequested();
                 sources[i] = Source.Create(_inputs[i], start.HasValue, start.GetValueOrDefault(), backwards, cancellationToken);
                 sources[i].Range = range;
+                sources[i].ValuePrefixLength = valuePrefixLength;
                 initialized++;
                 if (await MoveNextSourceAsync(sources, i, cancellationToken).ConfigureAwait(false))
                 {
@@ -460,6 +461,7 @@ internal sealed class MergeIterator : IStorageIterator
         public int MemValueLength;
         public bool MemStarted;
         public bool MemTombstone;
+        public int ValuePrefixLength;
         public SsTable? Table;
         public List<KeyValuePair<ByteSlice, ByteSlice>>? Entries;
         public IAsyncEnumerator<KeyValuePair<ByteSlice, ByteSlice>>? Enumerator;
@@ -522,6 +524,7 @@ internal sealed class MergeIterator : IStorageIterator
                     From = from,
                     SeekPending = hasFrom,
                     Step = backwards ? -1 : 1,
+                    ValuePrefixLength = int.MaxValue,
                 };
             }
             if (input.Entries != null)
@@ -662,9 +665,10 @@ internal sealed class MergeIterator : IStorageIterator
                     return false;
                 }
                 Copy(ref MemKey, key);
-                Copy(ref MemValue, value);
+                var retainedValue = value[..Math.Min(value.Length, ValuePrefixLength)];
+                Copy(ref MemValue, retainedValue);
                 MemKeyLength = key.Length;
-                MemValueLength = value.Length;
+                MemValueLength = retainedValue.Length;
                 MemTombstone = tombstone;
                 MemStarted = true;
                 return true;

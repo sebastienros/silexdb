@@ -33,7 +33,15 @@ public sealed class OrderedReadCursor : IDisposable
     public long? Sequence { get; }
 
     /// <summary>Returns at most maxEntries and maxBytes of key-plus-value payload. Oversized first entries throw.</summary>
-    public async ValueTask<OrderedReadBatch> ReadBatchAsync(int maxEntries, int maxBytes,
+    public ValueTask<OrderedReadBatch> ReadBatchAsync(int maxEntries, int maxBytes,
+        CancellationToken cancellationToken = default) =>
+        ReadBatchCoreAsync(maxEntries, maxBytes, false, cancellationToken);
+
+    internal ValueTask<OrderedReadBatch> ReadKeyBatchAsync(int maxEntries, int maxBytes,
+        CancellationToken cancellationToken = default) =>
+        ReadBatchCoreAsync(maxEntries, maxBytes, true, cancellationToken);
+
+    private async ValueTask<OrderedReadBatch> ReadBatchCoreAsync(int maxEntries, int maxBytes, bool keysOnly,
         CancellationToken cancellationToken = default)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxEntries);
@@ -44,7 +52,7 @@ public sealed class OrderedReadCursor : IDisposable
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             cancellationToken.ThrowIfCancellationRequested();
-            batch = new OrderedReadBatch(maxEntries, maxBytes);
+            batch = new OrderedReadBatch(maxEntries, maxBytes, keysOnly);
             // Even exhausted cursors reject advances after storage shutdown or failure.
             if (_mvcc is not null)
             {
