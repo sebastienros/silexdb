@@ -2,8 +2,8 @@
 
 A Jepsen-style consistency harness for `MvccStorage` and, for the single-key and crash workloads, plain `LsmStorage`. Silex is not distributed, so concurrent clients are
 threads in one process, and "nemeses" are background flush/compaction/GC/WAL-sync plus `SIGKILL` of a child
-process. It is **not** part of CI: `.github/workflows/build.yml` builds and tests only `Silex.Test`, and this
-project is a console app, not a test project.
+process. CI runs a short smoke pass (`all --seconds 1 --crash-cycles 2 --seed 7`, capped at 1 minute) in the `jepsen` job of
+`.github/workflows/build.yml` on Linux, Windows and macOS; longer runs are manual.
 
 ```bash
 dotnet run -c Release --project tests/Silex.Jepsen -- --help

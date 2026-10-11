@@ -5,7 +5,7 @@ namespace Silex.Jepsen;
 internal static class Program
 {
     private const string Usage = """
-        Silex Jepsen-style consistency harness (not part of CI).
+        Silex Jepsen-style consistency harness (CI runs a short smoke pass).
 
         Usage: dotnet run -c Release --project tests/Silex.Jepsen -- [workload ...] [options]
 
