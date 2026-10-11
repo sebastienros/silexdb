@@ -23,7 +23,7 @@ public sealed partial class MvccStorage
     }
 
     internal OrderedReadCursor CreateOrderedReadCursorAt(long sequence, OrderedReadRange? range,
-        OrderedReadDirection direction)
+        OrderedReadDirection direction, OrderedWriteSnapshot? writes = null)
     {
         ValidateDirection(direction);
         range ??= new OrderedReadRange();
@@ -33,7 +33,7 @@ public sealed partial class MvccStorage
             AddSnapshot(sequence);
             try
             {
-                return new OrderedReadCursor(null, this, sequence, range, direction);
+                return new OrderedReadCursor(null, this, sequence, range, direction, writes);
             }
             catch
             {
@@ -52,7 +52,8 @@ public sealed partial class MvccStorage
     }
 
     internal async ValueTask ReadOrderedBatchAsync(OrderedReadRange range, OrderedReadDirection direction,
-        byte[]? resume, long sequence, OrderedReadBatch batch, bool exhausted, CancellationToken cancellationToken)
+        byte[]? resume, long sequence, OrderedReadBatch batch, bool exhausted, CancellationToken cancellationToken,
+        OrderedWriteSnapshot? writes = null)
     {
         CheckDisposed();
         var backwards = direction == OrderedReadDirection.Reverse;
@@ -69,23 +70,30 @@ public sealed partial class MvccStorage
                 lower is null ? new byte[] { DataPrefix } : lower.Slice.Memory, effective.LowerInclusive,
                 upper is null ? new byte[] { 2 } : upper.Slice.Memory,
                 upper is not null && effective.UpperInclusive);
-        using var state = new OrderedScanState(sequence, backwards, batch);
+        using var state = new OrderedScanState(sequence, backwards, batch, exhausted ? null : writes,
+            resume, cancellationToken);
         await _storage.ScanOrderedAsync(physical, direction, state,
             static (s, key, value) => s.Accept(key, value), cancellationToken).ConfigureAwait(false);
         if (backwards && !batch.Full)
         {
             state.Flush();
         }
+        if (!batch.Full)
+        {
+            state.FlushWrites();
+        }
         batch.IsExhausted = !batch.Full;
     }
 
-    private sealed class OrderedScanState(long sequence, bool backwards, OrderedReadBatch batch) : IDisposable
+    private sealed class OrderedScanState(long sequence, bool backwards, OrderedReadBatch batch,
+        OrderedWriteSnapshot? writes, byte[]? resume, CancellationToken cancellationToken) : IDisposable
     {
         private readonly PooledArrayBufferWriter<byte> _key = new();
         private readonly PooledArrayBufferWriter<byte> _value = new();
         private bool _hasGroup;
         private bool _resolved;
         private bool _live;
+        private int _writeIndex = writes?.Seek(resume, backwards) ?? 0;
 
         public bool Accept(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
         {
@@ -115,8 +123,8 @@ public sealed partial class MvccStorage
             _live = value[0] == LiveValue;
             if (!backwards)
             {
-                return !_live || InvokeUserReader(batch,
-                    static (b, k, v) => b.Add(k, v), userKey, value[1..]);
+                return !_live || InvokeUserReader(this,
+                    static (s, k, v) => s.Emit(k, v), userKey, value[1..]);
             }
             // Physical reverse order visits oldest versions first; retain the newest eligible candidate.
             _value.Reset();
@@ -128,8 +136,51 @@ public sealed partial class MvccStorage
             return true;
         }
 
-        public bool Flush() => !_hasGroup || !_live || InvokeUserReader(batch,
-            static (b, k, v) => b.Add(k, v), _key.WrittenSpan, _value.WrittenSpan);
+        public bool Flush() => !_hasGroup || !_live || InvokeUserReader(this,
+            static (s, k, v) => s.Emit(k, v), _key.WrittenSpan, _value.WrittenSpan);
+
+        private bool HasWrite => writes is not null && _writeIndex >= 0 && _writeIndex < writes.Count;
+
+        private bool Emit(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
+        {
+            while (HasWrite)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var comparison = writes!.Key(_writeIndex).SequenceCompareTo(key);
+                if (backwards ? comparison < 0 : comparison > 0)
+                {
+                    break;
+                }
+                if (!EmitWrite())
+                {
+                    return false;
+                }
+                if (comparison == 0)
+                {
+                    return true;
+                }
+            }
+            return batch.Add(key, value);
+        }
+
+        private bool EmitWrite()
+        {
+            var index = _writeIndex;
+            _writeIndex += backwards ? -1 : 1;
+            return writes!.IsTombstone(index) || batch.Add(writes.Key(index), writes.Value(index));
+        }
+
+        public void FlushWrites()
+        {
+            while (HasWrite)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (!EmitWrite())
+                {
+                    break;
+                }
+            }
+        }
 
         public void Dispose()
         {

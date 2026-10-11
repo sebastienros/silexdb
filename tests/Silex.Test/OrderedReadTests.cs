@@ -409,11 +409,13 @@ public class OrderedReadTests
     }
 
     [Test]
-    [Arguments(false, false)]
-    [Arguments(false, true)]
-    [Arguments(true, false)]
-    [Arguments(true, true)]
-    public async Task WaitingMutableSourceRejectsPartialFailedBatchAndKeepsContinuation(bool mvcc, bool next)
+    [Arguments(false, false, false)]
+    [Arguments(false, true, false)]
+    [Arguments(true, false, false)]
+    [Arguments(true, true, false)]
+    [Arguments(true, false, true)]
+    [Arguments(true, true, true)]
+    public async Task WaitingMutableSourceRejectsPartialFailedBatchAndKeepsContinuation(bool mvcc, bool next, bool transactional)
     {
         using var folder = TempFolder.Create();
         using var readerReached = new ManualResetEventSlim();
@@ -450,7 +452,10 @@ public class OrderedReadTests
         var engine = lsm ?? PrivateField<LsmStorage>(versioned!, "_storage");
         var inner = PrivateField<LsmStorageInner>(engine, "_inner");
         var tableLock = PrivateField<ReaderWriterLockSlim>(inner, "_currentMemTableLock");
-        using var cursor = mvcc ? versioned!.CreateOrderedReadCursor() : lsm!.CreateOrderedReadCursor();
+        using var scanTransaction = transactional ? versioned!.BeginTransaction() : null;
+        scanTransaction?.Put(new byte[] { 4 }, new byte[] { 4 });
+        using var cursor = transactional ? scanTransaction!.CreateOrderedReadCursor() :
+            mvcc ? versioned!.CreateOrderedReadCursor() : lsm!.CreateOrderedReadCursor();
         using var previous = await cursor.ReadBatchAsync(1, 2);
         var continuation = PrivateField<byte[]>(cursor, "_resume").ToArray();
         armed = true;

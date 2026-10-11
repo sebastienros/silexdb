@@ -96,6 +96,10 @@ moving the cursor; retry with a larger budget. The limits bound **returned paylo
 working memory: one source record per overlapping table, decoded SST blocks, the memtable's sorted
 index, and (for reverse MVCC) one candidate version are additionally retained during an advance.
 Large individual entries can therefore require internal memory even when rejected by the batch limit.
+Transaction cursor creation copies only current in-range mutations into pooled storage and sorts their
+descriptors once; it does not materialize stored entries or copy stale overwritten values/tracked reads.
+This frozen overlay lives until cursor disposal and is not bounded by per-batch payload limits. Each
+advance binary-seeks the overlay continuation and merges it with the shared bounded MVCC traversal.
 
 The consistency model is explicit on `cursor.Consistency`:
 
@@ -103,10 +107,26 @@ The consistency model is explicit on `cursor.Consistency`:
   an advance. Concurrent replacements/deletions may affect unread entries; inserts ahead of the
   continuation may appear, while changes behind it are not revisited. Do not use this as a stable
   export under concurrent writes.
-- **`Snapshot`** (`MvccStorage.CreateOrderedReadCursor` or `MvccSnapshot.CreateOrderedReadCursor`):
+- **`Snapshot`** (`MvccStorage`, `MvccSnapshot`, or `MvccTransaction.CreateOrderedReadCursor`):
   every batch reads `cursor.Sequence`. A snapshot-created cursor retains that exact sequence
   independently, including after disposing the originating snapshot. Later mutations remain invisible,
   and garbage collection preserves required versions until the cursor is disposed.
+
+`transaction.CreateOrderedReadCursor(range, direction)` reads the transaction's **exact starting
+sequence**, merged with pending inserts/replacements and with pending deletions suppressed. Each
+logical key appears once in encoded byte order. The pending-write overlay is copied and **frozen at
+cursor creation** (statement start): later `Put`/`Delete` calls do not change an open cursor or cause
+updates to revisit newly written index entries. Create another cursor for a later statement's writes.
+Point reads continue to see the transaction's current pending writes.
+
+Transaction cursors own their overlay and retain their snapshot independently. They remain readable
+after transaction disposal, successful commit, conflict, or canceled/failed commit, subject to the
+store's health/shutdown contract; a failed commit that faults storage also prevents cursor advances.
+Cursor creation and all other operations on a transaction are single-consumer and must not overlap.
+After creation, a cursor advances independently and may overlap subsequent transaction operations.
+Range reads **do not track point or interval dependencies**, including empty ranges and returned
+keys. Use `GetForUpdateRawAsync` explicitly for point dependencies; this API provides snapshot
+isolation, not serializability or phantom/range-conflict validation.
 
 No blocking storage lock or borrowed engine memory survives an advance. Independent lookups,
 mutations, maintenance, and network awaits are allowed between advances. Internal traversal holds a
@@ -126,7 +146,7 @@ new advances (even on exhausted cursors) reject a closed/faulted store. Returned
 after later advances, cursor disposal, maintenance, or storage closure, until **their own disposal**.
 Do not dispose a batch while another operation still uses its memory. Dispose snapshot cursors promptly
 to avoid indefinite version retention; there is no engine expiry. Continuation tokens across process
-restarts, token expiry, projections and transactional read-your-writes ranges are not part of this API.
+restarts, token expiry and projections are not part of this API.
 Existing callback APIs retain their borrowed-span and callback lock-lifetime contracts unchanged.
 
 ### Recovery, integrity, and salvage
