@@ -351,3 +351,6 @@ MigrationBackup/
 
 # Rider/Idea
 .idea
+
+# Jepsen-style harness output
+jepsen-results/

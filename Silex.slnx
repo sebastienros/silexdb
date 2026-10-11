@@ -14,6 +14,7 @@
   <Project Path="src/Silex/Silex.csproj" />
   <Project Path="tests/Silex.Benchmarks/Silex.Benchmarks.csproj" />
   <Project Path="tests/Silex.Analyzers.Tests/Silex.Analyzers.Tests.csproj" />
+  <Project Path="tests/Silex.Jepsen/Silex.Jepsen.csproj" />
   <Project Path="tests/Silex.Test/Silex.Test.csproj" />
   <Project Path="tests/Silex.WalBenchmarks/Silex.WalBenchmarks.csproj" />
 </Solution>
