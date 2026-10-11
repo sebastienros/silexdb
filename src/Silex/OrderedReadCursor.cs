@@ -10,18 +10,20 @@ public sealed class OrderedReadCursor : IDisposable
     private readonly LsmStorage? _lsm;
     private readonly MvccStorage? _mvcc;
     private readonly OrderedReadRange _range;
+    private readonly OrderedWriteSnapshot? _writes;
     private byte[]? _resume;
     private int _busy;
     private bool _disposed;
     private bool _exhausted;
 
     internal OrderedReadCursor(LsmStorage? lsm, MvccStorage? mvcc, long? sequence,
-        OrderedReadRange range, OrderedReadDirection direction)
+        OrderedReadRange range, OrderedReadDirection direction, OrderedWriteSnapshot? writes = null)
     {
         _lsm = lsm;
         _mvcc = mvcc;
         Sequence = sequence;
         _range = range;
+        _writes = writes;
         Direction = direction;
         _exhausted = range.IsEmpty;
     }
@@ -47,7 +49,7 @@ public sealed class OrderedReadCursor : IDisposable
             if (_mvcc is not null)
             {
                 await _mvcc.ReadOrderedBatchAsync(_range, Direction, _resume, Sequence!.Value,
-                    batch, _exhausted, cancellationToken).ConfigureAwait(false);
+                    batch, _exhausted, cancellationToken, _writes).ConfigureAwait(false);
             }
             else
             {
@@ -82,6 +84,7 @@ public sealed class OrderedReadCursor : IDisposable
             {
                 _disposed = true;
                 _resume = null;
+                _writes?.Dispose();
                 if (_mvcc is not null)
                 {
                     _mvcc.ReleaseSnapshot(Sequence!.Value);

@@ -24,6 +24,34 @@ public sealed class MvccTransaction : IDisposable
     /// </summary>
     public long Sequence { get; }
 
+    /// <summary>Creates a bounded cursor over the starting snapshot and the current pending writes.</summary>
+    /// <remarks>
+    /// Pending writes are copied and frozen at creation; later mutations are invisible to this cursor.
+    /// The cursor independently owns its overlay and retains the exact starting sequence, including
+    /// after transaction disposal or any commit outcome. Reads do not register conflict dependencies.
+    /// Creation, mutation, reads, commit and disposal of a transaction must not overlap.
+    /// </remarks>
+    public OrderedReadCursor CreateOrderedReadCursor(OrderedReadRange? range = null,
+        OrderedReadDirection direction = OrderedReadDirection.Forward)
+    {
+        var storage = GetStorage();
+        if (direction is not (OrderedReadDirection.Forward or OrderedReadDirection.Reverse))
+        {
+            throw new ArgumentOutOfRangeException(nameof(direction));
+        }
+        range ??= new OrderedReadRange();
+        var writes = OrderedWriteSnapshot.Create(_writes, range);
+        try
+        {
+            return storage.CreateOrderedReadCursorAt(Sequence, range, direction, writes);
+        }
+        catch
+        {
+            writes?.Dispose();
+            throw;
+        }
+    }
+
     public void Put(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
     {
         GetStorage();
