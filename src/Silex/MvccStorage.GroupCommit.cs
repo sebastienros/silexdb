@@ -129,6 +129,14 @@ public sealed partial class MvccStorage
                 {
                     _owner.CheckDisposed();
                     request.CancellationToken.ThrowIfCancellationRequested();
+                    if (request.Writes.HasVersionstamps)
+                    {
+                        if (sequence == long.MaxValue)
+                        {
+                            throw new InvalidOperationException("The MVCC sequence space is exhausted.");
+                        }
+                        request.Writes.ResolveVersionstamps(sequence + 1);
+                    }
                     var conflict = ConflictsWithAccepted(request, acceptedCount) ??
                         await _owner.ValidateAsync(request.Sequence, request.Writes, request.CancellationToken).ConfigureAwait(false);
                     if (conflict is not null)
@@ -180,6 +188,7 @@ public sealed partial class MvccStorage
                 Interlocked.Add(ref _owner._groupedCommits, acceptedCount);
                 for (var i = 0; i < acceptedCount; i++)
                 {
+                    _accepted[i]!.Writes.CommitSequence = _accepted[i]!.CommitSequence;
                     _accepted[i]!.Completion.SetResult(null);
                 }
             }

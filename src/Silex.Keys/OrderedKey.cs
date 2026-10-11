@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.Unicode;
 
 namespace Silex.Keys;
 
@@ -16,19 +17,26 @@ namespace Silex.Keys;
 /// <list type="bullet">
 /// <item><description>Boolean: tag <c>0x04</c> (false) or <c>0x05</c> (true), 1 byte.</description></item>
 /// <item><description>Bytes <c>0x10</c> and String <c>0x11</c>: tag, payload with every <c>0x00</c> written as
-/// <c>00 FF</c>, then terminator <c>00 01</c>. Strings are strict UTF-8; order is by Unicode code point.</description></item>
+/// <c>00 FF</c>, then terminator <c>00 01</c>. Strings use Unicode code-point order through strict UTF-8 byte
+/// ordering, which can differ from .NET's UTF-16 <see cref="StringComparer.Ordinal"/>.</description></item>
 /// <item><description>Int64 <c>0x20</c>: tag + big-endian value with the sign bit flipped (9 bytes).</description></item>
 /// <item><description>UInt64 <c>0x21</c>: tag + big-endian value (9 bytes).</description></item>
 /// <item><description>Double <c>0x22</c>: tag + big-endian IEEE-754 bits transformed to a total order (9 bytes):
 /// -Infinity &lt; negative finite &lt; -0.0 &lt; +0.0 &lt; positive finite &lt; +Infinity &lt; NaN. All NaNs encode as
 /// one canonical NaN, so non-canonical NaN payloads are not preserved.</description></item>
+/// <item><description>Decimal <c>0x23</c>: tag + 24-byte big-endian signed integer with its highest bit flipped
+/// (25 bytes). For unsigned 96-bit coefficient C, scale s and sign, the integer is +/-C * 10^(28-s),
+/// computed with integer arithmetic. Equal decimal values, including scaled and signed zeros, encode identically.
+/// Decoding returns the minimum possible scale and positive scale-zero zero, not the original decimal bits.
+/// Payloads that cannot represent an exact decimal value are malformed, even if within the numeric bounds.</description></item>
 /// <item><description>Descending: the whole component (tag, payload, terminator) is bitwise complemented, which
 /// exactly reverses the order of that component because encodings are prefix-free.</description></item>
 /// </list>
 /// <para>
-/// Different kinds are separated by tag order (Boolean &lt; Bytes &lt; String &lt; Int64 &lt; UInt64 &lt; Double, then
-/// all descending kinds in reverse). Integers and doubles are never interleaved numerically. The format defines
-/// no NULL, collation, case folding, decimal, date or JSON ordering; those semantics belong to the layer using it.
+/// Different kinds are separated by tag order (Boolean &lt; Bytes &lt; String &lt; Int64 &lt; UInt64 &lt; Double &lt; Decimal,
+/// then all descending kinds in reverse). Numeric kinds are never interleaved by magnitude. The format defines
+/// no NULL, collation, case folding, date or JSON ordering; those semantics belong to the layer using it.
+/// Existing component encodings are unchanged.
 /// </para>
 /// </remarks>
 public static class OrderedKey
@@ -44,6 +52,9 @@ public static class OrderedKey
 
     /// <summary>Encoded size of a <see cref="double"/> component.</summary>
     public const int DoubleLength = 9;
+
+    /// <summary>Encoded size of a <see cref="decimal"/> component.</summary>
+    public const int DecimalLength = 25;
 
     internal const ulong CanonicalNaNBits = 0x7FF8000000000000UL;
 
@@ -62,6 +73,16 @@ public static class OrderedKey
     public static int GetStringLength(ReadOnlySpan<char> value)
     {
         return checked(3 + StrictUtf8.GetByteCount(value) + value.Count('\0'));
+    }
+
+    /// <summary>Exact encoded size of a UTF-8 string component (identical for both orders).</summary>
+    /// <param name="value">Decoded string content encoded as strict UTF-8, not a JSON token.</param>
+    /// <exception cref="ArgumentException">The value contains malformed UTF-8.</exception>
+    /// <exception cref="OverflowException">The size does not fit in <see cref="int"/>.</exception>
+    public static int GetUtf8StringLength(ReadOnlySpan<byte> value)
+    {
+        if (!Utf8.IsValid(value)) throw new ArgumentException("The value contains malformed UTF-8.", nameof(value));
+        return GetBytesLength(value);
     }
 
     internal static byte Tag(OrderedKeyComponent kind, bool boolValue, OrderedKeyOrder order)

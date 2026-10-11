@@ -226,28 +226,55 @@ reader.TryReadUInt64(out var ts, OrderedKeyOrder.Descending);
 Everything is span based and allocation free; the caller owns all buffers.
 
 * **Components** (each with `Ascending` or `Descending` order): `Boolean`, `Bytes`, `String`, `Int64`,
-  `UInt64`, `Double`.
+  `UInt64`, `Double`, `Decimal`.
 * **Format.** Each component begins with a tag (`04`/`05` boolean false/true, `10` bytes, `11` string,
-  `20` int64, `21` uint64, `22` double); a descending component uses the bitwise complement of its entire
+  `20` int64, `21` uint64, `22` double, `23` decimal); a descending component uses the bitwise complement of its entire
   encoding, including the tag. Integers are big-endian (int64 with the sign bit flipped). Doubles use the
   IEEE-754 bit transform giving `-Infinity < negatives < -0.0 < +0.0 < positives < +Infinity < NaN`; every NaN
   is written as one canonical NaN, so NaN payloads are not preserved. Bytes and strings escape each `00`
-  as `00 FF` and end with `00 01`. Strings are strict UTF-8 ordered by code point (unpaired surrogates throw
-  `ArgumentException`); no case folding or collation is applied.
+  as `00 FF` and end with `00 01`. Strings use **Unicode code-point order through strict UTF-8 byte ordering**;
+  no case folding or collation is applied. This is not interchangeable with .NET's UTF-16
+  `StringComparer.Ordinal`: U+10000 sorts after U+FFFF here, but before it in UTF-16 ordinal order.
+  Query evaluators must use comparison semantics consistent with their index encoding.
+* **UTF-8 strings.** `TryWriteUtf8String(ReadOnlySpan<byte>)` accepts decoded string content encoded as UTF-8,
+  not a JSON token, and writes exactly the same `String` component as `TryWriteString` for equivalent text
+  (for example `"café"` and its UTF-8 bytes). Both use the existing tag, escaping and terminator, with no
+  on-disk format change. `GetUtf8StringLength` reports the exact encoded size, and
+  `TryReadUtf8String(Span<byte>, out int length)` reads the unescaped UTF-8 into caller-owned memory.
+  Malformed UTF-8 (including overlong sequences, surrogate code points, truncation and out-of-range code
+  points) is never replaced: sizing/writing throw `ArgumentException` before writing, even with insufficient
+  capacity, and reading returns `Malformed` without advancing, even with an undersized destination.
+  `TryWriteString` likewise rejects unpaired UTF-16 surrogates. JSON unescaping belongs to the document
+  layer: JSON `"a"` and `"\u0061"` must reach these APIs as the same decoded content.
+* **Decimal.** A fixed 25-byte component: tag `23` followed by a 24-byte two's-complement big-endian integer
+  with its highest bit flipped. For unsigned 96-bit coefficient `C`, scale `s` in `[0,28]` and sign, the
+  integer is `N = +/-C * 10^(28-s)`, computed entirely with integer arithmetic. Its maximum magnitude
+  `(2^96-1) * 10^28` needs 190 bits. Descending complements all 25 bytes, including tag `DC`.
+  Equal decimal values have identical keys regardless of trailing-zero scale or zero sign. Decoding returns
+  the minimum possible scale, with positive scale-zero zero; it preserves value, not the original decimal bits.
+  A payload must be exactly representable as a decimal: even in-range integers such as `N = 2^96` are
+  rejected when removing trailing zeros cannot reduce the coefficient to 96 bits. Reads, peeks and skips
+  reject malformed decimal payloads without advancing. Existing kinds' bytes and semantics are unchanged.
 * **Boundaries.** No component encoding is a byte prefix of another, so tuple boundaries are
   unambiguous and the raw key bytes of a tuple prefix (for example `writer.WrittenSpan`) are exactly the byte
   prefix of every longer tuple that starts with it, which composes with `PrefixKeyspace`. Different kinds
-  order by tag (Boolean < Bytes < String < Int64 < UInt64 < Double, then descending kinds); integers and
-  doubles are never interleaved numerically, and position-wise consistent schemas are the caller's concern.
+  order by tag (Boolean < Bytes < String < Int64 < UInt64 < Double < Decimal, then descending kinds); numeric
+  kinds are never interleaved by magnitude, and position-wise consistent schemas are the caller's concern.
 * **Buffers.** `TryWrite*` returns `false` when the exact encoded size does not fit, leaving
   `Written` unchanged; sizes are `OrderedKey.BooleanLength` (1), `Int64Length`/`UInt64Length`/`DoubleLength` (9),
-  and `GetBytesLength`/`GetStringLength`. Readers return an `OrderedKeyDecodeStatus`
+  `DecimalLength` (25), and `GetBytesLength`/`GetStringLength`/`GetUtf8StringLength`. Readers return an `OrderedKeyDecodeStatus`
   (`EndOfData`, `UnexpectedComponent`, `Malformed`, `DestinationTooSmall` with the exact required length) and
-  do not advance on failure. Decoding is strict, so each key has exactly one decoding.
+  do not advance on failure. String read lengths are UTF-16 characters for `TryReadString` and UTF-8 bytes
+  for `TryReadUtf8String`. Decoding is strict, so each key has exactly one decoding.
 * **Limits.** Sizes are `int`-bounded, and keys remain subject to the storage engine's own key limits.
-  No NULL, decimal, date/time, GUID, or case-insensitive components are defined; layers can compose them from
+  No NULL, date/time, GUID, or case-insensitive components are defined; layers can compose them from
   these building blocks (for example a leading boolean or `UInt64` marker for NULL placement). The format is
   versionless and its encodings are fixed; future component kinds would use new tags.
+
+Decimal normalization does not introduce mixed-type numeric equality: `Int64(1)`, `Double(1.0)` and
+`Decimal(1.00)` remain distinct keys in separate tag-ordered regions. Unified SQL/JSON numeric comparison
+requires a separate encoding or coercion policy; converting all numbers to `Double` loses integer
+distinctions above `2^53` and decimal precision. Double still distinguishes negative and positive zero.
 
 ### Batched point reads
 
@@ -970,8 +997,8 @@ Mutation count means **distinct staged keys**, including deletions, not the numb
 Repeated tracked reads are deduplicated; reads of pending writes need no extra dependency.
 `MutationCount`, `TrackedReadCount`, and `BufferedBytes` expose the current accounting.
 
-`BufferedBytes` counts retained arena bytes plus active mutation (20 bytes), tracked-read (8), read-range (32), undo
-(24), and savepoint (24) descriptors. It includes obsolete replacement bytes and checkpoint-protected
+`BufferedBytes` counts retained arena bytes plus active mutation (28 bytes), tracked-read (8), read-range (32), undo
+(32), and savepoint (24) descriptors. It includes obsolete replacement bytes and checkpoint-protected
 values, not just live key/value sizes. In-place overwrites reuse capacity. Savepoint replacements append
 bytes and undo records; rollback restores both accounting and state. Release removes checkpoint charges
 and, when the last marker is released, undo charges, but does not compact the byte arena.
@@ -986,6 +1013,45 @@ rounding/spare capacity, lookup/sort indexes, object headers, commit/WAL batches
 independently owned frozen cursor overlays are excluded. Index and descriptor storage is proportional
 to the transaction's peak key counts; rollback retains rented capacity until disposal. Limit the number
 of concurrent transactions/cursors separately. No disk spilling is provided.
+
+### Commit-time versionstamps
+
+`PutVersionstamped(key, value, keyOffset: -1, valueOffset: -1)` substitutes the transaction's
+commit sequence into an existing eight-byte region of the key, value, or both. Offsets are zero-based;
+`-1` disables that component and at least one must be enabled. Existing region bytes are replaced
+by a positive big-endian Int64, preserving sequence order in lexicographic keys. All entries in one
+transaction receive the same stamp; include an unstamped suffix to distinguish multiple entries.
+
+```csharp
+using var transaction = db.BeginTransaction();
+var globalKey = new byte[9];
+globalKey[0] = 0x47; // Application-owned global index prefix.
+transaction.PutVersionstamped(globalKey, "event"u8, keyOffset: 1);
+transaction.Put("stream/head"u8, "event"u8);
+await transaction.CommitAsync();
+Console.WriteLine(transaction.CommitSequence);
+```
+
+The engine resolves templates under the commit gate **before** conflict validation and batch
+preparation. Independent streams can therefore use identical global-index templates without a
+shared conflicting position counter, and the index and stream writes share one atomic recovery
+frame. Resolved keys still conflict with ordinary writes and tracked point/range reads. Two distinct
+templates resolving to the same key within one transaction throw `ArgumentException` before writing;
+repeated staging at the same unresolved template replaces its mutation.
+`PrefixKeyspace.PutVersionstamped` accepts fully encoded keys and offsets, but rejects substitution
+inside its prefix so resolved keys remain in the keyspace.
+
+Pending point reads, scans and frozen cursors show unresolved bytes. Savepoints restore values and
+substitution offsets together; ordinary `Put` or `Delete` at the template removes substitution.
+Resolution updates the pooled arena and rebuilds its key index without allocating per-stamp objects.
+Mutation and undo descriptors each include eight bytes for the two offsets, including ordinary writes.
+
+`CommitSequence` is retained after transaction consumption and is set only after a successful
+nonempty commit (including ordinary commits). Empty, conflicting, canceled and throwing commits
+leave it null, even if a storage exception reports a committed or indeterminate outcome. Sequences
+are database-local, not timestamps, and may have gaps; unrelated writes also consume positions.
+WAL configuration still determines durability. Restoring a backup creates a separate ordering
+history and does not make stamps globally unique across databases or restores.
 
 ### Durable transaction group commit
 
@@ -1004,6 +1070,8 @@ promise. Transaction buffers must not be changed or disposed during a commit.
 Validation and publication remain serialized. Each transaction checks both changes published since
 its starting snapshot and the written keys of earlier accepted transactions in its group, including
 tracked point-read dependencies. Conflicts return `false` and contribute no frame or sequence.
+Sequentially awaiting each commit provides nothing to group. Concurrent transactions updating one
+shared position key still conflict; use application batching or versionstamped index keys instead.
 Cancellation is checked during admission, validation, and once more after preparing the transaction's
 frame data. Acceptance ends cancellation: canceling an accepted transaction does not interrupt the
 group or return a misleading cancellation result. Read-only transactions require no WAL boundary.

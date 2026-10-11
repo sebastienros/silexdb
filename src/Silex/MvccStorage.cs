@@ -424,6 +424,10 @@ public sealed partial class MvccStorage : IAsyncDisposable
         try
         {
             CheckDisposed();
+            if (writes.HasVersionstamps)
+            {
+                writes.ResolveVersionstamps(AllocateSequence());
+            }
             var conflict = await ValidateAsync(snapshotSequence, writes, cancellationToken).ConfigureAwait(false);
             if (conflict is not null)
             {
@@ -443,6 +447,7 @@ public sealed partial class MvccStorage : IAsyncDisposable
             _storage.BeforeMvccPublication();
             _allocatedSequence = sequence;
             Volatile.Write(ref _publishedSequence, sequence);
+            writes.CommitSequence = sequence;
             return null;
         }
         finally
@@ -1150,6 +1155,7 @@ internal sealed class MvccWriteBuffer : IDisposable
     private int _nextSavepointId;
     private int _byteCount;
     private bool _disposed;
+    private bool _hasVersionstamps;
 
     public int MutationCount { get; private set; }
 
@@ -1157,8 +1163,12 @@ internal sealed class MvccWriteBuffer : IDisposable
 
     public int ReadRangeCount { get; private set; }
 
-    public long BufferedBytes => (long)_byteCount + 20L * MutationCount + 8L * TrackedReadCount
-        + 32L * ReadRangeCount + 24L * _undoCount + 24L * _savepointCount;
+    public long BufferedBytes => (long)_byteCount + 28L * MutationCount + 8L * TrackedReadCount
+        + 32L * ReadRangeCount + 32L * _undoCount + 24L * _savepointCount;
+
+    public long? CommitSequence { get; set; }
+
+    public bool HasVersionstamps => _hasVersionstamps && MutationCount != 0;
 
     internal MvccWriteBuffer(int indexThreshold = DefaultIndexThreshold, TransactionLimits? limits = null)
     {
@@ -1241,12 +1251,13 @@ internal sealed class MvccWriteBuffer : IDisposable
         return -1;
     }
 
-    public void AddMutation(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool isTombstone)
+    public void AddMutation(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool isTombstone,
+        int keyVersionstampOffset = -1, int valueVersionstampOffset = -1)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         CheckCount("mutations", _limits.Mutations, (long)MutationCount + 1);
         var additional = (long)key.Length + (isTombstone ? 0 : value.Length);
-        CheckBytes(additional + 20);
+        CheckBytes(additional + 28);
         EnsureByteCapacity(additional);
         EnsureMutationCapacity();
         EnsureIndexCapacity(ref _mutationIndex, MutationCount, reads: false);
@@ -1257,12 +1268,23 @@ internal sealed class MvccWriteBuffer : IDisposable
             key.Length,
             valueOffset,
             isTombstone ? -1 : value.Length,
-            isTombstone ? 0 : value.Length);
+            isTombstone ? 0 : value.Length, keyVersionstampOffset, valueVersionstampOffset);
+        _hasVersionstamps |= keyVersionstampOffset >= 0 || valueVersionstampOffset >= 0;
         if (_mutationIndex.Length != 0) InsertIndex(_mutationIndex, MutationCount - 1, key);
         _orderDirty = true;
     }
 
-    public void SetValue(int index, ReadOnlySpan<byte> value, bool isTombstone)
+    public void SetValue(int index, ReadOnlySpan<byte> value, bool isTombstone,
+        int keyVersionstampOffset = -1, int valueVersionstampOffset = -1)
+    {
+        SetValueCore(index, value, isTombstone);
+        ref var mutation = ref _mutations[index];
+        mutation.KeyVersionstampOffset = keyVersionstampOffset;
+        mutation.ValueVersionstampOffset = valueVersionstampOffset;
+        _hasVersionstamps |= keyVersionstampOffset >= 0 || valueVersionstampOffset >= 0;
+    }
+
+    private void SetValueCore(int index, ReadOnlySpan<byte> value, bool isTombstone)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         ArgumentOutOfRangeException.ThrowIfNegative(index);
@@ -1274,7 +1296,7 @@ internal sealed class MvccWriteBuffer : IDisposable
         ref var mutation = ref _mutations[index];
         if (_savepointCount != 0)
         {
-            CheckBytes(24L + (isTombstone ? 0 : value.Length));
+            CheckBytes(32L + (isTombstone ? 0 : value.Length));
             if (_undoCount == _undo.Length)
             {
                 var replacement = ArrayPool<MvccUndo>.Shared.Rent(
@@ -1321,6 +1343,37 @@ internal sealed class MvccWriteBuffer : IDisposable
         mutation.ValueOffset = Append(value);
         mutation.ValueLength = value.Length;
         mutation.ValueCapacity = value.Length;
+    }
+
+    public void ResolveVersionstamps(long sequence)
+    {
+        if (!_hasVersionstamps) return;
+        var keysChanged = false;
+        for (var i = 0; i < MutationCount; i++)
+        {
+            var mutation = _mutations[i];
+            if (mutation.KeyVersionstampOffset >= 0)
+            {
+                BinaryPrimitives.WriteInt64BigEndian(
+                    _bytes.AsSpan(mutation.KeyOffset + mutation.KeyVersionstampOffset, sizeof(long)), sequence);
+                keysChanged = true;
+            }
+            if (mutation.ValueVersionstampOffset >= 0)
+            {
+                BinaryPrimitives.WriteInt64BigEndian(
+                    _bytes.AsSpan(mutation.ValueOffset + mutation.ValueVersionstampOffset, sizeof(long)), sequence);
+            }
+        }
+        if (!keysChanged) return;
+        _orderDirty = true;
+        RebuildIndex(_mutationIndex, reads: false);
+        for (var i = 0; i < MutationCount; i++)
+        {
+            if (FindMutation(GetMutationKey(i).Span) != i)
+            {
+                throw new ArgumentException("Versionstamp substitution produced duplicate transaction keys.");
+            }
+        }
     }
 
     public void TrackRead(ReadOnlySpan<byte> key)
@@ -1646,13 +1699,16 @@ internal sealed class MvccWriteBuffer : IDisposable
     }
 }
 
-internal struct MvccMutation(int keyOffset, int keyLength, int valueOffset, int valueLength, int valueCapacity)
+internal struct MvccMutation(int keyOffset, int keyLength, int valueOffset, int valueLength, int valueCapacity,
+    int keyVersionstampOffset = -1, int valueVersionstampOffset = -1)
 {
     public int KeyOffset { get; } = keyOffset;
     public int KeyLength { get; } = keyLength;
     public int ValueOffset { get; set; } = valueOffset;
     public int ValueLength { get; set; } = valueLength;
     public int ValueCapacity { get; set; } = valueCapacity;
+    public int KeyVersionstampOffset { get; set; } = keyVersionstampOffset;
+    public int ValueVersionstampOffset { get; set; } = valueVersionstampOffset;
     public readonly bool IsTombstone => ValueLength < 0;
 }
 

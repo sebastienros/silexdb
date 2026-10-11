@@ -109,6 +109,18 @@ public ref struct OrderedKeyReader
         return status;
     }
 
+    /// <summary>Reads an exact decimal component with the minimum possible scale and positive scale-zero zero.</summary>
+    /// <remarks>Payloads not exactly representable as decimal are malformed; failed reads do not advance.</remarks>
+    public OrderedKeyDecodeStatus TryReadDecimal(out decimal value, OrderedKeyOrder order = OrderedKeyOrder.Ascending)
+    {
+        value = 0;
+        var status = Expect(OrderedKeyComponent.Decimal, order, out var c);
+        if (status != OrderedKeyDecodeStatus.Success) return status;
+        value = c.DecimalValue;
+        _position += c.Total;
+        return status;
+    }
+
     /// <summary>Reads a bytes component into <paramref name="destination"/>.</summary>
     /// <param name="destination">Receives the unescaped payload.</param>
     /// <param name="length">The payload length written, or the required length if the destination is too small.</param>
@@ -139,6 +151,33 @@ public ref struct OrderedKeyReader
         return status;
     }
 
+    /// <summary>Reads a string component as strict UTF-8 bytes.</summary>
+    /// <param name="destination">Receives the decoded string content as unescaped UTF-8 bytes, not a JSON token.</param>
+    /// <param name="length">The bytes written, or the exact bytes required if the destination is too small; zero for other failures.</param>
+    /// <param name="order">The expected order.</param>
+    /// <remarks>Malformed UTF-8 is rejected even when the destination is too small. Failed reads do not advance;
+    /// destination contents are unspecified on failure.</remarks>
+    public OrderedKeyDecodeStatus TryReadUtf8String(Span<byte> destination, out int length, OrderedKeyOrder order = OrderedKeyOrder.Ascending)
+    {
+        length = 0;
+        var status = Expect(OrderedKeyComponent.String, order, out var c);
+        if (status != OrderedKeyDecodeStatus.Success) return status;
+        var body = Remaining.Slice(1, c.Total - 3);
+        if (destination.Length < c.Payload)
+        {
+            // Validate into the existing decoder's scratch before reporting a required byte count.
+            if (DecodeUtf8(body, c.Mask, Span<char>.Empty, out _) == OrderedKeyDecodeStatus.Malformed)
+                return OrderedKeyDecodeStatus.Malformed;
+            length = c.Payload;
+            return OrderedKeyDecodeStatus.DestinationTooSmall;
+        }
+        Unescape(body, c.Mask, destination);
+        if (!Utf8.IsValid(destination.Slice(0, c.Payload))) return OrderedKeyDecodeStatus.Malformed;
+        length = c.Payload;
+        _position += c.Total;
+        return OrderedKeyDecodeStatus.Success;
+    }
+
     private OrderedKeyDecodeStatus ReadFixed(OrderedKeyComponent kind, OrderedKeyOrder order, out ulong bits, bool keepPosition = false)
     {
         bits = 0;
@@ -164,6 +203,7 @@ public ref struct OrderedKeyReader
         public bool BoolValue;
         public int Total;
         public int Payload;
+        public decimal DecimalValue;
     }
 
     private static OrderedKeyDecodeStatus Parse(ReadOnlySpan<byte> src, out Parsed c)
@@ -188,6 +228,12 @@ public ref struct OrderedKeyReader
                 c.Kind = (OrderedKeyComponent)tag;
                 c.Total = 9;
                 return src.Length >= 9 ? OrderedKeyDecodeStatus.Success : OrderedKeyDecodeStatus.Malformed;
+            case 0x23:
+                c.Kind = OrderedKeyComponent.Decimal;
+                c.Total = OrderedKey.DecimalLength;
+                if (src.Length < c.Total) return OrderedKeyDecodeStatus.Malformed;
+                return OrderedDecimal.TryDecode(src.Slice(1, c.Total - 1), c.Mask, out c.DecimalValue)
+                    ? OrderedKeyDecodeStatus.Success : OrderedKeyDecodeStatus.Malformed;
             case 0x10:
             case 0x11:
                 c.Kind = (OrderedKeyComponent)tag;

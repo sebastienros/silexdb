@@ -27,6 +27,13 @@ public sealed class MvccTransaction : IDisposable
     /// </summary>
     public long Sequence { get; }
 
+    /// <summary>Gets the committed ordering sequence after a successful nonempty commit, otherwise null.</summary>
+    /// <remarks>
+    /// Retained after the transaction is consumed. A thrown commit, including an indeterminate or committed
+    /// storage failure, does not set this property. Sequences are local to this database and may have gaps.
+    /// </remarks>
+    public long? CommitSequence { get; private set; }
+
     /// <summary>Gets the first detected commit conflict, retained after this transaction is consumed.</summary>
     /// <remarks>
     /// Null before commit, after success, and on cancellation or storage failure. Only inspect after the
@@ -217,16 +224,52 @@ public sealed class MvccTransaction : IDisposable
     }
 
     public void Put(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
+        => PutCore(key, value, -1, -1);
+
+    /// <summary>Stages a put with the commit sequence substituted into an eight-byte key and/or value region.</summary>
+    /// <remarks>
+    /// Offsets are zero-based; -1 disables substitution in that component. At least one must be enabled.
+    /// The region's existing bytes are replaced by a positive, big-endian Int64 under the commit gate before
+    /// conflict validation. All substitutions in this transaction use the same sequence. Use a suffix outside
+    /// the region to distinguish multiple entries in one commit.
+    /// Pending reads and cursors expose the unresolved template. Staging again at the same template replaces
+    /// the put and its offsets; ordinary Put or Delete removes substitution. Savepoints restore both.
+    /// Resolved keys participate in ordinary write, point-read and range conflict checks. Distinct templates
+    /// resolving to the same key in one transaction are rejected before writing. No shared counter is needed.
+    /// Durability is governed by the store's WAL options, as with ordinary puts.
+    /// </remarks>
+    public void PutVersionstamped(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value,
+        int keyOffset = -1, int valueOffset = -1)
+    {
+        GetStorage();
+        ValidateVersionstampOffset(keyOffset, key.Length, nameof(keyOffset));
+        ValidateVersionstampOffset(valueOffset, value.Length, nameof(valueOffset));
+        if (keyOffset == -1 && valueOffset == -1)
+        {
+            throw new ArgumentException("At least one versionstamp offset must be specified.");
+        }
+        PutCore(key, value, keyOffset, valueOffset);
+    }
+
+    private static void ValidateVersionstampOffset(int offset, int length, string name)
+    {
+        if (offset < -1 || (offset >= 0 && offset > length - sizeof(long)))
+        {
+            throw new ArgumentOutOfRangeException(name, "The offset must select an existing eight-byte region, or be -1.");
+        }
+    }
+
+    private void PutCore(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, int keyOffset, int valueOffset)
     {
         GetStorage();
         var mutationIndex = _writes.FindMutation(key);
         if (mutationIndex < 0)
         {
-            _writes.AddMutation(key, value, isTombstone: false);
+            _writes.AddMutation(key, value, isTombstone: false, keyOffset, valueOffset);
         }
         else
         {
-            _writes.SetValue(mutationIndex, value, isTombstone: false);
+            _writes.SetValue(mutationIndex, value, isTombstone: false, keyOffset, valueOffset);
         }
     }
 
@@ -321,6 +364,10 @@ public sealed class MvccTransaction : IDisposable
         try
         {
             Conflict = await storage.TryCommitAsync(Sequence, _writes, cancellationToken).ConfigureAwait(false);
+            if (Conflict is null)
+            {
+                CommitSequence = _writes.CommitSequence;
+            }
             return Conflict is null;
         }
         finally

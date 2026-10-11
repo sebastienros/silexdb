@@ -10,8 +10,8 @@ namespace Silex.Keys;
 /// Every <c>TryWrite*</c> method either appends the complete component and returns <see langword="true"/>, or
 /// returns <see langword="false"/> because the remaining capacity is smaller than the exact encoded size; in
 /// the latter case <see cref="Written"/> is unchanged and the unwritten tail's contents are unspecified. Invalid
-/// input (an unpaired surrogate) throws <see cref="ArgumentException"/> before anything is written. Inputs must not
-/// overlap the destination. Default-constructed writers have zero capacity.
+/// input (an unpaired surrogate or malformed UTF-8) throws <see cref="ArgumentException"/> before anything is
+/// written. Inputs must not overlap the destination. Default-constructed writers have zero capacity.
 /// </remarks>
 public ref struct OrderedKeyWriter
 {
@@ -63,31 +63,20 @@ public ref struct OrderedKeyWriter
         return TryWriteFixed(OrderedKeyComponent.Double, OrderedKey.ToOrderedDoubleBits(value), order);
     }
 
+    /// <summary>Appends an exact decimal number; decimal scale and signed zero are normalized.</summary>
+    public bool TryWriteDecimal(decimal value, OrderedKeyOrder order = OrderedKeyOrder.Ascending)
+    {
+        if (!TryBegin(OrderedKey.DecimalLength, out var s)) return false;
+        s[0] = OrderedKey.Tag(OrderedKeyComponent.Decimal, false, order);
+        OrderedDecimal.Encode(value, s.Slice(1));
+        Complement(s, order);
+        return true;
+    }
+
     /// <summary>Appends a bytes component; its size is <see cref="OrderedKey.GetBytesLength"/>.</summary>
     public bool TryWriteBytes(ReadOnlySpan<byte> value, OrderedKeyOrder order = OrderedKeyOrder.Ascending)
     {
-        if (!TryBegin(OrderedKey.GetBytesLength(value), out var s)) return false;
-        s[0] = OrderedKey.Tag(OrderedKeyComponent.Bytes, false, order);
-        var p = 1;
-        while (true)
-        {
-            var i = value.IndexOf((byte)0);
-            if (i < 0)
-            {
-                value.CopyTo(s.Slice(p));
-                p += value.Length;
-                break;
-            }
-            value.Slice(0, i).CopyTo(s.Slice(p));
-            p += i;
-            s[p++] = 0;
-            s[p++] = 0xFF;
-            value = value.Slice(i + 1);
-        }
-        s[p++] = 0;
-        s[p] = 1;
-        Complement(s, order);
-        return true;
+        return TryWriteEscapedBytes(value, OrderedKeyComponent.Bytes, OrderedKey.GetBytesLength(value), order);
     }
 
     /// <summary>Appends a string component as strict UTF-8; its size is <see cref="OrderedKey.GetStringLength"/>.</summary>
@@ -104,6 +93,41 @@ public ref struct OrderedKeyWriter
             Utf8.FromUtf16(segment, s.Slice(p), out _, out var w, replaceInvalidSequences: false, isFinalBlock: true);
             p += w;
             if (i < 0) break;
+            s[p++] = 0;
+            s[p++] = 0xFF;
+            value = value.Slice(i + 1);
+        }
+        s[p++] = 0;
+        s[p] = 1;
+        Complement(s, order);
+        return true;
+    }
+
+    /// <summary>Appends a strict UTF-8 string using the same encoding as <see cref="TryWriteString"/>.</summary>
+    /// <param name="value">Decoded string content encoded as UTF-8, not a JSON token; no JSON unescaping is performed.</param>
+    /// <param name="order">The component's sort direction.</param>
+    /// <exception cref="ArgumentException">The value contains malformed UTF-8.</exception>
+    public bool TryWriteUtf8String(ReadOnlySpan<byte> value, OrderedKeyOrder order = OrderedKeyOrder.Ascending)
+    {
+        return TryWriteEscapedBytes(value, OrderedKeyComponent.String, OrderedKey.GetUtf8StringLength(value), order);
+    }
+
+    private bool TryWriteEscapedBytes(ReadOnlySpan<byte> value, OrderedKeyComponent kind, int length, OrderedKeyOrder order)
+    {
+        if (!TryBegin(length, out var s)) return false;
+        s[0] = OrderedKey.Tag(kind, false, order);
+        var p = 1;
+        while (true)
+        {
+            var i = value.IndexOf((byte)0);
+            if (i < 0)
+            {
+                value.CopyTo(s.Slice(p));
+                p += value.Length;
+                break;
+            }
+            value.Slice(0, i).CopyTo(s.Slice(p));
+            p += i;
             s[p++] = 0;
             s[p++] = 0xFF;
             value = value.Slice(i + 1);
