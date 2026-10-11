@@ -47,6 +47,10 @@ internal sealed class SsTable : IDisposable
     public long MetaBlockOffset { get; }
 
     public IBloomFilter BloomFilter { get; }
+    internal IBloomFilter? VersionPrefixBloomFilter { get; set; }
+
+    internal bool MayContainVersionPrefix(ReadOnlySpan<byte> prefix) =>
+        VersionPrefixBloomFilter is null || !VersionPrefixBloom.IsPrefix(prefix) || VersionPrefixBloomFilter.Probe(prefix);
 
     public string Filename => _filename;
 
@@ -357,7 +361,7 @@ internal sealed class SsTable : IDisposable
 
     public static async Task<SsTable> LoadSsTableAsync(string filename, ISsTableEncoder tableEncoder, BlockBuilder blockBuilder, IBloomFilterFactory bloomFilterFactory, long? id = null, CancellationToken cancellationToken = default)
     {
-        byte[] footerBuffer = ArrayPool<byte>.Shared.Rent(SsTableFormat.FooterLength);
+        byte[] footerBuffer = ArrayPool<byte>.Shared.Rent(VersionPrefixBloom.TrailerLength);
         var stream = OpenRead(filename);
         var success = false;
 
@@ -375,6 +379,38 @@ internal sealed class SsTable : IDisposable
                 {
                     contentLength -= SsTableFormat.FooterLength;
                 }
+            }
+
+            IBloomFilter? prefixBloom = null;
+            if (formatVersion >= 2)
+            {
+                if (contentLength < VersionPrefixBloom.TrailerLength)
+                    throw new InvalidDataException("The SST is missing its version-prefix filter trailer.");
+                var trailerOffset = contentLength - VersionPrefixBloom.TrailerLength;
+                stream.Seek(trailerOffset, SeekOrigin.Begin);
+                await stream.ReadExactlyAsync(footerBuffer.AsMemory(0, VersionPrefixBloom.TrailerLength), cancellationToken);
+                var hashes = BinaryPrimitives.ReadUInt32LittleEndian(footerBuffer);
+                var algorithm = BinaryPrimitives.ReadUInt32LittleEndian(footerBuffer.AsSpan(4));
+                var offset = BinaryPrimitives.ReadUInt64LittleEndian(footerBuffer.AsSpan(8));
+                var checksum = BinaryPrimitives.ReadUInt32LittleEndian(footerBuffer.AsSpan(16));
+                if (BinaryPrimitives.ReadUInt32LittleEndian(footerBuffer.AsSpan(20)) != VersionPrefixBloom.Magic ||
+                    hashes > int.MaxValue || algorithm > byte.MaxValue || offset < sizeof(uint) ||
+                    offset > (ulong)trailerOffset || (ulong)trailerOffset - offset > int.MaxValue)
+                    throw new InvalidDataException("The SST contains invalid version-prefix filter metadata.");
+                var bytes = new byte[(int)((ulong)trailerOffset - offset)];
+                stream.Seek((long)offset, SeekOrigin.Begin);
+                await stream.ReadExactlyAsync(bytes, cancellationToken);
+                if (VersionPrefixBloom.Checksum(bytes, footerBuffer.AsSpan(0, 16)) != checksum)
+                    throw new InvalidDataException("The SST version-prefix filter checksum does not match.");
+                try
+                {
+                    prefixBloom = bloomFilterFactory.CreateBloomFilterFromOwnedBytes(bytes, (int)hashes, (int)algorithm);
+                }
+                catch (ArgumentException exception)
+                {
+                    throw new InvalidDataException("The SST contains invalid version-prefix filter data.", exception);
+                }
+                contentLength = (long)offset;
             }
 
             if (contentLength < BloomFilterPersistence.LegacyFooterLength)
@@ -467,6 +503,7 @@ internal sealed class SsTable : IDisposable
             {
                 ValidateBlockMetadata(blockMetadata, metaBlockOffset, formatVersion);
                 var table = new SsTable(id ?? IdGenerator.GetNextId(), stream, filename, blockMetadata, metaBlockOffset, blockBuilder, bloomFilter);
+                table.VersionPrefixBloomFilter = prefixBloom;
                 success = true;
                 return table;
             }

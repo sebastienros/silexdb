@@ -49,6 +49,9 @@ internal sealed class BufferedSsTableBuilder : ISsTableBuilder
     [OwnedResource]
     private OwnedByteSlice? _lastKey = default;
     private readonly IBloomFilter _bloomFilter;
+    private readonly IBloomFilterFactory _bloomFilterFactory;
+    private readonly int _entryEstimate;
+    private IBloomFilter? _versionPrefixBloom;
     private readonly BlockBuilder _blockBuilder;
     private readonly BlockCompressor _blockCompressor;
     private readonly int _formatVersion;
@@ -80,6 +83,8 @@ internal sealed class BufferedSsTableBuilder : ISsTableBuilder
         _tempFilename = filename + ".tmp";
         _tableEncoder = tableEncoder;
         _bloomFilter = bloomFilterFactory.CreateBloomFilter(count, 0.01);
+        _bloomFilterFactory = bloomFilterFactory;
+        _entryEstimate = count;
         _blockBuilder = new BlockBuilder(blockEncoder);
         _blockCompressor = new BlockCompressor(compression, compressionLevel, minimumCompressionSavingsPercent);
         if (formatVersion is < SsTableFormat.LegacyVersion or > SsTableFormat.CurrentVersion
@@ -115,7 +120,7 @@ internal sealed class BufferedSsTableBuilder : ISsTableBuilder
         if (_blockBuilder.Add(key, value))
         {
             // The key was encoded once by the block builder; reuse those exact bytes for the bloom filter.
-            _bloomFilter.Add(_blockBuilder.LastEncodedKey);
+            AddBloomKeys();
             ReplaceLastKey(key);
             return;
         }
@@ -130,13 +135,24 @@ internal sealed class BufferedSsTableBuilder : ISsTableBuilder
             throw new InvalidOperationException("The data was not successfully added to a block.");
         }
 
-        _bloomFilter.Add(_blockBuilder.LastEncodedKey);
+        AddBloomKeys();
 
         _firstKey = OwnedByteSlice.CopyFrom(key.Span);
         ReplaceLastKey(key);
     }
 
     public long EstimatedSize => _offset;
+
+    private void AddBloomKeys()
+    {
+        var key = _blockBuilder.LastEncodedKey;
+        _bloomFilter.Add(key);
+        if (_formatVersion >= 2 && VersionPrefixBloom.IsVersionKey(key))
+        {
+            _versionPrefixBloom ??= _bloomFilterFactory.CreateBloomFilter(_entryEstimate, 0.01);
+            _versionPrefixBloom.Add(key[..^sizeof(long)]);
+        }
+    }
 
     private async Task FinishBlockAsync(CancellationToken cancellationToken)
     {
@@ -221,9 +237,20 @@ internal sealed class BufferedSsTableBuilder : ISsTableBuilder
         var bloomFilterOffset = _offset + binaryWriter.BytesWritten;
 
         WriteBloomFilter(ref binaryWriter, bloomFilterOffset);
+        if (_versionPrefixBloom is not null)
+        {
+            var prefixOffset = _offset + binaryWriter.BytesWritten;
+            var bytes = _versionPrefixBloom.GetBytes();
+            Span<byte> descriptor = stackalloc byte[16];
+            VersionPrefixBloom.WriteDescriptor(descriptor, _versionPrefixBloom.K, _versionPrefixBloom.AlgorithmVersion, prefixOffset);
+            binaryWriter.WriteRaw(bytes);
+            binaryWriter.WriteRaw(descriptor);
+            binaryWriter.WriteUInt32(VersionPrefixBloom.Checksum(bytes, descriptor));
+            binaryWriter.WriteUInt32(VersionPrefixBloom.Magic);
+        }
         if (_formatVersion >= 1)
         {
-            SsTableFormat.WriteFooter(ref binaryWriter);
+            SsTableFormat.WriteFooter(ref binaryWriter, _versionPrefixBloom is null ? 1 : _formatVersion);
         }
 
         binaryWriter.Flush();
@@ -242,6 +269,7 @@ internal sealed class BufferedSsTableBuilder : ISsTableBuilder
         try
         {
             table = new SsTable(IdGenerator.GetNextId(), readStream, _filename, flattenedMetadata, metadataOffset, _blockBuilder, _bloomFilter);
+            table.VersionPrefixBloomFilter = _versionPrefixBloom;
         }
         catch
         {

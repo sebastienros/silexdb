@@ -14,21 +14,27 @@ public class BloomFilterBenchmarks
     [Params(10_000, 1_000_000)]
     public int Count { get; set; }
 
+    [Params(BloomFilter.CacheLocalAlgorithmVersion, BloomFilter.CurrentAlgorithmVersion)]
+    public int Algorithm { get; set; }
+
+    [Params(4, 16)]
+    public int KeyLength { get; set; }
+
     [GlobalSetup]
     public void Setup()
     {
-        _filter = new BloomFilter(Count, P);
+        _filter = new BloomFilter(Count, P, Algorithm);
 
-        _members = new byte[Count * sizeof(int)];
-        _misses = new byte[Count * sizeof(int)];
+        _members = new byte[Count * KeyLength];
+        _misses = new byte[Count * KeyLength];
 
         for (var i = 0; i < Count; i++)
         {
-            var member = _members.AsSpan(i * sizeof(int), sizeof(int));
+            var member = _members.AsSpan(i * KeyLength, KeyLength);
             BinaryPrimitives.WriteInt32LittleEndian(member, i);
             _filter.Add(member);
 
-            var miss = _misses.AsSpan(i * sizeof(int), sizeof(int));
+            var miss = _misses.AsSpan(i * KeyLength, KeyLength);
             BinaryPrimitives.WriteInt32LittleEndian(miss, Count + 1 + i);
         }
     }
@@ -36,10 +42,10 @@ public class BloomFilterBenchmarks
     [Benchmark]
     public void Add()
     {
-        var filter = new BloomFilter(Count, P);
+        var filter = new BloomFilter(Count, P, Algorithm);
         for (var i = 0; i < Count; i++)
         {
-            filter.Add(_members.AsSpan(i * sizeof(int), sizeof(int)));
+            filter.Add(_members.AsSpan(i * KeyLength, KeyLength));
         }
     }
 
@@ -49,7 +55,7 @@ public class BloomFilterBenchmarks
         var count = 0;
         for (var i = 0; i < Count; i++)
         {
-            if (_filter.Probe(_members.AsSpan(i * sizeof(int), sizeof(int))))
+            if (_filter.Probe(_members.AsSpan(i * KeyLength, KeyLength)))
             {
                 count++;
             }
@@ -64,7 +70,7 @@ public class BloomFilterBenchmarks
         var count = 0;
         for (var i = 0; i < Count; i++)
         {
-            if (_filter.Probe(_misses.AsSpan(i * sizeof(int), sizeof(int))))
+            if (_filter.Probe(_misses.AsSpan(i * KeyLength, KeyLength)))
             {
                 count++;
             }

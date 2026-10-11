@@ -6,16 +6,16 @@ namespace Silex.Tables;
 internal static class SsTableFormat
 {
     public const int LegacyVersion = 0;
-    public const int CurrentVersion = 1;
+    public const int CurrentVersion = 2;
     public const int FooterLength = sizeof(ulong) + sizeof(uint);
     public const int MaxCompressedBlockUncompressedLength = 64 * 1024 * 1024;
 
     private const ulong Magic = 0x54535358454C4953;
 
-    public static void WriteFooter(ref EncoderBinaryWriter writer)
+    public static void WriteFooter(ref EncoderBinaryWriter writer, int version = CurrentVersion)
     {
         writer.WriteUInt64(Magic);
-        writer.WriteUInt32(CurrentVersion);
+        writer.WriteUInt32((uint)version);
     }
 
     public static int TryReadVersion(ReadOnlySpan<byte> footer)

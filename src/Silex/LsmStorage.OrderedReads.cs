@@ -2,6 +2,15 @@ namespace Silex;
 
 public sealed partial class LsmStorage
 {
+    internal ValueTask<TSink> ReadFirstRawAsync<TSink>(
+        ReadOnlyMemory<byte> from, ReadOnlyMemory<byte> prefix, TSink sink,
+        CancellationToken cancellationToken, int valuePrefixLength = int.MaxValue)
+        where TSink : struct, IRawEntrySink
+    {
+        CheckDisposed();
+        return _inner.ReadFirstRawAsync(from, prefix, sink, cancellationToken, valuePrefixLength);
+    }
+
     /// <summary>Creates a live, bounded cursor; no historical snapshot is implied.</summary>
     public OrderedReadCursor CreateOrderedReadCursor(OrderedReadRange? range = null,
         OrderedReadDirection direction = OrderedReadDirection.Forward)

@@ -8,13 +8,13 @@ namespace Silex.MemTables;
 
 /// <summary>
 /// Stores keys and values in arena slabs and keeps compact record descriptors in contiguous arrays.
-/// Point lookups use open addressing; sorted iteration uses a lazily rebuilt index of record positions.
+/// Point lookups use open addressing; ordered reads use a lazily built, pooled paged index of record positions.
 /// </summary>
 /// <remarks>
 /// Writes are synchronized by <see cref="LsmStorageInner"/>. Frozen tables support concurrent readers.
 /// A MemTable only owns writes and tombstones; it is not a read cache.
 /// </remarks>
-internal sealed class MemTable : IMemTable, IRawBytesMemTable
+internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
 {
     private const int InitialRecordCapacity = 16;
     private const int InitialBucketCapacity = 32;
@@ -27,7 +27,7 @@ internal sealed class MemTable : IMemTable, IRawBytesMemTable
     private MemTableRecord[] _records;
     private int[] _buckets;
     private int _bucketCapacity;
-    private int[]? _sortedIndices;
+    private OrderedIndex? _orderedIndex;
     private int _count;
     private long _size;
     private volatile bool _sortDirty;
@@ -191,9 +191,9 @@ internal sealed class MemTable : IMemTable, IRawBytesMemTable
             };
             _buckets[bucket] = newIndex + 1;
 
-            if (_sortedIndices is not null && !_sortDirty)
+            if (_orderedIndex is not null && !_sortDirty)
             {
-                InsertSortedRecord(newIndex);
+                _orderedIndex.Insert(newIndex);
             }
             else
             {
@@ -213,10 +213,10 @@ internal sealed class MemTable : IMemTable, IRawBytesMemTable
         cancellationToken.ThrowIfCancellationRequested();
         EnsureSortedIndex();
 
-        for (var i = 0; i < _count; i++)
+        for (var cursor = _orderedIndex!.Begin(false); cursor.IsValid; cursor.Move(false))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var record = _records[_sortedIndices![i]];
+            var record = _records[cursor.Record];
             var key = _arena.GetByteSlice(record.Key);
             var value = record.IsTombstone ? ByteSlice.Tombstone : _arena.GetByteSlice(record.Value);
             await builder.AddAsync(key, value, cancellationToken).ConfigureAwait(false);
@@ -311,133 +311,54 @@ internal sealed class MemTable : IMemTable, IRawBytesMemTable
     private void EnsureSortedIndex()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        if (!_sortDirty && _sortedIndices is not null)
+        if (!_sortDirty && _orderedIndex is not null)
         {
             return;
         }
 
         lock (_recordComparer)
         {
-            if (!_sortDirty && _sortedIndices is not null)
+            if (!_sortDirty && _orderedIndex is not null)
             {
                 return;
             }
 
-            EnsureSortedCapacity(_count);
-
-            for (var i = 0; i < _count; i++)
+            var sorted = ArrayPool<int>.Shared.Rent(Math.Max(1, _count));
+            try
             {
-                _sortedIndices[i] = i;
+                for (var i = 0; i < _count; i++) sorted[i] = i;
+                Array.Sort(sorted, 0, _count, _recordComparer);
+                _orderedIndex = new OrderedIndex(this, sorted.AsSpan(0, _count));
+                _sortDirty = false;
             }
-
-            Array.Sort(_sortedIndices, 0, _count, _recordComparer);
-            _sortDirty = false;
-        }
-    }
-
-    private void InsertSortedRecord(int recordIndex)
-    {
-        EnsureSortedCapacity(_count + 1);
-
-        var key = _arena.GetSpan(_records[recordIndex].Key);
-        var low = 0;
-        var high = _count;
-        while (low < high)
-        {
-            var middle = low + ((high - low) >> 1);
-            var middleKey = _arena.GetSpan(_records[_sortedIndices![middle]].Key);
-            if (middleKey.SequenceCompareTo(key) < 0)
+            finally
             {
-                low = middle + 1;
-            }
-            else
-            {
-                high = middle;
+                ArrayPool<int>.Shared.Return(sorted);
             }
         }
-
-        _sortedIndices!.AsSpan(low, _count - low).CopyTo(_sortedIndices.AsSpan(low + 1));
-        _sortedIndices[low] = recordIndex;
-    }
-
-    [MemberNotNull(nameof(_sortedIndices))]
-    private void EnsureSortedCapacity(int required)
-    {
-        if (_sortedIndices is not null && _sortedIndices.Length >= required)
-        {
-            return;
-        }
-
-        var replacement = ArrayPool<int>.Shared.Rent(Math.Max(1, required));
-        if (_sortedIndices is not null)
-        {
-            _sortedIndices.AsSpan(0, Math.Min(_count, required)).CopyTo(replacement);
-            ArrayPool<int>.Shared.Return(_sortedIndices);
-        }
-
-        _sortedIndices = replacement;
-    }
-
-    private int FindFirstAtOrAfter(ReadOnlySpan<byte> key)
-    {
-        var low = 0;
-        var high = _count;
-
-        while (low < high)
-        {
-            var middle = low + ((high - low) >> 1);
-            var record = _records[_sortedIndices![middle]];
-            if (_arena.GetSpan(record.Key).SequenceCompareTo(key) < 0)
-            {
-                low = middle + 1;
-            }
-            else
-            {
-                high = middle;
-            }
-        }
-
-        return low;
     }
 
     internal bool TryGetNextRaw(ReadOnlySpan<byte> from, bool hasFrom, bool inclusive, bool backwards,
         out ReadOnlySpan<byte> key, out ReadOnlySpan<byte> value, out bool tombstone)
     {
         EnsureSortedIndex();
-        var index = backwards ? _count - 1 : 0;
-        if (hasFrom)
-        {
-            index = FindFirstAtOrAfter(from);
-            var equal = index < _count &&
-                _arena.GetSpan(_records[_sortedIndices![index]].Key).SequenceEqual(from);
-            if (backwards)
-            {
-                if (!equal || !inclusive)
-                {
-                    index--;
-                }
-            }
-            else if (equal && !inclusive)
-            {
-                index++;
-            }
-        }
-        if ((uint)index >= (uint)_count)
+        var cursor = hasFrom ? _orderedIndex!.Seek(from, inclusive, backwards) : _orderedIndex!.Begin(backwards);
+        if (!cursor.IsValid)
         {
             key = value = default;
             tombstone = false;
             return false;
         }
-        var record = _records[_sortedIndices![index]];
+        var record = _records[cursor.Record];
         key = _arena.GetSpan(record.Key);
         tombstone = record.IsTombstone;
         value = tombstone ? default : _arena.GetSpan(record.Value);
         return true;
     }
 
-    private KeyValuePair<ByteSlice, ByteSlice> Materialize(int sortedIndex)
+    private KeyValuePair<ByteSlice, ByteSlice> Materialize(int recordIndex)
     {
-        var record = _records[_sortedIndices![sortedIndex]];
+        var record = _records[recordIndex];
         return new KeyValuePair<ByteSlice, ByteSlice>(
             _arena.GetByteSlice(record.Key),
             record.IsTombstone ? ByteSlice.Tombstone : _arena.GetByteSlice(record.Value));
@@ -461,11 +382,8 @@ internal sealed class MemTable : IMemTable, IRawBytesMemTable
             ArrayPool<int>.Shared.Return(buckets);
         }
 
-        if (_sortedIndices is not null)
-        {
-            ArrayPool<int>.Shared.Return(_sortedIndices);
-            _sortedIndices = null;
-        }
+        _orderedIndex?.Dispose();
+        _orderedIndex = null;
     }
 
     private static uint Hash(ReadOnlySpan<byte> key)
@@ -510,10 +428,10 @@ internal sealed class MemTable : IMemTable, IRawBytesMemTable
             [EnumeratorCancellation] CancellationToken cancellationToken = default)
         {
             table.EnsureSortedIndex();
-            for (var i = 0; i < table._count; i++)
+            for (var cursor = table._orderedIndex!.Begin(false); cursor.IsValid; cursor.Move(false))
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                yield return table.Materialize(i);
+                yield return table.Materialize(cursor.Record);
             }
         }
 
@@ -522,11 +440,10 @@ internal sealed class MemTable : IMemTable, IRawBytesMemTable
             [EnumeratorCancellation] CancellationToken cancellationToken = default)
         {
             table.EnsureSortedIndex();
-            var start = table.FindFirstAtOrAfter(from.Span);
-            for (var i = start; i < table._count; i++)
+            for (var cursor = table._orderedIndex!.Seek(from.Span, true, false); cursor.IsValid; cursor.Move(false))
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                yield return table.Materialize(i);
+                yield return table.Materialize(cursor.Record);
             }
         }
 
@@ -534,10 +451,10 @@ internal sealed class MemTable : IMemTable, IRawBytesMemTable
             [EnumeratorCancellation] CancellationToken cancellationToken = default)
         {
             table.EnsureSortedIndex();
-            for (var i = table._count - 1; i >= 0; i--)
+            for (var cursor = table._orderedIndex!.Begin(true); cursor.IsValid; cursor.Move(true))
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                yield return table.Materialize(i);
+                yield return table.Materialize(cursor.Record);
             }
         }
 
@@ -546,17 +463,10 @@ internal sealed class MemTable : IMemTable, IRawBytesMemTable
             [EnumeratorCancellation] CancellationToken cancellationToken = default)
         {
             table.EnsureSortedIndex();
-            var start = table.FindFirstAtOrAfter(from.Span);
-            if (start == table._count ||
-                !table._arena.GetSpan(table._records[table._sortedIndices![start]].Key).SequenceEqual(from.Span))
-            {
-                start--;
-            }
-
-            for (var i = start; i >= 0; i--)
+            for (var cursor = table._orderedIndex!.Seek(from.Span, true, true); cursor.IsValid; cursor.Move(true))
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                yield return table.Materialize(i);
+                yield return table.Materialize(cursor.Record);
             }
         }
 #pragma warning restore CS1998
