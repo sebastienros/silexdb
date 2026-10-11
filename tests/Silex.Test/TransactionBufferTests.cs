@@ -19,9 +19,9 @@ public class TransactionBufferTests
     [Test]
     public async Task AccountingDescriptorSizesMatchTheirRepresentations()
     {
-        await Assert.That(Unsafe.SizeOf<MvccMutation>()).IsEqualTo(20);
+        await Assert.That(Unsafe.SizeOf<MvccMutation>()).IsEqualTo(28);
         await Assert.That(Unsafe.SizeOf<MvccKey>()).IsEqualTo(8);
-        await Assert.That(Unsafe.SizeOf<MvccUndo>()).IsEqualTo(24);
+        await Assert.That(Unsafe.SizeOf<MvccUndo>()).IsEqualTo(32);
         await Assert.That(Unsafe.SizeOf<MvccCheckpoint>()).IsEqualTo(24);
     }
 
@@ -73,7 +73,7 @@ public class TransactionBufferTests
     {
         using var folder = TempFolder.Create();
         var options = Options(group);
-        options.MvccTransactionMaxBytes = 72;
+        options.MvccTransactionMaxBytes = 88;
         options.MvccTransactionMaxMutations = 1;
         options.MvccTransactionMaxTrackedReads = 1;
         options.MvccTransactionMaxSavepoints = 1;
@@ -81,15 +81,15 @@ public class TransactionBufferTests
         options.MvccTransactionMaxMutations = 0; // Store-open policy is captured, not a mutable reference.
         using var tx = db.BeginTransaction();
         tx.Put([1], [1, 2, 3]);
-        await Assert.That(tx.BufferedBytes).IsEqualTo(24L);
+        await Assert.That(tx.BufferedBytes).IsEqualTo(32L);
         await Assert.That(() => tx.Put([2], [2])).Throws<TransactionLimitException>();
         await Assert.That(() => tx.Delete([2])).Throws<TransactionLimitException>();
         var marker = tx.CreateSavepoint();
-        await Assert.That(tx.BufferedBytes).IsEqualTo(48L);
+        await Assert.That(tx.BufferedBytes).IsEqualTo(56L);
         await Assert.That(() => tx.CreateSavepoint()).Throws<TransactionLimitException>();
-        await Assert.That(() => tx.Put([1], [9])).Throws<TransactionLimitException>(); // 73 bytes.
+        await Assert.That(() => tx.Put([1], [9])).Throws<TransactionLimitException>(); // 89 bytes.
         await Assert.That(() => tx.Put([1], new byte[1000])).Throws<TransactionLimitException>();
-        await Assert.That(tx.BufferedBytes).IsEqualTo(48L);
+        await Assert.That(tx.BufferedBytes).IsEqualTo(56L);
         var destination = new byte[3];
         await Assert.That(await tx.GetRawAsync([1], destination)).IsEqualTo(3);
         await Assert.That(destination).IsEquivalentTo(new byte[] { 1, 2, 3 }, CollectionOrdering.Matching);
@@ -97,20 +97,20 @@ public class TransactionBufferTests
         await Assert.That(tx.TrackedReadCount).IsEqualTo(0);
         await tx.GetForUpdateRawAsync([3], destination);
         await tx.GetForUpdateRawAsync([3], destination);
-        await Assert.That(tx.BufferedBytes).IsEqualTo(57L);
+        await Assert.That(tx.BufferedBytes).IsEqualTo(65L);
         await Assert.That(async () => await tx.GetForUpdateRawAsync([4], destination))
             .Throws<TransactionLimitException>();
         await Assert.That(tx.TrackedReadCount).IsEqualTo(1);
         tx.RollbackToSavepoint(marker);
         await Assert.That(tx.TrackedReadCount).IsEqualTo(0);
-        await Assert.That(tx.BufferedBytes).IsEqualTo(48L);
-        tx.Delete([1]); // Undo-only change fits exactly at 72 bytes.
-        await Assert.That(tx.BufferedBytes).IsEqualTo(72L);
+        await Assert.That(tx.BufferedBytes).IsEqualTo(56L);
+        tx.Delete([1]); // Undo-only change fits exactly at 88 bytes.
+        await Assert.That(tx.BufferedBytes).IsEqualTo(88L);
         tx.RollbackToSavepoint(marker);
         tx.ReleaseSavepoint(marker);
         tx.Put([1], [8]);
         await Assert.That(tx.MutationCount).IsEqualTo(1);
-        await Assert.That(tx.BufferedBytes).IsEqualTo(24L); // Retained arena, not only live value bytes.
+        await Assert.That(tx.BufferedBytes).IsEqualTo(32L); // Retained arena, not only live value bytes.
         await tx.CommitAsync();
         await Assert.That(db.Health).IsEqualTo(StorageHealth.Healthy);
         db.Put([2], [7]);
@@ -122,22 +122,22 @@ public class TransactionBufferTests
     [Test]
     public async Task ByteBudgetIncludesObsoleteBytesUndoAndCheckpointDescriptors()
     {
-        using var buffer = new MvccWriteBuffer(limits: new TransactionLimits(90, 10, 10, 10));
+        using var buffer = new MvccWriteBuffer(limits: new TransactionLimits(106, 10, 10, 10));
         buffer.AddMutation([1], new byte[10], false);
         buffer.AddMutation([2], [], true);
-        await Assert.That(buffer.BufferedBytes).IsEqualTo(52L);
+        await Assert.That(buffer.BufferedBytes).IsEqualTo(68L);
         buffer.SetValue(0, new byte[11], false); // Non-tail growth retains the original value.
-        await Assert.That(buffer.BufferedBytes).IsEqualTo(63L);
+        await Assert.That(buffer.BufferedBytes).IsEqualTo(79L);
         var marker = buffer.CreateSavepoint();
-        await Assert.That(buffer.BufferedBytes).IsEqualTo(87L);
+        await Assert.That(buffer.BufferedBytes).IsEqualTo(103L);
         await Assert.That(() => buffer.TrackRead([])).Throws<TransactionLimitException>();
         await Assert.That(() => buffer.SetValue(0, [], true)).Throws<TransactionLimitException>();
         buffer.RollbackToSavepoint(marker);
         buffer.ReleaseSavepoint(marker);
-        await Assert.That(buffer.BufferedBytes).IsEqualTo(63L);
+        await Assert.That(buffer.BufferedBytes).IsEqualTo(79L);
         buffer.SetValue(0, [], true);
         buffer.SetValue(0, new byte[11], false); // Capacity reuse after deletion.
-        await Assert.That(buffer.BufferedBytes).IsEqualTo(63L);
+        await Assert.That(buffer.BufferedBytes).IsEqualTo(79L);
     }
 
     [Test]
@@ -187,7 +187,7 @@ public class TransactionBufferTests
         var bytes = buffer.BufferedBytes;
         buffer.TrackRead(Key(64));
         buffer.SetValue(buffer.FindMutation(Key(64)), [], true);
-        await Assert.That(buffer.BufferedBytes).IsEqualTo(bytes + 24);
+        await Assert.That(buffer.BufferedBytes).IsEqualTo(bytes + 32);
         buffer.RollbackToSavepoint(root);
         await Assert.That(buffer.BufferedBytes).IsEqualTo(24L);
         await Assert.That(buffer.MutationCount).IsEqualTo(0);

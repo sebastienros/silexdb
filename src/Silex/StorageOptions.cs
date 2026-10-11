@@ -228,7 +228,7 @@ public class StorageOptions
     /// <summary>Maximum accounted bytes per MVCC transaction; defaults to no configured limit.</summary>
     /// <remarks>
     /// Counts retained key/value arena bytes, including obsolete and savepoint-protected values, plus
-    /// active mutation (20), tracked-read (8), read-range (32), undo (24), and savepoint (24) descriptors.
+    /// active mutation (28), tracked-read (8), read-range (32), undo (32), and savepoint (24) descriptors.
     /// Pool rounding, spare capacity, lookup/sort indexes, commit batches and independent cursor copies
     /// are excluded. Captured at store open; zero is permitted. No disk spilling is performed.
     /// </remarks>
