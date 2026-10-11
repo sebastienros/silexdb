@@ -590,6 +590,98 @@ versions, transaction buffers, and sequence metadata writes. Dispose snapshots a
 call `CollectGarbageAsync` periodically to remove versions that no active view can observe. Pass
 `compact: true` when the call should also flush and compact the resulting physical tombstones.
 
+### Conditional insert and compare-and-set
+
+Use the existing transaction read/write/commit primitives for conditional mutations. The condition is
+checked against the starting snapshot **and current pending writes**; staging a mutation is not success
+until commit validation and the requested durability boundary complete.
+
+For an insert only when the key is absent, a zero-length destination is sufficient to test existence:
+
+```csharp
+using var tx = db.BeginTransaction();
+if (await tx.GetForUpdateRawAsync("user:1"u8, Memory<byte>.Empty) == -1)
+{
+    tx.Put("user:1"u8, "active"u8);
+    tx.Put("index:active:1"u8, []);
+    bool committed = await tx.TryCommitAsync(); // false if a dependency changed since tx.Sequence
+}
+// A false condition stages nothing here; dispose rather than commit unrelated work by accident.
+```
+
+For byte-exact compare-and-set, supply caller-owned scratch memory at least as large as the expected value:
+
+```csharp
+ReadOnlyMemory<byte> expected = "active"u8.ToArray();
+var scratch = new byte[expected.Length]; // may be reused across non-overlapping operations
+using var tx = db.BeginTransaction();
+int length = await tx.GetForUpdateRawAsync("user:1"u8, scratch);
+if (length == expected.Length && scratch.AsSpan(0, length).SequenceEqual(expected.Span))
+{
+    tx.Put("user:1"u8, "inactive"u8);
+    tx.Delete("index:active:1"u8);
+    bool committed = await tx.TryCommitAsync();
+}
+```
+
+Always compare the returned **length before bytes**: `-1` is absence, `0` is a present empty value, and a
+larger value returns its required length without copying into an undersized destination. Stale scratch
+bytes must never be treated as a match. These examples compare against a present value; use the absence
+recipe separately. Scratch and expected bytes must not change during the read/comparison.
+
+For a guard key that is not itself changed, use `GetForUpdateRawAsync` and stage any dependent `Put`/`Delete`
+operations in the same transaction. A plain `GetRawAsync` does not protect that guard. Written keys already
+validate automatically, but explicitly tracking the condition keeps this recipe safe if the dependent
+batch later stops writing the guard. Commit rejects **any intervening write**, including deletion,
+same-value replacement or an A -> B -> A change, rather than simply rechecking the latest value. Two
+transactions that both observe absence cannot both insert successfully.
+
+These recipes retain ordinary conflict diagnostics, transaction limits, savepoints, group commit and
+failure/durability semantics. A false condition leaves a tracked read (unless the key already has a pending
+mutation); rollback to a prior savepoint removes it if the caller continues other work. A commit attempt
+consumes the transaction on every outcome. A conflict needs a new transaction and a caller decision about
+replay safety; a storage exception is not a false condition or a conflict.
+
+**Scope decision (catalog item 14):** defer public convenience APIs; neither pattern needs a new primitive,
+and no demonstrated caller requirement justifies a wrapper over these composable operations.
+The recipes allow caller-owned scratch memory, compose with multi-key work and avoid a second transaction
+implementation. The catalog supplies no concrete plain-LSM-only consumer or latency target. Plain
+`LsmStorage.GetRawAsync` followed by `Write(LsmWriteBatch)` is **not** atomic conditional mutation, and a
+plain batch supplies neither a snapshot nor a validated read dependency. Do not use that sequence under
+concurrent writers, or open an MVCC path through the plain facade.
+
+`ConditionalMutationBenchmarks` compares the existing validated MVCC recipe, an unconditional MVCC
+transaction, and an **unchecked** plain read/batch cost baseline. Each iteration starts from 8,192 SST-resident
+100-byte values and measures 1,024 uncontended two-key replacements, with WAL enabled both with and without
+file synchronization; setup, flush and cleanup are excluded. This bounds version growth and keeps samples
+comparable, but is not a sustained compaction, contention, group-commit or power-loss experiment. A faster
+unchecked baseline alone would not justify weakening coordination or adding a new plain-LSM conditional
+batch API: that requires a demonstrated consumer without snapshots and representative sustained measurements.
+
+Measured on Apple M4 Pro, .NET 8.0.30, BenchmarkDotNet ShortRun (three measured iterations); means and
+managed allocations are **per two-key operation**, not per iteration:
+
+| Operation | WAL, no file sync | WAL + file sync | Allocated, no file sync |
+|---|---:|---:|---:|
+| Unchecked plain read/batch | 3.78 us | 4.28 ms | 404 B |
+| Unconditional MVCC transaction | 12.44 us | 4.29 ms | 36,446 B |
+| Conditional MVCC transaction | 19.10 us | 4.32 ms | 53,783 B |
+
+MVCC overhead is material in this unsynchronized workload (about 5x time and 133x allocation versus the
+unchecked baseline); it is not hidden by calling the same operations through a convenience helper. With
+file synchronization, these means are within about 1%, and do not establish an ordering. The growing active
+memtable's per-seek setup contributes to MVCC allocation; these numbers are not constant per-transaction
+buffer costs. Unsynchronized iterations remain below BenchmarkDotNet's recommended 100 ms, and ShortRun
+confidence intervals are wide: treat timings as exploratory, not a performance guarantee. This is evidence
+to investigate for a concrete plain-only workload, **not** evidence of that workload's demand or of a safe,
+faster conditional implementation. No production hot path or persistent format changes here.
+
+Reproduce with:
+
+```bash
+dotnet run --project tests/Silex.Benchmarks -c Release -- --filter '*ConditionalMutationBenchmarks*'
+```
+
 ### Conflict diagnostics
 
 `TryCommitAsync` still returns `false` on conflict; inspect `transaction.Conflict` after the awaited
