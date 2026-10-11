@@ -101,6 +101,10 @@ public sealed class MvccTransaction : IDisposable
     /// </remarks>
     public OrderedReadCursor CreateOrderedReadCursor(OrderedReadRange? range = null,
         OrderedReadDirection direction = OrderedReadDirection.Forward)
+        => CreateOrderedReadCursorCore(range, direction, false);
+
+    private OrderedReadCursor CreateOrderedReadCursorCore(OrderedReadRange? range,
+        OrderedReadDirection direction, bool keysOnly)
     {
         var storage = GetStorage();
         if (direction is not (OrderedReadDirection.Forward or OrderedReadDirection.Reverse))
@@ -108,7 +112,7 @@ public sealed class MvccTransaction : IDisposable
             throw new ArgumentOutOfRangeException(nameof(direction));
         }
         range ??= new OrderedReadRange();
-        var writes = OrderedWriteSnapshot.Create(_writes, range);
+        var writes = OrderedWriteSnapshot.Create(_writes, range, keysOnly);
         try
         {
             return storage.CreateOrderedReadCursorAt(Sequence, range, direction, writes);
@@ -118,6 +122,98 @@ public sealed class MvccTransaction : IDisposable
             writes?.Dispose();
             throw;
         }
+    }
+
+    /// <summary>Stages point deletions for up to maxEntries keys visible in an encoded range, in ascending order.</summary>
+    /// <remarks>
+    /// This is logical deletion only: it adds ordinary MVCC tombstones to this transaction, and nothing becomes
+    /// visible or durable until commit. Physical data stays readable by older snapshots and is reclaimed only by
+    /// MVCC garbage collection and compaction after retention allows it; no files are deleted here. Keys are
+    /// those visible at <see cref="Sequence"/> plus this transaction's own pending writes (pending puts are deleted,
+    /// already-deleted keys are skipped). The scanned span (the range's lower bound through the last processed key,
+    /// or the whole range when complete) is registered as a read dependency, so commit conflicts with any later
+    /// commit that wrote, inserted into, or deleted from it, including gaps. Keys in the unprocessed
+    /// <see cref="RangeDeleteResult.Remaining"/> suffix are not tracked. Call repeatedly, each time in a new bounded
+    /// transaction, with Remaining until complete; a retry after conflict simply resumes from the same range.
+    /// The call is all-or-nothing: on cancellation, a <see cref="TransactionLimitException"/> or any other failure, staged
+    /// writes and dependencies are restored. It temporarily uses one savepoint slot and cannot be combined with
+    /// overlapping transaction operations. Traversal batches copy only keys (at most 256 keys and 64 KiB of key
+    /// payload, or one larger key alone); pending overlays copy keys and markers, not values. Ordinary SST block
+    /// loading, overlay keys, bounds and staged writes/undo are additional to the batch working set.
+    /// </remarks>
+    /// <exception cref="TransactionLimitException">Staging the deletions or tracking the range would exceed a budget.</exception>
+    public async ValueTask<RangeDeleteResult> DeleteRangeAsync(OrderedReadRange range, int maxEntries,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(range);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxEntries);
+        GetStorage();
+        cancellationToken.ThrowIfCancellationRequested();
+        if (range.IsEmpty)
+        {
+            return new RangeDeleteResult(0, null);
+        }
+
+        var savepoint = _writes.CreateSavepoint();
+        try
+        {
+            var result = await DeleteRangeCoreAsync(range, maxEntries, cancellationToken).ConfigureAwait(false);
+            _writes.ReleaseSavepoint(savepoint);
+            return result;
+        }
+        catch
+        {
+            _writes.RollbackToSavepoint(savepoint);
+            _writes.ReleaseSavepoint(savepoint);
+            throw;
+        }
+    }
+
+    private async ValueTask<RangeDeleteResult> DeleteRangeCoreAsync(OrderedReadRange range, int maxEntries,
+        CancellationToken cancellationToken)
+    {
+        const int ChunkEntries = 256;
+        const int ChunkKeyBytes = 64 * 1024;
+        using var cursor = CreateOrderedReadCursorCore(range, OrderedReadDirection.Forward, true);
+        byte[]? last = null;
+        var deleted = 0;
+        var complete = false;
+        while (true)
+        {
+            var remaining = maxEntries - deleted;
+            using var batch = await cursor.ReadKeyBatchAsync(remaining == 0 ? 1 : Math.Min(remaining, ChunkEntries),
+                ChunkKeyBytes, cancellationToken).ConfigureAwait(false);
+            if (remaining == 0)
+            {
+                complete = batch.Count == 0;
+                break;
+            }
+            for (var i = 0; i < batch.Count; i++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                Delete(batch[i].Key.Span);
+                deleted++;
+            }
+            if (batch.Count != 0)
+            {
+                last = batch[batch.Count - 1].Key.ToArray();
+            }
+            if (batch.IsExhausted)
+            {
+                complete = true;
+                break;
+            }
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        if (complete)
+        {
+            TrackReadRange(range);
+            return new RangeDeleteResult(deleted, null);
+        }
+        TrackReadRange(new OrderedReadRange(range.Lower, range.LowerInclusive, last, upperInclusive: true));
+        return new RangeDeleteResult(deleted,
+            new OrderedReadRange(last, lowerInclusive: false, range.Upper, range.UpperInclusive));
     }
 
     public void Put(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)

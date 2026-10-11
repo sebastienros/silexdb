@@ -73,7 +73,8 @@ public sealed partial class MvccStorage
         using var state = new OrderedScanState(sequence, backwards, batch, exhausted ? null : writes,
             resume, cancellationToken);
         await _storage.ScanOrderedAsync(physical, direction, state,
-            static (s, key, value) => s.Accept(key, value), cancellationToken).ConfigureAwait(false);
+            static (s, key, value) => s.Accept(key, value), cancellationToken,
+            batch.KeysOnly ? 1 : int.MaxValue).ConfigureAwait(false);
         if (backwards && !batch.Full)
         {
             state.Flush();
@@ -128,7 +129,7 @@ public sealed partial class MvccStorage
             }
             // Physical reverse order visits oldest versions first; retain the newest eligible candidate.
             _value.Reset();
-            if (_live)
+            if (_live && !batch.KeysOnly)
             {
                 value[1..].CopyTo(_value.GetSpan(value.Length - 1));
                 _value.Advance(value.Length - 1);

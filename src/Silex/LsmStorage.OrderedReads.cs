@@ -23,6 +23,6 @@ public sealed partial class LsmStorage
     }
 
     internal ValueTask<bool> ScanOrderedAsync<TArg>(OrderedReadRange range, OrderedReadDirection direction,
-        TArg arg, ReadRawEntryAction<TArg> reader, CancellationToken cancellationToken) =>
-        _inner.ReadOrderedAsync(range, direction, null, arg, reader, false, cancellationToken);
+        TArg arg, ReadRawEntryAction<TArg> reader, CancellationToken cancellationToken, int valuePrefixLength = int.MaxValue) =>
+        _inner.ReadOrderedAsync(range, direction, null, arg, reader, false, cancellationToken, valuePrefixLength);
 }

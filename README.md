@@ -809,6 +809,49 @@ Commit-time validation scans the physical versions inside each interval under th
 intervals on hot keyspaces are costly, and group-commit conflict checks between members are linear in
 accepted writes times registered intervals. Intervals are validated at commit only; they do not block writers.
 
+### Bounded logical range deletion
+
+```csharp
+var range = new OrderedReadRange(lower, true, upper, false);    // encoded binary bounds, as for cursors
+while (true)
+{
+    using var tx = db.BeginTransaction();
+    var result = await tx.DeleteRangeAsync(range, maxEntries: 1000);
+    await tx.CommitAsync();                                      // retry the same range after a conflict
+    if (result.IsComplete) break;
+    range = result.Remaining!;                                   // unprocessed suffix
+}
+```
+
+`DeleteRangeAsync` is *logical* deletion: it stages ordinary MVCC point tombstones for up to `maxEntries` keys
+visible to the transaction (its snapshot plus its own pending writes) in ascending order. Nothing is visible or
+durable before commit, existing snapshots and cursors keep seeing the old values, and no file is deleted;
+space is reclaimed later by MVCC garbage collection and compaction once no snapshot needs the versions. It is
+not physical file deletion (dropping stores/files is a separate operation) and not a catalog drop: higher layers
+should mark an object dropped, then delete its records in bounded batches like the loop above.
+
+Deletion uses an internal key-only projection of the shared MVCC ordered traversal, including its frozen
+pending-write overlay and tombstone/version resolution. It copies no user values, even for the exhaustion
+probe; memtable traversal retains only the MVCC kind byte. Temporary key batches contain at most 256 keys
+and 64 KiB of key payload, except that a single larger key is allowed alone. Pending-overlay key copies,
+resume bounds, staging/undo bytes and ordinary SST block loading/cache memory are additional to this
+batch bound; SST reads still load whole blocks. No public projection API or on-disk format is introduced.
+
+The scanned span (range lower bound through the last processed key, or the entire range when complete) is
+registered as a read dependency, so a concurrent commit that updates, deletes or inserts into it, including
+gaps, makes this commit conflict with normal diagnostics; keys in `Remaining` are not tracked. The call is
+all-or-nothing: cancellation, a `TransactionLimitException` (mutations, bytes, tracked ranges) or a failure
+restores staged writes and dependencies (it briefly uses one savepoint slot). Choose `maxEntries` so a batch
+fits the mutation/byte limits; commits use the normal path including group commit, WAL and failure/health
+semantics. Inserts after a batch commits are never deleted by later batches that have already passed that
+position, so completion means "all keys visible at each batch's snapshot", not an atomic whole-range delete.
+
+**Design choice: no range tombstones.** Versioned range tombstones would make point reads, cursors, compaction,
+GC, WAL/recovery, backup and conflict validation all consult an additional interval structure. Batched point
+tombstones reuse the existing, verified read/recovery/compaction/conflict paths, cost proportional to deleted
+keys (the same as the eventual physical reclamation), and bound transaction size. They can be revisited if
+measurements show batched deletion is inadequate (very large ranges where tombstone write volume dominates).
+
 ### Transaction savepoints
 
 ```csharp
