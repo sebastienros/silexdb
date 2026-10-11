@@ -16,6 +16,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Silex\Silex.csproj" />
+    <ProjectReference Include="..\..\src\Silex.Keys\Silex.Keys.csproj" />
   </ItemGroup>
 
 </Project>

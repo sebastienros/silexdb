@@ -37,6 +37,7 @@ jobs:
       - name: Build
         run: |
           dotnet build src/Silex/Silex.csproj --configuration Release
+          dotnet build src/Silex.Keys/Silex.Keys.csproj --configuration Release
           dotnet build tests/Silex.Test/Silex.Test.csproj --configuration Release
 
       - name: Test
