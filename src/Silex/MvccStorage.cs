@@ -1130,12 +1130,69 @@ internal sealed class MvccWriteBuffer : IDisposable
     private byte[] _bytes = [];
     private MvccMutation[] _mutations = [];
     private MvccKey[] _trackedReads = [];
+    private MvccCheckpoint[] _savepoints = [];
+    private MvccUndo[] _undo = [];
+    private int _savepointCount;
+    private int _undoCount;
+    private long _nextSavepointId;
     private int _byteCount;
     private bool _disposed;
 
     public int MutationCount { get; private set; }
 
     public int TrackedReadCount { get; private set; }
+
+    public MvccSavepoint CreateSavepoint()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        var id = checked(_nextSavepointId + 1);
+        if (_savepointCount == _savepoints.Length)
+        {
+            var replacement = ArrayPool<MvccCheckpoint>.Shared.Rent(
+                Math.Max(InitialDescriptorCapacity, checked(_savepoints.Length * 2)));
+            _savepoints.AsSpan(0, _savepointCount).CopyTo(replacement);
+            if (_savepoints.Length != 0) ArrayPool<MvccCheckpoint>.Shared.Return(_savepoints);
+            _savepoints = replacement;
+        }
+        _savepoints[_savepointCount++] = new MvccCheckpoint(
+            id, MutationCount, TrackedReadCount, _byteCount, _undoCount);
+        _nextSavepointId = id;
+        return new MvccSavepoint(this, id);
+    }
+
+    public void RollbackToSavepoint(MvccSavepoint savepoint)
+    {
+        var index = FindSavepoint(savepoint);
+        var checkpoint = _savepoints[index];
+        while (_undoCount > checkpoint.UndoCount)
+        {
+            var undo = _undo[--_undoCount];
+            _mutations[undo.Index] = undo.Mutation;
+        }
+        MutationCount = checkpoint.MutationCount;
+        TrackedReadCount = checkpoint.TrackedReadCount;
+        _byteCount = checkpoint.ByteCount;
+        _savepointCount = index + 1;
+    }
+
+    public void ReleaseSavepoint(MvccSavepoint savepoint)
+    {
+        _savepointCount = FindSavepoint(savepoint);
+        if (_savepointCount == 0) _undoCount = 0;
+    }
+
+    private int FindSavepoint(MvccSavepoint savepoint)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (ReferenceEquals(savepoint.Owner, this))
+        {
+            for (var i = _savepointCount - 1; i >= 0; i--)
+            {
+                if (_savepoints[i].Id == savepoint.Id) return i;
+            }
+        }
+        throw new ArgumentException("The savepoint is not active in this transaction.", nameof(savepoint));
+    }
 
     public int FindMutation(ReadOnlySpan<byte> key)
     {
@@ -1175,6 +1232,26 @@ internal sealed class MvccWriteBuffer : IDisposable
         }
 
         ref var mutation = ref _mutations[index];
+        if (_savepointCount != 0)
+        {
+            if (_undoCount == _undo.Length)
+            {
+                var replacement = ArrayPool<MvccUndo>.Shared.Rent(
+                    Math.Max(InitialDescriptorCapacity, checked(_undo.Length * 2)));
+                _undo.AsSpan(0, _undoCount).CopyTo(replacement);
+                if (_undo.Length != 0) ArrayPool<MvccUndo>.Shared.Return(_undo);
+                _undo = replacement;
+            }
+
+            // Preserve old bytes as well as the descriptor; rollback can then rewind without copying.
+            var offset = isTombstone ? 0 : Append(value);
+            _undo[_undoCount++] = new MvccUndo(index, mutation);
+            mutation.ValueOffset = offset;
+            mutation.ValueLength = isTombstone ? -1 : value.Length;
+            mutation.ValueCapacity = isTombstone ? 0 : value.Length;
+            return;
+        }
+
         if (isTombstone)
         {
             mutation.ValueLength = -1;
@@ -1244,6 +1321,16 @@ internal sealed class MvccWriteBuffer : IDisposable
         }
 
         _disposed = true;
+        if (_savepoints.Length != 0)
+        {
+            ArrayPool<MvccCheckpoint>.Shared.Return(_savepoints);
+            _savepoints = [];
+        }
+        if (_undo.Length != 0)
+        {
+            ArrayPool<MvccUndo>.Shared.Return(_undo);
+            _undo = [];
+        }
         if (_bytes.Length != 0)
         {
             ArrayPool<byte>.Shared.Return(_bytes);
@@ -1349,3 +1436,8 @@ internal struct MvccMutation(int keyOffset, int keyLength, int valueOffset, int 
 }
 
 internal readonly record struct MvccKey(int Offset, int Length);
+
+internal readonly record struct MvccCheckpoint(
+    long Id, int MutationCount, int TrackedReadCount, int ByteCount, int UndoCount);
+
+internal readonly record struct MvccUndo(int Index, MvccMutation Mutation);
