@@ -20,19 +20,28 @@ public enum MvccGarbageCollectionStopReason
 /// A cursor is only a scan hint. It carries no retention decision: every call recomputes which versions are
 /// required from the live snapshot registry, so a stale cursor (even from before a restart or from another
 /// process) can never cause a needed version to be deleted. Versions behind the cursor are simply not
-/// re-examined until a later call starts without one.
+/// re-examined until a later call starts without one. Cursors returned by this open instance retain verified
+/// scan history. Reconstructed or foreign cursors conservatively retain the remainder of their starting key
+/// group; start a later pass without a cursor to reclaim those versions.
 /// </remarks>
 public sealed class MvccGarbageCollectionCursor
 {
     private readonly byte[] _position;
+    internal object? Origin { get; }
+    internal bool PreserveGroup { get; }
 
     /// <summary>Restores a cursor previously obtained from <see cref="Position"/>.</summary>
     public MvccGarbageCollectionCursor(ReadOnlySpan<byte> position) => _position = position.ToArray();
 
-    internal MvccGarbageCollectionCursor(byte[] ownedPosition) => _position = ownedPosition;
+    internal MvccGarbageCollectionCursor(byte[] ownedPosition, object origin, bool preserveGroup)
+    {
+        _position = ownedPosition;
+        Origin = origin;
+        PreserveGroup = preserveGroup;
+    }
 
-    /// <summary>The persistable position bytes; validated when the cursor is used.</summary>
-    public ReadOnlyMemory<byte> Position => _position;
+    /// <summary>A copy of the persistable position bytes; validated when the cursor is used.</summary>
+    public ReadOnlyMemory<byte> Position => _position.ToArray();
 
     internal byte[] PositionArray => _position;
 }

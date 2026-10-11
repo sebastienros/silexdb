@@ -5,6 +5,8 @@ namespace Silex;
 
 public sealed partial class MvccStorage
 {
+    private readonly object _garbageCollectionCursorOrigin = new();
+
     // Test seams: invoked after a chunk's obsolete keys are chosen and before they are deleted, and after the delete.
     internal Func<int, CancellationToken, ValueTask>? GarbageCollectionBeforeApply;
     internal Func<int, CancellationToken, ValueTask>? GarbageCollectionAfterApply;
@@ -54,7 +56,8 @@ public sealed partial class MvccStorage
     /// at the next scan step or commit-gate wait; chunks already applied remain committed and valid, and the last
     /// chunk is either applied entirely or not at all. <see cref="MvccGarbageCollectionOptions.Progress"/> reports
     /// the resume cursor after each applied chunk, and a result's <c>Resume</c> continues where the call stopped.
-    /// Resuming mid-key is exact: the cursor's sequence determines which required sequences were already satisfied.
+    /// Resuming a cursor returned by this open instance uses verified scan history. Reconstructed or foreign
+    /// cursors retain the remainder of the starting key group rather than inferring history from position bytes.
     /// Concurrent calls are serialized. Disposal waits for the current chunk and the call then fails with
     /// <see cref="ObjectDisposedException"/>.
     /// </para>
@@ -110,7 +113,7 @@ public sealed partial class MvccStorage
             }
 
             RefreshRequiredSequences(state);
-            state.BeginChunk(cursor?.PositionArray, examined, deleted);
+            state.BeginChunk(cursor, _garbageCollectionCursorOrigin, examined, deleted);
 
             var lower = cursor is null ? new byte[] { DataPrefix } : cursor.PositionArray;
             var range = new OrderedReadRange(lower, cursor is null, new byte[] { DataPrefix + 1 }, false);
@@ -141,7 +144,8 @@ public sealed partial class MvccStorage
             var exhausted = state.Stop == GarbageCollectionStop.None;
             if (state.ChunkExamined != 0)
             {
-                cursor = new MvccGarbageCollectionCursor(state.CopyLastKey());
+                cursor = new MvccGarbageCollectionCursor(state.CopyLastKey(), _garbageCollectionCursorOrigin,
+                    state.LastKeyPreserveGroup);
             }
 
             options.Progress?.Report(new MvccGarbageCollectionProgress(examined, deleted, exhausted ? null : cursor));
@@ -212,10 +216,12 @@ public sealed partial class MvccStorage
         private int _lastKeyLength;
         private long _passExamined;
         private long _passDeleted;
+        private bool _preserveGroup;
 
         public LsmWriteBatch Batch { get; } = new();
         public int ChunkExamined { get; private set; }
         public GarbageCollectionStop Stop { get; private set; }
+        public bool LastKeyPreserveGroup { get; private set; }
 
         // Sorted descending and distinct, always including the published sequence; element 0 is the largest.
         public void SetRequired(Dictionary<long, int>.KeyCollection active, int activeCount, long published)
@@ -246,7 +252,7 @@ public sealed partial class MvccStorage
             _requiredCount = distinct;
         }
 
-        public void BeginChunk(byte[]? cursorKey, long examined, long deleted)
+        public void BeginChunk(MvccGarbageCollectionCursor? cursor, object origin, long examined, long deleted)
         {
             _passExamined = examined;
             _passDeleted = deleted;
@@ -254,12 +260,15 @@ public sealed partial class MvccStorage
             Stop = GarbageCollectionStop.None;
             Batch.Clear();
             _nextRequired = 0;
-            if (cursorKey is null)
+            _preserveGroup = cursor is not null &&
+                (!ReferenceEquals(cursor.Origin, origin) || cursor.PreserveGroup);
+            if (cursor is null)
             {
                 _lastKeyLength = 0;
                 return;
             }
 
+            var cursorKey = cursor.PositionArray;
             long sequence;
             try
             {
@@ -274,9 +283,9 @@ public sealed partial class MvccStorage
                 throw new ArgumentException("The cursor is not an MVCC version position.", nameof(options), exception);
             }
 
-            // Every required sequence at or above the last processed version is already satisfied by a version at
-            // or before that position: either kept earlier, or newer than all of them and untouched.
-            while (_nextRequired < _requiredCount && _required[_nextRequired] >= sequence)
+            // Only a locally issued, immutable cursor proves that this store's preceding versions were scanned.
+            // Unverified positions may precede the newest version; keep that entire group across resumptions.
+            while (!_preserveGroup && _nextRequired < _requiredCount && _required[_nextRequired] >= sequence)
             {
                 _nextRequired++;
             }
@@ -305,9 +314,10 @@ public sealed partial class MvccStorage
             if (_group.Set(encodedUserKey))
             {
                 _nextRequired = 0;
+                _preserveGroup = false;
             }
 
-            var keep = false;
+            var keep = _preserveGroup;
             while (_nextRequired < _requiredCount && sequence <= _required[_nextRequired])
             {
                 keep = true;
@@ -352,6 +362,7 @@ public sealed partial class MvccStorage
 
             key.CopyTo(_lastKey);
             _lastKeyLength = key.Length;
+            LastKeyPreserveGroup = _preserveGroup;
         }
 
         public void Dispose()

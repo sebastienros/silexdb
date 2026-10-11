@@ -609,9 +609,11 @@ created afterwards reads a sequence of at least `P`, so nothing already obsolete
 required set can only be stale in the conservative direction. Versions above `P` are never deleted, and the
 newest version or tombstone of every key is always kept (range-dependency validation relies on this). Active
 views are therefore never invalidated, and commits and snapshot creation need no coordination beyond the
-registry lock. Resuming inside a key's version chain is exact: required sequences at or above the cursor's
-sequence are already satisfied. A cursor is only a position hint, never a retention decision, so stale
-cursors are safe.
+registry lock. Resuming a cursor returned by the same open instance uses verified scan history: required
+sequences at or above its sequence are already satisfied by actual preceding versions. Position bytes alone
+are not proof: reconstructed, foreign, or pre-restart cursors conservatively keep the remainder of their
+starting key group, including across subsequent bounded resumptions. A later pass starting without a cursor
+can reclaim those versions. `Position` returns a copy so callers cannot mutate verified scan history.
 
 Cancellation throws `OperationCanceledException` at the next scan step or gate wait; applied chunks stay
 committed, and a chunk is applied entirely or not at all. `Progress` reports the resume cursor after each

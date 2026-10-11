@@ -1,3 +1,6 @@
+using System.Buffers.Binary;
+using System.Runtime.InteropServices;
+
 namespace Silex.Test;
 
 public class MvccGarbageCollectionTests
@@ -336,6 +339,119 @@ public class MvccGarbageCollectionTests
         await storage.CollectGarbageAsync(new MvccGarbageCollectionOptions { Resume = partial.Resume });
         await Assert.That(await ReadAsync(snapshot, 1)).IsEqualTo((byte)4);
         await Assert.That(await ReadAsync(storage, 1)).IsEqualTo((byte)5);
+    }
+
+    [Test]
+    [Arguments(false, false)]
+    [Arguments(false, true)]
+    [Arguments(true, false)]
+    [Arguments(true, true)]
+    public async Task ForeignAndForgedCursorsRetainActualStartingGroup(bool forged, bool tombstone)
+    {
+        using var sourceFolder = TempFolder.Create();
+        await using var source = await MvccStorage.OpenAsync(sourceFolder, _options);
+        for (var i = 0; i < 39; i++)
+        {
+            source.Put([200], [1]);
+        }
+        source.Put([1], [40]);
+        var sourceResult = await source.CollectGarbageAsync(new MvccGarbageCollectionOptions
+        {
+            MaxVersionsExamined = 1,
+        });
+        var cursor = sourceResult.Resume!;
+        if (forged)
+        {
+            byte[] nonexistentVersion = [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            BinaryPrimitives.WriteUInt64BigEndian(nonexistentVersion.AsSpan(4), ~(ulong)40);
+            cursor = new MvccGarbageCollectionCursor(nonexistentVersion);
+        }
+
+        using var folder = TempFolder.Create();
+        await using var storage = await MvccStorage.OpenAsync(folder, _options);
+        storage.Put([1], [10]);
+        using var snapshot = storage.CreateSnapshot();
+        using var transaction = storage.BeginTransaction();
+        transaction.TrackReadRange(new OrderedReadRange(new byte[] { 1 }, true, new byte[] { 1 }, true));
+        storage.Put([1], [20]);
+        if (tombstone)
+        {
+            storage.Delete([1]);
+        }
+        else
+        {
+            storage.Put([1], [30]);
+        }
+        for (var i = 0; i < 42; i++)
+        {
+            storage.Put([200], [1]);
+        }
+
+        // K40 is before the actual newest K3, while the published sequence is 45.
+        // The unverified group's conservative retention must survive newly issued local cursors too.
+        long deleted = 0;
+        for (var calls = 0; ; calls++)
+        {
+            await Assert.That(calls).IsLessThan(100);
+            var result = await storage.CollectGarbageAsync(new MvccGarbageCollectionOptions
+            {
+                Resume = cursor,
+                ChunkSize = 1,
+                MaxVersionsExamined = 1,
+            });
+            deleted += result.VersionsDeleted;
+            if (result.IsCompleted)
+            {
+                break;
+            }
+            cursor = result.Resume!;
+        }
+
+        await Assert.That(deleted).IsEqualTo(41);
+        await Assert.That(await ReadAsync(snapshot, 1)).IsEqualTo((byte)10);
+        var latest = new byte[1];
+        await Assert.That(await storage.GetRawAsync([1], latest)).IsEqualTo(tombstone ? -1 : 1);
+        if (!tombstone)
+        {
+            await Assert.That(latest[0]).IsEqualTo((byte)30);
+        }
+        await Assert.That(await transaction.TryCommitAsync()).IsFalse();
+        await Assert.That(transaction.Conflict!.Kind).IsEqualTo(MvccConflictKind.TrackedRange);
+        await Assert.That(transaction.Conflict.ConflictingSequence).IsEqualTo(3);
+        await Assert.That(transaction.Conflict.Key.Span.SequenceEqual(new byte[] { 1 })).IsTrue();
+
+        // A normal pass can now remove the conservatively retained intermediate version.
+        await Assert.That(await storage.CollectGarbageAsync()).IsEqualTo(1);
+        await Assert.That(await ReadAsync(snapshot, 1)).IsEqualTo((byte)10);
+        await Assert.That(await storage.GetRawAsync([1], latest)).IsEqualTo(tombstone ? -1 : 1);
+    }
+
+    [Test]
+    public async Task ExposedPositionCannotModifyVerifiedCursorHistory()
+    {
+        using var folder = TempFolder.Create();
+        await using var storage = await MvccStorage.OpenAsync(folder, _options);
+        storage.Put([1], [10]);
+        using var snapshot = storage.CreateSnapshot();
+        storage.Put([1], [20]);
+        storage.Put([1], [30]);
+        for (var i = 0; i < 42; i++)
+        {
+            storage.Put([200], [1]);
+        }
+        var result = await storage.CollectGarbageAsync(new MvccGarbageCollectionOptions
+        {
+            MaxVersionsExamined = 1,
+        });
+        var cursor = result.Resume!;
+        var exportedPosition = cursor.Position;
+        await Assert.That(MemoryMarshal.TryGetArray(exportedPosition, out var buffer)).IsTrue();
+        BinaryPrimitives.WriteUInt64BigEndian(buffer.AsSpan()[^8..], ~(ulong)40);
+
+        await Assert.That(BinaryPrimitives.ReadUInt64BigEndian(cursor.Position.Span[^8..])).IsEqualTo(~(ulong)3);
+        await storage.CollectGarbageAsync(new MvccGarbageCollectionOptions { Resume = cursor, ChunkSize = 1 });
+        await Assert.That(await ReadAsync(storage, 1)).IsEqualTo((byte)30);
+        await Assert.That(await ReadAsync(snapshot, 1)).IsEqualTo((byte)10);
     }
 
     [Test]
