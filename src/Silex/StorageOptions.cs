@@ -228,7 +228,7 @@ public class StorageOptions
     /// <summary>Maximum accounted bytes per MVCC transaction; defaults to no configured limit.</summary>
     /// <remarks>
     /// Counts retained key/value arena bytes, including obsolete and savepoint-protected values, plus
-    /// active mutation (20), tracked-read (8), undo (24), and savepoint (24) descriptors.
+    /// active mutation (20), tracked-read (8), read-range (32), undo (24), and savepoint (24) descriptors.
     /// Pool rounding, spare capacity, lookup/sort indexes, commit batches and independent cursor copies
     /// are excluded. Captured at store open; zero is permitted. No disk spilling is performed.
     /// </remarks>
@@ -239,6 +239,10 @@ public class StorageOptions
 
     /// <summary>Maximum distinct tracked point-read keys per MVCC transaction.</summary>
     public int MvccTransactionMaxTrackedReads { get; set; } = int.MaxValue;
+
+    /// <summary>Maximum registered range-read dependencies per MVCC transaction.</summary>
+    /// <remarks>Each active interval is accounted as 32 bytes plus its retained bound bytes.</remarks>
+    public int MvccTransactionMaxTrackedReadRanges { get; set; } = int.MaxValue;
 
     /// <summary>Maximum simultaneously active savepoints per MVCC transaction.</summary>
     public int MvccTransactionMaxSavepoints { get; set; } = int.MaxValue;

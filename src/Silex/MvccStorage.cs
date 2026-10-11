@@ -315,6 +315,8 @@ public sealed partial class MvccStorage : IAsyncDisposable
                     .ToArray();
             }
 
+            // Invariant relied on by range-read validation: the published sequence is always required, so the
+            // newest version (or tombstone) of every user key is retained and its sequence never regresses.
             using var state = new GarbageCollectionState(requiredSequences);
             await _storage.ScanRawAsync(
                 state,
@@ -510,7 +512,60 @@ public sealed partial class MvccStorage : IAsyncDisposable
                 return false;
             }
         }
+        for (var i = 0; i < writes.ReadRangeCount; i++)
+        {
+            if (await RangeModifiedAfterAsync(writes.GetReadRange(i), snapshotSequence, published, cancellationToken).ConfigureAwait(false))
+            {
+                return false;
+            }
+        }
         return true;
+    }
+
+    // Every user key keeps its newest version through GC (the published sequence is always required), so the
+    // newest physical version per key in the interval is exactly the key's latest commit, even after
+    // intermediate versions were reclaimed. Tombstones are versions too, so deletions remain visible here.
+    private async ValueTask<bool> RangeModifiedAfterAsync(
+        OrderedReadRange range, long snapshotSequence, long publishedSequence, CancellationToken cancellationToken)
+    {
+        using var lower = range.Lower is { } low ? EncodeVersionKey(low.Span, range.LowerInclusive ? long.MaxValue : 0) : null;
+        using var upper = range.Upper is { } high ? EncodeVersionKey(high.Span, range.UpperInclusive ? 0 : long.MaxValue) : null;
+        var physical = new OrderedReadRange(
+            lower is null ? new byte[] { DataPrefix } : lower.Slice.Memory, true,
+            upper is null ? new byte[] { 2 } : upper.Slice.Memory, upper is not null && range.UpperInclusive);
+        using var state = new RangeConflictState(snapshotSequence, publishedSequence);
+        await _storage.ScanOrderedAsync(physical, OrderedReadDirection.Forward, state,
+            static (s, key, _) => s.Accept(key), cancellationToken).ConfigureAwait(false);
+        return state.Conflict;
+    }
+
+    private sealed class RangeConflictState(long snapshot, long published) : IDisposable
+    {
+        private readonly KeyGroup _group = new();
+        private bool _resolved;
+
+        public bool Conflict { get; private set; }
+
+        public bool Accept(ReadOnlySpan<byte> key)
+        {
+            if (!TryParseVersionKey(key, out var userKey, out var sequence))
+            {
+                return true;
+            }
+            if (_group.Set(userKey))
+            {
+                _resolved = false;
+            }
+            if (_resolved || sequence > published)
+            {
+                return true;
+            }
+            _resolved = true;
+            Conflict = sequence > snapshot;
+            return !Conflict;
+        }
+
+        public void Dispose() => _group.Dispose();
     }
 
     private static void PrepareBatch(MvccWriteBuffer writes, LsmWriteBatch batch, long sequence)
@@ -1144,11 +1199,12 @@ internal sealed class MvccWriteBuffer : IDisposable
     private byte[] _bytes = [];
     private MvccMutation[] _mutations = [];
     private MvccKey[] _trackedReads = [];
+    private MvccRange[] _ranges = [];
     private MvccCheckpoint[] _savepoints = [];
     private MvccUndo[] _undo = [];
     private int _savepointCount;
     private int _undoCount;
-    private long _nextSavepointId;
+    private int _nextSavepointId;
     private int _byteCount;
     private bool _disposed;
 
@@ -1156,8 +1212,10 @@ internal sealed class MvccWriteBuffer : IDisposable
 
     public int TrackedReadCount { get; private set; }
 
+    public int ReadRangeCount { get; private set; }
+
     public long BufferedBytes => (long)_byteCount + 20L * MutationCount + 8L * TrackedReadCount
-        + 24L * _undoCount + 24L * _savepointCount;
+        + 32L * ReadRangeCount + 24L * _undoCount + 24L * _savepointCount;
 
     internal MvccWriteBuffer(int indexThreshold = DefaultIndexThreshold, TransactionLimits? limits = null)
     {
@@ -1180,7 +1238,7 @@ internal sealed class MvccWriteBuffer : IDisposable
             _savepoints = replacement;
         }
         _savepoints[_savepointCount++] = new MvccCheckpoint(
-            id, MutationCount, TrackedReadCount, _byteCount, _undoCount);
+            id, MutationCount, TrackedReadCount, _byteCount, _undoCount, ReadRangeCount);
         _nextSavepointId = id;
         return new MvccSavepoint(this, id);
     }
@@ -1199,6 +1257,7 @@ internal sealed class MvccWriteBuffer : IDisposable
         _orderDirty |= mutationsRemoved;
         MutationCount = checkpoint.MutationCount;
         TrackedReadCount = checkpoint.TrackedReadCount;
+        ReadRangeCount = checkpoint.RangeCount;
         _byteCount = checkpoint.ByteCount;
         _savepointCount = index + 1;
         if (mutationsRemoved) RebuildIndex(_mutationIndex, reads: false);
@@ -1349,6 +1408,73 @@ internal sealed class MvccWriteBuffer : IDisposable
         return -1;
     }
 
+    public void TrackReadRange(OrderedReadRange range)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (range.IsEmpty) return;
+        var lower = range.Lower is { } l ? l.Span : default;
+        var upper = range.Upper is { } u ? u.Span : default;
+        var flags = (range.LowerInclusive ? 1 : 0) | (range.UpperInclusive ? 2 : 0);
+        var candidate = new MvccRange(0, range.Lower.HasValue ? lower.Length : -1, 0,
+            range.Upper.HasValue ? upper.Length : -1, flags);
+        // Registering inside the previous interval adds no information; later rollback removes both or keeps the cover.
+        if (ReadRangeCount != 0 && Covers(_ranges[ReadRangeCount - 1], range)) return;
+        CheckCount("tracked read ranges", _limits.ReadRanges, (long)ReadRangeCount + 1);
+        CheckBytes(32L + lower.Length + upper.Length);
+        EnsureByteCapacity((long)lower.Length + upper.Length);
+        EnsureRangeCapacity();
+        candidate.LowerOffset = Append(lower);
+        candidate.UpperOffset = Append(upper);
+        _ranges[ReadRangeCount++] = candidate;
+    }
+
+    public bool ReadRangeContains(ReadOnlySpan<byte> key)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        for (var i = 0; i < ReadRangeCount; i++)
+        {
+            var range = _ranges[i];
+            if (range.LowerLength >= 0)
+            {
+                var c = key.SequenceCompareTo(_bytes.AsSpan(range.LowerOffset, range.LowerLength));
+                if (c < 0 || (c == 0 && (range.Flags & 1) == 0)) continue;
+            }
+            if (range.UpperLength >= 0)
+            {
+                var c = key.SequenceCompareTo(_bytes.AsSpan(range.UpperOffset, range.UpperLength));
+                if (c > 0 || (c == 0 && (range.Flags & 2) == 0)) continue;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    public OrderedReadRange GetReadRange(int index)
+    {
+        var range = _ranges[index];
+        ReadOnlyMemory<byte>? lower = null, upper = null;
+        if (range.LowerLength >= 0) lower = _bytes.AsMemory(range.LowerOffset, range.LowerLength);
+        if (range.UpperLength >= 0) upper = _bytes.AsMemory(range.UpperOffset, range.UpperLength);
+        return new OrderedReadRange(lower, (range.Flags & 1) != 0, upper, (range.Flags & 2) != 0);
+    }
+
+    private bool Covers(MvccRange outer, OrderedReadRange inner)
+    {
+        if (outer.LowerLength >= 0)
+        {
+            if (inner.Lower is not { } low) return false;
+            var c = low.Span.SequenceCompareTo(_bytes.AsSpan(outer.LowerOffset, outer.LowerLength));
+            if (c < 0 || (c == 0 && (outer.Flags & 1) == 0 && inner.LowerInclusive)) return false;
+        }
+        if (outer.UpperLength >= 0)
+        {
+            if (inner.Upper is not { } high) return false;
+            var c = high.Span.SequenceCompareTo(_bytes.AsSpan(outer.UpperOffset, outer.UpperLength));
+            if (c > 0 || (c == 0 && (outer.Flags & 2) == 0 && inner.UpperInclusive)) return false;
+        }
+        return true;
+    }
+
     public ReadOnlySpan<int> OrderedMutations()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
@@ -1484,6 +1610,21 @@ internal sealed class MvccWriteBuffer : IDisposable
             ArrayPool<MvccKey>.Shared.Return(_trackedReads);
             _trackedReads = [];
         }
+
+        if (_ranges.Length != 0)
+        {
+            ArrayPool<MvccRange>.Shared.Return(_ranges);
+            _ranges = [];
+        }
+    }
+
+    private void EnsureRangeCapacity()
+    {
+        if (ReadRangeCount < _ranges.Length) return;
+        var replacement = ArrayPool<MvccRange>.Shared.Rent(Math.Max(InitialDescriptorCapacity, _ranges.Length * 2));
+        _ranges.AsSpan(0, ReadRangeCount).CopyTo(replacement);
+        if (_ranges.Length != 0) ArrayPool<MvccRange>.Shared.Return(_ranges);
+        _ranges = replacement;
     }
 
     private int Append(ReadOnlySpan<byte> value)
@@ -1574,8 +1715,17 @@ internal struct MvccMutation(int keyOffset, int keyLength, int valueOffset, int 
 
 internal readonly record struct MvccKey(int Offset, int Length);
 
+internal struct MvccRange(int lowerOffset, int lowerLength, int upperOffset, int upperLength, int flags)
+{
+    public int LowerOffset = lowerOffset;
+    public int LowerLength = lowerLength;
+    public int UpperOffset = upperOffset;
+    public int UpperLength = upperLength;
+    public int Flags = flags;
+}
+
 internal readonly record struct MvccCheckpoint(
-    long Id, int MutationCount, int TrackedReadCount, int ByteCount, int UndoCount);
+    int Id, int MutationCount, int TrackedReadCount, int ByteCount, int UndoCount, int RangeCount);
 
 internal readonly record struct MvccUndo(int Index, MvccMutation Mutation);
 

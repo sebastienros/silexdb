@@ -17,9 +17,9 @@ public sealed class TransactionLimitException : InvalidOperationException
     public long Requested { get; }
 }
 
-internal readonly record struct TransactionLimits(long Bytes, int Mutations, int TrackedReads, int Savepoints)
+internal readonly record struct TransactionLimits(long Bytes, int Mutations, int TrackedReads, int Savepoints, int ReadRanges = int.MaxValue)
 {
-    public static TransactionLimits Unlimited => new(long.MaxValue, int.MaxValue, int.MaxValue, int.MaxValue);
+    public static TransactionLimits Unlimited => new(long.MaxValue, int.MaxValue, int.MaxValue, int.MaxValue, int.MaxValue);
 
     public static TransactionLimits FromOptions(StorageOptions options)
     {
@@ -27,7 +27,9 @@ internal readonly record struct TransactionLimits(long Bytes, int Mutations, int
         ArgumentOutOfRangeException.ThrowIfNegative(options.MvccTransactionMaxMutations);
         ArgumentOutOfRangeException.ThrowIfNegative(options.MvccTransactionMaxTrackedReads);
         ArgumentOutOfRangeException.ThrowIfNegative(options.MvccTransactionMaxSavepoints);
+        ArgumentOutOfRangeException.ThrowIfNegative(options.MvccTransactionMaxTrackedReadRanges);
         return new(options.MvccTransactionMaxBytes, options.MvccTransactionMaxMutations,
-            options.MvccTransactionMaxTrackedReads, options.MvccTransactionMaxSavepoints);
+            options.MvccTransactionMaxTrackedReads, options.MvccTransactionMaxSavepoints,
+            options.MvccTransactionMaxTrackedReadRanges);
     }
 }
