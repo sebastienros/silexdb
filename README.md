@@ -232,8 +232,20 @@ Everything is span based and allocation free; the caller owns all buffers.
   encoding, including the tag. Integers are big-endian (int64 with the sign bit flipped). Doubles use the
   IEEE-754 bit transform giving `-Infinity < negatives < -0.0 < +0.0 < positives < +Infinity < NaN`; every NaN
   is written as one canonical NaN, so NaN payloads are not preserved. Bytes and strings escape each `00`
-  as `00 FF` and end with `00 01`. Strings are strict UTF-8 ordered by code point (unpaired surrogates throw
-  `ArgumentException`); no case folding or collation is applied.
+  as `00 FF` and end with `00 01`. Strings use **Unicode code-point order through strict UTF-8 byte ordering**;
+  no case folding or collation is applied. This is not interchangeable with .NET's UTF-16
+  `StringComparer.Ordinal`: U+10000 sorts after U+FFFF here, but before it in UTF-16 ordinal order.
+  Query evaluators must use comparison semantics consistent with their index encoding.
+* **UTF-8 strings.** `TryWriteUtf8String(ReadOnlySpan<byte>)` accepts decoded string content encoded as UTF-8,
+  not a JSON token, and writes exactly the same `String` component as `TryWriteString` for equivalent text
+  (for example `"café"` and its UTF-8 bytes). Both use the existing tag, escaping and terminator, with no
+  on-disk format change. `GetUtf8StringLength` reports the exact encoded size, and
+  `TryReadUtf8String(Span<byte>, out int length)` reads the unescaped UTF-8 into caller-owned memory.
+  Malformed UTF-8 (including overlong sequences, surrogate code points, truncation and out-of-range code
+  points) is never replaced: sizing/writing throw `ArgumentException` before writing, even with insufficient
+  capacity, and reading returns `Malformed` without advancing, even with an undersized destination.
+  `TryWriteString` likewise rejects unpaired UTF-16 surrogates. JSON unescaping belongs to the document
+  layer: JSON `"a"` and `"\u0061"` must reach these APIs as the same decoded content.
 * **Decimal.** A fixed 25-byte component: tag `23` followed by a 24-byte two's-complement big-endian integer
   with its highest bit flipped. For unsigned 96-bit coefficient `C`, scale `s` in `[0,28]` and sign, the
   integer is `N = +/-C * 10^(28-s)`, computed entirely with integer arithmetic. Its maximum magnitude
@@ -250,9 +262,10 @@ Everything is span based and allocation free; the caller owns all buffers.
   kinds are never interleaved by magnitude, and position-wise consistent schemas are the caller's concern.
 * **Buffers.** `TryWrite*` returns `false` when the exact encoded size does not fit, leaving
   `Written` unchanged; sizes are `OrderedKey.BooleanLength` (1), `Int64Length`/`UInt64Length`/`DoubleLength` (9),
-  `DecimalLength` (25), and `GetBytesLength`/`GetStringLength`. Readers return an `OrderedKeyDecodeStatus`
+  `DecimalLength` (25), and `GetBytesLength`/`GetStringLength`/`GetUtf8StringLength`. Readers return an `OrderedKeyDecodeStatus`
   (`EndOfData`, `UnexpectedComponent`, `Malformed`, `DestinationTooSmall` with the exact required length) and
-  do not advance on failure. Decoding is strict, so each key has exactly one decoding.
+  do not advance on failure. String read lengths are UTF-16 characters for `TryReadString` and UTF-8 bytes
+  for `TryReadUtf8String`. Decoding is strict, so each key has exactly one decoding.
 * **Limits.** Sizes are `int`-bounded, and keys remain subject to the storage engine's own key limits.
   No NULL, date/time, GUID, or case-insensitive components are defined; layers can compose them from
   these building blocks (for example a leading boolean or `UInt64` marker for NULL placement). The format is
