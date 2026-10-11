@@ -120,6 +120,93 @@ public sealed class MvccTransaction : IDisposable
         }
     }
 
+    /// <summary>Stages point deletions for up to maxEntries keys visible in an encoded range, in ascending order.</summary>
+    /// <remarks>
+    /// This is logical deletion only: it adds ordinary MVCC tombstones to this transaction, and nothing becomes
+    /// visible or durable until commit. Physical data stays readable by older snapshots and is reclaimed only by
+    /// MVCC garbage collection and compaction after retention allows it; no files are deleted here. Keys are
+    /// those visible at <see cref="Sequence"/> plus this transaction's own pending writes (pending puts are deleted,
+    /// already-deleted keys are skipped). The scanned span (the range's lower bound through the last processed key,
+    /// or the whole range when complete) is registered as a read dependency, so commit conflicts with any later
+    /// commit that wrote, inserted into, or deleted from it, including gaps. Keys in the unprocessed
+    /// <see cref="RangeDeleteResult.Remaining"/> suffix are not tracked. Call repeatedly, each time in a new bounded
+    /// transaction, with Remaining until complete; a retry after conflict simply resumes from the same range.
+    /// The call is all-or-nothing: on cancellation, a <see cref="TransactionLimitException"/> or any other failure, staged
+    /// writes and dependencies are restored. It temporarily uses one savepoint slot and cannot be combined with
+    /// overlapping transaction operations.
+    /// </remarks>
+    /// <exception cref="TransactionLimitException">Staging the deletions or tracking the range would exceed a budget.</exception>
+    public async ValueTask<RangeDeleteResult> DeleteRangeAsync(OrderedReadRange range, int maxEntries,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(range);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxEntries);
+        GetStorage();
+        cancellationToken.ThrowIfCancellationRequested();
+        if (range.IsEmpty)
+        {
+            return new RangeDeleteResult(0, null);
+        }
+
+        var savepoint = _writes.CreateSavepoint();
+        try
+        {
+            var result = await DeleteRangeCoreAsync(range, maxEntries, cancellationToken).ConfigureAwait(false);
+            _writes.ReleaseSavepoint(savepoint);
+            return result;
+        }
+        catch
+        {
+            _writes.RollbackToSavepoint(savepoint);
+            _writes.ReleaseSavepoint(savepoint);
+            throw;
+        }
+    }
+
+    private async ValueTask<RangeDeleteResult> DeleteRangeCoreAsync(OrderedReadRange range, int maxEntries,
+        CancellationToken cancellationToken)
+    {
+        const int ChunkEntries = 256;
+        using var cursor = CreateOrderedReadCursor(range);
+        byte[]? last = null;
+        var deleted = 0;
+        var complete = false;
+        while (true)
+        {
+            var remaining = maxEntries - deleted;
+            using var batch = await cursor.ReadBatchAsync(remaining == 0 ? 1 : Math.Min(remaining, ChunkEntries),
+                int.MaxValue, cancellationToken).ConfigureAwait(false);
+            if (remaining == 0)
+            {
+                complete = batch.Count == 0;
+                break;
+            }
+            for (var i = 0; i < batch.Count; i++)
+            {
+                Delete(batch[i].Key.Span);
+                deleted++;
+            }
+            if (batch.Count != 0)
+            {
+                last = batch[batch.Count - 1].Key.ToArray();
+            }
+            if (batch.IsExhausted)
+            {
+                complete = true;
+                break;
+            }
+        }
+
+        if (complete)
+        {
+            TrackReadRange(range);
+            return new RangeDeleteResult(deleted, null);
+        }
+        TrackReadRange(new OrderedReadRange(range.Lower, range.LowerInclusive, last, upperInclusive: true));
+        return new RangeDeleteResult(deleted,
+            new OrderedReadRange(last, lowerInclusive: false, range.Upper, range.UpperInclusive));
+    }
+
     public void Put(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
     {
         GetStorage();
