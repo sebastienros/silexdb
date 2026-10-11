@@ -30,6 +30,9 @@ public enum OrderedKeyComponent : byte
 
     /// <summary>A 64-bit IEEE-754 value with a total order (see <see cref="OrderedKey"/>).</summary>
     Double = 0x22,
+
+    /// <summary>An exact decimal value; scale and signed zero are normalized (see <see cref="OrderedKey"/>).</summary>
+    Decimal = 0x23,
 }
 
 /// <summary>Outcome of a read from <see cref="OrderedKeyReader"/>.</summary>

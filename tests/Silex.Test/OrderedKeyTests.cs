@@ -1,3 +1,4 @@
+using System.Numerics;
 using System.Text;
 using Silex.Keys;
 
@@ -47,6 +48,14 @@ public class OrderedKeyTests
     {
         var w = new OrderedKeyWriter(b);
         w.TryWriteDouble(v, o);
+        return w.Written;
+    });
+
+    private static byte[] DecimalKey(decimal v, OrderedKeyOrder o = OrderedKeyOrder.Ascending) => Encode(b =>
+    {
+        var w = new OrderedKeyWriter(b);
+        True(w.TryWriteDecimal(v, o));
+        Eq(w.Written, OrderedKey.DecimalLength);
         return w.Written;
     });
 
@@ -193,6 +202,8 @@ public class OrderedKeyTests
             Int64Key(long.MaxValue),
             UInt64Key(0),
             DoubleKey(double.NaN),
+            DecimalKey(decimal.MinValue),
+            DecimalKey(decimal.MaxValue, OrderedKeyOrder.Descending),
             DoubleKey(double.NaN, OrderedKeyOrder.Descending),
             UInt64Key(0, OrderedKeyOrder.Descending),
             Int64Key(0, OrderedKeyOrder.Descending),
@@ -496,6 +507,7 @@ public class OrderedKeyTests
     [Test]
     public void SizesMatchWriterOutput()
     {
+        Eq(OrderedKey.DecimalLength, 25);
         Eq(OrderedKey.GetBytesLength([0, 0, 5]), 3 + 3 + 2);
         Eq(OrderedKey.GetStringLength("é\0"), 3 + 3 + 1);
         Eq(OrderedKey.GetStringLength("\U0001F600"), 3 + 4);
@@ -524,11 +536,339 @@ public class OrderedKeyTests
         w.TryWriteBytes(payload);
         w.TryWriteInt64(-5);
         w.TryWriteDouble(1.5, OrderedKeyOrder.Descending);
+        w.TryWriteDecimal(decimal.MinValue, OrderedKeyOrder.Descending);
         var r = new OrderedKeyReader(w.WrittenSpan);
         r.TryReadString(chars, out _, OrderedKeyOrder.Descending);
         r.TryReadBytes(bytes, out _);
         r.TryReadInt64(out _);
         r.TryReadDouble(out _, OrderedKeyOrder.Descending);
+        if (r.TryReadDecimal(out var dec, OrderedKeyOrder.Descending) != OrderedKeyDecodeStatus.Success
+            || dec != decimal.MinValue) throw new InvalidOperationException();
         if (!r.IsEnd) throw new InvalidOperationException();
+    }
+
+    [Test]
+    public void DecimalGoldenFixtures()
+    {
+        (decimal Value, string Hex)[] fixtures =
+        [
+            (0m, "23800000000000000000000000000000000000000000000000"),
+            (0.0000000000000000000000000001m, "23800000000000000000000000000000000000000000000001"),
+            (-0.0000000000000000000000000001m, "237FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"),
+            (1m, "23800000000000000000000000204FCE5E3E25026110000000"),
+            (-1m, "237FFFFFFFFFFFFFFFFFFFFFFFDFB031A1C1DAFD9EF0000000"),
+            (decimal.MaxValue, "23A04FCE5E3E2502610FFFFFFFDFB031A1C1DAFD9EF0000000"),
+            (decimal.MinValue, "235FB031A1C1DAFD9EF0000000204FCE5E3E25026110000000"),
+            (new decimal(-1, -1, -1, false, 28), "23800000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF"),
+            (new decimal(0, 0, 1, false, 28), "23800000000000000000000000000000010000000000000000"),
+            (new decimal(0, 1, 0, false, 0), "238000000000000000204FCE5E3E2502611000000000000000"),
+        ];
+        foreach (var (value, hex) in fixtures)
+        {
+            var expected = Hex(hex);
+            True(DecimalKey(value).AsSpan().SequenceEqual(expected));
+            for (var i = 0; i < expected.Length; i++) expected[i] = (byte)~expected[i];
+            Eq(expected[0], (byte)0xDC);
+            True(DecimalKey(value, OrderedKeyOrder.Descending).AsSpan().SequenceEqual(expected));
+        }
+    }
+
+    [Test]
+    public void DecimalScalesAndSignedZerosCanonicalize()
+    {
+        foreach (var order in new[] { OrderedKeyOrder.Ascending, OrderedKeyOrder.Descending })
+        {
+            foreach (var negative in new[] { false, true })
+            {
+                for (byte scale = 0; scale <= 28; scale++)
+                {
+                    var zero = new decimal(0, 0, 0, negative, scale);
+                    var key = DecimalKey(zero, order);
+                    True(key.AsSpan().SequenceEqual(DecimalKey(0m, order)));
+                    var reader = new OrderedKeyReader(key);
+                    Eq(reader.TryReadDecimal(out var decoded, order), OrderedKeyDecodeStatus.Success);
+                    True(decimal.GetBits(decoded).AsSpan().SequenceEqual(new int[4]));
+                }
+            }
+            foreach (var value in new[] { 1m, 1.0m, 1.00m, 1.0000000000000000000000000000m })
+            {
+                True(DecimalKey(value, order).AsSpan().SequenceEqual(DecimalKey(1m, order)));
+                True(DecimalKey(-value, order).AsSpan().SequenceEqual(DecimalKey(-1m, order)));
+            }
+        }
+    }
+
+    private static BigInteger DecimalInteger(decimal value)
+    {
+        var bits = decimal.GetBits(value);
+        var coefficient = (BigInteger)(uint)bits[0] | (BigInteger)(uint)bits[1] << 32 | (BigInteger)(uint)bits[2] << 64;
+        var magnitude = coefficient * BigInteger.Pow(10, 28 - ((bits[3] >> 16) & 0xFF));
+        return bits[3] < 0 ? -magnitude : magnitude;
+    }
+
+    private static byte[] RawDecimalKey(BigInteger integer, OrderedKeyOrder order)
+    {
+        var payload = integer.ToByteArray(isUnsigned: false, isBigEndian: true);
+        True(payload.Length <= 24);
+        var key = new byte[25];
+        if (integer.Sign < 0) Array.Fill(key, (byte)0xFF);
+        payload.CopyTo(key, 25 - payload.Length);
+        key[0] = 0x23;
+        key[1] ^= 0x80;
+        if (order == OrderedKeyOrder.Descending)
+            for (var i = 0; i < key.Length; i++) key[i] = (byte)~key[i];
+        return key;
+    }
+
+    private static bool TryModelDecimal(BigInteger integer, out decimal value)
+    {
+        value = 0;
+        var coefficient = BigInteger.Abs(integer);
+        var maximumCoefficient = (BigInteger.One << 96) - 1;
+        if (coefficient > maximumCoefficient * BigInteger.Pow(10, 28)) return false;
+        if (coefficient.IsZero) return true;
+        byte scale = 28;
+        while (scale > 0 && coefficient % 10 == 0)
+        {
+            coefficient /= 10;
+            scale--;
+        }
+        if (coefficient > maximumCoefficient) return false;
+        value = new decimal(unchecked((int)(uint)(coefficient & uint.MaxValue)),
+            unchecked((int)(uint)((coefficient >> 32) & uint.MaxValue)),
+            unchecked((int)(uint)(coefficient >> 64)), integer.Sign < 0, scale);
+        return true;
+    }
+
+    [Test]
+    public void RandomDecimalOrderAndRoundTripMatchIntegerModel()
+    {
+        var random = new Random(15731);
+        decimal NextValue() => new(unchecked((int)random.NextInt64()), unchecked((int)random.NextInt64()),
+            unchecked((int)random.NextInt64()), random.Next(2) == 0, (byte)random.Next(29));
+        for (var i = 0; i < 10_000; i++)
+        {
+            var value = NextValue();
+            var other = NextValue();
+            var integer = DecimalInteger(value);
+            True(TryModelDecimal(integer, out var normalized));
+            foreach (var order in new[] { OrderedKeyOrder.Ascending, OrderedKeyOrder.Descending })
+            {
+                var key = DecimalKey(value, order);
+                True(key.AsSpan().SequenceEqual(RawDecimalKey(integer, order)));
+                Eq(Cmp(key, DecimalKey(other, order)), Sign(decimal.Compare(value, other))
+                    * (order == OrderedKeyOrder.Ascending ? 1 : -1));
+                var reader = new OrderedKeyReader(key);
+                Eq(reader.TryReadDecimal(out var decoded, order), OrderedKeyDecodeStatus.Success);
+                Eq(decoded, value);
+                True(decimal.GetBits(decoded).AsSpan().SequenceEqual(decimal.GetBits(normalized)));
+                True(key.AsSpan().SequenceEqual(DecimalKey(decoded, order)));
+                True(reader.IsEnd);
+            }
+        }
+    }
+
+    [Test]
+    public void DecimalCoefficientAndScaleBoundariesMatchIntegerModel()
+    {
+        BigInteger[] coefficients =
+        [
+            0, 1, 10, uint.MaxValue, BigInteger.One << 32, (BigInteger.One << 64) - 1,
+            BigInteger.One << 64, BigInteger.One << 95, (BigInteger.One << 96) - 2, (BigInteger.One << 96) - 1,
+        ];
+        foreach (var coefficient in coefficients)
+        {
+            for (byte scale = 0; scale <= 28; scale++)
+            {
+                foreach (var negative in new[] { false, true })
+                {
+                    var value = new decimal(unchecked((int)(uint)(coefficient & uint.MaxValue)),
+                        unchecked((int)(uint)((coefficient >> 32) & uint.MaxValue)),
+                        unchecked((int)(uint)(coefficient >> 64)), negative, scale);
+                    var integer = DecimalInteger(value);
+                    True(TryModelDecimal(integer, out var expected));
+                    foreach (var order in new[] { OrderedKeyOrder.Ascending, OrderedKeyOrder.Descending })
+                    {
+                        var key = DecimalKey(value, order);
+                        True(key.AsSpan().SequenceEqual(RawDecimalKey(integer, order)));
+                        var reader = new OrderedKeyReader(key);
+                        Eq(reader.TryReadDecimal(out var decoded, order), OrderedKeyDecodeStatus.Success);
+                        True(decimal.GetBits(decoded).AsSpan().SequenceEqual(decimal.GetBits(expected)));
+                        True(key.AsSpan().SequenceEqual(DecimalKey(decoded, order)));
+                    }
+                }
+            }
+        }
+    }
+
+    [Test]
+    public void DecimalPayloadValidationMatchesIntegerModel()
+    {
+        var maximum = ((BigInteger.One << 96) - 1) * BigInteger.Pow(10, 28);
+        BigInteger[] boundaries =
+        [
+            0, 1, -1, maximum, -maximum, maximum - 1, -maximum + 1, maximum + 1, -maximum - 1,
+            BigInteger.One << 96, -(BigInteger.One << 96),
+            -(BigInteger.One << 191), (BigInteger.One << 191) - 1,
+        ];
+        var random = new Random(2728);
+        var raw = new byte[24];
+        for (var i = 0; i < 3000 + boundaries.Length; i++)
+        {
+            random.NextBytes(raw);
+            var integer = i < boundaries.Length ? boundaries[i] : new BigInteger(raw, isUnsigned: false, isBigEndian: true);
+            var representable = TryModelDecimal(integer, out var expected);
+            foreach (var order in new[] { OrderedKeyOrder.Ascending, OrderedKeyOrder.Descending })
+            {
+                var key = RawDecimalKey(integer, order);
+                var reader = new OrderedKeyReader(key);
+                var status = reader.TryReadDecimal(out var decoded, order);
+                Eq(status, representable ? OrderedKeyDecodeStatus.Success : OrderedKeyDecodeStatus.Malformed);
+                Eq(reader.Position, representable ? 25 : 0);
+                if (representable)
+                {
+                    True(decimal.GetBits(decoded).AsSpan().SequenceEqual(decimal.GetBits(expected)));
+                    True(key.AsSpan().SequenceEqual(DecimalKey(decoded, order)));
+                }
+                var peeker = new OrderedKeyReader(key);
+                Eq(peeker.TryPeek(out _, out _), status);
+                Eq(peeker.TryPeekLength(out _), status);
+                Eq(peeker.Position, 0);
+                Eq(peeker.TrySkip(), status);
+                Eq(peeker.Position, representable ? 25 : 0);
+            }
+        }
+    }
+
+    [Test]
+    public void DecimalTruncationCapacityAndWrongKindDoNotAdvance()
+    {
+        foreach (var order in new[] { OrderedKeyOrder.Ascending, OrderedKeyOrder.Descending })
+        {
+            foreach (var value in new[] { decimal.MinValue, decimal.MaxValue, 0m, 0.0000000000000000000000000001m })
+            {
+                var key = DecimalKey(value, order);
+                for (var length = 0; length < 25; length++)
+                {
+                    var reader = new OrderedKeyReader(key.AsSpan(0, length));
+                    var status = length == 0 ? OrderedKeyDecodeStatus.EndOfData : OrderedKeyDecodeStatus.Malformed;
+                    Eq(reader.TryReadDecimal(out _, order), status);
+                    Eq(reader.TryPeek(out _, out _), status);
+                    Eq(reader.TryPeekLength(out _), status);
+                    Eq(reader.TrySkip(), status);
+                    Eq(reader.Position, 0);
+                    var buffer = new byte[length];
+                    var writer = new OrderedKeyWriter(buffer);
+                    False(writer.TryWriteDecimal(value, order));
+                    Eq(writer.Written, 0);
+                }
+                var wrongOrder = new OrderedKeyReader(key);
+                Eq(wrongOrder.TryReadDecimal(out _, order == OrderedKeyOrder.Ascending
+                    ? OrderedKeyOrder.Descending : OrderedKeyOrder.Ascending), OrderedKeyDecodeStatus.UnexpectedComponent);
+                Eq(wrongOrder.Position, 0);
+                Eq(wrongOrder.TryReadDouble(out _, order), OrderedKeyDecodeStatus.UnexpectedComponent);
+                Eq(wrongOrder.Position, 0);
+            }
+        }
+        var otherKind = new OrderedKeyReader(Int64Key(1));
+        Eq(otherKind.TryReadDecimal(out _), OrderedKeyDecodeStatus.UnexpectedComponent);
+        Eq(otherKind.Position, 0);
+        var exact = new OrderedKeyWriter(new byte[25]);
+        True(exact.TryWriteDecimal(123.45m));
+        Eq(exact.Remaining, 0);
+        exact.Reset();
+        True(exact.TryWriteBoolean(true));
+        False(exact.TryWriteDecimal(123.45m));
+        Eq(exact.Written, 1);
+        var empty = new OrderedKeyWriter(default);
+        False(empty.TryWriteDecimal(0m));
+    }
+
+    [Test]
+    public void DecimalConsumesExactlyOneComponentInMixedTuples()
+    {
+        foreach (var order in new[] { OrderedKeyOrder.Ascending, OrderedKeyOrder.Descending })
+        {
+            var writer = new OrderedKeyWriter(new byte[128]);
+            True(writer.TryWriteBoolean(true));
+            True(writer.TryWriteDecimal(-123.4500m, order));
+            True(writer.TryWriteInt64(42));
+            True(writer.TryWriteString("tail"));
+            var reader = new OrderedKeyReader(writer.WrittenSpan);
+            Eq(reader.TryReadBoolean(out _), OrderedKeyDecodeStatus.Success);
+            Eq(reader.TryPeek(out var kind, out var direction), OrderedKeyDecodeStatus.Success);
+            Eq(kind, OrderedKeyComponent.Decimal);
+            Eq(direction, order);
+            Eq(reader.TryPeekLength(out var length), OrderedKeyDecodeStatus.Success);
+            Eq(length, 25);
+            Eq(reader.TryPeekPayloadLength(out _), OrderedKeyDecodeStatus.UnexpectedComponent);
+            Eq(reader.Position, 1);
+            Eq(reader.TryReadDecimal(out var value, order), OrderedKeyDecodeStatus.Success);
+            Eq(value, -123.45m);
+            True(decimal.GetBits(value).AsSpan().SequenceEqual(decimal.GetBits(-123.45m)));
+            Eq(reader.Position, 26);
+            Eq(reader.TryReadInt64(out var integer), OrderedKeyDecodeStatus.Success);
+            Eq(integer, 42L);
+            var chars = new char[4];
+            Eq(reader.TryReadString(chars, out _), OrderedKeyDecodeStatus.Success);
+            Eq(new string(chars), "tail");
+            True(reader.IsEnd);
+            var skipper = new OrderedKeyReader(writer.WrittenSpan);
+            Eq(skipper.TrySkip(), OrderedKeyDecodeStatus.Success);
+            Eq(skipper.TrySkip(), OrderedKeyDecodeStatus.Success);
+            Eq(skipper.Position, 26);
+            Eq(skipper.TryReadInt64(out integer), OrderedKeyDecodeStatus.Success);
+            Eq(integer, 42L);
+        }
+    }
+
+    [Test]
+    public void MalformedDecimalAfterValidPrefixDoesNotAdvance()
+    {
+        foreach (var order in new[] { OrderedKeyOrder.Ascending, OrderedKeyOrder.Descending })
+        {
+            var invalid = RawDecimalKey(BigInteger.One << 96, order);
+            var key = new byte[27];
+            key[0] = 0x05;
+            invalid.CopyTo(key, 1);
+            key[26] = 0x04;
+            var reader = new OrderedKeyReader(key);
+            Eq(reader.TryReadBoolean(out _), OrderedKeyDecodeStatus.Success);
+            Eq(reader.TryReadDecimal(out var value, order), OrderedKeyDecodeStatus.Malformed);
+            Eq(value, 0m);
+            Eq(reader.TryPeek(out _, out _), OrderedKeyDecodeStatus.Malformed);
+            Eq(reader.TryPeekLength(out _), OrderedKeyDecodeStatus.Malformed);
+            Eq(reader.TrySkip(), OrderedKeyDecodeStatus.Malformed);
+            Eq(reader.Position, 1);
+        }
+    }
+
+    [Test]
+    public void DecimalBoundaryEncodingAndDecodingDoNotAllocate()
+    {
+        decimal[] values = [0m, new decimal(0, 0, 0, true, 28), -1.00m, 1m,
+            0.0000000000000000000000000001m, -0.0000000000000000000000000001m, decimal.MinValue, decimal.MaxValue];
+        var buffer = new byte[25];
+        Check();
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        for (var i = 0; i < 1000; i++) Check();
+        Eq(GC.GetAllocatedBytesForCurrentThread() - before, 0L);
+
+        void Check()
+        {
+            foreach (var value in values)
+            {
+                for (var direction = 0; direction < 2; direction++)
+                {
+                    var order = (OrderedKeyOrder)direction;
+                    var writer = new OrderedKeyWriter(buffer);
+                    if (!writer.TryWriteDecimal(value, order)) throw new InvalidOperationException();
+                    var reader = new OrderedKeyReader(writer.WrittenSpan);
+                    if (reader.TryPeek(out _, out _) != OrderedKeyDecodeStatus.Success
+                        || reader.TryReadDecimal(out var decoded, order) != OrderedKeyDecodeStatus.Success
+                        || decoded != value || !reader.IsEnd) throw new InvalidOperationException();
+                }
+            }
+        }
     }
 }

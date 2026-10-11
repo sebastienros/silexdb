@@ -109,6 +109,18 @@ public ref struct OrderedKeyReader
         return status;
     }
 
+    /// <summary>Reads an exact decimal component with the minimum possible scale and positive scale-zero zero.</summary>
+    /// <remarks>Payloads not exactly representable as decimal are malformed; failed reads do not advance.</remarks>
+    public OrderedKeyDecodeStatus TryReadDecimal(out decimal value, OrderedKeyOrder order = OrderedKeyOrder.Ascending)
+    {
+        value = 0;
+        var status = Expect(OrderedKeyComponent.Decimal, order, out var c);
+        if (status != OrderedKeyDecodeStatus.Success) return status;
+        value = c.DecimalValue;
+        _position += c.Total;
+        return status;
+    }
+
     /// <summary>Reads a bytes component into <paramref name="destination"/>.</summary>
     /// <param name="destination">Receives the unescaped payload.</param>
     /// <param name="length">The payload length written, or the required length if the destination is too small.</param>
@@ -164,6 +176,7 @@ public ref struct OrderedKeyReader
         public bool BoolValue;
         public int Total;
         public int Payload;
+        public decimal DecimalValue;
     }
 
     private static OrderedKeyDecodeStatus Parse(ReadOnlySpan<byte> src, out Parsed c)
@@ -188,6 +201,12 @@ public ref struct OrderedKeyReader
                 c.Kind = (OrderedKeyComponent)tag;
                 c.Total = 9;
                 return src.Length >= 9 ? OrderedKeyDecodeStatus.Success : OrderedKeyDecodeStatus.Malformed;
+            case 0x23:
+                c.Kind = OrderedKeyComponent.Decimal;
+                c.Total = OrderedKey.DecimalLength;
+                if (src.Length < c.Total) return OrderedKeyDecodeStatus.Malformed;
+                return OrderedDecimal.TryDecode(src.Slice(1, c.Total - 1), c.Mask, out c.DecimalValue)
+                    ? OrderedKeyDecodeStatus.Success : OrderedKeyDecodeStatus.Malformed;
             case 0x10:
             case 0x11:
                 c.Kind = (OrderedKeyComponent)tag;
