@@ -632,10 +632,52 @@ of concurrent transactions/cursors separately. No disk spilling is provided.
 
 Up to 8 mutations or tracked reads use linear lookup with no key index. Beyond that, each set lazily
 creates its own pooled, open-addressed hash index using arena offsets rather than allocated key objects.
-Expected point lookup/deduplication is constant-time; rollback rebuilds indexes in linear time in their
-retained capacity. Ordered scans lazily sort and cache mutation positions, binary-search the lower bound,
-then copy only the matching frozen overlay. Value changes do not invalidate key order; newly staged or
+Expected point lookup/deduplication is constant-time; rollback that removes keys rebuilds the affected
+indexes in linear time in their retained capacity. Ordered scans lazily sort and cache mutation positions,
+binary-search the lower bound, then copy only the matching frozen overlay. Value changes do not invalidate key order; newly staged or
 rolled-back keys do. Frozen cursors remain independent of later mutations, rollback, release, and commit.
+
+#### Buffer measurements
+
+Reproduce the data-structure comparison with:
+
+```sh
+dotnet run --project tests/Silex.Benchmarks -c Release -- \
+  --filter '*TransactionBufferBenchmarks*' '*TransactionBufferOrderedBenchmarks*'
+```
+
+BenchmarkDotNet 0.14.0 ShortRun (3 warmups/3 measured iterations), Apple M4 Pro, macOS 15.8.1,
+.NET 8.0.30 ARM64; eight-byte keys and sixteen-byte values. These are in-memory buffer microbenchmarks,
+not disk throughput or commit-validation measurements. Linear-only and forced-index cases use the same
+buffer/accounting implementation, isolating lookup structure costs.
+
+| Distinct keys | Stage all keys, linear-only | Stage all keys, forced index | Stage all keys, eight-key hybrid |
+|---|---:|---:|---:|
+| 1 | 35.9 ns | 48.3 ns | 36.1 ns |
+| 4 | 70.6 ns | 89.2 ns | 68.6 ns |
+| 8 | 144.1 ns | 139.1 ns | 144.2 ns |
+| 16 | 428.6 ns | 299.0 ns | 336.2 ns |
+
+The eight-key cutoff preserves cheaper tiny-transaction staging without renting indexes; indexing
+is already worthwhile by sixteen keys. Eight-key staging is near parity, not a universal crossover.
+Read-heavy tiny transactions can favor earlier indexing, so this threshold is a staging/memory tradeoff,
+not a claim that linear lookup always wins below it.
+
+| Workload | Reference | Production hybrid/cached order |
+|---|---:|---:|
+| 64 mixed point probes over 4,096 writes | 409.7 us | 0.257 us |
+| Deduplicate 4,096 already-tracked reads | 16,842.5 us | 27.1 us |
+| Stage 4,096 distinct writes | 16,826.7 us | 102.4 us |
+| Freeze a 32-key range among 65,536 writes, warmed ordering | 443.3 us | 0.676 us |
+
+Indexed point probes and duplicate reads report zero managed allocation. Tests additionally verify
+warmed indexed savepoint/staging cycles and order invalidation/re-sorting allocate zero managed bytes.
+Creating a new buffer still allocates its owner object; frozen overlay copies intentionally own data
+(176 managed bytes per warmed range freeze here, with payload/descriptors rented from pools).
+The ordered reference scans every pending key and sorts the matching copy, omitting its wrapper object
+to conservatively favor the old algorithm. The cached measurement excludes the initial full-key sort:
+first scans and scans after key membership changes still pay `O(n log n)` sorting. Short-run timing and
+pool behavior are machine/workload-dependent; sustained disk/compaction and commit-gate costs are unchanged.
 
 ### Durable transaction group commit
 

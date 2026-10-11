@@ -1194,13 +1194,15 @@ internal sealed class MvccWriteBuffer : IDisposable
             var undo = _undo[--_undoCount];
             _mutations[undo.Index] = undo.Mutation;
         }
-        _orderDirty |= MutationCount != checkpoint.MutationCount;
+        var mutationsRemoved = MutationCount != checkpoint.MutationCount;
+        var readsRemoved = TrackedReadCount != checkpoint.TrackedReadCount;
+        _orderDirty |= mutationsRemoved;
         MutationCount = checkpoint.MutationCount;
         TrackedReadCount = checkpoint.TrackedReadCount;
         _byteCount = checkpoint.ByteCount;
         _savepointCount = index + 1;
-        RebuildIndex(_mutationIndex, reads: false);
-        RebuildIndex(_readIndex, reads: true);
+        if (mutationsRemoved) RebuildIndex(_mutationIndex, reads: false);
+        if (readsRemoved) RebuildIndex(_readIndex, reads: true);
     }
 
     public void ReleaseSavepoint(MvccSavepoint savepoint)

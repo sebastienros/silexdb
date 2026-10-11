@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.IO.Hashing;
+using System.Runtime.CompilerServices;
 using TUnit.Assertions.Enums;
 
 namespace Silex.Test;
@@ -14,6 +15,15 @@ public class TransactionBufferTests
         FlushPeriod = TimeSpan.Zero,
         CompactionStrategy = CompactionStrategy.None,
     };
+
+    [Test]
+    public async Task AccountingDescriptorSizesMatchTheirRepresentations()
+    {
+        await Assert.That(Unsafe.SizeOf<MvccMutation>()).IsEqualTo(20);
+        await Assert.That(Unsafe.SizeOf<MvccKey>()).IsEqualTo(8);
+        await Assert.That(Unsafe.SizeOf<MvccUndo>()).IsEqualTo(24);
+        await Assert.That(Unsafe.SizeOf<MvccCheckpoint>()).IsEqualTo(24);
+    }
 
     [Test]
     public async Task CollisionChainsEmptyKeysAndIndexRebuilds()
