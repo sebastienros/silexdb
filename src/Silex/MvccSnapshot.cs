@@ -34,6 +34,15 @@ public sealed class MvccSnapshot : IDisposable
         return GetStorage().GetRawAtAsync(key, Sequence, destination, cancellationToken);
     }
 
+    /// <summary>Reads many keys at this snapshot's exact sequence; see <see cref="MvccStorage.ReadManyRawAsync"/>.</summary>
+    public ValueTask<PointReadBatch> ReadManyRawAsync(
+        ReadOnlyMemory<ReadOnlyMemory<byte>> keys,
+        int maxBytes,
+        CancellationToken cancellationToken = default)
+    {
+        return GetStorage().ReadManyAtAsync(keys, Sequence, maxBytes, null, cancellationToken);
+    }
+
     public ValueTask<bool> TryReadRawAsync<TArg>(
         ReadOnlySpan<byte> key,
         TArg arg,

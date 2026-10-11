@@ -149,6 +149,40 @@ to avoid indefinite version retention; there is no engine expiry. Continuation t
 restarts, token expiry and projections are not part of this API.
 Existing callback APIs retain their borrowed-span and callback lock-lifetime contracts unchanged.
 
+### Batched point reads
+
+`MvccSnapshot`, `MvccStorage` and `MvccTransaction` expose `ReadManyRawAsync(keys, maxBytes)`, a generic
+multi-get against **one** consistent view: the snapshot's exact sequence, the sequence captured once for a
+store call, or a transaction's starting sequence overlaid with its pending writes and deletions. It is for the
+index-to-record pattern: read identifiers with a cursor, then resolve them together.
+
+```csharp
+using var ids = await cursor.ReadBatchAsync(64, 4096);
+var keys = new ReadOnlyMemory<byte>[ids.Count];
+for (var i = 0; i < keys.Length; i++) keys[i] = ids[i].Value;
+using var records = await snapshot.ReadManyRawAsync(keys, maxBytes: 1 << 20);
+for (var i = 0; i < records.Count; i++)
+{
+    if (records.TryGetValue(i, out var value)) { /* record bytes */ }
+}
+```
+
+Results are positional (duplicates and misses allowed) and owned by the `PointReadBatch` until it is disposed,
+independent of the snapshot and store. `maxBytes` bounds value bytes: when the next value would exceed it, the
+batch stops early (`IsComplete == false`, `Count` leading keys resolved) and the caller continues with
+`keys.AsMemory(batch.Count)`; a first value larger than `maxBytes` throws. Keys must stay unchanged until the
+call completes. Transaction reads are untracked like `GetRawAsync`; use `GetForUpdateRawAsync` for dependencies.
+Cancellation, health/shutdown and disposal behave like individual point reads, and no engine memory or lock is
+held after the call returns. This does not make reads inside scan callbacks safe, and there are no joins or
+record hydration.
+
+Measured (`PointReadBatchBenchmarks`, 65,536 × 100 B values, random keys, Apple M-series, .NET 8 ShortRun):
+batching is within about ±10% of looping `GetRawAsync` for 1–512 keys, for both SST-resident data (≈1.0 µs/key
+at 512 keys) and memtable-resident data, with equal allocations. The cost is dominated by per-key seek setup
+(memtable-resident seeks build merge inputs per call, roughly 2–4 ms and 3–5 MB per key at this size), which batching
+does not amortize; so the API deliberately adds no specialized execution path. Its value is a single snapshot
+registration, bounded owned results and one call per page, not throughput.
+
 ### Recovery, integrity, and salvage
 
 Normal opening refuses a database with a missing manifest-referenced SST, even when a WAL with
