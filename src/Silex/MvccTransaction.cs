@@ -173,6 +173,23 @@ public sealed class MvccTransaction : IDisposable
     }
 
     /// <summary>
+    /// Reads many keys from the starting snapshot overlaid with this transaction's pending writes.
+    /// </summary>
+    /// <remarks>
+    /// Equivalent to <see cref="GetRawAsync"/> per key: reads are not tracked for conflict detection, so use
+    /// <see cref="GetForUpdateRawAsync"/> for keys that must be dependencies. Like other transaction operations,
+    /// it must not overlap mutation, commit or disposal. See <see cref="MvccStorage.ReadManyRawAsync"/> for
+    /// the byte-budget behavior.
+    /// </remarks>
+    public ValueTask<PointReadBatch> ReadManyRawAsync(
+        ReadOnlyMemory<ReadOnlyMemory<byte>> keys,
+        int maxBytes,
+        CancellationToken cancellationToken = default)
+    {
+        return GetStorage().ReadManyAtAsync(keys, Sequence, maxBytes, _writes, cancellationToken);
+    }
+
+    /// <summary>
     /// Reads a key and includes it in commit-time conflict detection.
     /// </summary>
     public ValueTask<int> GetForUpdateRawAsync(
