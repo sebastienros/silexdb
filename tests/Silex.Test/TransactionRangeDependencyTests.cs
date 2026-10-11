@@ -81,6 +81,9 @@ public class TransactionRangeDependencyTests
         holder.Dispose();
         await db.CollectGarbageAsync(compact: true);
         await Assert.That(await tx.TryCommitAsync()).IsFalse();
+        await Assert.That(tx.Conflict!.Kind).IsEqualTo(MvccConflictKind.TrackedRange);
+        await Assert.That(tx.Conflict.Key.Span.SequenceEqual(new byte[] { 5 })).IsTrue();
+        await Assert.That(tx.Conflict.ConflictingSequence).IsEqualTo(db.PublishedSequence - 3);
         await db.CollectGarbageAsync(compact: true);
 
         using var later = db.BeginTransaction();

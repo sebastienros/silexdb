@@ -51,6 +51,12 @@ public class MvccGroupCommitTests
         await harness.BlockingTask;
         var results = await Task.WhenAll(commits).WaitAsync(Timeout);
         await Assert.That(results.SequenceEqual([true, false, false, true])).IsTrue();
+        await Assert.That(conflicting.Conflict!.Kind).IsEqualTo(MvccConflictKind.WrittenKey);
+        await Assert.That(tracked.Conflict!.Kind).IsEqualTo(MvccConflictKind.TrackedPointRead);
+        await Assert.That(conflicting.Conflict.Key.Span.SequenceEqual(new byte[] { 1 })).IsTrue();
+        await Assert.That(tracked.Conflict.Key.Span.SequenceEqual(new byte[] { 1 })).IsTrue();
+        await Assert.That(conflicting.Conflict.ConflictingSequence).IsEqualTo(3L);
+        await Assert.That(tracked.Conflict.ConflictingSequence).IsEqualTo(3L);
         await Assert.That(points.Count(p => p == StorageFaultPoint.WalBeforeWrite)).IsEqualTo(2);
         await Assert.That(points.Count(p => p == StorageFaultPoint.WalBeforeSync)).IsEqualTo(1);
         await Assert.That(points.IndexOf(StorageFaultPoint.BatchBeforeApply))
@@ -65,6 +71,53 @@ public class MvccGroupCommitTests
         await storage.SynchronizeAsync();
         await storage.FlushAndCompactAsync();
         await AssertValueAsync(storage, 5, 55);
+    }
+
+    [Test]
+    [Arguments(false)]
+    [Arguments(true)]
+    public async Task AcceptedMemberRangeConflictRetainsDiagnosticsEvenIfMemberFails(bool fail)
+    {
+        await using var harness = await Harness.OpenAsync();
+        using var writer = harness.Storage.BeginTransaction();
+        using var reader = harness.Storage.BeginTransaction();
+        using var later = harness.Storage.BeginTransaction();
+        writer.Put([15], [1]);
+        reader.TrackReadRange(new OrderedReadRange(new byte[] { 10 }, false, new byte[] { 20 }, true));
+        reader.Put([30], [1]);
+        later.Put([30], [2]); // A rejected member's staged key must not invalidate this member.
+        await harness.BlockAsync();
+        harness.Inject = point =>
+        {
+            if (fail && point == StorageFaultPoint.WalBeforeWrite) throw new IOException("Rejected before WAL write.");
+        };
+        var write = writer.TryCommitAsync().AsTask();
+        var read = reader.TryCommitAsync().AsTask();
+        var next = later.TryCommitAsync().AsTask();
+        harness.Release.Set();
+        await harness.BlockingTask.WaitAsync(Timeout);
+        await Assert.That(await read.WaitAsync(Timeout)).IsFalse();
+        var conflict = reader.Conflict!;
+        await Assert.That(conflict.Kind).IsEqualTo(MvccConflictKind.TrackedRange);
+        await Assert.That(conflict.Key.Span.SequenceEqual(new byte[] { 15 })).IsTrue();
+        await Assert.That(conflict.SnapshotSequence).IsEqualTo(reader.Sequence);
+        await Assert.That(conflict.ConflictingSequence).IsEqualTo(2L);
+        await Assert.That(conflict.Range!.Lower!.Value.Span.SequenceEqual(new byte[] { 10 })).IsTrue();
+        await Assert.That(conflict.Range.LowerInclusive).IsFalse();
+        await Assert.That(conflict.Range.Upper!.Value.Span.SequenceEqual(new byte[] { 20 })).IsTrue();
+        await Assert.That(conflict.Range.UpperInclusive).IsTrue();
+        if (fail)
+        {
+            await Assert.That(async () => await write).Throws<StorageOperationException>();
+            await Assert.That(async () => await next).Throws<StorageOperationException>();
+            await Assert.That(harness.Storage.PublishedSequence).IsEqualTo(1L);
+        }
+        else
+        {
+            await Assert.That(await write).IsTrue();
+            await Assert.That(await next).IsTrue();
+        }
+        await Assert.That(writer.Conflict is null && later.Conflict is null).IsTrue();
     }
 
     [Test]
@@ -111,6 +164,8 @@ public class MvccGroupCommitTests
             syncRelease.Set();
         }
         await Assert.That(async () => await firstCommit).Throws<OperationCanceledException>();
+        await Assert.That(first.Conflict is null).IsTrue();
+        await Assert.That(second.Conflict is null).IsTrue();
         await Assert.That(harness.Storage.PublishedSequence).IsEqualTo(2L);
         await Assert.That(await harness.Storage.GetRawAsync([1], new byte[1])).IsEqualTo(-1);
         await AssertValueAsync(harness.Storage, 2, 22);
@@ -155,6 +210,7 @@ public class MvccGroupCommitTests
         var commits = new[] { CaptureAsync(first), CaptureAsync(second), CaptureAsync(third) };
         harness.Release.Set();
         var failures = await Task.WhenAll(commits).WaitAsync(Timeout);
+        await Assert.That(first.Conflict is null && second.Conflict is null && third.Conflict is null).IsTrue();
         var beforeFirst = point == (int)StorageFaultPoint.WalBeforeWrite && occurrence == 1;
         var allApplied = point == (int)StorageFaultPoint.MvccBeforePublication ||
             point == (int)StorageFaultPoint.MemTableBeforeCreate;

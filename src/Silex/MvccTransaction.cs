@@ -27,6 +27,14 @@ public sealed class MvccTransaction : IDisposable
     /// </summary>
     public long Sequence { get; }
 
+    /// <summary>Gets the first detected commit conflict, retained after this transaction is consumed.</summary>
+    /// <remarks>
+    /// Null before commit, after success, and on cancellation or storage failure. Only inspect after the
+    /// commit operation completes; transaction operations must not overlap. Retry and replay safety belong
+    /// to the caller.
+    /// </remarks>
+    public MvccConflict? Conflict { get; private set; }
+
     /// <summary>Gets the accounted retained bytes as defined by <see cref="StorageOptions.MvccTransactionMaxBytes"/>.</summary>
     public long BufferedBytes { get { GetStorage(); return _writes.BufferedBytes; } }
 
@@ -180,7 +188,10 @@ public sealed class MvccTransaction : IDisposable
     /// <summary>
     /// Attempts to commit all buffered writes atomically.
     /// </summary>
-    /// <returns><c>false</c> when a tracked or written key, or a key in a tracked range, changed after this transaction started.</returns>
+    /// <returns>
+    /// <c>false</c> when a tracked or written key, or a key in a tracked range, changed after this transaction
+    /// started. Inspect <see cref="Conflict"/> for the first detected dependency conflict.
+    /// </returns>
     /// <remarks>
     /// Cancellation is observed before the final write starts. Once writing starts, it completes without
     /// polling cancellation. A <see cref="StorageOperationException"/> can report an indeterminate or
@@ -196,7 +207,8 @@ public sealed class MvccTransaction : IDisposable
 
         try
         {
-            return await storage.TryCommitAsync(Sequence, _writes, cancellationToken).ConfigureAwait(false);
+            Conflict = await storage.TryCommitAsync(Sequence, _writes, cancellationToken).ConfigureAwait(false);
+            return Conflict is null;
         }
         finally
         {
@@ -207,11 +219,12 @@ public sealed class MvccTransaction : IDisposable
     /// <summary>
     /// Commits all buffered writes atomically, throwing on a conflict.
     /// </summary>
+    /// <exception cref="MvccConflictException">A dependency conflict, with owned diagnostics in its Conflict property.</exception>
     public async ValueTask CommitAsync(CancellationToken cancellationToken = default)
     {
         if (!await TryCommitAsync(cancellationToken).ConfigureAwait(false))
         {
-            throw new MvccConflictException();
+            throw new MvccConflictException(Conflict!);
         }
     }
 

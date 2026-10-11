@@ -30,7 +30,7 @@ public sealed partial class MvccStorage
             }
         }
 
-        public async ValueTask<bool> CommitAsync(long sequence, MvccWriteBuffer writes, CancellationToken cancellationToken)
+        public async ValueTask<MvccConflict?> CommitAsync(long sequence, MvccWriteBuffer writes, CancellationToken cancellationToken)
         {
             await _slots.WaitAsync(cancellationToken).ConfigureAwait(false);
             try
@@ -118,16 +118,17 @@ public sealed partial class MvccStorage
                 {
                     _owner.CheckDisposed();
                     request.CancellationToken.ThrowIfCancellationRequested();
-                    if (ConflictsWithAccepted(request, acceptedCount) ||
-                        !await _owner.ValidateAsync(request.Sequence, request.Writes, request.CancellationToken).ConfigureAwait(false))
+                    var conflict = ConflictsWithAccepted(request, acceptedCount) ??
+                        await _owner.ValidateAsync(request.Sequence, request.Writes, request.CancellationToken).ConfigureAwait(false);
+                    if (conflict is not null)
                     {
-                        request.Completion.SetResult(false);
+                        request.Completion.SetResult(conflict);
                         continue;
                     }
                     if (request.Writes.MutationCount == 0)
                     {
                         request.CancellationToken.ThrowIfCancellationRequested();
-                        request.Completion.SetResult(true);
+                        request.Completion.SetResult(null);
                         continue;
                     }
                     if (sequence == long.MaxValue)
@@ -166,7 +167,7 @@ public sealed partial class MvccStorage
                 }
                 for (var i = 0; i < acceptedCount; i++)
                 {
-                    _accepted[i]!.Completion.SetResult(true);
+                    _accepted[i]!.Completion.SetResult(null);
                 }
             }
             catch (Exception exception)
@@ -179,26 +180,32 @@ public sealed partial class MvccStorage
             }
         }
 
-        private bool ConflictsWithAccepted(CommitRequest request, int acceptedCount)
+        private MvccConflict? ConflictsWithAccepted(CommitRequest request, int acceptedCount)
         {
             for (var i = 0; i < acceptedCount; i++)
             {
-                var writes = _accepted[i]!.Writes;
+                var accepted = _accepted[i]!;
+                var writes = accepted.Writes;
                 for (var j = 0; j < writes.MutationCount; j++)
                 {
                     var key = writes.GetMutationKey(j).Span;
                     if (request.Writes.FindMutation(key) >= 0)
                     {
-                        return true;
+                        return new MvccConflict(MvccConflictKind.WrittenKey, key, request.Sequence, accepted.CommitSequence);
                     }
-                    if (request.Writes.FindTrackedRead(key) >= 0 ||
-                        (request.Writes.ReadRangeCount != 0 && request.Writes.ReadRangeContains(key)))
+                    if (request.Writes.FindTrackedRead(key) >= 0)
                     {
-                        return true;
+                        return new MvccConflict(MvccConflictKind.TrackedPointRead, key, request.Sequence, accepted.CommitSequence);
+                    }
+                    var rangeIndex = request.Writes.FindReadRange(key);
+                    if (rangeIndex >= 0)
+                    {
+                        return new MvccConflict(MvccConflictKind.TrackedRange, key, request.Sequence,
+                            accepted.CommitSequence, request.Writes.GetReadRange(rangeIndex));
                     }
                 }
             }
-            return false;
+            return null;
         }
 
         private sealed class CommitRequest(long sequence, MvccWriteBuffer writes, CancellationToken cancellationToken)
@@ -207,7 +214,7 @@ public sealed partial class MvccStorage
             public MvccWriteBuffer Writes { get; } = writes;
             public CancellationToken CancellationToken { get; } = cancellationToken;
             public long CommitSequence { get; set; }
-            public TaskCompletionSource<bool> Completion { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            public TaskCompletionSource<MvccConflict?> Completion { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         }
     }
 }

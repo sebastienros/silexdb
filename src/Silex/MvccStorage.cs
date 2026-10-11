@@ -452,7 +452,7 @@ public sealed partial class MvccStorage : IAsyncDisposable
         return SeekEncodedAtAsync(encodedFrom, sequence, arg, reader, maxEntries, cancellationToken);
     }
 
-    internal async ValueTask<bool> TryCommitAsync(
+    internal async ValueTask<MvccConflict?> TryCommitAsync(
         long snapshotSequence,
         MvccWriteBuffer writes,
         CancellationToken cancellationToken)
@@ -467,14 +467,15 @@ public sealed partial class MvccStorage : IAsyncDisposable
         try
         {
             CheckDisposed();
-            if (!await ValidateAsync(snapshotSequence, writes, cancellationToken).ConfigureAwait(false))
+            var conflict = await ValidateAsync(snapshotSequence, writes, cancellationToken).ConfigureAwait(false);
+            if (conflict is not null)
             {
-                return false;
+                return conflict;
             }
 
             if (writes.MutationCount == 0)
             {
-                return true;
+                return null;
             }
 
             var sequence = AllocateSequence();
@@ -485,7 +486,7 @@ public sealed partial class MvccStorage : IAsyncDisposable
             _storage.BeforeMvccPublication();
             _allocatedSequence = sequence;
             Volatile.Write(ref _publishedSequence, sequence);
-            return true;
+            return null;
         }
         finally
         {
@@ -493,39 +494,43 @@ public sealed partial class MvccStorage : IAsyncDisposable
         }
     }
 
-    private async ValueTask<bool> ValidateAsync(long snapshotSequence, MvccWriteBuffer writes, CancellationToken cancellationToken)
+    private async ValueTask<MvccConflict?> ValidateAsync(long snapshotSequence, MvccWriteBuffer writes, CancellationToken cancellationToken)
     {
         var published = Volatile.Read(ref _publishedSequence);
         for (var i = 0; i < writes.MutationCount; i++)
         {
-            if (await WasModifiedAfterAsync(writes.GetMutationKey(i), snapshotSequence, published, cancellationToken).ConfigureAwait(false))
+            var key = writes.GetMutationKey(i);
+            var sequence = await FindVisibleSequenceAsync(key.Span, published, cancellationToken).ConfigureAwait(false);
+            if (sequence > snapshotSequence)
             {
-                return false;
+                return new MvccConflict(MvccConflictKind.WrittenKey, key.Span, snapshotSequence, sequence);
             }
         }
         for (var i = 0; i < writes.TrackedReadCount; i++)
         {
             var key = writes.GetTrackedRead(i);
-            if (writes.FindMutation(key.Span) < 0 &&
-                await WasModifiedAfterAsync(key, snapshotSequence, published, cancellationToken).ConfigureAwait(false))
+            if (writes.FindMutation(key.Span) >= 0) continue;
+            var sequence = await FindVisibleSequenceAsync(key.Span, published, cancellationToken).ConfigureAwait(false);
+            if (sequence > snapshotSequence)
             {
-                return false;
+                return new MvccConflict(MvccConflictKind.TrackedPointRead, key.Span, snapshotSequence, sequence);
             }
         }
         for (var i = 0; i < writes.ReadRangeCount; i++)
         {
-            if (await RangeModifiedAfterAsync(writes.GetReadRange(i), snapshotSequence, published, cancellationToken).ConfigureAwait(false))
+            var conflict = await RangeModifiedAfterAsync(writes.GetReadRange(i), snapshotSequence, published, cancellationToken).ConfigureAwait(false);
+            if (conflict is not null)
             {
-                return false;
+                return conflict;
             }
         }
-        return true;
+        return null;
     }
 
     // Every user key keeps its newest version through GC (the published sequence is always required), so the
     // newest physical version per key in the interval is exactly the key's latest commit, even after
     // intermediate versions were reclaimed. Tombstones are versions too, so deletions remain visible here.
-    private async ValueTask<bool> RangeModifiedAfterAsync(
+    private async ValueTask<MvccConflict?> RangeModifiedAfterAsync(
         OrderedReadRange range, long snapshotSequence, long publishedSequence, CancellationToken cancellationToken)
     {
         using var lower = range.Lower is { } low ? EncodeVersionKey(low.Span, range.LowerInclusive ? long.MaxValue : 0) : null;
@@ -533,18 +538,18 @@ public sealed partial class MvccStorage : IAsyncDisposable
         var physical = new OrderedReadRange(
             lower is null ? new byte[] { DataPrefix } : lower.Slice.Memory, true,
             upper is null ? new byte[] { 2 } : upper.Slice.Memory, upper is not null && range.UpperInclusive);
-        using var state = new RangeConflictState(snapshotSequence, publishedSequence);
+        using var state = new RangeConflictState(snapshotSequence, publishedSequence, range);
         await _storage.ScanOrderedAsync(physical, OrderedReadDirection.Forward, state,
             static (s, key, _) => s.Accept(key), cancellationToken).ConfigureAwait(false);
         return state.Conflict;
     }
 
-    private sealed class RangeConflictState(long snapshot, long published) : IDisposable
+    private sealed class RangeConflictState(long snapshot, long published, OrderedReadRange range) : IDisposable
     {
         private readonly KeyGroup _group = new();
         private bool _resolved;
 
-        public bool Conflict { get; private set; }
+        public MvccConflict? Conflict { get; private set; }
 
         public bool Accept(ReadOnlySpan<byte> key)
         {
@@ -561,8 +566,18 @@ public sealed partial class MvccStorage : IAsyncDisposable
                 return true;
             }
             _resolved = true;
-            Conflict = sequence > snapshot;
-            return !Conflict;
+            if (sequence > snapshot)
+            {
+                return InvokeUserReader((State: this, Sequence: sequence),
+                    static (s, decodedKey, _) => s.State.SetConflict(decodedKey, s.Sequence), userKey, default);
+            }
+            return true;
+        }
+
+        private bool SetConflict(ReadOnlySpan<byte> key, long sequence)
+        {
+            Conflict = new MvccConflict(MvccConflictKind.TrackedRange, key, snapshot, sequence, range);
+            return false;
         }
 
         public void Dispose() => _group.Dispose();
@@ -658,16 +673,6 @@ public sealed partial class MvccStorage : IAsyncDisposable
                 ArrayPool<byte>.Shared.Return(rented);
             }
         }
-    }
-
-    private async ValueTask<bool> WasModifiedAfterAsync(
-        ReadOnlyMemory<byte> key,
-        long snapshotSequence,
-        long publishedSequence,
-        CancellationToken cancellationToken)
-    {
-        var sequence = await FindVisibleSequenceAsync(key.Span, publishedSequence, cancellationToken).ConfigureAwait(false);
-        return sequence > snapshotSequence;
     }
 
     private ValueTask<long> FindVisibleSequenceAsync(ReadOnlySpan<byte> key, long sequence, CancellationToken cancellationToken)
@@ -1428,7 +1433,7 @@ internal sealed class MvccWriteBuffer : IDisposable
         _ranges[ReadRangeCount++] = candidate;
     }
 
-    public bool ReadRangeContains(ReadOnlySpan<byte> key)
+    public int FindReadRange(ReadOnlySpan<byte> key)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         for (var i = 0; i < ReadRangeCount; i++)
@@ -1444,9 +1449,9 @@ internal sealed class MvccWriteBuffer : IDisposable
                 var c = key.SequenceCompareTo(_bytes.AsSpan(range.UpperOffset, range.UpperLength));
                 if (c > 0 || (c == 0 && (range.Flags & 2) == 0)) continue;
             }
-            return true;
+            return i;
         }
-        return false;
+        return -1;
     }
 
     public OrderedReadRange GetReadRange(int index)
