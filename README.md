@@ -555,6 +555,38 @@ versions, transaction buffers, and sequence metadata writes. Dispose snapshots a
 call `CollectGarbageAsync` periodically to remove versions that no active view can observe. Pass
 `compact: true` when the call should also flush and compact the resulting physical tombstones.
 
+### Transaction savepoints
+
+```csharp
+var statement = transaction.CreateSavepoint();
+transaction.Put("alice"u8, "15"u8);
+transaction.Delete("bob"u8);
+transaction.RollbackToSavepoint(statement); // restore both prior staged values
+transaction.ReleaseSavepoint(statement);
+```
+
+Savepoints checkpoint **staged mutations and explicitly tracked point reads**, not committed history.
+Rollback restores overwritten values (including empty values and tombstones), removes newly staged
+keys, and removes read dependencies first registered after the marker. Earlier tracked reads remain,
+including keys read again after it. Reads against pending mutations still rely on written-key validation.
+This deliberately avoids conflicts caused only by discarded statement reads; callers must not use those
+discarded reads to decide later writes without tracking them again.
+
+Markers are ordered by creation. Rollback keeps the target active for repeated rollback followed by new
+writes, but invalidates all newer markers. Release removes the target and all newer markers without
+undoing writes or reads; an older marker can still undo released nested work. Default handles, handles
+from another transaction, and released/invalidated handles throw `ArgumentException`. Savepoint operations
+after disposal or any completed commit attempt throw `ObjectDisposedException`, just like other
+transaction operations. Success, conflict, cancellation, or failure of a commit attempt consumes the
+transaction; savepoints cannot revive it.
+
+Rollback never changes `Sequence`, external committed writes, or a previously created cursor's frozen
+overlay. New cursors and point reads see the restored buffer over the original starting snapshot.
+Savepoint operations are single-consumer and must not overlap reads, writes, commit, or disposal.
+Checkpoint/undo arrays are rented lazily and reused; ordinary transactions retain their existing
+in-place overwrite path. While any marker is active, replacements append bytes and undo descriptors;
+rollback rewinds their storage without allocating. Savepoints add no resource limits or buffer indexing.
+
 ### Durable transaction group commit
 
 Set `MvccCommitGroupSize` to a value from 2 through 64 to let concurrent transaction commits share WAL

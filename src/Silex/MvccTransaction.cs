@@ -24,6 +24,34 @@ public sealed class MvccTransaction : IDisposable
     /// </summary>
     public long Sequence { get; }
 
+    /// <summary>Creates a checkpoint of the current staged writes and tracked point reads.</summary>
+    /// <remarks>Like all transaction operations, savepoint operations must not overlap other operations.</remarks>
+    public MvccSavepoint CreateSavepoint()
+    {
+        GetStorage();
+        return _writes.CreateSavepoint();
+    }
+
+    /// <summary>Restores staged writes and tracked reads to a savepoint, keeping that savepoint reusable.</summary>
+    /// <remarks>
+    /// Newer savepoints are invalidated. Reads tracked after the target are removed; earlier dependencies
+    /// remain. The starting snapshot and already-created cursors are unchanged. No committed writes are undone.
+    /// </remarks>
+    /// <exception cref="ArgumentException">The handle is not active in this transaction.</exception>
+    public void RollbackToSavepoint(MvccSavepoint savepoint)
+    {
+        GetStorage();
+        _writes.RollbackToSavepoint(savepoint);
+    }
+
+    /// <summary>Releases a savepoint and all newer savepoints without changing staged writes or tracked reads.</summary>
+    /// <exception cref="ArgumentException">The handle is not active in this transaction.</exception>
+    public void ReleaseSavepoint(MvccSavepoint savepoint)
+    {
+        GetStorage();
+        _writes.ReleaseSavepoint(savepoint);
+    }
+
     /// <summary>Creates a bounded cursor over the starting snapshot and the current pending writes.</summary>
     /// <remarks>
     /// Pending writes are copied and frozen at creation; later mutations are invisible to this cursor.
