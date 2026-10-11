@@ -22,13 +22,19 @@ namespace Silex.Keys;
 /// <item><description>Double <c>0x22</c>: tag + big-endian IEEE-754 bits transformed to a total order (9 bytes):
 /// -Infinity &lt; negative finite &lt; -0.0 &lt; +0.0 &lt; positive finite &lt; +Infinity &lt; NaN. All NaNs encode as
 /// one canonical NaN, so non-canonical NaN payloads are not preserved.</description></item>
+/// <item><description>Decimal <c>0x23</c>: tag + 24-byte big-endian signed integer with its highest bit flipped
+/// (25 bytes). For unsigned 96-bit coefficient C, scale s and sign, the integer is +/-C * 10^(28-s),
+/// computed with integer arithmetic. Equal decimal values, including scaled and signed zeros, encode identically.
+/// Decoding returns the minimum possible scale and positive scale-zero zero, not the original decimal bits.
+/// Payloads that cannot represent an exact decimal value are malformed, even if within the numeric bounds.</description></item>
 /// <item><description>Descending: the whole component (tag, payload, terminator) is bitwise complemented, which
 /// exactly reverses the order of that component because encodings are prefix-free.</description></item>
 /// </list>
 /// <para>
-/// Different kinds are separated by tag order (Boolean &lt; Bytes &lt; String &lt; Int64 &lt; UInt64 &lt; Double, then
-/// all descending kinds in reverse). Integers and doubles are never interleaved numerically. The format defines
-/// no NULL, collation, case folding, decimal, date or JSON ordering; those semantics belong to the layer using it.
+/// Different kinds are separated by tag order (Boolean &lt; Bytes &lt; String &lt; Int64 &lt; UInt64 &lt; Double &lt; Decimal,
+/// then all descending kinds in reverse). Numeric kinds are never interleaved by magnitude. The format defines
+/// no NULL, collation, case folding, date or JSON ordering; those semantics belong to the layer using it.
+/// Existing component encodings are unchanged.
 /// </para>
 /// </remarks>
 public static class OrderedKey
@@ -44,6 +50,9 @@ public static class OrderedKey
 
     /// <summary>Encoded size of a <see cref="double"/> component.</summary>
     public const int DoubleLength = 9;
+
+    /// <summary>Encoded size of a <see cref="decimal"/> component.</summary>
+    public const int DecimalLength = 25;
 
     internal const ulong CanonicalNaNBits = 0x7FF8000000000000UL;
 

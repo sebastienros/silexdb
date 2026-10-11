@@ -63,6 +63,16 @@ public ref struct OrderedKeyWriter
         return TryWriteFixed(OrderedKeyComponent.Double, OrderedKey.ToOrderedDoubleBits(value), order);
     }
 
+    /// <summary>Appends an exact decimal number; decimal scale and signed zero are normalized.</summary>
+    public bool TryWriteDecimal(decimal value, OrderedKeyOrder order = OrderedKeyOrder.Ascending)
+    {
+        if (!TryBegin(OrderedKey.DecimalLength, out var s)) return false;
+        s[0] = OrderedKey.Tag(OrderedKeyComponent.Decimal, false, order);
+        OrderedDecimal.Encode(value, s.Slice(1));
+        Complement(s, order);
+        return true;
+    }
+
     /// <summary>Appends a bytes component; its size is <see cref="OrderedKey.GetBytesLength"/>.</summary>
     public bool TryWriteBytes(ReadOnlySpan<byte> value, OrderedKeyOrder order = OrderedKeyOrder.Ascending)
     {

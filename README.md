@@ -226,28 +226,42 @@ reader.TryReadUInt64(out var ts, OrderedKeyOrder.Descending);
 Everything is span based and allocation free; the caller owns all buffers.
 
 * **Components** (each with `Ascending` or `Descending` order): `Boolean`, `Bytes`, `String`, `Int64`,
-  `UInt64`, `Double`.
+  `UInt64`, `Double`, `Decimal`.
 * **Format.** Each component begins with a tag (`04`/`05` boolean false/true, `10` bytes, `11` string,
-  `20` int64, `21` uint64, `22` double); a descending component uses the bitwise complement of its entire
+  `20` int64, `21` uint64, `22` double, `23` decimal); a descending component uses the bitwise complement of its entire
   encoding, including the tag. Integers are big-endian (int64 with the sign bit flipped). Doubles use the
   IEEE-754 bit transform giving `-Infinity < negatives < -0.0 < +0.0 < positives < +Infinity < NaN`; every NaN
   is written as one canonical NaN, so NaN payloads are not preserved. Bytes and strings escape each `00`
   as `00 FF` and end with `00 01`. Strings are strict UTF-8 ordered by code point (unpaired surrogates throw
   `ArgumentException`); no case folding or collation is applied.
+* **Decimal.** A fixed 25-byte component: tag `23` followed by a 24-byte two's-complement big-endian integer
+  with its highest bit flipped. For unsigned 96-bit coefficient `C`, scale `s` in `[0,28]` and sign, the
+  integer is `N = +/-C * 10^(28-s)`, computed entirely with integer arithmetic. Its maximum magnitude
+  `(2^96-1) * 10^28` needs 190 bits. Descending complements all 25 bytes, including tag `DC`.
+  Equal decimal values have identical keys regardless of trailing-zero scale or zero sign. Decoding returns
+  the minimum possible scale, with positive scale-zero zero; it preserves value, not the original decimal bits.
+  A payload must be exactly representable as a decimal: even in-range integers such as `N = 2^96` are
+  rejected when removing trailing zeros cannot reduce the coefficient to 96 bits. Reads, peeks and skips
+  reject malformed decimal payloads without advancing. Existing kinds' bytes and semantics are unchanged.
 * **Boundaries.** No component encoding is a byte prefix of another, so tuple boundaries are
   unambiguous and the raw key bytes of a tuple prefix (for example `writer.WrittenSpan`) are exactly the byte
   prefix of every longer tuple that starts with it, which composes with `PrefixKeyspace`. Different kinds
-  order by tag (Boolean < Bytes < String < Int64 < UInt64 < Double, then descending kinds); integers and
-  doubles are never interleaved numerically, and position-wise consistent schemas are the caller's concern.
+  order by tag (Boolean < Bytes < String < Int64 < UInt64 < Double < Decimal, then descending kinds); numeric
+  kinds are never interleaved by magnitude, and position-wise consistent schemas are the caller's concern.
 * **Buffers.** `TryWrite*` returns `false` when the exact encoded size does not fit, leaving
   `Written` unchanged; sizes are `OrderedKey.BooleanLength` (1), `Int64Length`/`UInt64Length`/`DoubleLength` (9),
-  and `GetBytesLength`/`GetStringLength`. Readers return an `OrderedKeyDecodeStatus`
+  `DecimalLength` (25), and `GetBytesLength`/`GetStringLength`. Readers return an `OrderedKeyDecodeStatus`
   (`EndOfData`, `UnexpectedComponent`, `Malformed`, `DestinationTooSmall` with the exact required length) and
   do not advance on failure. Decoding is strict, so each key has exactly one decoding.
 * **Limits.** Sizes are `int`-bounded, and keys remain subject to the storage engine's own key limits.
-  No NULL, decimal, date/time, GUID, or case-insensitive components are defined; layers can compose them from
+  No NULL, date/time, GUID, or case-insensitive components are defined; layers can compose them from
   these building blocks (for example a leading boolean or `UInt64` marker for NULL placement). The format is
   versionless and its encodings are fixed; future component kinds would use new tags.
+
+Decimal normalization does not introduce mixed-type numeric equality: `Int64(1)`, `Double(1.0)` and
+`Decimal(1.00)` remain distinct keys in separate tag-ordered regions. Unified SQL/JSON numeric comparison
+requires a separate encoding or coercion policy; converting all numbers to `Double` loses integer
+distinctions above `2^53` and decimal precision. Double still distinguishes negative and positive zero.
 
 ### Batched point reads
 
