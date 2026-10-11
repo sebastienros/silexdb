@@ -42,3 +42,40 @@ jobs:
 
       - name: Test
         run: dotnet test tests/Silex.Test/Silex.Test.csproj --configuration Release --no-build
+
+  jepsen:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, windows-latest, macos-latest ]
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    env:
+      DOTNET_NOLOGO: true
+      DOTNET_CLI_TELEMETRY_OPTOUT: 1
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+          global-json-file: global.json
+
+      - name: Build
+        run: dotnet build tests/Silex.Jepsen/Silex.Jepsen.csproj --configuration Release
+
+      # Time-boxed smoke run (~35s locally); the step is capped at 1 minute.
+      - name: Jepsen smoke
+        timeout-minutes: 1
+        run: dotnet run --no-build -c Release --project tests/Silex.Jepsen -- all --seconds 1 --crash-cycles 2 --seed 7 --output jepsen-results
+
+      - name: Upload failing histories
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jepsen-results-${{ matrix.os }}
+          path: jepsen-results
+          if-no-files-found: ignore
