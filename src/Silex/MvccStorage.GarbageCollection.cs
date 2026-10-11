@@ -77,7 +77,7 @@ public sealed partial class MvccStorage
         try
         {
             CheckDisposed();
-            return await RunGarbageCollectionAsync(options, cancellationToken).ConfigureAwait(false);
+            return await TrackGarbageCollectionAsync(options, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -127,7 +127,7 @@ public sealed partial class MvccStorage
 
             if (state.Batch.Count != 0)
             {
-                await _commitGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+                await EnterCommitGateAsync(cancellationToken).ConfigureAwait(false);
                 try
                 {
                     CheckDisposed();
@@ -141,6 +141,7 @@ public sealed partial class MvccStorage
 
             examined += state.ChunkExamined;
             deleted += state.Batch.Count;
+            RecordGarbageCollectionChunk(state.ChunkExamined, state.Batch.Count);
             var exhausted = state.Stop == GarbageCollectionStop.None;
             if (state.ChunkExamined != 0)
             {
@@ -224,7 +225,7 @@ public sealed partial class MvccStorage
         public bool LastKeyPreserveGroup { get; private set; }
 
         // Sorted descending and distinct, always including the published sequence; element 0 is the largest.
-        public void SetRequired(Dictionary<long, int>.KeyCollection active, int activeCount, long published)
+        public void SetRequired(Dictionary<long, SnapshotEntry>.KeyCollection active, int activeCount, long published)
         {
             if (_required.Length < activeCount + 1)
             {

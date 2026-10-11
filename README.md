@@ -590,6 +590,37 @@ versions, transaction buffers, and sequence metadata writes. Dispose snapshots a
 call `CollectGarbageAsync` periodically to remove versions that no active view can observe. Pass
 `compact: true` when the call should also flush and compact the resulting physical tombstones.
 
+### Engine diagnostics and backpressure signals
+
+`LsmStorage.GetStatisticsAsync()` and `MvccStorage.GetStatisticsAsync()` return point-in-time snapshots that higher layers
+can use for admission control and service metrics. The engine only reports; timeout, shedding and overload policy
+stay in the caller. Snapshots remain available on a faulted instance (with `Health`/`Fault` set) and throw
+`ObjectDisposedException` after disposal.
+
+- **Unavailable is `null`, never zero.** Durations (`DurationStatistics`) have `Max`/`Last`/`Average` only after the first
+  sample; `WriteAmplification`, `SpaceAmplificationEstimate`, `HitRatio`, backlog bytes and oldest-view fields are `null`
+  when they cannot be measured (no writes, cache disabled, no compaction strategy, no pinned views).
+- **LSM**: write operations and user bytes, WAL bytes and fsync latency (`Wal.Sync`; no samples unless writes
+  synchronize), memtable and immutable memtable counts and bytes, per-level table counts and bytes, flush and compaction
+  duration/input/output/running state, block-cache hits/misses/evictions/size, writer-lock wait time, and background
+  maintenance failures (count, last exception, time).
+- **Pressure**: `Pressure` is a `StoragePressureCauses` flag set (`Faulted`, `MemTableLimit`, `Level0Backlog`,
+  `CompactionBacklog`). The engine has no write-stall mechanism (immutable memtables accumulate), so these flags describe
+  work that is due, and writer wait is measured rather than injected.
+- **MVCC**: active read views, distinct pinned sequences, oldest retained sequence, retained sequence span, an upper
+  bound on the oldest view's age, commits published, commit-gate acquisitions/waiters/wait time, group-commit counters
+  and pending requests, and garbage-collection passes (completed/failed/canceled), versions examined/deleted, duration
+  and last result/failure.
+- **Range estimates**: `EstimateRangeAsync(range)` returns `StorageRangeEstimate`, a *physical* approximation from SST
+  block boundaries: stored (compressed) bytes, decoded bytes, overlapping tables and blocks. Whole blocks are counted, and
+  overlapping tables and versions are summed, so it is neither an exact count nor logical cardinality or selectivity.
+  The unflushed memtable contribution is an unscoped upper bound reported separately. On `MvccStorage` the range is in user
+  keys and covers retained versions.
+- **`System.Diagnostics.Metrics`**: meter `Silex.Storage` (`StorageMeter.MeterName`) exposes cheap counters (writes, user
+  and WAL bytes, WAL syncs, completed/running flushes and compactions, background failures) as observable instruments
+  tagged `silex.storage.path`; nothing is recorded on the hot path. Derived or asynchronous signals (pressure, range
+  estimates, snapshot ages) are only in the statistics API.
+
 ### Incremental, bounded garbage collection
 
 `CollectGarbageAsync(MvccGarbageCollectionOptions)` reclaims versions in bounded chunks and returns an

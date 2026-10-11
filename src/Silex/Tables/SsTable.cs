@@ -227,7 +227,7 @@ internal sealed class SsTable : IDisposable
         }
     }
 
-    private (long Offset, int Length) GetBlockExtent(int index)
+    internal (long Offset, int Length) GetBlockExtent(int index)
     {
         var offset = _blockMetadata[index].Offset;
 

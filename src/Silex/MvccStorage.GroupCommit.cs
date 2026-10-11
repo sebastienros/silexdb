@@ -53,6 +53,17 @@ public sealed partial class MvccStorage
             }
         }
 
+        public int PendingCount
+        {
+            get
+            {
+                lock (_lock)
+                {
+                    return _pending.Count;
+                }
+            }
+        }
+
         public Task StopAsync()
         {
             lock (_lock)
@@ -66,7 +77,7 @@ public sealed partial class MvccStorage
         {
             while (true)
             {
-                await _owner._commitGate.WaitAsync().ConfigureAwait(false);
+                await _owner.EnterCommitGateAsync(CancellationToken.None).ConfigureAwait(false);
                 try
                 {
                     int count;
@@ -165,6 +176,8 @@ public sealed partial class MvccStorage
                     _owner._allocatedSequence = _accepted[i]!.CommitSequence;
                     Volatile.Write(ref _owner._publishedSequence, _accepted[i]!.CommitSequence);
                 }
+                Interlocked.Increment(ref _owner._commitGroups);
+                Interlocked.Add(ref _owner._groupedCommits, acceptedCount);
                 for (var i = 0; i < acceptedCount; i++)
                 {
                     _accepted[i]!.Completion.SetResult(null);

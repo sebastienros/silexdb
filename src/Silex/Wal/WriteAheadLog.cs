@@ -50,6 +50,7 @@ internal sealed class WriteAheadLog : IDisposable
 
     internal int RecordWriteCount { get; private set; }
     internal int DiskFlushCount { get; private set; }
+    internal StorageMetrics? Metrics { get; init; }
 
     public WriteAheadLog(string path, bool syncToDisk, Action<StorageFaultPoint>? faultInjector = null)
     {
@@ -156,8 +157,10 @@ internal sealed class WriteAheadLog : IDisposable
     internal void Synchronize()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        var started = Metrics is null ? 0 : System.Diagnostics.Stopwatch.GetTimestamp();
         _stream.Flush(flushToDisk: true);
         DiskFlushCount++;
+        Metrics?.RecordWalSync(started);
     }
 
     internal void SynchronizeGroup()
@@ -245,12 +248,15 @@ internal sealed class WriteAheadLog : IDisposable
         }
         _faultInjector?.Invoke(StorageFaultPoint.WalAfterWrite);
         RecordWriteCount++;
+        Metrics?.RecordWalBytes(frame.Length);
         if (_syncToDisk && synchronize)
         {
             _faultInjector?.Invoke(StorageFaultPoint.WalBeforeSync);
+            var started = Metrics is null ? 0 : System.Diagnostics.Stopwatch.GetTimestamp();
             _stream.Flush(flushToDisk: true);
             _faultInjector?.Invoke(StorageFaultPoint.WalAfterSync);
             DiskFlushCount++;
+            Metrics?.RecordWalSync(started);
         }
         AppendOutcome = StorageCommitOutcome.Committed;
     }

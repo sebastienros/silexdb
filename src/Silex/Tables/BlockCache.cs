@@ -20,6 +20,16 @@ internal sealed class BlockCache : IDisposable
     [ThreadStatic]
     private static int t_recencyCounter;
     private bool _disposed;
+    private readonly StripedCounter _hits = new();
+    private long _misses;
+    private long _evictions;
+
+    public long SizeLimit => _sizeLimit;
+    public long Hits => _hits.Value;
+    public long Misses => Interlocked.Read(ref _misses);
+    public long Evictions => Interlocked.Read(ref _evictions);
+    public long SizeBytes => Interlocked.Read(ref _size);
+    public long EntryCount => _entries.Count;
 
     public BlockCache(long sizeLimit)
     {
@@ -43,6 +53,7 @@ internal sealed class BlockCache : IDisposable
 
         if (TryAcquire(key, out var lease))
         {
+            _hits.Increment();
             return new ValueTask<BlockLease>(lease);
         }
 
@@ -66,6 +77,7 @@ internal sealed class BlockCache : IDisposable
 
             if (TryAcquire(key, out var lease))
             {
+                _hits.Increment();
                 return lease;
             }
 
@@ -109,11 +121,13 @@ internal sealed class BlockCache : IDisposable
 
                 if (TryAcquireLocked(key, out var lease))
                 {
+                    _hits.Increment();
                     return lease;
                 }
 
                 var entry = new Entry(key, block, block.Memory.Length, refCount: 1);
                 block = null;
+                Interlocked.Increment(ref _misses);
 
                 if (_sizeLimit == 0)
                 {
@@ -223,6 +237,7 @@ internal sealed class BlockCache : IDisposable
                 Remove(entry);
                 _entries.TryRemove(entry.Key, out _);
                 _size -= entry.Size;
+                Interlocked.Increment(ref _evictions);
                 entry.MarkEvicted();
                 Interlocked.CompareExchange(ref _mostRecent, null, entry);
             }

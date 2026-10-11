@@ -11,7 +11,7 @@ public sealed partial class MvccStorage
     public async Task CreateBackupAsync(string destination, CancellationToken cancellationToken = default)
     {
         CheckDisposed();
-        await _commitGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await EnterCommitGateAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             CheckDisposed();
