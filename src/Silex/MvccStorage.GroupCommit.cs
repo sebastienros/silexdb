@@ -191,12 +191,9 @@ public sealed partial class MvccStorage
                     {
                         return true;
                     }
-                    for (var k = 0; k < request.Writes.TrackedReadCount; k++)
+                    if (request.Writes.FindTrackedRead(key) >= 0)
                     {
-                        if (key.SequenceEqual(request.Writes.GetTrackedRead(k).Span))
-                        {
-                            return true;
-                        }
+                        return true;
                     }
                 }
             }

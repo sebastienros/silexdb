@@ -15,7 +15,9 @@ public class MvccGroupCommitTests
     };
 
     [Test]
-    public async Task OrderedValidationIncludesAcceptedWritesAndTrackedReads()
+    [Arguments(0)]
+    [Arguments(256)]
+    public async Task OrderedValidationIncludesAcceptedWritesAndTrackedReads(int indexedEntries)
     {
         await using var harness = await Harness.OpenAsync();
         var storage = harness.Storage;
@@ -32,6 +34,14 @@ public class MvccGroupCommitTests
         tracked.Put([3], [33]);
         independent.Delete([4]);
         independent.Put([5], [55]);
+        for (var i = 0; i < indexedEntries; i++)
+        {
+            var key = new byte[4];
+            BinaryPrimitives.WriteInt32BigEndian(key, i);
+            first.Put(key, []);
+            conflicting.Delete(key);
+            await tracked.GetForUpdateRawAsync(key, Memory<byte>.Empty);
+        }
         await harness.BlockAsync();
         var points = new List<StorageFaultPoint>();
         harness.Inject = points.Add;

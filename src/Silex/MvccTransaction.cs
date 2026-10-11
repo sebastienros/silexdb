@@ -7,15 +7,17 @@ namespace Silex;
 /// Writes are buffered until commit and participate in write-write conflict detection. Use
 /// <see cref="GetForUpdateRawAsync"/> for reads whose values influence writes; those keys also participate in
 /// conflict detection. Range scans are not tracked, so this type does not prevent phantom reads.
+/// Transaction objects are single-consumer: no operations, including reads, may overlap.
 /// </remarks>
 public sealed class MvccTransaction : IDisposable
 {
     private MvccStorage? _storage;
-    private readonly MvccWriteBuffer _writes = new();
+    private readonly MvccWriteBuffer _writes;
 
-    internal MvccTransaction(MvccStorage storage, long sequence)
+    internal MvccTransaction(MvccStorage storage, long sequence, TransactionLimits limits)
     {
         _storage = storage;
+        _writes = new MvccWriteBuffer(limits: limits);
         Sequence = sequence;
     }
 
@@ -23,6 +25,15 @@ public sealed class MvccTransaction : IDisposable
     /// Gets the snapshot sequence captured when the transaction started.
     /// </summary>
     public long Sequence { get; }
+
+    /// <summary>Gets the accounted retained bytes as defined by <see cref="StorageOptions.MvccTransactionMaxBytes"/>.</summary>
+    public long BufferedBytes { get { GetStorage(); return _writes.BufferedBytes; } }
+
+    /// <summary>Gets the number of distinct staged keys, including tombstones.</summary>
+    public int MutationCount { get { GetStorage(); return _writes.MutationCount; } }
+
+    /// <summary>Gets the number of distinct tracked point-read dependencies.</summary>
+    public int TrackedReadCount { get { GetStorage(); return _writes.TrackedReadCount; } }
 
     /// <summary>Creates a checkpoint of the current staged writes and tracked point reads.</summary>
     /// <remarks>Like all transaction operations, savepoint operations must not overlap other operations.</remarks>
