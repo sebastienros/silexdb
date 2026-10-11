@@ -6,7 +6,8 @@ namespace Silex;
 /// <remarks>
 /// Writes are buffered until commit and participate in write-write conflict detection. Use
 /// <see cref="GetForUpdateRawAsync"/> for reads whose values influence writes; those keys also participate in
-/// conflict detection. Range scans are not tracked, so this type does not prevent phantom reads.
+/// conflict detection. Range scans are not tracked unless the caller registers the interval with
+/// <see cref="TrackReadRange"/>; otherwise this type does not prevent phantom reads.
 /// Transaction objects are single-consumer: no operations, including reads, may overlap.
 /// </remarks>
 public sealed class MvccTransaction : IDisposable
@@ -35,7 +36,27 @@ public sealed class MvccTransaction : IDisposable
     /// <summary>Gets the number of distinct tracked point-read dependencies.</summary>
     public int TrackedReadCount { get { GetStorage(); return _writes.TrackedReadCount; } }
 
-    /// <summary>Creates a checkpoint of the current staged writes and tracked point reads.</summary>
+    /// <summary>Gets the number of registered range-read dependencies.</summary>
+    public int TrackedReadRangeCount { get { GetStorage(); return _writes.ReadRangeCount; } }
+
+    /// <summary>Registers an encoded byte-key interval as a commit-time read dependency.</summary>
+    /// <remarks>
+    /// Commit fails if any key inside the interval, including a key absent from the starting snapshot or
+    /// deleted afterwards, was written by a commit after <see cref="Sequence"/>. This covers insertions into
+    /// empty ranges, updates, deletions and gaps between returned keys. The caller must register every interval
+    /// that influenced its decisions; this does not by itself provide end-to-end serializability, and the engine
+    /// knows nothing about predicates. Empty intervals are ignored. Bounds are copied. This transaction's own
+    /// writes never conflict. Validation cost is proportional to the physical versions in the interval.
+    /// </remarks>
+    /// <exception cref="TransactionLimitException">A transaction resource budget would be exceeded.</exception>
+    public void TrackReadRange(OrderedReadRange range)
+    {
+        ArgumentNullException.ThrowIfNull(range);
+        GetStorage();
+        _writes.TrackReadRange(range);
+    }
+
+    /// <summary>Creates a checkpoint of the current staged writes and tracked point and range reads.</summary>
     /// <remarks>Like all transaction operations, savepoint operations must not overlap other operations.</remarks>
     public MvccSavepoint CreateSavepoint()
     {
@@ -45,7 +66,7 @@ public sealed class MvccTransaction : IDisposable
 
     /// <summary>Restores staged writes and tracked reads to a savepoint, keeping that savepoint reusable.</summary>
     /// <remarks>
-    /// Newer savepoints are invalidated. Reads tracked after the target are removed; earlier dependencies
+    /// Newer savepoints are invalidated. Reads and ranges tracked after the target are removed; earlier dependencies
     /// remain. The starting snapshot and already-created cursors are unchanged. No committed writes are undone.
     /// </remarks>
     /// <exception cref="ArgumentException">The handle is not active in this transaction.</exception>
@@ -159,7 +180,7 @@ public sealed class MvccTransaction : IDisposable
     /// <summary>
     /// Attempts to commit all buffered writes atomically.
     /// </summary>
-    /// <returns><c>false</c> when a tracked or written key changed after this transaction started.</returns>
+    /// <returns><c>false</c> when a tracked or written key, or a key in a tracked range, changed after this transaction started.</returns>
     /// <remarks>
     /// Cancellation is observed before the final write starts. Once writing starts, it completes without
     /// polling cancellation. A <see cref="StorageOperationException"/> can report an indeterminate or

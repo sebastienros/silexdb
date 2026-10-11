@@ -125,8 +125,8 @@ store's health/shutdown contract; a failed commit that faults storage also preve
 Cursor creation and all other operations on a transaction are single-consumer and must not overlap.
 After creation, a cursor advances independently and may overlap subsequent transaction operations.
 Range reads **do not track point or interval dependencies**, including empty ranges and returned
-keys. Use `GetForUpdateRawAsync` explicitly for point dependencies; this API provides snapshot
-isolation, not serializability or phantom/range-conflict validation.
+keys. Use `GetForUpdateRawAsync` for point dependencies and `TrackReadRange` to opt in to interval
+(phantom) validation; the default is snapshot isolation, not serializability.
 
 No blocking storage lock or borrowed engine memory survives an advance. Independent lookups,
 mutations, maintenance, and network awaits are allowed between advances. Internal traversal holds a
@@ -547,13 +547,46 @@ Transactions provide snapshot isolation with optimistic commit-time validation:
 - Written keys detect write-write conflicts automatically.
 - `GetForUpdateRawAsync` also tracks read-write conflicts and prevents point-read write skew.
 - Plain `GetRawAsync` reads do not participate in conflict detection.
-- Range reads are not range-locked, so transactions can still observe phantom conflicts at the application
-  level; serializable range transactions are not provided.
+- Range reads and cursors are untracked by default. `TrackReadRange` optionally registers an encoded byte
+  interval as a read dependency (see below); end-to-end serializability is still the caller's responsibility.
 
 MVCC users pay for larger physical keys (11 bytes plus one escape byte per zero in the user key), retained old
 versions, transaction buffers, and sequence metadata writes. Dispose snapshots and transactions promptly, then
 call `CollectGarbageAsync` periodically to remove versions that no active view can observe. Pass
 `compact: true` when the call should also flush and compact the resulting physical tombstones.
+
+### Range-read dependencies
+
+```csharp
+using var tx = db.BeginTransaction();
+using var cursor = tx.CreateOrderedReadCursor(range);   // read as usual...
+tx.TrackReadRange(range);                                // ...and opt in to validating it
+tx.Put("summary"u8, total);
+await tx.CommitAsync();                                  // fails if anything in `range` changed since tx.Sequence
+```
+
+`TrackReadRange(OrderedReadRange)` registers a lower/upper interval (inclusive, exclusive or unbounded, in
+encoded byte order) as a commit-time dependency. Commit returns `false` / throws `MvccConflictException`
+when another commit after the transaction's `Sequence` wrote **any key in the interval**: an insertion into
+an empty range, an update, a deletion (tombstone), or a new key in a gap between keys the reader saw. Writes
+outside the interval, and the transaction's own writes, never conflict; read-only transactions are validated
+too. Empty intervals are ignored and bounds are copied. Default snapshot isolation and unregistered range reads
+are unchanged.
+
+Validation takes the newest committed version of each key in the interval, so it holds with ordinary and
+grouped commits (accepted earlier group members are checked against later members' intervals, and rejected
+members never conflict). MVCC garbage collection always retains the newest version or tombstone of every user
+key (the published sequence is always required), so reclaiming intermediate versions cannot hide a conflict;
+this is a GC invariant that any future reclamation must preserve. Savepoint rollback removes intervals
+registered after the marker (like tracked point reads); release keeps them. Intervals count against
+`MvccTransactionMaxTrackedReadRanges` and `BufferedBytes` (32 bytes plus bound bytes each, plus the bounds in the arena);
+an interval equal to or inside the most recently registered one is not stored again.
+
+Limitations: callers must translate predicates into intervals and register *every* relevant dependency; the
+engine only knows byte intervals, not SQL/JSON predicates, and the API alone does not promise serializability.
+Commit-time validation scans the physical versions inside each interval under the commit gate, so very wide
+intervals on hot keyspaces are costly, and group-commit conflict checks between members are linear in
+accepted writes times registered intervals. Intervals are validated at commit only; they do not block writers.
 
 ### Transaction savepoints
 
@@ -565,7 +598,7 @@ transaction.RollbackToSavepoint(statement); // restore both prior staged values
 transaction.ReleaseSavepoint(statement);
 ```
 
-Savepoints checkpoint **staged mutations and explicitly tracked point reads**, not committed history.
+Savepoints checkpoint **staged mutations and explicitly tracked point and range reads**, not committed history.
 Rollback restores overwritten values (including empty values and tombstones), removes newly staged
 keys, and removes read dependencies first registered after the marker. Earlier tracked reads remain,
 including keys read again after it. Reads against pending mutations still rely on written-key validation.
@@ -599,6 +632,7 @@ var options = new StorageOptions
     MvccTransactionMaxBytes = 16 * 1024 * 1024,
     MvccTransactionMaxMutations = 100_000,
     MvccTransactionMaxTrackedReads = 100_000,
+    MvccTransactionMaxTrackedReadRanges = 1_000,
     MvccTransactionMaxSavepoints = 64,
 };
 await using var db = await MvccStorage.OpenAsync("bounded-db", options);
@@ -613,7 +647,7 @@ Mutation count means **distinct staged keys**, including deletions, not the numb
 Repeated tracked reads are deduplicated; reads of pending writes need no extra dependency.
 `MutationCount`, `TrackedReadCount`, and `BufferedBytes` expose the current accounting.
 
-`BufferedBytes` counts retained arena bytes plus active mutation (20 bytes), tracked-read (8), undo
+`BufferedBytes` counts retained arena bytes plus active mutation (20 bytes), tracked-read (8), read-range (32), undo
 (24), and savepoint (24) descriptors. It includes obsolete replacement bytes and checkpoint-protected
 values, not just live key/value sizes. In-place overwrites reuse capacity. Savepoint replacements append
 bytes and undo records; rollback restores both accounting and state. Release removes checkpoint charges

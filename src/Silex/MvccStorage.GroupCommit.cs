@@ -191,7 +191,8 @@ public sealed partial class MvccStorage
                     {
                         return true;
                     }
-                    if (request.Writes.FindTrackedRead(key) >= 0)
+                    if (request.Writes.FindTrackedRead(key) >= 0 ||
+                        (request.Writes.ReadRangeCount != 0 && request.Writes.ReadRangeContains(key)))
                     {
                         return true;
                     }
