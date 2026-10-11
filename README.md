@@ -401,8 +401,8 @@ stops instead of silently continuing. Stopping the background loop drains an alr
 operation rather than canceling it halfway through.
 
 Read cancellation or an exception in a caller's read callback makes no mutations and does not fault the
-instance. `CollectGarbageAsync` performs individual deletions, not one atomic transaction: cancellation
-can leave a successfully committed prefix of its work while the instance remains healthy. Its optional
+instance. `CollectGarbageAsync` deletes in atomic per-chunk batches, not one transaction: cancellation
+can leave a successfully committed prefix of chunks while the instance remains healthy. Its optional
 flush/compaction phase follows the structural-maintenance contract above.
 
 Dispose a faulted instance before reopening the same directory. Faulted disposal stops background work
@@ -589,6 +589,39 @@ MVCC users pay for larger physical keys (11 bytes plus one escape byte per zero 
 versions, transaction buffers, and sequence metadata writes. Dispose snapshots and transactions promptly, then
 call `CollectGarbageAsync` periodically to remove versions that no active view can observe. Pass
 `compact: true` when the call should also flush and compact the resulting physical tombstones.
+
+### Incremental, bounded garbage collection
+
+`CollectGarbageAsync(MvccGarbageCollectionOptions)` reclaims versions in bounded chunks and returns an
+`MvccGarbageCollectionResult` (versions examined/deleted, `StopReason`, a `Resume` cursor, elapsed time). The
+commit gate is **not** held while scanning: each chunk is scanned against the ordinary ordered-read view and
+its deletions are applied as one atomic `LsmWriteBatch` while holding the gate only for that write, so
+commits wait for at most one chunk's batch. `ChunkSize` (default 1024 versions) and `MaxChunkBytes` (default
+1 MiB of keys) bound per-chunk work, hold time, and temporary memory; `MaxVersionsExamined`,
+`MaxVersionsDeleted`, and `MaxDuration` bound a call (checked per chunk, and the time budget every 64
+versions). Every call examines at least one version, so repeated bounded calls always make progress.
+`CollectGarbageAsync(compact)` is unchanged for callers: it runs every chunk to completion.
+
+Safety invariant. The required set is the active snapshots/transactions plus the published sequence `P`, read
+under the snapshot registry lock at the start of every chunk. A version is deleted only if it is not the
+newest version at or below any required sequence. Commits only add versions above `P`, and any snapshot
+created afterwards reads a sequence of at least `P`, so nothing already obsolete can become needed; the
+required set can only be stale in the conservative direction. Versions above `P` are never deleted, and the
+newest version or tombstone of every key is always kept (range-dependency validation relies on this). Active
+views are therefore never invalidated, and commits and snapshot creation need no coordination beyond the
+registry lock. Resuming inside a key's version chain is exact: required sequences at or above the cursor's
+sequence are already satisfied. A cursor is only a position hint, never a retention decision, so stale
+cursors are safe.
+
+Cancellation throws `OperationCanceledException` at the next scan step or gate wait; applied chunks stay
+committed, and a chunk is applied entirely or not at all. `Progress` reports the resume cursor after each
+applied chunk. Calls are serialized; disposal waits for at most the in-flight chunk and the call then throws
+`ObjectDisposedException`. Faults propagate as in other commits. Optional `Compact` runs afterwards without the
+commit gate, is not bounded by the budgets, and runs only if versions were deleted.
+
+Tradeoff: pruning during LSM compaction is not implemented. It would make every compaction consult the
+snapshot registry and a retention horizon, which plain `LsmStorage` users must not pay for; physical space is
+reclaimed by the deletion tombstones plus normal or requested compaction.
 
 ### Conditional insert and compare-and-set
 

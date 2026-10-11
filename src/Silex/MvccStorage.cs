@@ -28,6 +28,7 @@ public sealed partial class MvccStorage : IAsyncDisposable
 
     private readonly LsmStorage _storage;
     private readonly SemaphoreSlim _commitGate = new(1, 1);
+    private readonly SemaphoreSlim _garbageCollectionGate = new(1, 1);
     private readonly object _snapshotLock = new();
     private readonly Dictionary<long, int> _activeSnapshots = [];
     private long _allocatedSequence;
@@ -290,59 +291,6 @@ public sealed partial class MvccStorage : IAsyncDisposable
     }
 
     /// <summary>
-    /// Deletes physical versions that are not visible to the current state or any active snapshot or transaction.
-    /// </summary>
-    /// <param name="compact">
-    /// When <c>true</c>, flushes and compacts after writing the version tombstones so their storage can be reclaimed.
-    /// </param>
-    /// <returns>The number of obsolete physical versions deleted.</returns>
-    public async ValueTask<long> CollectGarbageAsync(bool compact = false, CancellationToken cancellationToken = default)
-    {
-        CheckDisposed();
-        await _commitGate.WaitAsync(cancellationToken).ConfigureAwait(false);
-
-        try
-        {
-            CheckDisposed();
-
-            long[] requiredSequences;
-            lock (_snapshotLock)
-            {
-                requiredSequences = _activeSnapshots.Keys
-                    .Append(Volatile.Read(ref _publishedSequence))
-                    .Distinct()
-                    .OrderDescending()
-                    .ToArray();
-            }
-
-            // Invariant relied on by range-read validation: the published sequence is always required, so the
-            // newest version (or tombstone) of every user key is retained and its sequence never regresses.
-            using var state = new GarbageCollectionState(requiredSequences);
-            await _storage.ScanRawAsync(
-                state,
-                static (s, key, _) => s.Accept(key),
-                cancellationToken: cancellationToken).ConfigureAwait(false);
-
-            foreach (var key in state.ObsoleteKeys)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                _storage.Delete(key);
-            }
-
-            if (compact && state.ObsoleteKeys.Count != 0)
-            {
-                await _storage.FlushAndCompactAsync(cancellationToken).ConfigureAwait(false);
-            }
-
-            return state.ObsoleteKeys.Count;
-        }
-        finally
-        {
-            _commitGate.Release();
-        }
-    }
-
-    /// <summary>
     /// Flushes and compacts the underlying LSM tree.
     /// </summary>
     public Task FlushAndCompactAsync(CancellationToken cancellationToken = default)
@@ -394,6 +342,9 @@ public sealed partial class MvccStorage : IAsyncDisposable
         {
             await _commitCoordinator.StopAsync().ConfigureAwait(false);
         }
+        // An in-flight collection observes the disposed state at its next chunk boundary and exits promptly.
+        await _garbageCollectionGate.WaitAsync().ConfigureAwait(false);
+        _garbageCollectionGate.Release();
         await _commitGate.WaitAsync().ConfigureAwait(false);
 
         try
@@ -1108,43 +1059,6 @@ public sealed partial class MvccStorage : IAsyncDisposable
 
             Count++;
             return InvokeUserReader(arg, reader, encodedUserKey, value[1..]) && Count < maxEntries;
-        }
-
-        public void Dispose() => _group.Dispose();
-    }
-
-    private sealed class GarbageCollectionState(long[] requiredSequences) : IDisposable
-    {
-        private readonly KeyGroup _group = new();
-        private int _nextRequired;
-
-        public List<byte[]> ObsoleteKeys { get; } = [];
-
-        public bool Accept(ReadOnlySpan<byte> key)
-        {
-            if (!TryParseVersionKey(key, out var encodedUserKey, out var sequence))
-            {
-                return true;
-            }
-
-            if (_group.Set(encodedUserKey))
-            {
-                _nextRequired = 0;
-            }
-
-            var keep = false;
-            while (_nextRequired < requiredSequences.Length && sequence <= requiredSequences[_nextRequired])
-            {
-                keep = true;
-                _nextRequired++;
-            }
-
-            if (!keep)
-            {
-                ObsoleteKeys.Add(key.ToArray());
-            }
-
-            return true;
         }
 
         public void Dispose() => _group.Dispose();
