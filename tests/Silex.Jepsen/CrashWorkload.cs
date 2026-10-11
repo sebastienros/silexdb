@@ -19,10 +19,11 @@ internal static class CrashWorkload
 
     public static bool IsChild(string[] args) => args.Length > 0 && args[0] == ChildFlag;
 
-    public static async Task<WorkloadResult> RunAsync(RunContext ctx)
+    public static async Task<WorkloadResult> RunAsync(RunContext ctx, bool lsm = false)
     {
+        var name = lsm ? "crash-lsm" : "crash";
         var anomalies = new List<string>();
-        var path = ctx.DatabasePath("crash");
+        var path = ctx.DatabasePath(name);
         var syncWal = Profiles.HasWal(ctx.Profile);
         var options = Profiles.Create(ctx.Profile, syncWal);
         var rng = new Random(unchecked((int)ctx.Seed));
@@ -52,6 +53,7 @@ internal static class CrashWorkload
             info.ArgumentList.Add(ctx.Profile);
             info.ArgumentList.Add(syncWal ? "1" : "0");
             info.ArgumentList.Add((ctx.Seed + cycle).ToString());
+            info.ArgumentList.Add(lsm ? "lsm" : "mvcc");
 
             using var child = Process.Start(info)!;
             var stderr = new ConcurrentQueue<string>();
@@ -125,11 +127,15 @@ internal static class CrashWorkload
 
             try
             {
-                await using var db = await MvccStorage.OpenAsync(path, options);
+                MvccStorage? mvcc = lsm ? null : await MvccStorage.OpenAsync(path, options);
+                LsmStorage? plain = lsm ? await LsmStorage.OpenAsync(path, options) : null;
+                ValueTask<int> Get(int key, byte[] buffer) => lsm
+                    ? plain!.GetRawAsync(Harness.KeyBytes(key), buffer)
+                    : mvcc!.GetRawAsync(Harness.KeyBytes(key), buffer);
                 var buffer = new byte[16];
                 for (var lane = 0; lane < Lanes; lane++)
                 {
-                    var length = await db.GetRawAsync(Harness.KeyBytes(lane * LaneStride), buffer);
+                    var length = await Get(lane * LaneStride, buffer);
                     var counter = length < 0 ? 0 : BinaryPrimitives.ReadInt64LittleEndian(buffer);
                     if (counter < ok[lane])
                     {
@@ -143,7 +149,7 @@ internal static class CrashWorkload
 
                     for (var k = 1; k <= KeysPerLane; k++)
                     {
-                        var l = await db.GetRawAsync(Harness.KeyBytes(lane * LaneStride + k), buffer);
+                        var l = await Get(lane * LaneStride + k, buffer);
                         var value = l < 0 ? 0 : BinaryPrimitives.ReadInt64LittleEndian(buffer);
                         if (value != counter)
                         {
@@ -154,6 +160,15 @@ internal static class CrashWorkload
 
                     totalAcked += Math.Max(0, ok[lane] - recovered[lane]);
                     recovered[lane] = counter;
+                }
+
+                if (lsm)
+                {
+                    await plain!.DisposeAsync();
+                }
+                else
+                {
+                    await mvcc!.DisposeAsync();
                 }
 
                 cycles++;
@@ -170,7 +185,7 @@ internal static class CrashWorkload
             }
         }
 
-        return new WorkloadResult("crash", ctx.Profile, ctx.Seed, anomalies.Count == 0, false,
+        return new WorkloadResult(name, ctx.Profile, ctx.Seed, anomalies.Count == 0, false,
             $"cycles={cycles} acknowledged-commits={totalAcked} final-counters={string.Join(",", recovered)} sync-wal={syncWal}",
             anomalies);
     }
@@ -182,7 +197,9 @@ internal static class CrashWorkload
         var sync = args[3] == "1";
         var seed = long.Parse(args[4]);
         var options = Profiles.Create(profile, sync);
-        var db = await MvccStorage.OpenAsync(path, options);
+        var lsm = args[5] == "lsm";
+        var db = lsm ? null : await MvccStorage.OpenAsync(path, options);
+        var plain = lsm ? await LsmStorage.OpenAsync(path, options) : null;
         var output = Console.Out;
         var gate = new object();
 
@@ -195,7 +212,7 @@ internal static class CrashWorkload
             }
         }
 
-        var nemesis = new Nemesis(db, seed);
+        var nemesis = lsm ? new Nemesis(plain!, seed, sync) : new Nemesis(db!, seed, sync);
         var tasks = new Task[Lanes];
         for (var lane = 0; lane < Lanes; lane++)
         {
@@ -204,9 +221,35 @@ internal static class CrashWorkload
             {
                 var buffer = new byte[16];
                 var counterKey = Harness.KeyBytes(l * LaneStride);
+                var batch = new LsmWriteBatch();
+                long counter = 0;
+                if (lsm)
+                {
+                    var length = await plain!.GetRawAsync(counterKey, buffer);
+                    counter = length < 0 ? 0 : BinaryPrimitives.ReadInt64LittleEndian(buffer);
+                }
+
+                while (lsm)
+                {
+                    var next = ++counter;
+                    var value = new byte[sizeof(long)];
+                    BinaryPrimitives.WriteInt64LittleEndian(value, next);
+                    batch.Clear();
+                    batch.Put(counterKey, value);
+                    for (var k = 1; k <= KeysPerLane; k++)
+                    {
+                        batch.Put(Harness.KeyBytes(l * LaneStride + k), value);
+                    }
+
+                    Emit($"invoke {l} {next}");
+                    plain!.Write(batch);
+                    Emit($"ok {l} {next}");
+                    await Task.Yield();
+                }
+
                 while (true)
                 {
-                    using var txn = db.BeginTransaction();
+                    using var txn = db!.BeginTransaction();
                     var length = await txn.GetForUpdateRawAsync(counterKey, buffer);
                     var next = (length < 0 ? 0 : BinaryPrimitives.ReadInt64LittleEndian(buffer)) + 1;
                     var value = new byte[sizeof(long)];

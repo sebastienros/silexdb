@@ -172,6 +172,27 @@ internal sealed class Nemesis : IAsyncDisposable
     public ConcurrentQueue<string> Errors { get; } = new();
 
     public Nemesis(MvccStorage db, long seed, bool synchronize = true)
+        : this(seed,
+        [
+            () => db.FlushAndCompactAsync(),
+            () => db.CollectGarbageAsync(compact: false).AsTask(),
+            () => db.CollectGarbageAsync(compact: true).AsTask(),
+            .. synchronize ? new Func<Task>[] { () => db.SynchronizeAsync() } : [],
+        ])
+    {
+    }
+
+    public Nemesis(LsmStorage db, long seed, bool synchronize = true)
+        : this(seed,
+        [
+            () => db.FlushAndCompactAsync(),
+            .. synchronize ? new Func<Task>[] { () => db.SynchronizeAsync() } : [],
+        ])
+    {
+    }
+
+    // Maintenance is never cancelled mid-flight: cancelling a flush faults the store.
+    private Nemesis(long seed, Func<Task>[] actions)
     {
         _task = Task.Run(async () =>
         {
@@ -181,14 +202,7 @@ internal sealed class Nemesis : IAsyncDisposable
                 try
                 {
                     await Task.Delay(rng.Next(1, 25), _cts.Token).ConfigureAwait(false);
-                    // Maintenance is never cancelled mid-flight: cancelling a flush faults the store.
-                    switch (rng.Next(synchronize ? 4 : 3))
-                    {
-                        case 0: await db.FlushAndCompactAsync().ConfigureAwait(false); break;
-                        case 1: await db.CollectGarbageAsync(compact: false).ConfigureAwait(false); break;
-                        case 2: await db.CollectGarbageAsync(compact: true).ConfigureAwait(false); break;
-                        default: await db.SynchronizeAsync().ConfigureAwait(false); break;
-                    }
+                    await actions[rng.Next(actions.Length)]().ConfigureAwait(false);
                 }
                 catch (OperationCanceledException) when (_cts.IsCancellationRequested)
                 {

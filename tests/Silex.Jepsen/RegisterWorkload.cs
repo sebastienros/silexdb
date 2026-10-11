@@ -230,17 +230,22 @@ internal static class RegisterWorkload
 
     private sealed record CasOut(bool Applied, int Observed);
 
-    public static async Task<WorkloadResult> RunAsync(RunContext ctx)
+    public static async Task<WorkloadResult> RunAsync(RunContext ctx, bool lsm = false)
     {
+        var name = lsm ? "register-lsm" : "register";
         var anomalies = new List<string>();
         var history = new History(ctx.Clients);
         var errors = new ConcurrentQueue<string>();
         var options = Profiles.Create(ctx.Profile);
-        await using var db = await MvccStorage.OpenAsync(ctx.DatabasePath("register"), options);
+        var path = ctx.DatabasePath(name);
+        MvccStorage? db = lsm ? null : await MvccStorage.OpenAsync(path, options);
+        LsmStorage? plain = lsm ? await LsmStorage.OpenAsync(path, options) : null;
         long opCounter = -1;
         var valueCounter = 0;
 
-        await using (var nemesis = new Nemesis(db, ctx.Seed, Profiles.HasWal(ctx.Profile)))
+        await using (var nemesis = lsm
+            ? new Nemesis(plain!, ctx.Seed, Profiles.HasWal(ctx.Profile))
+            : new Nemesis(db!, ctx.Seed, Profiles.HasWal(ctx.Profile)))
         {
             await Harness.RunClientsAsync(ctx.Clients, ctx.Duration, async (client, running) =>
             {
@@ -257,13 +262,13 @@ internal static class RegisterWorkload
                         if (roll < 45)
                         {
                             var op = history.Begin(client, "read", key);
-                            var length = await db.GetRawAsync(keyBytes, buffer);
+                            var length = lsm ? await plain!.GetRawAsync(keyBytes, buffer) : await db!.GetRawAsync(keyBytes, buffer);
                             var value = length < 0 ? LinearizabilityChecker.Absent
                                 : BinaryPrimitives.ReadInt32LittleEndian(buffer);
                             History.End(op, OpStatus.Ok, value);
                             lastSeen[key] = value;
                         }
-                        else if (roll < 80)
+                        else if (roll < (lsm ? 85 : 80))
                         {
                             var value = Interlocked.Increment(ref valueCounter);
                             var op = history.Begin(client, "write", (key, value));
@@ -271,13 +276,27 @@ internal static class RegisterWorkload
                             {
                                 var valueBytes = new byte[sizeof(int)];
                                 BinaryPrimitives.WriteInt32LittleEndian(valueBytes, value);
-                                db.Put(keyBytes, valueBytes);
+                                if (lsm) { plain!.Put(keyBytes, valueBytes); } else { db!.Put(keyBytes, valueBytes); }
                                 History.End(op, OpStatus.Ok);
                             }
                             catch (Exception e)
                             {
                                 History.End(op, OpStatus.Info);
                                 errors.Enqueue($"write failed: {Harness.Describe(e)}");
+                            }
+                        }
+                        else if (lsm)
+                        {
+                            var op = history.Begin(client, "write", (key, LinearizabilityChecker.Absent));
+                            try
+                            {
+                                plain!.Delete(keyBytes);
+                                History.End(op, OpStatus.Ok);
+                            }
+                            catch (Exception e)
+                            {
+                                History.End(op, OpStatus.Info);
+                                errors.Enqueue($"delete failed: {Harness.Describe(e)}");
                             }
                         }
                         else
@@ -289,7 +308,7 @@ internal static class RegisterWorkload
                             var op = history.Begin(client, "cas", new CasIn(key, expected, next));
                             try
                             {
-                                using var txn = db.BeginTransaction();
+                                using var txn = db!.BeginTransaction();
                                 var length = await txn.GetForUpdateRawAsync(keyBytes, buffer);
                                 var current = length < 0 ? LinearizabilityChecker.Absent
                                     : BinaryPrimitives.ReadInt32LittleEndian(buffer);
@@ -333,6 +352,15 @@ internal static class RegisterWorkload
             }
         }
 
+        if (lsm)
+        {
+            await plain!.DisposeAsync();
+        }
+        else
+        {
+            await db!.DisposeAsync();
+        }
+
         foreach (var error in errors.Distinct().Take(10))
         {
             anomalies.Add($"unexpected exception: {error}");
@@ -371,11 +399,11 @@ internal static class RegisterWorkload
 
         if (anomalies.Count > 0)
         {
-            ctx.DumpHistory("register", all);
+            ctx.DumpHistory(name, all);
         }
 
         var summary = $"{history.Summary()} registers={checkedKeys} inconclusive={inconclusive}";
-        return new WorkloadResult("register", ctx.Profile, ctx.Seed, anomalies.Count == 0, false, summary, anomalies);
+        return new WorkloadResult(name, ctx.Profile, ctx.Seed, anomalies.Count == 0, false, summary, anomalies);
     }
 
     private static int KeyOf(Op op) => op.Input switch

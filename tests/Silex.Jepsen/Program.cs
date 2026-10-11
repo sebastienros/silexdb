@@ -9,13 +9,15 @@ internal static class Program
 
         Usage: dotnet run -c Release --project tests/Silex.Jepsen -- [workload ...] [options]
 
-        Workloads: register, bank, append-si, append-ser, scan, crash, selftest, all (default)
+        Workloads: register, register-lsm, bank, append-si, append-ser, scan, crash, crash-lsm, selftest, all (default)
           register    linearizability of reads, writes and CAS on single keys
           bank        total-balance invariant under transfers, scans and close/reopen
           append-si   Elle-style list-append, checked against strong snapshot isolation
           append-ser  Elle-style list-append with tracked reads, checked against strict serializability
           scan        atomic multi-key writes vs. forward/reverse snapshot scans
           selftest    verify the checkers against histories with known verdicts (runs first in "all")
+          register-lsm  linearizability of plain LsmStorage Get/Put/Delete (no transactions)
+          crash-lsm   SIGKILL a child committing atomic LsmWriteBatch writes
           crash       SIGKILL a committing child process, reopen, check durability and atomicity
 
         Options:
@@ -74,7 +76,7 @@ internal static class Program
             }
         }
 
-        string[] allWorkloads = ["selftest", "register", "bank", "append-si", "append-ser", "scan", "crash"];
+        string[] allWorkloads = ["selftest", "register", "register-lsm", "bank", "append-si", "append-ser", "scan", "crash", "crash-lsm"];
         if (workloads.Count == 0 || workloads.Contains("all"))
         {
             workloads = [.. allWorkloads];
@@ -116,7 +118,7 @@ internal static class Program
 
                     foreach (var p in profiles)
                     {
-                        if (name == "crash" && !Profiles.HasWal(p))
+                        if (name.StartsWith("crash") && !Profiles.HasWal(p))
                         {
                             continue;
                         }
@@ -143,10 +145,12 @@ internal static class Program
                             result = name switch
                             {
                                 "register" => await RegisterWorkload.RunAsync(ctx),
+                                "register-lsm" => await RegisterWorkload.RunAsync(ctx, lsm: true),
                                 "bank" => await BankWorkload.RunAsync(ctx),
                                 "append-si" => await AppendWorkload.RunAsync(ctx, serializable: false),
                                 "append-ser" => await AppendWorkload.RunAsync(ctx, serializable: true),
                                 "scan" => await ScanWorkload.RunAsync(ctx),
+                                "crash-lsm" => await CrashWorkload.RunAsync(ctx, lsm: true),
                                 _ => await CrashWorkload.RunAsync(ctx),
                             };
                         }
