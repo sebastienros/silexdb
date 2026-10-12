@@ -89,9 +89,9 @@ jobs:
       - name: Build
         run: dotnet build tests/Silex.Jepsen/Silex.Jepsen.csproj --configuration Release
 
-      # Time-boxed smoke run (~35s locally); the step is capped at 1 minute.
+      # Allow for startup, all profiles, checking and crash recovery on slower runners.
       - name: Jepsen smoke
-        timeout-minutes: 1
+        timeout-minutes: 3
         run: dotnet run --no-build -c Release --project tests/Silex.Jepsen -- all --seconds 1 --crash-cycles 2 --seed 7 --output jepsen-results
 
       - name: Upload failing histories

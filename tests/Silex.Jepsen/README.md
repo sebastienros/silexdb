@@ -2,8 +2,10 @@
 
 A Jepsen-style consistency harness for `MvccStorage` and, for the single-key and crash workloads, plain `LsmStorage`. Silex is not distributed, so concurrent clients are
 threads in one process, and "nemeses" are background flush/compaction/GC/WAL-sync plus `SIGKILL` of a child
-process. CI runs a short smoke pass (`all --seconds 1 --crash-cycles 2 --seed 7`, capped at 1 minute) in the `jepsen` job of
+process. CI runs a short smoke pass (`all --seconds 1 --crash-cycles 2 --seed 7`, capped at 3 minutes) in the `jepsen` job of
 `.github/workflows/build.yml` on Linux, Windows and macOS; longer runs are manual.
+`--seconds` limits each concurrent run, not the full suite; the step budget also covers startup, all profiles,
+checking, maintenance, crash recovery and cleanup. The whole job, including setup and build, is capped at 10 minutes.
 
 ```bash
 dotnet run -c Release --project tests/Silex.Jepsen -- --help
