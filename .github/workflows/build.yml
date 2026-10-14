@@ -76,10 +76,23 @@ jobs:
         shell: bash
         run: |
           if [[ "${{ runner.os }}" == "Windows" ]]; then
-            export SILEX_TEST_EXECUTABLE="$PWD/tool-installed/silex.exe"
+            powershell.exe -NoProfile -NonInteractive -Command '$ErrorActionPreference = "Stop"; & .\tool-installed\silex.cmd --help; exit $LASTEXITCODE'
+            native_name="Silex.Tool.exe"
           else
-            export SILEX_TEST_EXECUTABLE="$PWD/tool-installed/silex"
+            ./tool-installed/silex --help
+            native_name="Silex.Tool"
           fi
+          native_executable=""
+          native_count=0
+          while IFS= read -r candidate; do
+            native_executable="$candidate"
+            native_count=$((native_count + 1))
+          done < <(find tool-installed/.store -type f -path "*/tools/any/${{ matrix.rid }}/$native_name")
+          if [[ "$native_count" != "1" ]]; then
+            echo "Expected exactly one installed native tool executable, found $native_count." >&2
+            exit 1
+          fi
+          export SILEX_TEST_EXECUTABLE="$PWD/$native_executable"
           dotnet test tests/Silex.Tool.Tests/Silex.Tool.Tests.csproj -c Release --no-build
 
       - name: Pack portable tool and pointer
