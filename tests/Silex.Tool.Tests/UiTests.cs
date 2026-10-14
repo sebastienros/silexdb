@@ -11,6 +11,16 @@ namespace Silex.Tool.Tests;
 public class UiTests
 {
     [Test]
+    [Arguments("ui/index.html", "/ui/index.html")]
+    [Arguments("ui/assets/site.css", "/ui/assets/site.css")]
+    [Arguments("ui/assets\\site.js", "/ui/assets/site.js")]
+    [Arguments("ui/assets\\nested\\chunk.js", "/ui/assets/nested/chunk.js")]
+    public async Task EmbeddedAssetRequestPathsUseUrlSeparators(string resourceName, string expected)
+    {
+        await Assert.That(UiAssets.RequestPath(resourceName)).IsEqualTo(expected);
+    }
+
+    [Test]
     [Arguments("lsm")]
     [Arguments("mvcc")]
     public async Task UiStartsAndAttachesWithEmbeddedAssetsAndPublishedTables(string mode)
