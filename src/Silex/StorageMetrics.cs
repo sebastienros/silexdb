@@ -145,7 +145,7 @@ internal sealed class StripedCounter
         var slot = t_stripeSlot;
         if (slot == 0)
         {
-            slot = ((Interlocked.Increment(ref s_nextStripe) & (StripeCount - 1)) * StrideLongs) + 1;
+            slot = (((Interlocked.Increment(ref s_nextStripe) - 1) & (StripeCount - 1)) * StrideLongs) + 1;
             t_stripeSlot = slot;
         }
         return slot - 1;

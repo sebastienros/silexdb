@@ -511,7 +511,12 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
             {
                 return;
             }
-            _prefixBucketCapacity = Math.Max(InitialBucketCapacity, _bucketCapacity);
+            var targetCapacity = InitialBucketCapacity;
+            while (_count * 10 >= targetCapacity * 7)
+            {
+                targetCapacity *= 2;
+            }
+            _prefixBucketCapacity = Math.Max(targetCapacity, _bucketCapacity);
             var buckets = ArrayPool<int>.Shared.Rent(_prefixBucketCapacity);
             buckets.AsSpan(0, _prefixBucketCapacity).Clear();
             for (var i = 0; i < _count; i++)
@@ -535,10 +540,10 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
         newRec.NextVersionRecord = -1;
         var keyPrefixWord = newRec.KeyPrefixWord;
         var expectedKeyLength = prefix.Length + sizeof(long);
-        var mask = capacity - 1;
-        var bucket = (int)prefixHash & mask;
+        var mask = System.Numerics.BitOperations.RoundUpToPowerOf2((uint)capacity) - 1;
+        var bucket = (int)(prefixHash & mask);
         int headIndex;
-        while (true)
+        for (var probes = 0; probes <= mask; probes++)
         {
             headIndex = buckets[bucket] - 1;
             if (headIndex < 0)
@@ -553,10 +558,13 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
                     ? record.KeyPrefixWord == keyPrefixWord && _arena.GetSpan(record.Key).Slice(8, prefix.Length - 8).SequenceEqual(prefix[8..])
                     : _arena.GetSpan(record.Key)[..prefix.Length].SequenceEqual(prefix)))
             {
-                break;
+                goto FoundChain;
             }
-            bucket = (bucket + 1) & mask;
+            bucket = (int)((bucket + 1) & mask);
         }
+        return;
+
+    FoundChain:
 
         // Fast path: in normal MVCC execution, newer versions have a smaller ~sequence trailer and belong at the head.
         var newTrailer = System.Buffers.Binary.BinaryPrimitives.ReadUInt64BigEndian(_arena.GetSpan(newRec.Key)[^sizeof(long)..]);

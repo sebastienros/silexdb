@@ -46,24 +46,6 @@ internal sealed partial class LsmStorageInner
         try
         {
             CheckHealthy();
-            var hasTables = _state.LevelZeroTables.Count != 0;
-            if (!hasTables)
-            {
-                foreach (var level in _state.LeveledSsTables)
-                {
-                    if (level.Count != 0)
-                    {
-                        hasTables = true;
-                        break;
-                    }
-                }
-            }
-            if (!hasTables)
-            {
-                sink = ReadFirstMemTableRaw(from, prefix, sink, cancellationToken);
-                return true;
-            }
-
             if (TryReadLiveMemTableRaw(from, prefix, ref sink, out var hitTombstone) && !hitTombstone)
             {
                 return true;
@@ -79,6 +61,33 @@ internal sealed partial class LsmStorageInner
             try
             {
                 CheckHealthy();
+                _currentMemTableLock.EnterReadLock();
+                try
+                {
+                    CheckHealthy();
+                    var hasTables = _state.LevelZeroTables.Count != 0;
+                    if (!hasTables)
+                    {
+                        foreach (var level in _state.LeveledSsTables)
+                        {
+                            if (level.Count != 0)
+                            {
+                                hasTables = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!hasTables)
+                    {
+                        sink = ReadFirstMemTableRaw(from, prefix, sink, cancellationToken);
+                        return true;
+                    }
+                }
+                finally
+                {
+                    _currentMemTableLock.ExitReadLock();
+                }
+
                 cachedTables = Volatile.Read(ref _sortedSsTableRun) ?? Volatile.Read(ref _sortedMvccSsTableRun);
                 if (cachedTables is not null &&
                     TryReadFirstSortedSync(cachedTables, from, prefix, ref sink, cancellationToken))
@@ -126,10 +135,21 @@ internal sealed partial class LsmStorageInner
 
         Consider((MemTable)_state.CurrentMemTable, from, prefix, true,
             ref bestKey, ref bestValue, ref found, ref tombstone);
-        for (var i = _state.ImmutableMemTables.Length - 1; i >= 0; i--)
+        if (!_state.ImmutableMemTables.IsEmpty)
         {
-            Consider((MemTable)_state.ImmutableMemTables[i], from, prefix, true,
-                ref bestKey, ref bestValue, ref found, ref tombstone);
+            _immutableMemTablesLock.EnterReadLock();
+            try
+            {
+                for (var i = _state.ImmutableMemTables.Length - 1; i >= 0; i--)
+                {
+                    Consider((MemTable)_state.ImmutableMemTables[i], from, prefix, true,
+                        ref bestKey, ref bestValue, ref found, ref tombstone);
+                }
+            }
+            finally
+            {
+                _immutableMemTablesLock.ExitReadLock();
+            }
         }
 
         hitTombstone = tombstone;
@@ -287,35 +307,43 @@ internal sealed partial class LsmStorageInner
         ReadOnlySpan<byte> from, ReadOnlySpan<byte> prefix, TSink sink, CancellationToken cancellationToken)
         where TSink : struct, IRawEntrySink
     {
-        var inclusive = true;
-        while (true)
+        _immutableMemTablesLock.EnterReadLock();
+        try
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            ReadOnlySpan<byte> bestKey = default;
-            ReadOnlySpan<byte> bestValue = default;
-            var found = false;
-            var tombstone = false;
-            Consider((MemTable)_state.CurrentMemTable, from, prefix, inclusive,
-                ref bestKey, ref bestValue, ref found, ref tombstone);
-            for (var i = _state.ImmutableMemTables.Length - 1; i >= 0; i--)
+            var inclusive = true;
+            while (true)
             {
-                Consider((MemTable)_state.ImmutableMemTables[i], from, prefix, inclusive,
+                cancellationToken.ThrowIfCancellationRequested();
+                ReadOnlySpan<byte> bestKey = default;
+                ReadOnlySpan<byte> bestValue = default;
+                var found = false;
+                var tombstone = false;
+                Consider((MemTable)_state.CurrentMemTable, from, prefix, inclusive,
                     ref bestKey, ref bestValue, ref found, ref tombstone);
-            }
+                for (var i = _state.ImmutableMemTables.Length - 1; i >= 0; i--)
+                {
+                    Consider((MemTable)_state.ImmutableMemTables[i], from, prefix, inclusive,
+                        ref bestKey, ref bestValue, ref found, ref tombstone);
+                }
 
-            if (!found)
-            {
-                return sink;
-            }
-            if (!tombstone)
-            {
-                sink.Accept(bestKey, bestValue);
-                return sink;
-            }
+                if (!found)
+                {
+                    return sink;
+                }
+                if (!tombstone)
+                {
+                    sink.Accept(bestKey, bestValue);
+                    return sink;
+                }
 
-            // A physical deletion shadows the same version in older sources, not the next version.
-            from = bestKey;
-            inclusive = false;
+                // A physical deletion shadows the same version in older sources, not the next version.
+                from = bestKey;
+                inclusive = false;
+            }
+        }
+        finally
+        {
+            _immutableMemTablesLock.ExitReadLock();
         }
 
         static void Consider(MemTable table, ReadOnlySpan<byte> from, ReadOnlySpan<byte> prefix, bool inclusive,
@@ -409,8 +437,16 @@ internal sealed partial class LsmStorageInner
                 {
                     CheckHealthy();
                     Consider((MemTable)_state.CurrentMemTable, bound.Span, inclusive, prefix.Span, ref candidate);
-                    for (var i = _state.ImmutableMemTables.Length - 1; i >= 0; i--)
-                        Consider((MemTable)_state.ImmutableMemTables[i], bound.Span, inclusive, prefix.Span, ref candidate);
+                    _immutableMemTablesLock.EnterReadLock();
+                    try
+                    {
+                        for (var i = _state.ImmutableMemTables.Length - 1; i >= 0; i--)
+                            Consider((MemTable)_state.ImmutableMemTables[i], bound.Span, inclusive, prefix.Span, ref candidate);
+                    }
+                    finally
+                    {
+                        _immutableMemTablesLock.ExitReadLock();
+                    }
                 }
                 finally
                 {
