@@ -57,7 +57,9 @@ internal sealed class Registry
     public FileStream? TryAcquire(string name, string suffix)
     {
         try { return Acquire(name, suffix); }
-        catch (IOException exception) when ((exception.HResult & 0xffff) is 11 or 32 or 33)
+        // Unix contention exposes EAGAIN: 11 on Linux, 35 on macOS.
+        catch (IOException exception) when ((exception.HResult & 0xffff) is 11 or 32 or 33 ||
+            (OperatingSystem.IsMacOS() && (exception.HResult & 0xffff) == 35))
         {
             return null;
         }

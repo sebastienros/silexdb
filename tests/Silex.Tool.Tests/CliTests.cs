@@ -86,6 +86,25 @@ public class CliTests
     }
 
     [Test]
+    [NotInParallel]
+    public async Task RegistryLockContentionIsRetryableUntilOwnershipIsReleased()
+    {
+        using var folder = new TestFolder();
+        var previous = Environment.GetEnvironmentVariable("SILEX_STATE_DIRECTORY");
+        Environment.SetEnvironmentVariable("SILEX_STATE_DIRECTORY", folder.Path);
+        try
+        {
+            var registry = new Registry();
+            using (var ownership = registry.Acquire("contended", ".lock"))
+                await Assert.That(registry.TryAcquire("contended", ".lock")).IsNull();
+            using var acquired = registry.TryAcquire("contended", ".lock");
+            await Assert.That(acquired).IsNotNull();
+            await Assert.That(() => registry.TryAcquire("../invalid", ".lock")).Throws<ArgumentException>();
+        }
+        finally { Environment.SetEnvironmentVariable("SILEX_STATE_DIRECTORY", previous); }
+    }
+
+    [Test]
     public async Task ForegroundHostBlocksUntilStopped()
     {
         using var folder = new TestFolder();

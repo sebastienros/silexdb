@@ -70,8 +70,7 @@ jobs:
         run: |
           dotnet pack src/Silex.Tool/Silex.Tool.csproj -c Release -r "${{ matrix.rid }}" -o tool-artifacts -p:VersionSuffix=preview-${{ github.run_number }} -p:ContinuousIntegrationBuild=True
           dotnet pack src/Silex.Tool/Silex.Tool.csproj -c Release -o tool-artifacts -p:VersionSuffix=preview-${{ github.run_number }} -p:ContinuousIntegrationBuild=True
-          RID="${{ matrix.rid }}"
-          dotnet tool install Silex.Tool --tool-path tool-installed --add-source "$PWD/tool-artifacts" --arch "${RID##*-}" --version "1.0.0-preview-${{ github.run_number }}"
+          dotnet tool install Silex.Tool --tool-path tool-installed --add-source "$PWD/tool-artifacts" --version "1.0.0-preview-${{ github.run_number }}"
 
       - name: Test native tool
         shell: bash
