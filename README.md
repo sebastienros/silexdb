@@ -1369,8 +1369,9 @@ history and does not make stamps globally unique across databases or restores.
 ### Durable transaction group commit
 
 Set `MvccCommitGroupSize` to a value from 2 through 64 to let concurrent transaction commits share WAL
-file-content synchronization; the default of 1 preserves the ordinary commit path. Grouping requires
-both `UseWriteAheadLog = true` and `SyncWriteAheadLogToDisk = true`. It does not change plain LSM writes,
+writes and file-content synchronization; the default of 1 preserves the ordinary commit path. Grouping
+requires `UseWriteAheadLog = true` and works with both synchronous (`SyncWriteAheadLogToDisk = true`) and
+unsynchronized (`SyncWriteAheadLogToDisk = false`) WAL durability. It does not change plain LSM writes,
 MVCC `Put`/`Delete`, or the WAL format.
 
 The engine admits at most twice the configured group size, with further commit callers waiting on
@@ -1490,7 +1491,7 @@ is a valid starting point. The most commonly used options:
 | `BlockCacheSizeLimit`      | 1 MiB              | Size of the in-memory cache of decoded blocks.                           |
 | `UseWriteAheadLog`         | `true`             | Maintain a WAL so unflushed data is recovered after a crash.             |
 | `SyncWriteAheadLogToDisk`  | `false`            | Request OS file-content synchronization for every WAL frame before applying/acknowledging it; see durability limitations above. |
-| `MvccCommitGroupSize`      | `1`                | Maximum ready MVCC transactions sharing one synchronization (1 disables; 2-64 require synchronous WAL durability). |
+| `MvccCommitGroupSize`      | `1`                | Maximum ready MVCC transactions sharing one WAL write/sync group (1 disables; 2-64 require WAL). |
 | `CompactionStrategy`       | `Tiered`           | `None`, `Tiered` (write-optimized), or `Leveled` (read-optimized).       |
 
 Convenient size helpers are available as extension methods: `64.MiB()`, `4.KiB()`, `1.GiB()`,

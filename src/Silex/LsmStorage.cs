@@ -493,6 +493,8 @@ public sealed partial class LsmStorage : IDisposable, IAsyncDisposable
         _compacter = compacter;
     }
 
+    internal bool HasPendingWrites => _inner.HasPendingWrites;
+
     public void Put(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
     {
         CheckWritable();
@@ -550,6 +552,10 @@ public sealed partial class LsmStorage : IDisposable, IAsyncDisposable
     {
         CheckDisposed();
         ArgumentNullException.ThrowIfNull(destination);
+        if (_inner.TryReadRawSync(key, new LsmStorageInner.BufferWriterSink(destination), cancellationToken, out var syncLen))
+        {
+            return ValueTask.FromResult(syncLen >= 0);
+        }
 
         var ownedKey = OwnedByteSlice.CopyFrom(key);
         return DisposeKeyAsync(_inner.TryGetRawAsync(ownedKey.Slice, destination, cancellationToken), ownedKey);
@@ -578,6 +584,10 @@ public sealed partial class LsmStorage : IDisposable, IAsyncDisposable
     public ValueTask<int> GetRawAsync(ReadOnlySpan<byte> key, Memory<byte> destination, CancellationToken cancellationToken = default)
     {
         CheckDisposed();
+        if (_inner.TryReadRawSync(key, new LsmStorageInner.MemoryCopySink(destination), cancellationToken, out var syncLen))
+        {
+            return ValueTask.FromResult(syncLen);
+        }
 
         var ownedKey = OwnedByteSlice.CopyFrom(key);
         return DisposeKeyAsync(_inner.GetRawAsync(ownedKey.Slice, destination, cancellationToken), ownedKey);
@@ -606,6 +616,10 @@ public sealed partial class LsmStorage : IDisposable, IAsyncDisposable
     {
         CheckDisposed();
         ArgumentNullException.ThrowIfNull(reader);
+        if (_inner.TryReadRawSync(key, new LsmStorageInner.DelegateSink<TArg>(arg, reader), cancellationToken, out var syncLen))
+        {
+            return ValueTask.FromResult(syncLen >= 0);
+        }
 
         var ownedKey = OwnedByteSlice.CopyFrom(key);
         return DisposeKeyAsync(_inner.TryReadRawAsync(ownedKey.Slice, arg, reader, cancellationToken), ownedKey);
@@ -641,6 +655,10 @@ public sealed partial class LsmStorage : IDisposable, IAsyncDisposable
     {
         CheckDisposed();
         ArgumentNullException.ThrowIfNull(reader);
+        if (_inner.TrySeekRawSync(from, arg, reader, maxEntries, cancellationToken, out var syncCount))
+        {
+            return ValueTask.FromResult(syncCount);
+        }
 
         var ownedFrom = OwnedByteSlice.CopyFrom(from);
         return DisposeKeyAsync(_inner.SeekRawAsync(ownedFrom.Slice, arg, reader, maxEntries, cancellationToken), ownedFrom);

@@ -4,12 +4,14 @@ namespace Silex.MemTables;
 
 internal sealed partial class MemTable
 {
-    private sealed class OrderedIndex : IDisposable
+    internal sealed class OrderedIndex : IDisposable
     {
         private const int LeafCapacity = 256;
         private const int BranchCapacity = 32;
         private readonly MemTable _table;
         private Node _root;
+        private long _version;
+        public long Version => _version;
 
         public OrderedIndex(MemTable table, ReadOnlySpan<int> records)
         {
@@ -69,31 +71,34 @@ internal sealed partial class MemTable
         {
             var node = _root;
             while (node.Children is not null) node = node.Children[backwards ? node.Count : 0]!;
-            return new Cursor(node, backwards ? node.Count - 1 : 0);
+            return new Cursor(this, node, backwards ? node.Count - 1 : 0);
         }
 
         public Cursor Seek(ReadOnlySpan<byte> key, bool inclusive, bool backwards)
         {
             var node = _root;
-            while (node.Children is not null) node = node.Children[Bound(node, key, true)]!;
-            var slot = Bound(node, key, false);
-            var equal = slot < node.Count && Key(node.Keys[slot]).SequenceEqual(key);
+            var keyPrefix = ReadKeyPrefixWord(key);
+            while (node.Children is not null) node = node.Children[Bound(node, key, keyPrefix, true)]!;
+            var slot = Bound(node, key, keyPrefix, false);
+            var equal = slot < node.Count && EqualsKey(node.Keys[slot], key, keyPrefix);
             if (backwards)
             {
                 if (!equal || !inclusive) slot--;
-                if (slot < 0 && node.Previous is { } previous) return new Cursor(previous, previous.Count - 1);
+                if (slot < 0 && node.Previous is { } previous) return new Cursor(this, previous, previous.Count - 1);
             }
             else
             {
                 if (equal && !inclusive) slot++;
-                if (slot == node.Count && node.Next is { } next) return new Cursor(next, 0);
+                if (slot == node.Count && node.Next is { } next) return new Cursor(this, next, 0);
             }
-            return new Cursor(node, slot);
+            return new Cursor(this, node, slot);
         }
 
         public void Insert(int record)
         {
-            var right = Insert(_root, record, out var separator);
+            _version++;
+            var key = Key(record);
+            var right = Insert(_root, record, key, _table._records[record].KeyPrefixWord, out var separator);
             if (right is null) return;
             var root = new Node(false) { Count = 1 };
             root.Keys[0] = separator;
@@ -102,10 +107,10 @@ internal sealed partial class MemTable
             _root = root;
         }
 
-        private Node? Insert(Node node, int record, out int separator)
+        private Node? Insert(Node node, int record, ReadOnlySpan<byte> key, ulong keyPrefix, out int separator)
         {
             separator = 0;
-            var slot = Bound(node, Key(record), node.Children is not null);
+            var slot = Bound(node, key, keyPrefix, node.Children is not null);
             if (node.Children is null)
             {
                 node.Keys.AsSpan(slot, node.Count - slot).CopyTo(node.Keys.AsSpan(slot + 1));
@@ -113,7 +118,7 @@ internal sealed partial class MemTable
             }
             else
             {
-                var child = Insert(node.Children[slot]!, record, out var childSeparator);
+                var child = Insert(node.Children[slot]!, record, key, keyPrefix, out var childSeparator);
                 if (child is null) return null;
                 node.Keys.AsSpan(slot, node.Count - slot).CopyTo(node.Keys.AsSpan(slot + 1));
                 node.Children.AsSpan(slot + 1, node.Count - slot).CopyTo(node.Children.AsSpan(slot + 2));
@@ -149,14 +154,39 @@ internal sealed partial class MemTable
 
         private ReadOnlySpan<byte> Key(int record) => _table._arena.GetSpan(_table._records[record].Key);
 
-        private int Bound(Node node, ReadOnlySpan<byte> key, bool upper)
+        private bool EqualsKey(int record, ReadOnlySpan<byte> key, ulong keyPrefix)
+        {
+            ref var rec = ref _table._records[record];
+            if (rec.KeyPrefixWord != keyPrefix || rec.Key.Length != key.Length)
+            {
+                return false;
+            }
+            return key.Length <= 8 || _table._arena.GetSpan(rec.Key)[8..].SequenceEqual(key[8..]);
+        }
+
+        private int Bound(Node node, ReadOnlySpan<byte> key, ulong keyPrefix, bool upper)
         {
             var low = 0;
             var high = node.Count;
+            var records = _table._records;
             while (low < high)
             {
                 var middle = low + ((high - low) >> 1);
-                var comparison = Key(node.Keys[middle]).SequenceCompareTo(key);
+                ref var rec = ref records[node.Keys[middle]];
+                var recPrefix = rec.KeyPrefixWord;
+                int comparison;
+                if (recPrefix != keyPrefix)
+                {
+                    comparison = recPrefix < keyPrefix ? -1 : 1;
+                }
+                else if (rec.Key.Length <= 8 && key.Length <= 8)
+                {
+                    comparison = rec.Key.Length.CompareTo(key.Length);
+                }
+                else
+                {
+                    comparison = _table._arena.GetSpan(rec.Key).SequenceCompareTo(key);
+                }
                 if (comparison < 0 || upper && comparison == 0) low = middle + 1;
                 else high = middle;
             }
@@ -205,9 +235,14 @@ internal sealed partial class MemTable
 
         public struct Cursor
         {
+            private OrderedIndex _index;
+            private long _version;
             private Node _node;
             private int _slot;
-            public Cursor(Node node, int slot) { _node = node; _slot = slot; }
+            public Cursor(OrderedIndex index, Node node, int slot) { _index = index; _version = index._version; _node = node; _slot = slot; }
+            public readonly Node CurrentNode => _node;
+            public readonly int CurrentSlot => _slot;
+            public readonly bool IsCurrent(OrderedIndex index) => ReferenceEquals(_index, index) && _version == index._version;
             public readonly bool IsValid => (uint)_slot < (uint)_node.Count;
             public readonly int Record => _node.Keys[_slot];
             public void Move(bool backwards)

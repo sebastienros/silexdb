@@ -115,31 +115,122 @@ internal sealed class MergeIterator : IStorageIterator
         }
     }
 
-    internal async ValueTask<long> ScanRawAsync<TArg>(
-        bool hasFrom,
-        ReadOnlyMemory<byte> from,
-        TArg arg,
-        ReadRawEntryAction<TArg> reader,
-        long maxEntries,
+    internal async ValueTask<int> CompactToBuilderAsync(
+        BufferedSsTableBuilder builder,
+        bool dropTombstones,
         CancellationToken cancellationToken)
     {
         var sourceCount = _inputs.Count;
-        if (sourceCount == 0 || maxEntries == 0)
+        if (sourceCount == 0)
         {
             return 0;
         }
+
         var sources = ArrayPool<Source>.Shared.Rent(sourceCount);
         var heap = ArrayPool<int>.Shared.Rent(sourceCount);
         var heapCount = 0;
         const bool backwards = false;
-        long count = 0;
+        var added = 0;
 
         try
         {
             for (var i = 0; i < sourceCount; i++)
             {
-                sources[i] = Source.Create(_inputs[i], hasFrom, from, backwards, cancellationToken);
-                if (await MoveNextSourceAsync(sources, i, cancellationToken))
+                sources[i] = Source.Create(_inputs[i], hasFrom: false, default, backwards, cancellationToken);
+                if (await MoveNextSourceAsync(sources, i, cancellationToken).ConfigureAwait(false))
+                {
+                    Push(sources, heap, ref heapCount, i, backwards);
+                }
+            }
+
+            while (heapCount != 0)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var winner = Pop(sources, heap, ref heapCount, backwards);
+                while (heapCount != 0 && KeysEqual(sources[winner], sources[heap[0]]))
+                {
+                    var duplicate = Pop(sources, heap, ref heapCount, backwards);
+                    if (await MoveNextSourceAsync(sources, duplicate, cancellationToken).ConfigureAwait(false))
+                    {
+                        Push(sources, heap, ref heapCount, duplicate, backwards);
+                    }
+                }
+
+                var isTombstone = sources[winner].IsTombstone;
+                if (!dropTombstones || !isTombstone)
+                {
+                    if (!builder.TryAddRawFast(sources[winner].KeySpan, isTombstone ? default : sources[winner].ValueSpan, isTombstone))
+                    {
+                        await builder.RolloverBlockForRawAsync(cancellationToken).ConfigureAwait(false);
+                        if (!builder.TryAddRawFast(sources[winner].KeySpan, isTombstone ? default : sources[winner].ValueSpan, isTombstone))
+                        {
+                            throw new InvalidOperationException("The data was not successfully added to a block.");
+                        }
+                    }
+                    added++;
+                }
+
+                if (await MoveNextSourceAsync(sources, winner, cancellationToken).ConfigureAwait(false))
+                {
+                    Push(sources, heap, ref heapCount, winner, backwards);
+                }
+            }
+
+            return added;
+        }
+        finally
+        {
+            for (var i = 0; i < sourceCount; i++)
+            {
+                await sources[i].DisposeAsync().ConfigureAwait(false);
+                sources[i] = default;
+            }
+
+            ArrayPool<Source>.Shared.Return(sources);
+            ArrayPool<int>.Shared.Return(heap);
+        }
+    }
+
+    internal static bool TryScanMvccSourcesSync<TArg>(
+        Source[]? sources,
+        int[]? heap,
+        int sourceCount,
+        BlockCache? blockCache,
+        long snapshotSequence,
+        TArg arg,
+        ReadRawEntryAction<TArg> reader,
+        long maxEntries,
+        CancellationToken cancellationToken,
+        out long count)
+    {
+        count = 0;
+        if (sources == null || heap == null || sourceCount == 0 || maxEntries == 0)
+        {
+            return true;
+        }
+
+        var heapCount = 0;
+        const bool backwards = false;
+        ulong lastWord = 0;
+        var lastLen = -1;
+        var resolved = false;
+        byte[]? groupBuf = null;
+
+        try
+        {
+            if (sourceCount == 0 || maxEntries == 0)
+            {
+                return true;
+            }
+
+            for (var i = 0; i < sourceCount; i++)
+            {
+                if (!TryMoveNextSourceSync(sources, i, blockCache, cancellationToken, out var moved))
+                {
+                    moved = MoveNextSourceCoreStaticAsync(sources, i, blockCache, cancellationToken).AsTask().GetAwaiter().GetResult();
+                }
+                if (moved)
                 {
                     Push(sources, heap, ref heapCount, i, backwards);
                 }
@@ -153,7 +244,154 @@ internal sealed class MergeIterator : IStorageIterator
                 while (heapCount != 0 && KeysEqual(sources[winner], sources[heap[0]]))
                 {
                     var duplicate = Pop(sources, heap, ref heapCount, backwards);
-                    if (await MoveNextSourceAsync(sources, duplicate, cancellationToken))
+                    if (!TryMoveNextSourceSync(sources, duplicate, blockCache, cancellationToken, out var dupMoved))
+                    {
+                        dupMoved = MoveNextSourceCoreStaticAsync(sources, duplicate, blockCache, cancellationToken).AsTask().GetAwaiter().GetResult();
+                    }
+                    if (dupMoved)
+                    {
+                        Push(sources, heap, ref heapCount, duplicate, backwards);
+                    }
+                }
+
+                var keepGoing = true;
+                if (!sources[winner].IsTombstone)
+                {
+                    var key = sources[winner].KeySpan;
+                    var value = sources[winner].ValueSpan;
+                    if (key.Length >= 3 + sizeof(long) && key[0] == 1 && !value.IsEmpty)
+                    {
+                        var terminator = key.Length - sizeof(long) - 2;
+                        if (key[terminator] == 0 && key[terminator + 1] == 0)
+                        {
+                            var encodedUserKey = key.Slice(1, terminator - 1);
+                            var word = encodedUserKey.Length >= 8 ? System.Buffers.Binary.BinaryPrimitives.ReadUInt64BigEndian(encodedUserKey) : 0UL;
+                            var sameKey = encodedUserKey.Length == lastLen && word == lastWord &&
+                                (encodedUserKey.Length <= 8
+                                    ? encodedUserKey.SequenceEqual(groupBuf.AsSpan(0, lastLen))
+                                    : encodedUserKey[8..].SequenceEqual(groupBuf.AsSpan(8, lastLen - 8)));
+
+                            if (!sameKey)
+                            {
+                                lastWord = word;
+                                lastLen = encodedUserKey.Length;
+                                resolved = false;
+                                if (encodedUserKey.Length < 8 || encodedUserKey.Length > 8)
+                                {
+                                    if (groupBuf is null || groupBuf.Length < encodedUserKey.Length)
+                                    {
+                                        if (groupBuf is not null) ArrayPool<byte>.Shared.Return(groupBuf);
+                                        groupBuf = ArrayPool<byte>.Shared.Rent(encodedUserKey.Length);
+                                    }
+                                    encodedUserKey.CopyTo(groupBuf);
+                                }
+                            }
+
+                            if (!resolved)
+                            {
+                                var encoded = System.Buffers.Binary.BinaryPrimitives.ReadUInt64BigEndian(key[(terminator + 2)..]);
+                                var seq = (long)~encoded;
+                                if (seq >= 0 && seq <= snapshotSequence)
+                                {
+                                    resolved = true;
+                                    if (value[0] == 1)
+                                    {
+                                        count++;
+                                        keepGoing = MvccStorage.InvokeUserReader(arg, reader, encodedUserKey, value[1..]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (!keepGoing || count >= maxEntries)
+                {
+                    break;
+                }
+
+                if (!TryMoveNextSourceSync(sources, winner, blockCache, cancellationToken, out var winMoved))
+                {
+                    // Could not advance to next block synchronously after already delivering entries;
+                    // load the missing block synchronously via ReadBlockCachedAsync.AsTask().GetAwaiter().GetResult()
+                    // so we don't duplicate already-delivered entries on fallback.
+                    winMoved = MoveNextSourceCoreStaticAsync(sources, winner, blockCache, cancellationToken).AsTask().GetAwaiter().GetResult();
+                }
+                if (winMoved)
+                {
+                    Push(sources, heap, ref heapCount, winner, backwards);
+                }
+            }
+
+            return true;
+        }
+        finally
+        {
+            if (groupBuf is not null)
+            {
+                ArrayPool<byte>.Shared.Return(groupBuf);
+            }
+        }
+    }
+
+    internal static ValueTask<long> ScanRawSourcesAsync<TArg>(
+        Source[]? sources,
+        int[]? heap,
+        int sourceCount,
+        BlockCache? blockCache,
+        TArg arg,
+        ReadRawEntryAction<TArg> reader,
+        long maxEntries,
+        CancellationToken cancellationToken)
+    {
+        if (sources == null || heap == null)
+        {
+            return ValueTask.FromResult(0L);
+        }
+
+        var heapCount = 0;
+        const bool backwards = false;
+        var count = 0;
+
+        try
+        {
+            if (sourceCount == 0 || maxEntries == 0)
+            {
+                for (var i = 0; i < sourceCount; i++)
+                {
+                    sources[i].DisposeSyncOrAsync();
+                    sources[i] = default;
+                }
+                ArrayPool<Source>.Shared.Return(sources);
+                ArrayPool<int>.Shared.Return(heap);
+                return ValueTask.FromResult(0L);
+            }
+
+            for (var i = 0; i < sourceCount; i++)
+            {
+                if (!TryMoveNextSourceSync(sources, i, blockCache, cancellationToken, out var moved))
+                {
+                    return ScanRawSourcesSlowAsync(sources, heap, sourceCount, i, heapCount, count, blockCache, arg, reader, maxEntries, cancellationToken);
+                }
+                if (moved)
+                {
+                    Push(sources, heap, ref heapCount, i, backwards);
+                }
+            }
+
+            while (heapCount != 0 && count < maxEntries)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var winner = Pop(sources, heap, ref heapCount, backwards);
+                while (heapCount != 0 && KeysEqual(sources[winner], sources[heap[0]]))
+                {
+                    var duplicate = Pop(sources, heap, ref heapCount, backwards);
+                    if (!TryMoveNextSourceSync(sources, duplicate, blockCache, cancellationToken, out var dupMoved))
+                    {
+                        return ScanRawSourcesSlowFromDuplicateAsync(sources, heap, sourceCount, winner, duplicate, heapCount, count, blockCache, arg, reader, maxEntries, cancellationToken);
+                    }
+                    if (dupMoved)
                     {
                         Push(sources, heap, ref heapCount, duplicate, backwards);
                     }
@@ -171,9 +409,146 @@ internal sealed class MergeIterator : IStorageIterator
                     break;
                 }
 
-                if (await MoveNextSourceAsync(sources, winner, cancellationToken))
+                if (!TryMoveNextSourceSync(sources, winner, blockCache, cancellationToken, out var winMoved))
+                {
+                    return ScanRawSourcesSlowFromWinnerAsync(sources, heap, sourceCount, winner, heapCount, count, blockCache, arg, reader, maxEntries, cancellationToken);
+                }
+                if (winMoved)
                 {
                     Push(sources, heap, ref heapCount, winner, backwards);
+                }
+            }
+
+            for (var i = 0; i < sourceCount; i++)
+            {
+                sources[i].DisposeSyncOrAsync();
+                sources[i] = default;
+            }
+            ArrayPool<Source>.Shared.Return(sources);
+            ArrayPool<int>.Shared.Return(heap);
+            return ValueTask.FromResult((long)count);
+        }
+        catch
+        {
+            for (var i = 0; i < sourceCount; i++)
+            {
+                sources[i].DisposeSyncOrAsync();
+                sources[i] = default;
+            }
+            ArrayPool<Source>.Shared.Return(sources);
+            ArrayPool<int>.Shared.Return(heap);
+            throw;
+        }
+    }
+
+    private static ValueTask<long> ScanRawSourcesSlowFromDuplicateAsync<TArg>(
+        Source[] sources, int[] heap, int sourceCount, int winner, int duplicate, int heapCount, long count,
+        BlockCache? blockCache, TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries, CancellationToken cancellationToken)
+        => ScanRawSourcesContinueAsync(sources, heap, sourceCount, initIndex: sourceCount, winner, duplicate, state: 1, heapCount, count, blockCache, arg, reader, maxEntries, cancellationToken);
+
+    private static ValueTask<long> ScanRawSourcesSlowFromWinnerAsync<TArg>(
+        Source[] sources, int[] heap, int sourceCount, int winner, int heapCount, long count,
+        BlockCache? blockCache, TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries, CancellationToken cancellationToken)
+        => ScanRawSourcesContinueAsync(sources, heap, sourceCount, initIndex: sourceCount, winner, duplicate: -1, state: 2, heapCount, count, blockCache, arg, reader, maxEntries, cancellationToken);
+
+    private static ValueTask<long> ScanRawSourcesSlowAsync<TArg>(
+        Source[] sources, int[] heap, int sourceCount, int initIndex, int heapCount, long count,
+        BlockCache? blockCache, TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries, CancellationToken cancellationToken)
+        => ScanRawSourcesContinueAsync(sources, heap, sourceCount, initIndex, winner: -1, duplicate: -1, state: 0, heapCount, count, blockCache, arg, reader, maxEntries, cancellationToken);
+
+    private static async ValueTask<long> ScanRawSourcesContinueAsync<TArg>(
+        Source[] sources, int[] heap, int sourceCount, int initIndex, int winner, int duplicate, int state, int heapCount, long count,
+        BlockCache? blockCache, TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries, CancellationToken cancellationToken)
+    {
+        const bool backwards = false;
+        try
+        {
+            if (state == 0)
+            {
+                for (var i = initIndex; i < sourceCount; i++)
+                {
+                    if ((i > initIndex && TryMoveNextSourceSync(sources, i, blockCache, cancellationToken, out var moved))
+                        ? moved
+                        : await MoveNextSourceCoreStaticAsync(sources, i, blockCache, cancellationToken).ConfigureAwait(false))
+                    {
+                        Push(sources, heap, ref heapCount, i, backwards);
+                    }
+                }
+            }
+            else if (state == 1)
+            {
+                if (await MoveNextSourceCoreStaticAsync(sources, duplicate, blockCache, cancellationToken).ConfigureAwait(false))
+                {
+                    Push(sources, heap, ref heapCount, duplicate, backwards);
+                }
+                while (heapCount != 0 && KeysEqual(sources[winner], sources[heap[0]]))
+                {
+                    var dup = Pop(sources, heap, ref heapCount, backwards);
+                    if (TryMoveNextSourceSync(sources, dup, blockCache, cancellationToken, out var dupMoved)
+                        ? dupMoved
+                        : await MoveNextSourceCoreStaticAsync(sources, dup, blockCache, cancellationToken).ConfigureAwait(false))
+                    {
+                        Push(sources, heap, ref heapCount, dup, backwards);
+                    }
+                }
+                var keepGoing = true;
+                if (!sources[winner].IsTombstone)
+                {
+                    count++;
+                    keepGoing = reader(arg, sources[winner].KeySpan, sources[winner].ValueSpan);
+                }
+                if (!keepGoing || count >= maxEntries)
+                {
+                    return count;
+                }
+                if (TryMoveNextSourceSync(sources, winner, blockCache, cancellationToken, out var winMoved)
+                    ? winMoved
+                    : await MoveNextSourceCoreStaticAsync(sources, winner, blockCache, cancellationToken).ConfigureAwait(false))
+                {
+                    Push(sources, heap, ref heapCount, winner, backwards);
+                }
+            }
+            else if (state == 2)
+            {
+                if (await MoveNextSourceCoreStaticAsync(sources, winner, blockCache, cancellationToken).ConfigureAwait(false))
+                {
+                    Push(sources, heap, ref heapCount, winner, backwards);
+                }
+            }
+
+            while (heapCount != 0 && count < maxEntries)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var w = Pop(sources, heap, ref heapCount, backwards);
+                while (heapCount != 0 && KeysEqual(sources[w], sources[heap[0]]))
+                {
+                    var dup = Pop(sources, heap, ref heapCount, backwards);
+                    if (TryMoveNextSourceSync(sources, dup, blockCache, cancellationToken, out var dupMoved)
+                        ? dupMoved
+                        : await MoveNextSourceCoreStaticAsync(sources, dup, blockCache, cancellationToken).ConfigureAwait(false))
+                    {
+                        Push(sources, heap, ref heapCount, dup, backwards);
+                    }
+                }
+
+                var keepGoing = true;
+                if (!sources[w].IsTombstone)
+                {
+                    count++;
+                    keepGoing = reader(arg, sources[w].KeySpan, sources[w].ValueSpan);
+                }
+
+                if (!keepGoing || count >= maxEntries)
+                {
+                    break;
+                }
+
+                if (TryMoveNextSourceSync(sources, w, blockCache, cancellationToken, out var winMoved)
+                    ? winMoved
+                    : await MoveNextSourceCoreStaticAsync(sources, w, blockCache, cancellationToken).ConfigureAwait(false))
+                {
+                    Push(sources, heap, ref heapCount, w, backwards);
                 }
             }
 
@@ -183,13 +558,141 @@ internal sealed class MergeIterator : IStorageIterator
         {
             for (var i = 0; i < sourceCount; i++)
             {
-                await sources[i].DisposeAsync();
+                sources[i].DisposeSyncOrAsync();
                 sources[i] = default;
             }
 
             ArrayPool<Source>.Shared.Return(sources);
             ArrayPool<int>.Shared.Return(heap);
         }
+    }
+
+    private static bool TryMoveNextSourceSync(Source[] sources, int sourceIndex, BlockCache? blockCache, CancellationToken cancellationToken, out bool moved)
+    {
+        ref var source = ref sources[sourceIndex];
+        if (source.MemTable is not null)
+        {
+            moved = source.MoveNextMemTable();
+            return true;
+        }
+        if (source.Entries != null)
+        {
+            moved = source.MoveNextList();
+            return true;
+        }
+        if (source.Enumerator != null)
+        {
+            moved = false;
+            return false;
+        }
+        if (source.HasBlock && source.Cursor.MoveNext())
+        {
+            moved = true;
+            return true;
+        }
+        if (source.HasBlock)
+        {
+            source.DisposeBlock();
+            source.BlockIndex += source.Step;
+        }
+
+        var table = source.Table!;
+        while ((uint)source.BlockIndex < (uint)table.BlockMetadataArray.Length)
+        {
+            if (blockCache == null)
+            {
+                moved = false;
+                return false;
+            }
+            if (!table.TryAcquireCachedBlock(source.BlockIndex, blockCache, cancellationToken, out source.Lease))
+            {
+                var leaseTask = table.ReadBlockCachedAsync(source.BlockIndex, blockCache, cancellationToken);
+                if (!leaseTask.IsCompletedSuccessfully)
+                {
+                    moved = false;
+                    return false;
+                }
+                source.Lease = leaseTask.GetAwaiter().GetResult();
+            }
+
+            var block = source.Lease.Block;
+            if (block == null)
+            {
+                source.BlockIndex += source.Step;
+                continue;
+            }
+
+            var hasSeek = source.SeekPending;
+            var seek = hasSeek ? source.From.Span : default;
+            source.SeekPending = false;
+            source.Block = block;
+            source.HasBlock = true;
+            source.Cursor = new BlockIterator.Cursor(block, source.Step < 0, seek, hasSeek);
+
+            if (source.Cursor.MoveNext())
+            {
+                moved = true;
+                return true;
+            }
+
+            source.DisposeBlock();
+            source.BlockIndex += source.Step;
+        }
+
+        moved = false;
+        return true;
+    }
+
+    private static async ValueTask<bool> MoveNextSourceCoreStaticAsync(Source[] sources, int sourceIndex, BlockCache? blockCache, CancellationToken cancellationToken)
+    {
+        var enumerator = sources[sourceIndex].Enumerator;
+        if (enumerator != null)
+        {
+            return await enumerator.MoveNextAsync().ConfigureAwait(false);
+        }
+
+        var table = sources[sourceIndex].Table!;
+        while ((uint)sources[sourceIndex].BlockIndex < (uint)table.BlockMetadataArray.Length)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Block? block;
+            if (blockCache == null)
+            {
+                block = await table.ReadBlockAsync(sources[sourceIndex].BlockIndex, cancellationToken).ConfigureAwait(false);
+                sources[sourceIndex].OwnsBlock = block != null;
+            }
+            else
+            {
+                sources[sourceIndex].Lease = await table.ReadBlockCachedAsync(
+                    sources[sourceIndex].BlockIndex,
+                    blockCache,
+                    cancellationToken).ConfigureAwait(false);
+                block = sources[sourceIndex].Lease.Block;
+            }
+
+            if (block == null)
+            {
+                sources[sourceIndex].BlockIndex += sources[sourceIndex].Step;
+                continue;
+            }
+
+            var hasSeek = sources[sourceIndex].SeekPending;
+            var seek = hasSeek ? sources[sourceIndex].From.Span : default;
+            sources[sourceIndex].SeekPending = false;
+            sources[sourceIndex].Block = block;
+            sources[sourceIndex].HasBlock = true;
+            sources[sourceIndex].Cursor = new BlockIterator.Cursor(block, sources[sourceIndex].Step < 0, seek, hasSeek);
+
+            if (sources[sourceIndex].Cursor.MoveNext())
+            {
+                return true;
+            }
+
+            sources[sourceIndex].DisposeBlock();
+            sources[sourceIndex].BlockIndex += sources[sourceIndex].Step;
+        }
+
+        return false;
     }
 
     private IAsyncEnumerable<KeyValuePair<ByteSlice, ByteSlice>> EnumerateCore(
@@ -449,11 +952,11 @@ internal sealed class MergeIterator : IStorageIterator
         return result;
     }
 
-    private struct Source
+    internal struct Source
     {
         public OrderedReadRange? Range;
         public MemTable? MemTable;
-        public ReaderWriterLockSlim? MemTableLock;
+        public StripedReaderWriterLock? MemTableLock;
         public LsmStorageInner? MemTableStorage;
         public byte[]? MemKey;
         public byte[]? MemValue;
@@ -475,6 +978,9 @@ internal sealed class MergeIterator : IStorageIterator
         public BlockLease Lease;
         public bool OwnsBlock;
         public bool HasBlock;
+
+        public MemTable.OrderedIndex.Cursor MemCursor;
+        public bool MemHasCursor;
 
         public readonly ReadOnlySpan<byte> KeySpan =>
             MemTable != null ? MemKey.AsSpan(0, MemKeyLength) : Entries != null
@@ -655,7 +1161,7 @@ internal sealed class MergeIterator : IStorageIterator
                 MemTableStorage?.CheckHealthy();
                 var from = MemStarted ? MemKey.AsSpan(0, MemKeyLength) : From.Span;
                 var inclusive = !MemStarted && (Range is null || (Step < 0 ? Range.UpperInclusive : Range.LowerInclusive));
-                if (!MemTable!.TryGetNextRaw(from, MemStarted || SeekPending, inclusive, Step < 0,
+                if (!MemTable!.TryAdvanceRaw(ref MemCursor, ref MemHasCursor, from, MemStarted || SeekPending, inclusive, Step < 0,
                     out var key, out var value, out var tombstone))
                 {
                     return false;
@@ -664,6 +1170,7 @@ internal sealed class MergeIterator : IStorageIterator
                 {
                     return false;
                 }
+                SeekPending = false;
                 Copy(ref MemKey, key);
                 var retainedValue = value[..Math.Min(value.Length, ValuePrefixLength)];
                 Copy(ref MemValue, retainedValue);
@@ -711,6 +1218,26 @@ internal sealed class MergeIterator : IStorageIterator
             Cursor = default;
         }
 
+        public void DisposeSyncOrAsync()
+        {
+            if (MemKey is not null)
+            {
+                ArrayPool<byte>.Shared.Return(MemKey);
+                MemKey = null;
+            }
+            if (MemValue is not null)
+            {
+                ArrayPool<byte>.Shared.Return(MemValue);
+                MemValue = null;
+            }
+            DisposeBlock();
+            if (Enumerator != null)
+            {
+                Enumerator.DisposeAsync().AsTask().GetAwaiter().GetResult();
+                Enumerator = null;
+            }
+        }
+
         public async ValueTask DisposeAsync()
         {
             if (MemKey is not null)
@@ -734,7 +1261,7 @@ internal sealed class MergeIterator : IStorageIterator
 
     internal readonly struct Input
     {
-        private Input(MemTable memTable, ReaderWriterLockSlim memTableLock, LsmStorageInner? storage)
+        private Input(MemTable memTable, StripedReaderWriterLock memTableLock, LsmStorageInner? storage)
         {
             MemTable = memTable;
             MemTableLock = memTableLock;
@@ -752,7 +1279,7 @@ internal sealed class MergeIterator : IStorageIterator
 
         public SsTable? Table { get; }
         public MemTable? MemTable { get; }
-        public ReaderWriterLockSlim? MemTableLock { get; }
+        public StripedReaderWriterLock? MemTableLock { get; }
         public LsmStorageInner? MemTableStorage { get; }
 
         public List<KeyValuePair<ByteSlice, ByteSlice>>? Entries { get; }
@@ -760,7 +1287,7 @@ internal sealed class MergeIterator : IStorageIterator
         public IStorageIterator? Iterator { get; }
 
         public static Input FromTable(SsTable table) => new(table, null, null);
-        public static Input FromMemTable(MemTable table, ReaderWriterLockSlim tableLock, LsmStorageInner? storage = null) =>
+        public static Input FromMemTable(MemTable table, StripedReaderWriterLock tableLock, LsmStorageInner? storage = null) =>
             new(table, tableLock, storage);
 
         public static Input FromEntries(List<KeyValuePair<ByteSlice, ByteSlice>> entries) => new(null, entries, null);

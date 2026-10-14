@@ -30,6 +30,8 @@ internal sealed class BenchmarkResult
     public int Gen0Collections;
     public int Gen1Collections;
     public int Gen2Collections;
+    public long RestingMemoryBytes;
+    public long PeakMemoryBytes;
 }
 
 /// <summary>
@@ -54,13 +56,19 @@ internal sealed class Runner
     private const string ReadSeq = "readseq";
     private const string SeekRandom = "seekrandom";
     private const string ReadReverse = "readreverse";
+    private const string ScanLimit = "scanlimit";
+    private const string ScanSkip = "scanskip";
+    private const string ScanCount = "scancount";
     private const string Separator = "----------------------------------------------------------------";
 
     private readonly BenchmarkOptions _options;
     private readonly string _dbPath;
     private LsmStorage? _db;
+    private MvccStorage? _mvccDb;
     private bool _currentWalSync;
     private bool _needsReadBarrier;
+    private long _minRssBytes = long.MaxValue;
+    private long _maxRssBytes;
 
     public Runner(BenchmarkOptions options, string dbPath)
     {
@@ -68,9 +76,22 @@ internal sealed class Runner
         _dbPath = dbPath;
     }
 
+    private void SampleRss(long rssBytes)
+    {
+        if (rssBytes < _minRssBytes)
+        {
+            _minRssBytes = rssBytes;
+        }
+        if (rssBytes > _maxRssBytes)
+        {
+            _maxRssBytes = rssBytes;
+        }
+    }
+
     public async Task RunAsync()
     {
         PrintHeader();
+        SampleRss(Environment.WorkingSet);
 
         try
         {
@@ -99,9 +120,20 @@ internal sealed class Runner
                     await RunOneAsync(name);
                 }
             }
+
+            if (_minRssBytes <= _maxRssBytes)
+            {
+                Console.WriteLine(Separator);
+                Console.WriteLine($"Memory (RSS)   : {_minRssBytes / 1_048_576.0,11:F1} MiB resting; {_maxRssBytes / 1_048_576.0,8:F1} MiB peak");
+            }
         }
         finally
         {
+            if (_mvccDb != null)
+            {
+                await _mvccDb.DisposeAsync();
+            }
+
             if (_db != null)
             {
                 await _db.DisposeAsync();
@@ -174,7 +206,20 @@ internal sealed class Runner
                 Report(await RunSeekRandomAsync(name));
                 break;
             case ReadReverse:
-                WriteSkippedBenchmark(name, "not supported (Silex iterators are forward-only)");
+                await EnsureReadableAsync();
+                Report(await RunReadReverseAsync(name));
+                break;
+            case ScanLimit:
+                await EnsureReadableAsync();
+                Report(await RunScanBoundedAsync(name, skip: 0, limit: _options.ScanLimit, countOnly: false));
+                break;
+            case ScanSkip:
+                await EnsureReadableAsync();
+                Report(await RunScanBoundedAsync(name, skip: _options.ScanSkip, limit: _options.ScanLimit, countOnly: false));
+                break;
+            case ScanCount:
+                await EnsureReadableAsync();
+                Report(await RunScanBoundedAsync(name, skip: 0, limit: int.MaxValue, countOnly: true));
                 break;
         }
     }
@@ -191,6 +236,9 @@ internal sealed class Runner
         if (BenchmarkEquals(value, ReadSeq)) return ReadSeq;
         if (BenchmarkEquals(value, SeekRandom)) return SeekRandom;
         if (BenchmarkEquals(value, ReadReverse)) return ReadReverse;
+        if (BenchmarkEquals(value, ScanLimit)) return ScanLimit;
+        if (BenchmarkEquals(value, ScanSkip)) return ScanSkip;
+        if (BenchmarkEquals(value, ScanCount)) return ScanCount;
 
         return null;
     }
@@ -234,7 +282,7 @@ internal sealed class Runner
 
     private async Task EnsureOpenAsync()
     {
-        if (_db == null)
+        if (_db == null && _mvccDb == null)
         {
             await OpenAsync(walSync: false);
         }
@@ -246,7 +294,27 @@ internal sealed class Runner
 
         if (_needsReadBarrier)
         {
-            await _db!.FlushAndCompactAsync();
+            if (_options.FlushBeforeReads)
+            {
+                if (_mvccDb != null)
+                {
+                    await _mvccDb.FlushAndCompactAsync();
+                }
+                else
+                {
+                    await _db!.FlushAndCompactAsync();
+                }
+            }
+
+            if (_mvccDb != null)
+            {
+                await _mvccDb.ScanRawAsync(0, static (_, _, _) => true);
+            }
+            else
+            {
+                await _db!.ScanRawAsync(0, static (_, _, _) => true);
+            }
+
             _needsReadBarrier = false;
         }
     }
@@ -262,19 +330,14 @@ internal sealed class Runner
 
         if (_currentWalSync)
         {
-            await _db!.DisposeAsync();
-            _db = null;
+            await CloseCurrentAsync();
             await OpenAsync(walSync: false); // reuse the same directory, no wipe
         }
     }
 
     private async Task OpenFreshAsync(bool walSync)
     {
-        if (_db != null)
-        {
-            await _db.DisposeAsync();
-            _db = null;
-        }
+        await CloseCurrentAsync();
 
         if (!_options.UseExistingDb && Directory.Exists(_dbPath))
         {
@@ -285,10 +348,35 @@ internal sealed class Runner
         _needsReadBarrier = false;
     }
 
+    private async Task CloseCurrentAsync()
+    {
+        if (_mvccDb != null)
+        {
+            await _mvccDb.DisposeAsync();
+            _mvccDb = null;
+        }
+
+        if (_db != null)
+        {
+            await _db.DisposeAsync();
+            _db = null;
+        }
+    }
+
     private async Task OpenAsync(bool walSync)
     {
         Directory.CreateDirectory(_dbPath);
-        _db = await LsmStorage.OpenAsync(_dbPath, _options.ToStorageOptions(walSync));
+        var storageOptions = _options.ToStorageOptions(walSync);
+
+        if (_options.Mvcc)
+        {
+            _mvccDb = await MvccStorage.OpenAsync(_dbPath, storageOptions);
+        }
+        else
+        {
+            _db = await LsmStorage.OpenAsync(_dbPath, storageOptions);
+        }
+
         _currentWalSync = walSync;
         _needsReadBarrier = false;
     }
@@ -302,7 +390,8 @@ internal sealed class Runner
 
     private Task<BenchmarkResult> RunWritesAsync(string name, long totalOps, bool sequential, string extra = "")
     {
-        var db = _db!;
+        var db = _db;
+        var mvccDb = _mvccDb;
         var entryBytes = _options.KeySize + _options.ValueSize;
 
         // Writes total exactly totalOps so the resulting database is well defined for later read
@@ -315,6 +404,45 @@ internal sealed class Runner
             var key = new byte[_options.KeySize];
             var value = new byte[_options.ValueSize];
             var batchSize = _options.BatchSize;
+
+            if (mvccDb != null)
+            {
+                MvccTransaction? tx = null;
+                var staged = 0;
+
+                return new ThreadWorker(op =>
+                {
+                    var keyIndex = sequential ? start + op : rng.NextInt64(totalOps);
+                    keyGen.GenerateInto(keyIndex, key);
+                    valueGen.GenerateInto(value);
+
+                    tx ??= mvccDb.BeginTransaction();
+                    tx.Put(key, value);
+                    staged++;
+
+                    if (staged == batchSize || op + 1 == count)
+                    {
+                        var commitTx = tx;
+                        tx = null;
+                        staged = 0;
+                        var commitTask = commitTx.TryCommitAsync();
+                        if (commitTask.IsCompletedSuccessfully)
+                        {
+                            commitTask.GetAwaiter().GetResult();
+                            commitTx.Dispose();
+                            stats.Ops++;
+                            stats.ByteSlice += entryBytes;
+                            return new ValueTask<bool>(true);
+                        }
+                        return AwaitCommitAsync(commitTask, commitTx, stats, entryBytes);
+                    }
+
+                    stats.Ops++;
+                    stats.ByteSlice += entryBytes;
+                    return new ValueTask<bool>(true);
+                });
+            }
+
             var batch = batchSize == 1 ? null : new LsmWriteBatch();
 
             return new ThreadWorker(op =>
@@ -325,14 +453,14 @@ internal sealed class Runner
 
                 if (batch is null)
                 {
-                    db.Put(key, value);
+                    db!.Put(key, value);
                 }
                 else
                 {
                     batch.Put(key, value);
                     if (batch.Count == batchSize || op + 1 == count)
                     {
-                        db.Write(batch);
+                        db!.Write(batch);
                         batch.Clear();
                     }
                 }
@@ -344,9 +472,25 @@ internal sealed class Runner
         });
     }
 
+    private static async ValueTask<bool> AwaitCommitAsync(ValueTask<bool> commitTask, MvccTransaction commitTx, ThreadStats stats, int entryBytes)
+    {
+        try
+        {
+            await commitTask;
+        }
+        finally
+        {
+            commitTx.Dispose();
+        }
+        stats.Ops++;
+        stats.ByteSlice += entryBytes;
+        return true;
+    }
+
     private Task<BenchmarkResult> RunDeletesAsync(string name)
     {
-        var db = _db!;
+        var db = _db;
+        var mvccDb = _mvccDb;
 
         return RunParallelAsync(name, _options.Num, partitioned: true, extra: string.Empty, (threadId, start, count, stats) =>
         {
@@ -354,6 +498,43 @@ internal sealed class Runner
             var rng = RngStreams.Create(_options.Seed, threadId, RngStreams.Write);
             var key = new byte[_options.KeySize];
             var batchSize = _options.BatchSize;
+
+            if (mvccDb != null)
+            {
+                MvccTransaction? tx = null;
+                var staged = 0;
+
+                return new ThreadWorker(op =>
+                {
+                    keyGen.GenerateInto(rng.NextInt64(_options.Num), key);
+
+                    tx ??= mvccDb.BeginTransaction();
+                    tx.Delete(key);
+                    staged++;
+
+                    if (staged == batchSize || op + 1 == count)
+                    {
+                        var commitTx = tx;
+                        tx = null;
+                        staged = 0;
+                        var commitTask = commitTx.TryCommitAsync();
+                        if (commitTask.IsCompletedSuccessfully)
+                        {
+                            commitTask.GetAwaiter().GetResult();
+                            commitTx.Dispose();
+                            stats.Ops++;
+                            stats.ByteSlice += _options.KeySize;
+                            return new ValueTask<bool>(true);
+                        }
+                        return AwaitCommitAsync(commitTask, commitTx, stats, _options.KeySize);
+                    }
+
+                    stats.Ops++;
+                    stats.ByteSlice += _options.KeySize;
+                    return new ValueTask<bool>(true);
+                });
+            }
+
             var batch = batchSize == 1 ? null : new LsmWriteBatch();
 
             return new ThreadWorker(op =>
@@ -362,14 +543,14 @@ internal sealed class Runner
 
                 if (batch is null)
                 {
-                    db.Delete(key);
+                    db!.Delete(key);
                 }
                 else
                 {
                     batch.Delete(key);
                     if (batch.Count == batchSize || op + 1 == count)
                     {
-                        db.Write(batch);
+                        db!.Write(batch);
                         batch.Clear();
                     }
                 }
@@ -383,7 +564,8 @@ internal sealed class Runner
 
     private Task<BenchmarkResult> RunReadsAsync(string name, bool missing)
     {
-        var db = _db!;
+        var db = _db;
+        var mvccDb = _mvccDb;
 
         // Each thread performs a full Reads budget; total work scales with thread count.
         return RunParallelAsync(name, _options.EffectiveReads, partitioned: false, extra: string.Empty, (threadId, start, count, stats) =>
@@ -397,30 +579,50 @@ internal sealed class Runner
             var key = new byte[_options.KeySize];
             var valueBuffer = new byte[_options.ValueSize];
 
-            return new ThreadWorker(async op =>
+            return new ThreadWorker(op =>
             {
                 // readmissing reads from a key range that was never written ([num, 2*num)).
                 var keyIndex = rng.NextInt64(_options.Num) + (missing ? _options.Num : 0);
                 keyGen.GenerateInto(keyIndex, key);
-                var length = await db.GetRawAsync(key, valueBuffer);
+                var task = mvccDb != null
+                    ? mvccDb.GetRawAsync(key, valueBuffer)
+                    : db!.GetRawAsync(key.AsSpan(), valueBuffer);
 
-                stats.Ops++;
-                stats.ByteSlice += _options.KeySize;
-
-                if (length >= 0)
+                if (task.IsCompletedSuccessfully)
                 {
-                    stats.Found++;
-                    stats.ByteSlice += length;
+                    var length = task.GetAwaiter().GetResult();
+                    stats.Ops++;
+                    stats.ByteSlice += _options.KeySize;
+                    if (length >= 0)
+                    {
+                        stats.Found++;
+                        stats.ByteSlice += length;
+                    }
+                    return new ValueTask<bool>(true);
                 }
 
-                return true;
+                return AwaitReadAsync(task, stats, _options.KeySize);
             });
         });
+
+        static async ValueTask<bool> AwaitReadAsync(ValueTask<int> task, ThreadStats stats, int keySize)
+        {
+            var length = await task;
+            stats.Ops++;
+            stats.ByteSlice += keySize;
+            if (length >= 0)
+            {
+                stats.Found++;
+                stats.ByteSlice += length;
+            }
+            return true;
+        }
     }
 
     private async Task<BenchmarkResult> RunReadSeqAsync(string name)
     {
-        var db = _db!;
+        var db = _db;
+        var mvccDb = _mvccDb;
         var threads = _options.Threads;
         var perThread = new ThreadStats[threads];
         var tasks = new Task[threads];
@@ -431,11 +633,13 @@ internal sealed class Runner
         var gen0Before = gcStats ? GC.CollectionCount(0) : 0;
         var gen1Before = gcStats ? GC.CollectionCount(1) : 0;
         var gen2Before = gcStats ? GC.CollectionCount(2) : 0;
+        var restingMem = Environment.WorkingSet;
 
         var wall = Stopwatch.StartNew();
 
         // Each thread independently scans forward from the start, up to the Reads budget. The op loop stops
         // when the store is exhausted.
+        var maxReads = _options.EffectiveReads;
         for (var t = 0; t < threads; t++)
         {
             var stats = new ThreadStats();
@@ -446,13 +650,26 @@ internal sealed class Runner
                 var scanState = new ReadSeqScanState(stats);
                 var sw = Stopwatch.StartNew();
 
-                await db.ScanRawAsync(scanState, static (s, key, value) =>
+                if (mvccDb != null)
                 {
-                    s.Stats.Ops++;
-                    s.Stats.Found++;
-                    s.Stats.ByteSlice += key.Length + value.Length;
-                    return true;
-                }, _options.EffectiveReads);
+                    await mvccDb.ScanRawAsync(scanState, static (s, key, value) =>
+                    {
+                        s.Stats.Ops++;
+                        s.Stats.Found++;
+                        s.Stats.ByteSlice += key.Length + value.Length;
+                        return true;
+                    }, maxReads);
+                }
+                else
+                {
+                    await db!.ScanRawAsync(scanState, static (s, key, value) =>
+                    {
+                        s.Stats.Ops++;
+                        s.Stats.Found++;
+                        s.Stats.ByteSlice += key.Length + value.Length;
+                        return true;
+                    }, maxReads);
+                }
 
                 stats.ElapsedMicros = sw.Elapsed.TotalMicroseconds;
             });
@@ -461,7 +678,15 @@ internal sealed class Runner
         await Task.WhenAll(tasks);
         wall.Stop();
 
-        var result = new BenchmarkResult { Name = name, WallSeconds = wall.Elapsed.TotalSeconds, Extra = extra };
+        var peakMem = Math.Max(restingMem, Environment.WorkingSet);
+        var result = new BenchmarkResult
+        {
+            Name = name,
+            WallSeconds = wall.Elapsed.TotalSeconds,
+            Extra = extra,
+            RestingMemoryBytes = restingMem,
+            PeakMemoryBytes = peakMem,
+        };
 
         if (gcStats)
         {
@@ -482,6 +707,172 @@ internal sealed class Runner
         return result;
     }
 
+    private async Task<BenchmarkResult> RunReadReverseAsync(string name)
+    {
+        var db = _db;
+        var mvccDb = _mvccDb;
+        var threads = _options.Threads;
+        var perThread = new ThreadStats[threads];
+        var tasks = new Task[threads];
+        var extra = _options.Histogram ? "(cursor scan; histogram unavailable)" : string.Empty;
+
+        var gcStats = Environment.GetEnvironmentVariable("SILEX_BENCH_GC") is { Length: > 0 };
+        var allocBefore = gcStats ? GC.GetTotalAllocatedBytes(precise: false) : 0;
+        var gen0Before = gcStats ? GC.CollectionCount(0) : 0;
+        var gen1Before = gcStats ? GC.CollectionCount(1) : 0;
+        var gen2Before = gcStats ? GC.CollectionCount(2) : 0;
+        var restingMem = Environment.WorkingSet;
+
+        var wall = Stopwatch.StartNew();
+        var maxReads = _options.EffectiveReads;
+        var batchBytes = Math.Max(256 * 1024, (_options.KeySize + _options.ValueSize) * 1024);
+
+        for (var t = 0; t < threads; t++)
+        {
+            var stats = new ThreadStats();
+            perThread[t] = stats;
+
+            tasks[t] = Task.Run(async () =>
+            {
+                var sw = Stopwatch.StartNew();
+
+                if (mvccDb != null)
+                {
+                    await mvccDb.ScanReverseRawAsync(stats, static (s, key, value) =>
+                    {
+                        s.Ops++;
+                        s.Found++;
+                        s.ByteSlice += key.Length + value.Length;
+                        return true;
+                    }, maxReads);
+                }
+                else
+                {
+                    await db!.ScanReverseRawAsync(stats, static (s, key, value) =>
+                    {
+                        s.Ops++;
+                        s.Found++;
+                        s.ByteSlice += key.Length + value.Length;
+                        return true;
+                    }, maxReads);
+                }
+
+                stats.ElapsedMicros = sw.Elapsed.TotalMicroseconds;
+            });
+        }
+
+        await Task.WhenAll(tasks);
+        wall.Stop();
+
+        var peakMem = Math.Max(restingMem, Environment.WorkingSet);
+        var result = new BenchmarkResult
+        {
+            Name = name,
+            WallSeconds = wall.Elapsed.TotalSeconds,
+            Extra = extra,
+            RestingMemoryBytes = restingMem,
+            PeakMemoryBytes = peakMem,
+        };
+
+        if (gcStats)
+        {
+            result.AllocatedBytes = GC.GetTotalAllocatedBytes(precise: false) - allocBefore;
+            result.Gen0Collections = GC.CollectionCount(0) - gen0Before;
+            result.Gen1Collections = GC.CollectionCount(1) - gen1Before;
+            result.Gen2Collections = GC.CollectionCount(2) - gen2Before;
+        }
+
+        foreach (var stats in perThread)
+        {
+            result.TotalOps += stats.Ops;
+            result.TotalBytes += stats.ByteSlice;
+            result.Found += stats.Found;
+            result.SumThreadMicros += stats.ElapsedMicros;
+        }
+
+        return result;
+    }
+
+    private Task<BenchmarkResult> RunScanBoundedAsync(string name, int skip, int limit, bool countOnly)
+    {
+        var db = _db;
+        var mvccDb = _mvccDb;
+        var maxEntries = countOnly
+            ? long.MaxValue
+            : (long)skip + limit;
+        var totalScans = countOnly ? _options.EffectiveCountScans : _options.EffectiveScans;
+        var extra = countOnly
+            ? $"(full count scan, {totalScans:N0} scans/thread)"
+            : skip > 0
+                ? $"(skip={skip:N0}, limit={limit:N0}, {totalScans:N0} scans/thread)"
+                : $"(limit={limit:N0}, {totalScans:N0} scans/thread)";
+
+        return RunParallelAsync(name, totalScans, partitioned: false, extra, (threadId, start, count, stats) =>
+        {
+            var scanState = new BoundedScanState(stats, skip, limit, countOnly);
+
+            return new ThreadWorker(op =>
+            {
+                scanState.Reset();
+
+                var task = mvccDb != null
+                    ? mvccDb.ScanRawAsync(scanState, static (s, key, value) => s.Accept(key, value), maxEntries)
+                    : db!.ScanRawAsync(scanState, static (s, key, value) => s.Accept(key, value), maxEntries);
+
+                if (task.IsCompletedSuccessfully)
+                {
+                    task.GetAwaiter().GetResult();
+                    if (scanState.Collected > 0)
+                    {
+                        stats.Found++;
+                    }
+                    stats.Ops++;
+                    return new ValueTask<bool>(true);
+                }
+
+                return AwaitScanAsync(task, scanState, stats);
+            });
+        });
+
+        static async ValueTask<bool> AwaitScanAsync(ValueTask<long> task, BoundedScanState scanState, ThreadStats stats)
+        {
+            await task;
+            if (scanState.Collected > 0)
+            {
+                stats.Found++;
+            }
+            stats.Ops++;
+            return true;
+        }
+    }
+
+    private sealed class BoundedScanState(ThreadStats stats, int skip, int limit, bool countOnly)
+    {
+        public ThreadStats Stats { get; } = stats;
+        public int Seen { get; private set; }
+        public int Collected { get; private set; }
+
+        public void Reset()
+        {
+            Seen = 0;
+            Collected = 0;
+        }
+
+        public bool Accept(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
+        {
+            if (Seen < skip)
+            {
+                Seen++;
+                return true;
+            }
+
+            Seen++;
+            Collected++;
+            Stats.ByteSlice += countOnly ? key.Length : key.Length + value.Length;
+            return Collected < limit;
+        }
+    }
+
     private sealed class ReadSeqScanState(ThreadStats stats)
     {
         public ThreadStats Stats { get; } = stats;
@@ -489,7 +880,8 @@ internal sealed class Runner
 
     private Task<BenchmarkResult> RunSeekRandomAsync(string name)
     {
-        var db = _db!;
+        var db = _db;
+        var mvccDb = _mvccDb;
 
         // One op == one seek; after landing we materialize up to SeekNexts following entries.
         return RunParallelAsync(name, _options.EffectiveReads, partitioned: false, extra: string.Empty, (threadId, start, count, stats) =>
@@ -500,27 +892,52 @@ internal sealed class Runner
             var seekState = new SeekScanState(stats);
             var target = new byte[_options.KeySize];
 
-            return new ThreadWorker(async op =>
+            return new ThreadWorker(op =>
             {
                 keyGen.GenerateInto(rng.NextInt64(_options.Num), target);
                 seekState.Reset(target);
 
-                await db.SeekRawAsync(target, seekState, static (s, key, value) =>
-                {
-                    if (s.Read == 0 && key.SequenceEqual(s.Target))
+                var task = mvccDb != null
+                    ? mvccDb.SeekRawAsync(target, seekState, static (s, key, value) =>
                     {
-                        s.Stats.Found++;
-                    }
+                        if (s.Read == 0 && key.SequenceEqual(s.Target))
+                        {
+                            s.Stats.Found++;
+                        }
 
-                    s.Stats.ByteSlice += key.Length + value.Length;
-                    s.Read++;
-                    return true;
-                }, toRead);
+                        s.Stats.ByteSlice += key.Length + value.Length;
+                        s.Read++;
+                        return true;
+                    }, toRead)
+                    : db!.SeekRawAsync(target.AsSpan(), seekState, static (s, key, value) =>
+                    {
+                        if (s.Read == 0 && key.SequenceEqual(s.Target))
+                        {
+                            s.Stats.Found++;
+                        }
 
-                stats.Ops++;
-                return true;
+                        s.Stats.ByteSlice += key.Length + value.Length;
+                        s.Read++;
+                        return true;
+                    }, toRead);
+
+                if (task.IsCompletedSuccessfully)
+                {
+                    task.GetAwaiter().GetResult();
+                    stats.Ops++;
+                    return new ValueTask<bool>(true);
+                }
+
+                return AwaitSeekAsync(task, stats);
             });
         });
+
+        static async ValueTask<bool> AwaitSeekAsync(ValueTask<long> task, ThreadStats stats)
+        {
+            await task;
+            stats.Ops++;
+            return true;
+        }
     }
 
     private sealed class SeekScanState(ThreadStats stats)
@@ -556,21 +973,12 @@ internal sealed class Runner
     {
         var threads = _options.Threads;
         var perThread = new ThreadStats[threads];
+        var workers = new ThreadWorker[threads];
+        var counts = new long[threads];
         var tasks = new Task[threads];
-
-        // Capture process-wide allocation/GC counters around the benchmark body so a before/after run can
-        // attribute allocation changes to a specific benchmark. Only reported when SILEX_BENCH_GC is set.
-        var gcStats = Environment.GetEnvironmentVariable("SILEX_BENCH_GC") is { Length: > 0 };
-        var allocBefore = gcStats ? GC.GetTotalAllocatedBytes(precise: false) : 0;
-        var gen0Before = gcStats ? GC.CollectionCount(0) : 0;
-        var gen1Before = gcStats ? GC.CollectionCount(1) : 0;
-        var gen2Before = gcStats ? GC.CollectionCount(2) : 0;
-
-        var wall = Stopwatch.StartNew();
 
         for (var t = 0; t < threads; t++)
         {
-            var threadId = t;
             var stats = new ThreadStats { Histogram = _options.Histogram ? new Histogram() : null };
             perThread[t] = stats;
 
@@ -581,8 +989,8 @@ internal sealed class Runner
             {
                 var baseCount = totalOps / threads;
                 var remainder = totalOps % threads;
-                count = baseCount + (threadId < remainder ? 1 : 0);
-                start = threadId * baseCount + Math.Min(threadId, remainder);
+                count = baseCount + (t < remainder ? 1 : 0);
+                start = t * baseCount + Math.Min(t, remainder);
             }
             else
             {
@@ -590,9 +998,31 @@ internal sealed class Runner
                 count = totalOps;
             }
 
+            counts[t] = count;
+            workers[t] = setup(t, start, count, stats);
+        }
+
+        // Capture process-wide allocation/GC counters around the benchmark body so a before/after run can
+        // attribute allocation changes to a specific benchmark. Only reported when SILEX_BENCH_GC is set.
+        var gcStats = Environment.GetEnvironmentVariable("SILEX_BENCH_GC") is { Length: > 0 };
+        var allocBefore = gcStats ? GC.GetTotalAllocatedBytes(precise: false) : 0;
+        var gen0Before = gcStats ? GC.CollectionCount(0) : 0;
+        var gen1Before = gcStats ? GC.CollectionCount(1) : 0;
+        var gen2Before = gcStats ? GC.CollectionCount(2) : 0;
+        var restingMem = Environment.WorkingSet;
+        var peakMem = restingMem;
+
+        var wall = Stopwatch.StartNew();
+
+        for (var t = 0; t < threads; t++)
+        {
+            var threadId = t;
+            var stats = perThread[threadId];
+            var worker = workers[threadId];
+            var count = counts[threadId];
+
             tasks[t] = Task.Run(async () =>
             {
-                var worker = setup(threadId, start, count, stats);
                 var runOp = worker.RunOp;
                 var histogram = stats.Histogram;
                 var sw = Stopwatch.StartNew();
@@ -641,8 +1071,16 @@ internal sealed class Runner
 
         await Task.WhenAll(tasks);
         wall.Stop();
+        peakMem = Math.Max(peakMem, Environment.WorkingSet);
 
-        var result = new BenchmarkResult { Name = name, WallSeconds = wall.Elapsed.TotalSeconds, Extra = extra };
+        var result = new BenchmarkResult
+        {
+            Name = name,
+            WallSeconds = wall.Elapsed.TotalSeconds,
+            Extra = extra,
+            RestingMemoryBytes = restingMem,
+            PeakMemoryBytes = peakMem,
+        };
 
         if (gcStats)
         {
@@ -671,6 +1109,9 @@ internal sealed class Runner
 
     private void Report(BenchmarkResult result)
     {
+        SampleRss(result.RestingMemoryBytes);
+        SampleRss(result.PeakMemoryBytes);
+
         if (result.TotalOps == 0)
         {
             Console.WriteLine($"{result.Name,-14} : no operations");
@@ -698,7 +1139,7 @@ internal sealed class Runner
         if (result.AllocatedBytes > 0 || result.Gen0Collections > 0 || result.Gen1Collections > 0 || result.Gen2Collections > 0)
         {
             var bytesPerOp = (double)result.AllocatedBytes / result.TotalOps;
-            Console.WriteLine($"{"",-14}   alloc: {result.AllocatedBytes / 1_048_576.0,8:F1} MB total, {bytesPerOp,8:F1} B/op; GC g0/g1/g2: {result.Gen0Collections}/{result.Gen1Collections}/{result.Gen2Collections}");
+            Console.WriteLine($"{"",-14}   alloc: {result.AllocatedBytes / 1_048_576.0,8:F1} MB total, {bytesPerOp,8:F1} B/op; GC g0/g1/g2: {result.Gen0Collections}/{result.Gen1Collections}/{result.Gen2Collections}; RSS: {result.RestingMemoryBytes / 1_048_576.0:F1} -> {result.PeakMemoryBytes / 1_048_576.0:F1} MB");
         }
 
         if (result.Histogram != null)
@@ -714,8 +1155,12 @@ internal sealed class Runner
     private void PrintHeader()
     {
         var rawSizeMb = (_options.KeySize + _options.ValueSize) * (double)_options.Num / 1_048_576.0;
+        var modeDesc = _options.Mvcc
+            ? $"MVCC (group_size={_options.MvccCommitGroupSize})"
+            : "LSM";
 
         Console.WriteLine($"Silex DbBench");
+        Console.WriteLine($"Mode:       {modeDesc}");
         Console.WriteLine($"Keys:       {_options.KeySize} bytes each");
         Console.WriteLine($"Values:     {_options.ValueSize} bytes each (uncompressed)");
         Console.WriteLine($"Entries:    {_options.Num:N0}");

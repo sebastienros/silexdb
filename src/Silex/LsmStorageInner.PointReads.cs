@@ -10,8 +10,227 @@ internal interface IRawEntrySink
 }
 internal sealed partial class LsmStorageInner
 {
+    internal bool TryReadFirstRawSync<TSink>(
+        ReadOnlySpan<byte> from, ReadOnlySpan<byte> prefix, ref TSink sink,
+        CancellationToken cancellationToken)
+        where TSink : struct, IRawEntrySink
+    {
+        CheckHealthy();
+        cancellationToken.ThrowIfCancellationRequested();
+
+        using var operation = Lifetime.Enter();
+
+        // Fast path 1: when all user data is in a globally sorted SST run (and no writes are in MemTable),
+        // avoid _currentMemTableLock completely and binary-search the cached SST run under a striped read lock.
+        var cachedTables = Volatile.Read(ref _sortedSsTableRun) ?? Volatile.Read(ref _sortedMvccSsTableRun);
+        if (cachedTables is not null && _level0Lock.TryEnterReadLock(out var stripeSlot))
+        {
+            try
+            {
+                CheckHealthy();
+                cachedTables = Volatile.Read(ref _sortedSsTableRun) ?? Volatile.Read(ref _sortedMvccSsTableRun);
+                if (cachedTables is not null &&
+                    TryReadFirstSortedSync(cachedTables, from, prefix, ref sink, cancellationToken))
+                {
+                    return true;
+                }
+            }
+            finally
+            {
+                _level0Lock.ExitReadLock(stripeSlot);
+            }
+        }
+
+        // Fast path 2: check active and immutable memtables before acquiring _level0Lock.
+        _currentMemTableLock.EnterReadLock();
+        try
+        {
+            CheckHealthy();
+            var hasTables = _state.LevelZeroTables.Count != 0;
+            if (!hasTables)
+            {
+                foreach (var level in _state.LeveledSsTables)
+                {
+                    if (level.Count != 0)
+                    {
+                        hasTables = true;
+                        break;
+                    }
+                }
+            }
+            if (!hasTables)
+            {
+                sink = ReadFirstMemTableRaw(from, prefix, sink, cancellationToken);
+                return true;
+            }
+
+            if (TryReadLiveMemTableRaw(from, prefix, ref sink, out var hitTombstone) && !hitTombstone)
+            {
+                return true;
+            }
+        }
+        finally
+        {
+            _currentMemTableLock.ExitReadLock();
+        }
+
+        if (_level0Lock.TryEnterReadLock(out var stripeSlot2))
+        {
+            try
+            {
+                CheckHealthy();
+                cachedTables = Volatile.Read(ref _sortedSsTableRun) ?? Volatile.Read(ref _sortedMvccSsTableRun);
+                if (cachedTables is not null &&
+                    TryReadFirstSortedSync(cachedTables, from, prefix, ref sink, cancellationToken))
+                {
+                    return true;
+                }
+                if (cachedTables is null &&
+                    TryGetGloballySortedMvccSsTableRun(out var tables) &&
+                    TryReadFirstSortedSync(tables, from, prefix, ref sink, cancellationToken))
+                {
+                    return true;
+                }
+            }
+            finally
+            {
+                _level0Lock.ExitReadLock(stripeSlot2);
+            }
+        }
+
+        return false;
+    }
+
     // Version keys have a fixed-width suffix after their escaped, terminated user-key prefix.
-    internal async ValueTask<TSink> ReadFirstRawAsync<TSink>(
+    internal ValueTask<TSink> ReadFirstRawAsync<TSink>(
+        ReadOnlyMemory<byte> from, ReadOnlyMemory<byte> prefix, TSink sink,
+        CancellationToken cancellationToken, int valuePrefixLength)
+        where TSink : struct, IRawEntrySink
+    {
+        if (TryReadFirstRawSync(from.Span, prefix.Span, ref sink, cancellationToken))
+        {
+            return ValueTask.FromResult(sink);
+        }
+
+        return ReadFirstRawSlowAsync(from, prefix, sink, cancellationToken, valuePrefixLength);
+    }
+
+    private bool TryReadLiveMemTableRaw<TSink>(
+        ReadOnlySpan<byte> from, ReadOnlySpan<byte> prefix, ref TSink sink, out bool hitTombstone)
+        where TSink : struct, IRawEntrySink
+    {
+        ReadOnlySpan<byte> bestKey = default;
+        ReadOnlySpan<byte> bestValue = default;
+        var found = false;
+        var tombstone = false;
+
+        Consider((MemTable)_state.CurrentMemTable, from, prefix, true,
+            ref bestKey, ref bestValue, ref found, ref tombstone);
+        for (var i = _state.ImmutableMemTables.Length - 1; i >= 0; i--)
+        {
+            Consider((MemTable)_state.ImmutableMemTables[i], from, prefix, true,
+                ref bestKey, ref bestValue, ref found, ref tombstone);
+        }
+
+        hitTombstone = tombstone;
+        if (!found)
+        {
+            return false;
+        }
+        if (!tombstone)
+        {
+            sink.Accept(bestKey, bestValue);
+        }
+        return true;
+
+        static void Consider(MemTable table, ReadOnlySpan<byte> from, ReadOnlySpan<byte> prefix, bool inclusive,
+            ref ReadOnlySpan<byte> bestKey, ref ReadOnlySpan<byte> bestValue, ref bool found, ref bool tombstone)
+        {
+            if (table.Count != 0 &&
+                table.TryGetNextVersionRaw(from, prefix, inclusive, out var key, out var value, out var deleted) &&
+                (!found || key.SequenceCompareTo(bestKey) < 0))
+            {
+                bestKey = key;
+                bestValue = value;
+                found = true;
+                tombstone = deleted;
+            }
+        }
+    }
+
+    private bool TryReadFirstSortedSync<TSink>(
+        IReadOnlyList<SsTable> tables, ReadOnlySpan<byte> from, ReadOnlySpan<byte> prefix,
+        ref TSink sink, CancellationToken cancellationToken)
+        where TSink : struct, IRawEntrySink
+    {
+        if (_blockCache is null)
+        {
+            return false;
+        }
+        var startTable = FindStartTableIndex(tables, from);
+        for (var t = startTable; t < tables.Count; t++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var table = tables[t];
+            var metadata = table.BlockMetadataArray;
+            int startBlock;
+            if (t == startTable)
+            {
+                startBlock = metadata.FindStartBlockIndex(from);
+                if (metadata.GetLastKeySpan(startBlock).SequenceCompareTo(from) < 0)
+                {
+                    startBlock++;
+                }
+            }
+            else
+            {
+                if (table.FirstKey.Span.SequenceCompareTo(from) > 0 &&
+                    !table.FirstKey.Span.StartsWith(prefix))
+                {
+                    return true;
+                }
+                startBlock = 0;
+            }
+
+            var checkedPrefixBloom = false;
+            for (var b = startBlock; b < metadata.Length; b++)
+            {
+                if (!table.TryAcquireCachedBlock(b, _blockCache, cancellationToken, out var lease))
+                {
+                    if (!checkedPrefixBloom)
+                    {
+                        if (!table.MayContainVersionPrefix(prefix))
+                        {
+                            break;
+                        }
+                        checkedPrefixBloom = true;
+                    }
+                    var leaseTask = table.ReadBlockCachedAsync(b, _blockCache, cancellationToken);
+                    if (!leaseTask.IsCompletedSuccessfully)
+                    {
+                        return false;
+                    }
+                    lease = leaseTask.GetAwaiter().GetResult();
+                }
+
+                using (lease)
+                {
+                    var block = lease.Block;
+                    if (block is null)
+                    {
+                        continue;
+                    }
+                    if (!block.TryReadFirstMatchingPrefix(from, prefix, ref sink))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    private async ValueTask<TSink> ReadFirstRawSlowAsync<TSink>(
         ReadOnlyMemory<byte> from, ReadOnlyMemory<byte> prefix, TSink sink,
         CancellationToken cancellationToken, int valuePrefixLength)
         where TSink : struct, IRawEntrySink
@@ -23,7 +242,7 @@ internal sealed partial class LsmStorageInner
         try
         {
             CheckHealthy();
-            var cachedTables = Volatile.Read(ref _sortedSsTableRun);
+            var cachedTables = Volatile.Read(ref _sortedSsTableRun) ?? Volatile.Read(ref _sortedMvccSsTableRun);
             if (cachedTables is not null)
             {
                 return await ReadFirstSortedRawAsync(cachedTables, from, prefix, sink, cancellationToken)
@@ -49,7 +268,7 @@ internal sealed partial class LsmStorageInner
                 _currentMemTableLock.ExitReadLock();
             }
 
-            if (TryGetGloballySortedSsTableRun(out var tables))
+            if (TryGetGloballySortedMvccSsTableRun(out var tables))
             {
                 return await ReadFirstSortedRawAsync(tables, from, prefix, sink, cancellationToken)
                     .ConfigureAwait(false);
@@ -61,7 +280,6 @@ internal sealed partial class LsmStorageInner
         {
             _level0Lock.ExitReadLock();
         }
-
     }
 
     // Both locks are held: mutable bytes are stable and frozen tables cannot be retired during lookup.
@@ -77,15 +295,15 @@ internal sealed partial class LsmStorageInner
             ReadOnlySpan<byte> bestValue = default;
             var found = false;
             var tombstone = false;
-            Consider((MemTable)_state.CurrentMemTable, from, inclusive,
+            Consider((MemTable)_state.CurrentMemTable, from, prefix, inclusive,
                 ref bestKey, ref bestValue, ref found, ref tombstone);
             for (var i = _state.ImmutableMemTables.Length - 1; i >= 0; i--)
             {
-                Consider((MemTable)_state.ImmutableMemTables[i], from, inclusive,
+                Consider((MemTable)_state.ImmutableMemTables[i], from, prefix, inclusive,
                     ref bestKey, ref bestValue, ref found, ref tombstone);
             }
 
-            if (!found || !bestKey.StartsWith(prefix))
+            if (!found)
             {
                 return sink;
             }
@@ -100,11 +318,11 @@ internal sealed partial class LsmStorageInner
             inclusive = false;
         }
 
-        static void Consider(MemTable table, ReadOnlySpan<byte> from, bool inclusive,
+        static void Consider(MemTable table, ReadOnlySpan<byte> from, ReadOnlySpan<byte> prefix, bool inclusive,
             ref ReadOnlySpan<byte> bestKey, ref ReadOnlySpan<byte> bestValue, ref bool found, ref bool tombstone)
         {
             if (table.Count != 0 &&
-                table.TryGetNextRaw(from, true, inclusive, false, out var key, out var value, out var deleted) &&
+                table.TryGetNextVersionRaw(from, prefix, inclusive, out var key, out var value, out var deleted) &&
                 (!found || key.SequenceCompareTo(bestKey) < 0))
             {
                 bestKey = key;
@@ -227,8 +445,8 @@ internal sealed partial class LsmStorageInner
         static void Consider(MemTable table, ReadOnlySpan<byte> bound, bool inclusive,
             ReadOnlySpan<byte> prefix, ref PointCandidate candidate)
         {
-            if (table.Count != 0 && table.TryGetNextRaw(bound, true, inclusive, false,
-                out var key, out var value, out var tombstone) && key.StartsWith(prefix))
+            if (table.Count != 0 && table.TryGetNextVersionRaw(bound, prefix, inclusive,
+                out var key, out var value, out var tombstone))
                 candidate.Consider(key, value, tombstone);
         }
     }

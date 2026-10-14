@@ -14,6 +14,8 @@ internal sealed class BlockCache : IDisposable
     private readonly ConcurrentDictionary<BlockCacheKey, Entry> _entries = [];
     private readonly object[] _loadGates = CreateLoadGates();
     private Entry? _mostRecent;
+    [ThreadStatic]
+    private static Entry? t_mostRecent;
     private Entry? _lruHead;
     private Entry? _lruTail;
     private long _size;
@@ -39,6 +41,21 @@ internal sealed class BlockCache : IDisposable
         }
 
         _sizeLimit = sizeLimit;
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    internal bool TryAcquireEntry(Entry entry, out BlockLease lease)
+    {
+        if (!Volatile.Read(ref _disposed) && entry.TryAcquire())
+        {
+            _hits.Increment();
+            SampleRecency(entry);
+            lease = new BlockLease(entry);
+            return true;
+        }
+
+        lease = default;
+        return false;
     }
 
     public ValueTask<BlockLease> GetOrLoadAsync<TLoader>(BlockCacheKey key, TLoader loader, CancellationToken cancellationToken = default)
@@ -125,7 +142,7 @@ internal sealed class BlockCache : IDisposable
                     return lease;
                 }
 
-                var entry = new Entry(key, block, block.Memory.Length, refCount: 1);
+                var entry = new Entry(this, key, block, block.Memory.Length, refCount: 1);
                 block = null;
                 Interlocked.Increment(ref _misses);
 
@@ -158,8 +175,8 @@ internal sealed class BlockCache : IDisposable
 
     private bool TryAcquire(BlockCacheKey key, out BlockLease lease)
     {
-        var entry = Volatile.Read(ref _mostRecent);
-        if (entry is not null && entry.Key == key && entry.TryAcquire())
+        var entry = t_mostRecent;
+        if (entry is not null && ReferenceEquals(entry.Owner, this) && entry.Key == key && entry.TryAcquire())
         {
             SampleRecency(entry);
             lease = new BlockLease(entry);
@@ -168,7 +185,7 @@ internal sealed class BlockCache : IDisposable
 
         if (_entries.TryGetValue(key, out entry) && entry.TryAcquire())
         {
-            SetMostRecent(entry);
+            t_mostRecent = entry;
             SampleRecency(entry);
             lease = new BlockLease(entry);
             return true;
@@ -194,7 +211,9 @@ internal sealed class BlockCache : IDisposable
 
     private void SampleRecency(Entry entry)
     {
-        if ((++t_recencyCounter & RecencySampleMask) != 0
+        var mask = Interlocked.Read(ref _size) <= (_sizeLimit >> 1) ? 255 : RecencySampleMask;
+        if ((++t_recencyCounter & mask) != 0
+            || ReferenceEquals(entry, Volatile.Read(ref _lruHead))
             || !Monitor.TryEnter(_gate))
         {
             return;
@@ -347,14 +366,16 @@ internal sealed class BlockCache : IDisposable
         private int _evicted;
         private int _disposed;
 
-        public Entry(BlockCacheKey key, Block block, int size, int refCount)
+        public Entry(BlockCache owner, BlockCacheKey key, Block block, int size, int refCount)
         {
+            Owner = owner;
             Key = key;
             Block = block;
             Size = size;
             _refCount = refCount;
         }
 
+        public BlockCache Owner { get; }
         public BlockCacheKey Key { get; }
         public Block Block { get; }
         public int Size { get; }
@@ -432,6 +453,8 @@ internal readonly struct BlockLease : IDisposable
     {
         _entry = entry;
     }
+
+    internal BlockCache.Entry? Entry => _entry;
 
     public Block? Block => _entry?.Block;
 

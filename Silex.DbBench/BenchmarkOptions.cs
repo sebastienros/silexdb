@@ -46,6 +46,16 @@ internal sealed class BenchmarkOptions
 
     public int SeekNexts { get; set; }
 
+    public int ScanSkip { get; set; }
+
+    public int ScanLimit { get; set; } = 100;
+
+    public long Scans { get; set; } = -1;
+
+    public bool Mvcc { get; set; }
+
+    public int MvccCommitGroupSize { get; set; } = 1;
+
     public CompactionStrategy Compaction { get; set; } = CompactionStrategy.Tiered;
 
     public bool Wal { get; set; } = true;
@@ -76,9 +86,17 @@ internal sealed class BenchmarkOptions
 
     public long EffectiveReads => Reads < 0 ? Num : Reads;
 
+    public long EffectiveScans => Scans >= 0 ? Scans : Math.Clamp(Num / 10, 100, 10_000);
+
+    public long EffectiveCountScans => Scans >= 0 ? Scans : Math.Clamp(Num / 1_000, 10, 100);
+
+    public bool FlushBeforeReads { get; set; }
+
     public StorageOptions ToStorageOptions(bool walSync)
     {
         var blockSize = ToUInt16("--block_size", BlockSize);
+        var effectiveWalSync = Wal && (WalSync || walSync);
+        var groupSize = Mvcc && Wal ? Range("--mvcc_commit_group_size", MvccCommitGroupSize, 1, 64) : 1;
 
         return new StorageOptions
         {
@@ -90,7 +108,8 @@ internal sealed class BenchmarkOptions
             CompressionLevel = CompressionLevel,
             BloomFilterFactory = new RocksStyleBloomFilterFactory(NonNegative("--bloom_bits", BloomBits)),
             UseWriteAheadLog = Wal,
-            SyncWriteAheadLogToDisk = Wal && (WalSync || walSync),
+            SyncWriteAheadLogToDisk = effectiveWalSync,
+            MvccCommitGroupSize = groupSize,
             CompactionStrategy = Compaction,
             MaxCompactionTiers = Positive("--universal_max_read_amp", UniversalMaxReadAmp),
             MaxSizeAmplificationPercent = Positive("--universal_max_size_amplification_percent", UniversalMaxSizeAmplificationPercent),
@@ -104,6 +123,16 @@ internal sealed class BenchmarkOptions
             MaxCompactionParallelism = Positive("--compaction_parallelism", CompactionParallelism),
             MaxReadParallelism = Positive("--read_parallelism", ReadParallelism),
         };
+    }
+
+    private static int Range(string name, int value, int min, int max)
+    {
+        if (value < min || value > max)
+        {
+            throw new ArgumentOutOfRangeException(name, value, $"{name} must be in the range {min}..{max}.");
+        }
+
+        return value;
     }
 
     private static int NonNegative(string name, int value)

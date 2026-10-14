@@ -26,8 +26,8 @@ internal sealed partial class LsmStorageInner : IDisposable
     // For instance updating the MemTable should be synchronized, but not blocked by compaction.
     // Moreover, some locks are asynchronous (level0) while other are synchronous (mem tables).
 
-    private readonly ReaderWriterLockSlim _currentMemTableLock = new();
-    private readonly ReaderWriterLockSlim _immutableMemTablesLock = new();
+    private readonly StripedReaderWriterLock _currentMemTableLock = new();
+    private readonly StripedReaderWriterLock _immutableMemTablesLock = new();
     private readonly AsyncReaderWriterLock _level0Lock = new();
 
     // Serializes flush and compaction so they never interleave. This keeps each structural change's
@@ -393,17 +393,17 @@ internal sealed partial class LsmStorageInner : IDisposable
     /// Receives the raw value bytes of a live entry. Implemented by allocation-free structs and passed by
     /// value through the generic traversal so the JIT specialises each call site (no boxing, no closures).
     /// </summary>
-    private interface IValueByteSink
+    internal interface IValueByteSink
     {
         void Accept(ReadOnlySpan<byte> valueBytes);
     }
 
-    private readonly struct BufferWriterSink(IBufferWriter<byte> writer) : IValueByteSink
+    internal readonly struct BufferWriterSink(IBufferWriter<byte> writer) : IValueByteSink
     {
         public void Accept(ReadOnlySpan<byte> valueBytes) => writer.Write(valueBytes);
     }
 
-    private readonly struct MemoryCopySink(Memory<byte> destination) : IValueByteSink
+    internal readonly struct MemoryCopySink(Memory<byte> destination) : IValueByteSink
     {
         // Copy only when the value fits; the public GetRawAsync still reports the full length so the
         // caller can detect the short buffer and retry without an exception.
@@ -416,9 +416,243 @@ internal sealed partial class LsmStorageInner : IDisposable
         }
     }
 
-    private readonly struct DelegateSink<TArg>(TArg arg, ReadValueAction<TArg> reader) : IValueByteSink
+    internal readonly struct DelegateSink<TArg>(TArg arg, ReadValueAction<TArg> reader) : IValueByteSink
     {
         public void Accept(ReadOnlySpan<byte> valueBytes) => reader(arg, valueBytes);
+    }
+
+    internal bool TryReadRawSync<TSink>(ReadOnlySpan<byte> key, TSink sink, CancellationToken cancellationToken, out int length)
+        where TSink : struct, IValueByteSink
+    {
+        length = -1;
+        cancellationToken.ThrowIfCancellationRequested();
+        CheckHealthy();
+
+        using var operation = Lifetime.Enter();
+
+        // Fast path 1: globally sorted SST run when memtable is empty.
+        var cachedSorted = Volatile.Read(ref _sortedSsTableRun);
+        if (cachedSorted is not null && _blockCache is not null && _level0Lock.TryEnterReadLock(out var stripeSlot))
+        {
+            try
+            {
+                CheckHealthy();
+                cachedSorted = Volatile.Read(ref _sortedSsTableRun);
+                if (cachedSorted is not null &&
+                    TryReadSortedSsTableRunSync(cachedSorted, key, sink, cancellationToken, out length))
+                {
+                    return true;
+                }
+            }
+            finally
+            {
+                _level0Lock.ExitReadLock(stripeSlot);
+            }
+        }
+
+        // Fast path 2: check active and immutable memtables.
+        ImmutableArray<IMemTable> immutableMemTables;
+        _currentMemTableLock.EnterReadLock();
+        try
+        {
+            CheckHealthy();
+            var currentMemTable = _state.CurrentMemTable;
+            immutableMemTables = _state.ImmutableMemTables;
+
+            if (currentMemTable.Count != 0)
+            {
+                var memResult = TryResolveMemTableRaw(currentMemTable, key, sink, out length);
+                if (memResult == RawLookup.Live)
+                {
+                    return true;
+                }
+                if (memResult == RawLookup.Tombstone)
+                {
+                    length = -1;
+                    return true;
+                }
+            }
+
+            if (immutableMemTables.IsEmpty && _state.LevelZeroTables.Count == 0)
+            {
+                var anyLeveled = false;
+                foreach (var level in _state.LeveledSsTables)
+                {
+                    if (level.Count != 0)
+                    {
+                        anyLeveled = true;
+                        break;
+                    }
+                }
+                if (!anyLeveled)
+                {
+                    length = -1;
+                    return true;
+                }
+            }
+        }
+        finally
+        {
+            _currentMemTableLock.ExitReadLock();
+        }
+
+        if (!immutableMemTables.IsEmpty)
+        {
+            _immutableMemTablesLock.EnterReadLock();
+            try
+            {
+                immutableMemTables = _state.ImmutableMemTables;
+                for (var i = immutableMemTables.Length - 1; i >= 0; i--)
+                {
+                    var memResult = TryResolveMemTableRaw(immutableMemTables[i], key, sink, out length);
+                    if (memResult == RawLookup.Live)
+                    {
+                        return true;
+                    }
+                    if (memResult == RawLookup.Tombstone)
+                    {
+                        length = -1;
+                        return true;
+                    }
+                }
+            }
+            finally
+            {
+                _immutableMemTablesLock.ExitReadLock();
+            }
+        }
+
+        if (_blockCache is not null && _level0Lock.TryEnterReadLock(out var stripeSlot2))
+        {
+            try
+            {
+                CheckHealthy();
+                if (TryGetGloballySortedSsTableRun(out var sortedRun))
+                {
+                    if (TryReadSortedSsTableRunSync(sortedRun, key, sink, cancellationToken, out length))
+                    {
+                        return true;
+                    }
+                }
+                else
+                {
+                    var l0 = _state.LevelZeroTables;
+                    for (var i = l0.Count - 1; i >= 0; i--)
+                    {
+                        if (!TryReadTableSync(l0[i], key, sink, cancellationToken, out var kind, out length))
+                        {
+                            return false;
+                        }
+                        if (kind == RawLookup.Live) return true;
+                        if (kind == RawLookup.Tombstone) { length = -1; return true; }
+                    }
+
+                    var levels = _state.LeveledSsTables;
+                    for (var level = 0; level < levels.Count; level++)
+                    {
+                        var tables = levels[level];
+                        var t = FindStartTableIndex(tables, key);
+                        if (t < tables.Count)
+                        {
+                            if (!TryReadTableSync(tables[t], key, sink, cancellationToken, out var kind, out length))
+                            {
+                                return false;
+                            }
+                            if (kind == RawLookup.Live) return true;
+                            if (kind == RawLookup.Tombstone) { length = -1; return true; }
+                        }
+                    }
+
+                    length = -1;
+                    return true;
+                }
+            }
+            finally
+            {
+                _level0Lock.ExitReadLock(stripeSlot2);
+            }
+        }
+
+        return false;
+    }
+
+    private bool TryReadSortedSsTableRunSync<TSink>(
+        IReadOnlyList<SsTable> tables, ReadOnlySpan<byte> key, TSink sink, CancellationToken cancellationToken, out int length)
+        where TSink : struct, IValueByteSink
+    {
+        length = -1;
+        var t = FindStartTableIndex(tables, key);
+        if (t >= tables.Count)
+        {
+            return true;
+        }
+        var table = tables[t];
+        var blockIndex = table.BlockMetadataArray.FindMatchingBlockIndex(key);
+        if (blockIndex < 0)
+        {
+            return true;
+        }
+        if (table.TryAcquireCachedBlock(blockIndex, _blockCache!, cancellationToken, out var cachedLease))
+        {
+            using (cachedLease)
+            {
+                var cachedBlock = cachedLease.Block;
+                if (cachedBlock != null && TryResolveRawBlockValue(cachedBlock, key, sink, out var cachedLen) == RawLookup.Live)
+                {
+                    length = cachedLen;
+                }
+                return true;
+            }
+        }
+        if (!table.BloomFilter.Probe(key))
+        {
+            return true;
+        }
+        var leaseTask = table.ReadBlockCachedAsync(blockIndex, _blockCache!, cancellationToken);
+        if (!leaseTask.IsCompletedSuccessfully)
+        {
+            return false;
+        }
+        using var blockLease = leaseTask.GetAwaiter().GetResult();
+        var block = blockLease.Block;
+        if (block != null && TryResolveRawBlockValue(block, key, sink, out var resolvedLength) == RawLookup.Live)
+        {
+            length = resolvedLength;
+        }
+        return true;
+    }
+
+    private bool TryReadTableSync<TSink>(
+        SsTable table, ReadOnlySpan<byte> key, TSink sink, CancellationToken cancellationToken, out RawLookup kind, out int length)
+        where TSink : struct, IValueByteSink
+    {
+        kind = RawLookup.Miss;
+        length = 0;
+        if (key.SequenceCompareTo(table.FirstKey.Span) < 0 || key.SequenceCompareTo(table.LastKey.Span) > 0)
+        {
+            return true;
+        }
+        if (!table.BloomFilter.Probe(key))
+        {
+            return true;
+        }
+        var blockIndex = table.BlockMetadataArray.FindMatchingBlockIndex(key);
+        if (blockIndex < 0)
+        {
+            return true;
+        }
+        var leaseTask = table.ReadBlockCachedAsync(blockIndex, _blockCache!, cancellationToken);
+        if (!leaseTask.IsCompletedSuccessfully)
+        {
+            return false;
+        }
+        using var blockLease = leaseTask.GetAwaiter().GetResult();
+        var block = blockLease.Block;
+        if (block != null)
+        {
+            kind = TryResolveRawBlockValue(block, key, sink, out length);
+        }
+        return true;
     }
 
     /// <summary>
@@ -440,6 +674,10 @@ internal sealed partial class LsmStorageInner : IDisposable
     public ValueTask<bool> TryGetRawAsync(ReadOnlyMemory<byte> key, IBufferWriter<byte> destination, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(destination);
+        if (TryReadRawSync(key.Span, new BufferWriterSink(destination), cancellationToken, out var syncLen))
+        {
+            return ValueTask.FromResult(syncLen >= 0);
+        }
 
         return FoundAsync(TryReadRawCoreAsync(key, new BufferWriterSink(destination), cancellationToken));
 
@@ -454,14 +692,19 @@ internal sealed partial class LsmStorageInner : IDisposable
     /// missing or deleted. When the returned length is greater than <paramref name="destination"/>'s length
     /// the buffer was too small and nothing was written; retry with a buffer of at least that size.
     /// </returns>
-    public async ValueTask<int> GetRawAsync(ByteSlice key, Memory<byte> destination, CancellationToken cancellationToken = default)
+    public ValueTask<int> GetRawAsync(ByteSlice key, Memory<byte> destination, CancellationToken cancellationToken = default)
     {
-        return await GetRawAsync(key.Memory, destination, cancellationToken);
+        return GetRawAsync(key.Memory, destination, cancellationToken);
     }
 
-    public async ValueTask<int> GetRawAsync(ReadOnlyMemory<byte> key, Memory<byte> destination, CancellationToken cancellationToken = default)
+    public ValueTask<int> GetRawAsync(ReadOnlyMemory<byte> key, Memory<byte> destination, CancellationToken cancellationToken = default)
     {
-        return await TryReadRawCoreAsync(key, new MemoryCopySink(destination), cancellationToken);
+        if (TryReadRawSync(key.Span, new MemoryCopySink(destination), cancellationToken, out var syncLen))
+        {
+            return ValueTask.FromResult(syncLen);
+        }
+
+        return TryReadRawCoreAsync(key, new MemoryCopySink(destination), cancellationToken);
     }
 
     /// <summary>
@@ -484,6 +727,10 @@ internal sealed partial class LsmStorageInner : IDisposable
     public ValueTask<bool> TryReadRawAsync<TArg>(ReadOnlyMemory<byte> key, TArg arg, ReadValueAction<TArg> reader, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(reader);
+        if (TryReadRawSync(key.Span, new DelegateSink<TArg>(arg, reader), cancellationToken, out var syncLen))
+        {
+            return ValueTask.FromResult(syncLen >= 0);
+        }
 
         return FoundAsync(TryReadRawCoreAsync(key, new DelegateSink<TArg>(arg, reader), cancellationToken));
 
@@ -498,7 +745,91 @@ internal sealed partial class LsmStorageInner : IDisposable
     /// Non-overlapping SSTs stream directly. Overlapping SSTs use pooled raw block cursors and an index heap
     /// to resolve duplicate-key and tombstone semantics without materializing entries.
     /// </remarks>
-    public async ValueTask<long> ScanRawAsync<TArg>(TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries = long.MaxValue, CancellationToken cancellationToken = default)
+    public ValueTask<long> ScanRawAsync<TArg>(TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries = long.MaxValue, CancellationToken cancellationToken = default)
+    {
+        if (TryScanRawSync(arg, reader, maxEntries, cancellationToken, out var syncCount))
+        {
+            return ValueTask.FromResult(syncCount);
+        }
+
+        return ScanRawSlowAsync(arg, reader, maxEntries, cancellationToken);
+    }
+
+    private bool TryScanRawSync<TArg>(TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries, CancellationToken cancellationToken, out long count)
+    {
+        count = 0;
+        CheckHealthy();
+        ArgumentNullException.ThrowIfNull(reader);
+        ArgumentOutOfRangeException.ThrowIfNegative(maxEntries);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        if (maxEntries == 0)
+        {
+            return true;
+        }
+
+        using var operation = Lifetime.Enter();
+        if (!_level0Lock.TryEnterReadLock(out var stripeSlot))
+        {
+            return false;
+        }
+
+        try
+        {
+            CheckHealthy();
+            if (_blockCache != null && TryGetGloballySortedSsTableRun(out var tables) &&
+                (maxEntries <= 16_384 || TotalRunSize(tables) <= _blockCache.SizeLimit))
+            {
+                for (var t = 0; t < tables.Count; t++)
+                {
+                    var table = tables[t];
+                    var blockMetadata = table.BlockMetadataArray;
+
+                    for (var i = 0; i < blockMetadata.Length; i++)
+                    {
+                        if (!table.TryAcquireCachedBlock(i, _blockCache, cancellationToken, out var lease))
+                        {
+                            var leaseTask = table.ReadBlockCachedAsync(i, _blockCache, cancellationToken);
+                            if (!leaseTask.IsCompletedSuccessfully)
+                            {
+                                return false;
+                            }
+                            lease = leaseTask.GetAwaiter().GetResult();
+                        }
+
+                        using (lease)
+                        {
+                            var block = lease.Block;
+                            if (block == null)
+                            {
+                                continue;
+                            }
+
+                            if (!block.ForEachRaw(arg, reader, skipTombstones: true, maxEntries, ref count))
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                }
+
+                return true;
+            }
+
+            if (TryScanSingleMemTableRaw(hasFrom: false, default, arg, reader, maxEntries, out count))
+            {
+                return true;
+            }
+
+            return false;
+        }
+        finally
+        {
+            _level0Lock.ExitReadLock(stripeSlot);
+        }
+    }
+
+    private async ValueTask<long> ScanRawSlowAsync<TArg>(TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries, CancellationToken cancellationToken)
     {
         using var operation = Lifetime.Enter();
         CheckHealthy();
@@ -518,6 +849,33 @@ internal sealed partial class LsmStorageInner : IDisposable
             {
                 var state = new RawScanState<TArg>(arg, reader, maxEntries);
 
+                if (_blockCache != null && (maxEntries <= 16_384 || TotalRunSize(tables) <= _blockCache.SizeLimit))
+                {
+                    foreach (var table in tables)
+                    {
+                        var blockMetadata = table.BlockMetadataArray;
+
+                        for (var i = 0; i < blockMetadata.Length; i++)
+                        {
+                            cancellationToken.ThrowIfCancellationRequested();
+
+                            using var lease = await table.ReadBlockCachedAsync(i, _blockCache, cancellationToken);
+                            var block = lease.Block;
+                            if (block == null)
+                            {
+                                continue;
+                            }
+
+                            if (!block.ForEachRaw(state, static (s, key, value) => s.Accept(key, value), skipTombstones: true))
+                            {
+                                return state.Count;
+                            }
+                        }
+                    }
+
+                    return state.Count;
+                }
+
                 foreach (var table in tables)
                 {
                     var blockMetadata = table.BlockMetadataArray;
@@ -527,9 +885,7 @@ internal sealed partial class LsmStorageInner : IDisposable
                     {
                         cancellationToken.ThrowIfCancellationRequested();
 
-                        using var block = blockReader.ReadNextBlock();
-
-                        if (!block.ForEachRaw(state, static (s, key, value) => s.Accept(key, value), skipTombstones: true))
+                        if (!blockReader.ForEachNextBlockRaw(state, static (s, key, value) => s.Accept(key, value), skipTombstones: true))
                         {
                             return state.Count;
                         }
@@ -539,12 +895,12 @@ internal sealed partial class LsmStorageInner : IDisposable
                 return state.Count;
             }
 
-            var merge = new MergeIterator(BuildMergeInputs(
-                hasFrom: false,
-                default,
-                backwards: false,
-                cancellationToken));
-            return await merge.ScanRawAsync(
+            if (TryScanSingleMemTableRaw(hasFrom: false, default, arg, reader, maxEntries, out var singleMemCount))
+            {
+                return singleMemCount;
+            }
+
+            return await ScanHybridMergeRawAsync(
                 hasFrom: false,
                 default,
                 arg,
@@ -558,6 +914,652 @@ internal sealed partial class LsmStorageInner : IDisposable
         }
     }
 
+    public async ValueTask<long> ScanReverseRawAsync<TArg>(TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries = long.MaxValue, CancellationToken cancellationToken = default)
+    {
+        using var operation = Lifetime.Enter();
+        CheckHealthy();
+        ArgumentNullException.ThrowIfNull(reader);
+        ArgumentOutOfRangeException.ThrowIfNegative(maxEntries);
+
+        if (maxEntries == 0)
+        {
+            return 0;
+        }
+
+        await _level0Lock.EnterReadLockAsync(cancellationToken);
+
+        try
+        {
+            if (TryGetGloballySortedSsTableRun(out var tables))
+            {
+                var state = new RawScanState<TArg>(arg, reader, maxEntries);
+
+                for (var t = tables.Count - 1; t >= 0; t--)
+                {
+                    var table = tables[t];
+                    var blockMetadata = table.BlockMetadataArray;
+
+                    for (var i = blockMetadata.Length - 1; i >= 0; i--)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+
+                        if (_blockCache != null)
+                        {
+                            using var lease = await table.ReadBlockCachedAsync(i, _blockCache, cancellationToken);
+                            var block = lease.Block;
+                            if (block != null && !block.ForEachReverseRaw(state, static (s, key, value) => s.Accept(key, value), skipTombstones: true))
+                            {
+                                return state.Count;
+                            }
+                        }
+                        else
+                        {
+                            using var block = await table.ReadBlockAsync(i, cancellationToken);
+                            if (block != null && !block.ForEachReverseRaw(state, static (s, key, value) => s.Accept(key, value), skipTombstones: true))
+                            {
+                                return state.Count;
+                            }
+                        }
+                    }
+                }
+
+                return state.Count;
+            }
+
+            if (TryScanSingleMemTableReverseRaw(arg, reader, maxEntries, out var singleMemCount))
+            {
+                return singleMemCount;
+            }
+
+            var state2 = new RawScanState<TArg>(arg, reader, maxEntries);
+            await ReadOrderedAsync(new OrderedReadRange(), OrderedReadDirection.Reverse, null, state2,
+                static (s, key, value) => s.Accept(key, value), false, cancellationToken);
+            return state2.Count;
+        }
+        finally
+        {
+            _level0Lock.ExitReadLock();
+        }
+    }
+
+    internal bool TryScanMvccRawSync<TArg>(
+        long snapshotSequence,
+        bool hasFrom,
+        ReadOnlySpan<byte> from,
+        TArg arg,
+        ReadRawEntryAction<TArg> reader,
+        long maxEntries,
+        CancellationToken cancellationToken,
+        out long count)
+    {
+        count = 0;
+        CheckHealthy();
+        ArgumentNullException.ThrowIfNull(reader);
+        ArgumentOutOfRangeException.ThrowIfNegative(maxEntries);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (maxEntries == 0)
+        {
+            return true;
+        }
+
+        using var operation = Lifetime.Enter();
+        if (!_level0Lock.TryEnterReadLock(out var stripeSlot))
+        {
+            return false;
+        }
+
+        try
+        {
+            CheckHealthy();
+            if (_blockCache != null && TryGetGloballySortedMvccSsTableRun(out var tables))
+            {
+                var startTable = hasFrom ? FindStartTableIndex(tables, from) : 0;
+                ulong lastWord = 0;
+                var lastLen = -1;
+                var resolved = false;
+                byte[]? groupBuf = null;
+                var allSingleVersion = !hasFrom && SingleVersionPerKey(tables);
+
+                try
+                {
+                    for (var t = startTable; t < tables.Count; t++)
+                    {
+                        var table = tables[t];
+                        var metadata = table.BlockMetadataArray;
+                        var blockStart = 0;
+                        var seekFirst = false;
+
+                        if (hasFrom && t == startTable)
+                        {
+                            blockStart = metadata.FindStartBlockIndex(from);
+                            if (metadata.GetLastKeySpan(blockStart).SequenceCompareTo(from) < 0)
+                            {
+                                blockStart++;
+                            }
+                            else
+                            {
+                                seekFirst = true;
+                            }
+                        }
+
+                        for (var b = blockStart; b < metadata.Length; b++)
+                        {
+                            if (!table.TryAcquireCachedBlock(b, _blockCache, cancellationToken, out var lease))
+                            {
+                                var leaseTask = table.ReadBlockCachedAsync(b, _blockCache, cancellationToken);
+                                if (!leaseTask.IsCompletedSuccessfully)
+                                {
+                                    return false;
+                                }
+                                lease = leaseTask.GetAwaiter().GetResult();
+                            }
+
+                            using (lease)
+                            {
+                                var block = lease.Block;
+                                if (block != null && !(allSingleVersion && (!seekFirst || b != blockStart)
+                                    ? block.ScanMvccSingleVersionRaw(snapshotSequence, arg, reader, maxEntries, ref count)
+                                    : block.ScanMvccRaw(
+                                        seekFirst && b == blockStart ? from : default,
+                                        snapshotSequence, arg, reader, maxEntries,
+                                        ref count, ref lastWord, ref lastLen, ref resolved, ref groupBuf)))
+                                {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+
+                    return true;
+                }
+                finally
+                {
+                    if (groupBuf is not null)
+                    {
+                        ArrayPool<byte>.Shared.Return(groupBuf);
+                    }
+                }
+            }
+
+            if (TryScanSingleMemTableMvccRaw(snapshotSequence, hasFrom, from, arg, reader, maxEntries, out count))
+            {
+                return true;
+            }
+
+            if (maxEntries <= 16_384 &&
+                TryScanHybridMergeMvccRawSync(snapshotSequence, hasFrom, from, arg, reader, maxEntries, cancellationToken, out count))
+            {
+                return true;
+            }
+
+            return false;
+        }
+        finally
+        {
+            _level0Lock.ExitReadLock(stripeSlot);
+        }
+    }
+
+    private bool TryScanHybridMergeMvccRawSync<TArg>(
+        long snapshotSequence,
+        bool hasFrom,
+        ReadOnlySpan<byte> from,
+        TArg arg,
+        ReadRawEntryAction<TArg> reader,
+        long maxEntries,
+        CancellationToken cancellationToken,
+        out long count)
+    {
+        count = 0;
+        MergeIterator.Source[]? sources = null;
+        int[]? heap = null;
+        var sourceCount = 0;
+        byte[]? rentedFrom = null;
+
+        _currentMemTableLock.EnterReadLock();
+        try
+        {
+            CheckHealthy();
+            var state = _state;
+            var immutableMemTables = state.ImmutableMemTables;
+            var l0Tables = state.LevelZeroTables;
+            var leveledTables = state.LeveledSsTables;
+
+            for (var i = 0; i < immutableMemTables.Length; i++)
+            {
+                if (immutableMemTables[i] is not MemTable)
+                {
+                    return false;
+                }
+            }
+            if (state.CurrentMemTable.Count != 0 && state.CurrentMemTable is not MemTable)
+            {
+                return false;
+            }
+
+            var maxSources = (state.CurrentMemTable.Count != 0 ? 1 : 0) + immutableMemTables.Length + l0Tables.Count;
+            for (var i = 0; i < leveledTables.Count; i++)
+            {
+                maxSources += leveledTables[i].Count;
+            }
+            if (maxSources == 0)
+            {
+                return true;
+            }
+
+            ReadOnlyMemory<byte> fromMemory = default;
+            if (hasFrom)
+            {
+                rentedFrom = ArrayPool<byte>.Shared.Rent(from.Length);
+                from.CopyTo(rentedFrom);
+                fromMemory = rentedFrom.AsMemory(0, from.Length);
+            }
+
+            sources = ArrayPool<MergeIterator.Source>.Shared.Rent(maxSources);
+            heap = ArrayPool<int>.Shared.Rent(maxSources);
+
+            if (state.CurrentMemTable.Count != 0)
+            {
+                sources[sourceCount++] = MergeIterator.Source.Create(
+                    MergeIterator.Input.FromMemTable((MemTable)state.CurrentMemTable, _currentMemTableLock, this),
+                    hasFrom, fromMemory, backwards: false, cancellationToken);
+            }
+
+            for (var i = immutableMemTables.Length - 1; i >= 0; i--)
+            {
+                sources[sourceCount++] = MergeIterator.Source.Create(
+                    MergeIterator.Input.FromMemTable((MemTable)immutableMemTables[i], _currentMemTableLock),
+                    hasFrom, fromMemory, backwards: false, cancellationToken);
+            }
+
+            for (var i = l0Tables.Count - 1; i >= 0; i--)
+            {
+                var table = l0Tables[i];
+                if (hasFrom && table.LastKey.Span.SequenceCompareTo(from) < 0)
+                {
+                    continue;
+                }
+                sources[sourceCount++] = MergeIterator.Source.Create(
+                    MergeIterator.Input.FromTable(table),
+                    hasFrom, fromMemory, backwards: false, cancellationToken);
+            }
+
+            for (var l = 0; l < leveledTables.Count; l++)
+            {
+                var level = leveledTables[l];
+                for (var t = 0; t < level.Count; t++)
+                {
+                    var table = level[t];
+                    if (hasFrom && table.LastKey.Span.SequenceCompareTo(from) < 0)
+                    {
+                        continue;
+                    }
+                    sources[sourceCount++] = MergeIterator.Source.Create(
+                        MergeIterator.Input.FromTable(table),
+                        hasFrom, fromMemory, backwards: false, cancellationToken);
+                }
+            }
+        }
+        finally
+        {
+            _currentMemTableLock.ExitReadLock();
+        }
+
+        try
+        {
+            return MergeIterator.TryScanMvccSourcesSync(
+                sources, heap, sourceCount, _blockCache, snapshotSequence, arg, reader, maxEntries, cancellationToken, out count);
+        }
+        finally
+        {
+            if (sources is not null)
+            {
+                for (var i = 0; i < sourceCount; i++)
+                {
+                    sources[i].DisposeSyncOrAsync();
+                    sources[i] = default;
+                }
+                ArrayPool<MergeIterator.Source>.Shared.Return(sources);
+            }
+            if (heap is not null)
+            {
+                ArrayPool<int>.Shared.Return(heap);
+            }
+            if (rentedFrom is not null)
+            {
+                ArrayPool<byte>.Shared.Return(rentedFrom);
+            }
+        }
+    }
+
+    internal async ValueTask<long> ScanMvccRawAsync<TArg>(
+        long snapshotSequence,
+        bool hasFrom,
+        ReadOnlyMemory<byte> from,
+        TArg arg,
+        ReadRawEntryAction<TArg> reader,
+        long maxEntries,
+        CancellationToken cancellationToken = default)
+    {
+        using var operation = Lifetime.Enter();
+        CheckHealthy();
+        ArgumentNullException.ThrowIfNull(reader);
+        ArgumentOutOfRangeException.ThrowIfNegative(maxEntries);
+        if (maxEntries == 0)
+        {
+            return 0;
+        }
+
+        await _level0Lock.EnterReadLockAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (TryGetGloballySortedMvccSsTableRun(out var tables))
+            {
+                var startTable = hasFrom ? FindStartTableIndex(tables, from.Span) : 0;
+                long count = 0;
+                ulong lastWord = 0;
+                var lastLen = -1;
+                var resolved = false;
+                byte[]? groupBuf = null;
+                var allSingleVersion = SingleVersionPerKey(tables);
+
+                try
+                {
+                    if (_blockCache != null && (hasFrom || maxEntries <= 16_384 || TotalRunSize(tables) <= _blockCache.SizeLimit))
+                    {
+                        for (var t = startTable; t < tables.Count; t++)
+                        {
+                            var table = tables[t];
+                            var metadata = table.BlockMetadataArray;
+                            var blockStart = 0;
+                            var seekFirst = false;
+
+                            if (hasFrom && t == startTable)
+                            {
+                                blockStart = metadata.FindStartBlockIndex(from.Span);
+                                if (metadata.GetLastKeySpan(blockStart).SequenceCompareTo(from.Span) < 0)
+                                {
+                                    blockStart++;
+                                }
+                                else
+                                {
+                                    seekFirst = true;
+                                }
+                            }
+
+                            for (var b = blockStart; b < metadata.Length; b++)
+                            {
+                                cancellationToken.ThrowIfCancellationRequested();
+                                using var lease = await table.ReadBlockCachedAsync(b, _blockCache, cancellationToken).ConfigureAwait(false);
+                                var block = lease.Block;
+                                if (block != null && !(allSingleVersion && (!seekFirst || b != blockStart)
+                                    ? block.ScanMvccSingleVersionRaw(snapshotSequence, arg, reader, maxEntries, ref count)
+                                    : block.ScanMvccRaw(
+                                        seekFirst && b == blockStart ? from.Span : default,
+                                        snapshotSequence, arg, reader, maxEntries,
+                                        ref count, ref lastWord, ref lastLen, ref resolved, ref groupBuf)))
+                                {
+                                    return count;
+                                }
+                            }
+                        }
+
+                        return count;
+                    }
+
+                    for (var t = startTable; t < tables.Count; t++)
+                    {
+                        var table = tables[t];
+                        var metadata = table.BlockMetadataArray;
+                        using var blockReader = table.CreateSequentialBlockReader();
+
+                        for (var b = 0; b < metadata.Length; b++)
+                        {
+                            cancellationToken.ThrowIfCancellationRequested();
+                            using var block = blockReader.ReadNextBlock();
+                            if (block != null && !(allSingleVersion
+                                ? block.ScanMvccSingleVersionRaw(snapshotSequence, arg, reader, maxEntries, ref count)
+                                : block.ScanMvccRaw(
+                                    default,
+                                    snapshotSequence, arg, reader, maxEntries,
+                                    ref count, ref lastWord, ref lastLen, ref resolved, ref groupBuf)))
+                            {
+                                return count;
+                            }
+                        }
+                    }
+
+                    return count;
+                }
+                finally
+                {
+                    if (groupBuf is not null)
+                    {
+                        ArrayPool<byte>.Shared.Return(groupBuf);
+                    }
+                }
+            }
+
+            if (TryScanSingleMemTableMvccRaw(snapshotSequence, hasFrom, from.Span, arg, reader, maxEntries, out var singleMemCount))
+            {
+                return singleMemCount;
+            }
+        }
+        finally
+        {
+            _level0Lock.ExitReadLock();
+        }
+
+        return -1;
+    }
+
+    internal async ValueTask<long> ScanMvccReverseRawAsync<TArg>(
+        long snapshotSequence,
+        TArg arg,
+        ReadRawEntryAction<TArg> reader,
+        long maxEntries,
+        CancellationToken cancellationToken = default)
+    {
+        using var operation = Lifetime.Enter();
+        CheckHealthy();
+        ArgumentNullException.ThrowIfNull(reader);
+        ArgumentOutOfRangeException.ThrowIfNegative(maxEntries);
+        if (maxEntries == 0)
+        {
+            return 0;
+        }
+
+        await _level0Lock.EnterReadLockAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (TryGetGloballySortedMvccSsTableRun(out var tables))
+            {
+                long count = 0;
+                ulong lastWord = 0;
+                var lastLen = -1;
+                var hasCandidate = false;
+                var candidateLive = false;
+                byte[]? keyBuf = null;
+                byte[]? valBuf = null;
+                var valLen = 0;
+                var allSingleVersion = SingleVersionPerKey(tables);
+
+                try
+                {
+                    if (_blockCache != null && TotalRunSize(tables) <= _blockCache.SizeLimit)
+                    {
+                        for (var t = tables.Count - 1; t >= 0; t--)
+                        {
+                            var table = tables[t];
+                            var metadata = table.BlockMetadataArray;
+
+                            for (var b = metadata.Length - 1; b >= 0; b--)
+                            {
+                                cancellationToken.ThrowIfCancellationRequested();
+                                using var lease = await table.ReadBlockCachedAsync(b, _blockCache, cancellationToken).ConfigureAwait(false);
+                                var block = lease.Block;
+                                if (block == null) continue;
+                                if (allSingleVersion && !hasCandidate &&
+                                    block.ScanMvccSingleVersionReverseRaw(snapshotSequence, arg, reader, maxEntries, ref count))
+                                {
+                                    if (count >= maxEntries) return count;
+                                    continue;
+                                }
+                                if (!block.ScanMvccReverseRaw(
+                                    snapshotSequence, arg, reader, maxEntries,
+                                    ref count, ref lastWord, ref lastLen, ref hasCandidate, ref candidateLive,
+                                    ref keyBuf, ref valBuf, ref valLen))
+                                {
+                                    return count;
+                                }
+                            }
+                        }
+
+                        if (hasCandidate && candidateLive && count < maxEntries)
+                        {
+                            count++;
+                            MvccStorage.InvokeUserReader(arg, reader, keyBuf.AsSpan(0, lastLen), valBuf.AsSpan(0, valLen));
+                        }
+                        return count;
+                    }
+                }
+                finally
+                {
+                    if (keyBuf is not null) ArrayPool<byte>.Shared.Return(keyBuf);
+                    if (valBuf is not null) ArrayPool<byte>.Shared.Return(valBuf);
+                }
+            }
+
+            if (TryScanSingleMemTableMvccReverseRaw(snapshotSequence, arg, reader, maxEntries, out var singleMemCount))
+            {
+                return singleMemCount;
+            }
+        }
+        finally
+        {
+            _level0Lock.ExitReadLock();
+        }
+
+        return -1;
+    }
+
+    private bool TryScanSingleMemTableMvccReverseRaw<TArg>(
+        long snapshotSequence, TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries, out long count)
+    {
+        count = 0;
+        _currentMemTableLock.EnterReadLock();
+        try
+        {
+            CheckHealthy();
+            var state = _state;
+            if (!state.ImmutableMemTables.IsEmpty || state.LevelZeroTables.Count != 0)
+            {
+                return false;
+            }
+            foreach (var level in state.LeveledSsTables)
+            {
+                if (level.Count != 0)
+                {
+                    return false;
+                }
+            }
+            if (state.CurrentMemTable.Count == 0)
+            {
+                return true;
+            }
+            if (state.CurrentMemTable is not MemTable memTable)
+            {
+                return false;
+            }
+
+            count = memTable.ScanMvccReverseRaw(snapshotSequence, arg, reader, maxEntries);
+            return true;
+        }
+        finally
+        {
+            _currentMemTableLock.ExitReadLock();
+        }
+    }
+
+    private static bool SingleVersionPerKey(IReadOnlyList<SsTable> tables) =>
+        SsTable.SingleVersionPerKey(tables);
+
+    private bool TryScanSingleMemTableMvccRaw<TArg>(
+        long snapshotSequence, bool hasFrom, ReadOnlySpan<byte> from, TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries, out long count)
+    {
+        count = 0;
+        _currentMemTableLock.EnterReadLock();
+        try
+        {
+            CheckHealthy();
+            var state = _state;
+            if (!state.ImmutableMemTables.IsEmpty || state.LevelZeroTables.Count != 0)
+            {
+                return false;
+            }
+            foreach (var level in state.LeveledSsTables)
+            {
+                if (level.Count != 0)
+                {
+                    return false;
+                }
+            }
+            if (state.CurrentMemTable.Count == 0)
+            {
+                return true;
+            }
+            if (state.CurrentMemTable is not MemTable memTable)
+            {
+                return false;
+            }
+
+            count = memTable.ScanMvccRaw(snapshotSequence, hasFrom, from, arg, reader, maxEntries);
+            return true;
+        }
+        finally
+        {
+            _currentMemTableLock.ExitReadLock();
+        }
+    }
+
+    private bool TryScanSingleMemTableReverseRaw<TArg>(
+        TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries, out long count)
+    {
+        count = 0;
+        _currentMemTableLock.EnterReadLock();
+        try
+        {
+            CheckHealthy();
+            var state = _state;
+            if (!state.ImmutableMemTables.IsEmpty || state.LevelZeroTables.Count != 0)
+            {
+                return false;
+            }
+            foreach (var level in state.LeveledSsTables)
+            {
+                if (level.Count != 0)
+                {
+                    return false;
+                }
+            }
+            if (state.CurrentMemTable.Count == 0)
+            {
+                return true;
+            }
+            if (state.CurrentMemTable is not MemTable memTable)
+            {
+                return false;
+            }
+
+            count = memTable.ScanReverseRaw(arg, reader, maxEntries);
+            return true;
+        }
+        finally
+        {
+            _currentMemTableLock.ExitReadLock();
+        }
+    }
+
     /// <summary>
     /// Raw, cached, lower-bound seek: invokes <paramref name="reader"/> for up to <paramref name="maxEntries"/>
     /// live entries whose key is greater than or equal to <paramref name="from"/>, in ascending key order.
@@ -565,13 +1567,126 @@ internal sealed partial class LsmStorageInner : IDisposable
     /// the block cache, so a hot working set is reused across seeks instead of issuing an uncached read per call.
     /// Returns the number of live entries delivered.
     /// </summary>
-    public async ValueTask<long> SeekRawAsync<TArg>(ByteSlice from, TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries = long.MaxValue, CancellationToken cancellationToken = default)
+    internal bool TrySeekRawSync<TArg>(ReadOnlySpan<byte> from, TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries, CancellationToken cancellationToken, out long count)
     {
-        return await SeekRawAsync(from.Memory, arg, reader, maxEntries, cancellationToken);
+        count = 0;
+        CheckHealthy();
+        ArgumentNullException.ThrowIfNull(reader);
+        ArgumentOutOfRangeException.ThrowIfNegative(maxEntries);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        if (maxEntries == 0)
+        {
+            return true;
+        }
+
+        using var operation = Lifetime.Enter();
+        if (!_level0Lock.TryEnterReadLock(out var stripeSlot))
+        {
+            return false;
+        }
+
+        try
+        {
+            CheckHealthy();
+            if (_blockCache != null && TryGetGloballySortedSsTableRun(out var tables))
+            {
+                RawScanState<TArg>? state = maxEntries == 1 ? null : new RawScanState<TArg>(arg, reader, maxEntries);
+                var startTableIndex = FindStartTableIndex(tables, from);
+
+                for (var t = startTableIndex; t < tables.Count; t++)
+                {
+                    var table = tables[t];
+                    var blockMetadata = table.BlockMetadataArray;
+                    var blockStart = 0;
+                    var seekInFirstBlock = false;
+
+                    if (t == startTableIndex)
+                    {
+                        blockStart = blockMetadata.FindStartBlockIndex(from);
+                        if (blockMetadata.GetLastKeySpan(blockStart).SequenceCompareTo(from) < 0)
+                        {
+                            blockStart++;
+                        }
+                        else
+                        {
+                            seekInFirstBlock = true;
+                        }
+                    }
+
+                    for (var b = blockStart; b < blockMetadata.Length; b++)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        var leaseTask = table.ReadBlockCachedAsync(b, _blockCache, cancellationToken);
+                        if (!leaseTask.IsCompletedSuccessfully)
+                        {
+                            return false;
+                        }
+
+                        using var lease = leaseTask.GetAwaiter().GetResult();
+                        var block = lease.Block;
+                        if (block == null)
+                        {
+                            continue;
+                        }
+
+                        if (maxEntries == 1)
+                        {
+                            var encodedFrom = seekInFirstBlock && b == blockStart
+                                ? from
+                                : ReadOnlySpan<byte>.Empty;
+
+                            if (block.TryGetFirstRawFrom(encodedFrom, out var key, out var value, skipTombstones: true))
+                            {
+                                reader(arg, key, value);
+                                count = 1;
+                                return true;
+                            }
+
+                            continue;
+                        }
+
+                        var keepGoing = seekInFirstBlock && b == blockStart
+                            ? block.ForEachRawFrom(from, state!, static (s, key, value) => s.Accept(key, value), skipTombstones: true)
+                            : block.ForEachRaw(state!, static (s, key, value) => s.Accept(key, value), skipTombstones: true);
+
+                        if (!keepGoing)
+                        {
+                            count = state?.Count ?? 0;
+                            return true;
+                        }
+                    }
+                }
+
+                count = state?.Count ?? 0;
+                return true;
+            }
+
+            if (TryScanSingleMemTableRaw(hasFrom: true, from, arg, reader, maxEntries, out count))
+            {
+                return true;
+            }
+
+            return false;
+        }
+        finally
+        {
+            _level0Lock.ExitReadLock(stripeSlot);
+        }
+    }
+
+    public ValueTask<long> SeekRawAsync<TArg>(ByteSlice from, TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries = long.MaxValue, CancellationToken cancellationToken = default)
+    {
+        return SeekRawAsync(from.Memory, arg, reader, maxEntries, cancellationToken);
     }
 
     public async ValueTask<long> SeekRawAsync<TArg>(ReadOnlyMemory<byte> from, TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries = long.MaxValue, CancellationToken cancellationToken = default)
     {
+        if (TrySeekRawSync(from.Span, arg, reader, maxEntries, cancellationToken, out var syncCount))
+        {
+            return syncCount;
+        }
+
         using var operation = Lifetime.Enter();
         CheckHealthy();
         ArgumentNullException.ThrowIfNull(reader);
@@ -663,12 +1778,12 @@ internal sealed partial class LsmStorageInner : IDisposable
                 return state?.Count ?? 0;
             }
 
-            var merge = new MergeIterator(BuildMergeInputs(
-                hasFrom: true,
-                from,
-                backwards: false,
-                cancellationToken), _blockCache);
-            return await merge.ScanRawAsync(
+            if (TryScanSingleMemTableRaw(hasFrom: true, from.Span, arg, reader, maxEntries, out var singleMemCount))
+            {
+                return singleMemCount;
+            }
+
+            return await ScanHybridMergeRawAsync(
                 hasFrom: true,
                 from,
                 arg,
@@ -690,12 +1805,28 @@ internal sealed partial class LsmStorageInner : IDisposable
     {
         var start = 0;
         var end = tables.Count - 1;
+        var hasPrefix = from.Length >= 8;
+        var fromPrefix = hasPrefix ? System.Buffers.Binary.BinaryPrimitives.ReadUInt64BigEndian(from) : 0UL;
 
         while (start <= end)
         {
             var m = start + (end - start) / 2;
+            var lastKey = tables[m].LastKey.Span;
 
-            if (tables[m].LastKey.Span.SequenceCompareTo(from) < 0)
+            int cmp;
+            if (hasPrefix && lastKey.Length >= 8)
+            {
+                var lastPrefix = System.Buffers.Binary.BinaryPrimitives.ReadUInt64BigEndian(lastKey);
+                cmp = lastPrefix != fromPrefix
+                    ? (lastPrefix < fromPrefix ? -1 : 1)
+                    : lastKey[8..].SequenceCompareTo(from[8..]);
+            }
+            else
+            {
+                cmp = lastKey.SequenceCompareTo(from);
+            }
+
+            if (cmp < 0)
             {
                 start = m + 1;
             }
@@ -736,6 +1867,56 @@ internal sealed partial class LsmStorageInner : IDisposable
 
         return reader(arg, keyBytes, valueBytes);
     }
+
+    private static long TotalRunSize(IReadOnlyList<SsTable> tables)
+    {
+        long total = 0;
+        for (var i = 0; i < tables.Count; i++)
+        {
+            total += tables[i].Size;
+        }
+        return total;
+    }
+
+    private bool TryScanSingleMemTableRaw<TArg>(
+        bool hasFrom, ReadOnlySpan<byte> from, TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries, out long count)
+    {
+        count = 0;
+        _currentMemTableLock.EnterReadLock();
+        try
+        {
+            CheckHealthy();
+            var state = _state;
+            if (!state.ImmutableMemTables.IsEmpty || state.LevelZeroTables.Count != 0)
+            {
+                return false;
+            }
+            foreach (var level in state.LeveledSsTables)
+            {
+                if (level.Count != 0)
+                {
+                    return false;
+                }
+            }
+            if (state.CurrentMemTable.Count == 0)
+            {
+                return true;
+            }
+            if (state.CurrentMemTable is not MemTable memTable)
+            {
+                return false;
+            }
+
+            count = memTable.ScanRaw(hasFrom, from, arg, reader, maxEntries);
+            return true;
+        }
+        finally
+        {
+            _currentMemTableLock.ExitReadLock();
+        }
+    }
+
+    private SsTable[]? _sortedMvccSsTableRun;
 
     private bool TryGetGloballySortedSsTableRun(out IReadOnlyList<SsTable> tables)
     {
@@ -808,7 +1989,82 @@ internal sealed partial class LsmStorageInner : IDisposable
         }
     }
 
-    private void InvalidateSortedSsTableRun() => Volatile.Write(ref _sortedSsTableRun, null);
+    private void InvalidateSortedSsTableRun()
+    {
+        Volatile.Write(ref _sortedSsTableRun, null);
+        Volatile.Write(ref _sortedMvccSsTableRun, null);
+    }
+
+    private bool TryGetGloballySortedMvccSsTableRun(out IReadOnlyList<SsTable> tables)
+    {
+        CheckHealthy();
+        var cached = Volatile.Read(ref _sortedMvccSsTableRun);
+        if (cached != null)
+        {
+            tables = cached;
+            return true;
+        }
+
+        _currentMemTableLock.EnterReadLock();
+        try
+        {
+            CheckHealthy();
+            var state = _state;
+            if (!state.ImmutableMemTables.IsEmpty)
+            {
+                tables = [];
+                return false;
+            }
+            if (state.CurrentMemTable.Count != 0)
+            {
+                if (state.CurrentMemTable is not MemTable current ||
+                    current.TryGetNextRaw(new byte[] { 1 }, true, true, false, out _, out _, out _))
+                {
+                    tables = [];
+                    return false;
+                }
+            }
+
+            var count = state.LevelZeroTables.Count;
+            foreach (var level in state.LeveledSsTables)
+            {
+                count += level.Count;
+            }
+            if (count == 0)
+            {
+                tables = [];
+                return false;
+            }
+
+            var sorted = new SsTable[count];
+            var index = 0;
+            foreach (var table in state.LevelZeroTables) sorted[index++] = table;
+            foreach (var level in state.LeveledSsTables)
+            {
+                foreach (var table in level) sorted[index++] = table;
+            }
+
+            tables = sorted;
+            if (sorted.Length > 1)
+            {
+                Array.Sort(sorted, static (left, right) => _keyComparer.Compare(left.FirstKey, right.FirstKey));
+                for (var i = 1; i < sorted.Length; i++)
+                {
+                    if (_keyComparer.Compare(sorted[i - 1].LastKey, sorted[i].FirstKey) >= 0)
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            Volatile.Write(ref _sortedMvccSsTableRun, sorted);
+            return true;
+        }
+        finally
+        {
+            _currentMemTableLock.ExitReadLock();
+        }
+    }
 
     private List<MergeIterator.Input> BuildMergeInputs(
         bool hasFrom,
@@ -816,10 +2072,7 @@ internal sealed partial class LsmStorageInner : IDisposable
         bool backwards,
         CancellationToken cancellationToken)
     {
-        List<KeyValuePair<ByteSlice, ByteSlice>>? currentSnapshot = null;
-        ImmutableArray<IMemTable> immutableMemTables;
-        List<SsTable> tables;
-        var fromSlice = hasFrom ? ByteSlice.FromMemory(from) : null;
+        List<MergeIterator.Input> inputs;
 
         _currentMemTableLock.EnterReadLock();
 
@@ -827,32 +2080,57 @@ internal sealed partial class LsmStorageInner : IDisposable
         {
             CheckHealthy();
             var state = _state;
-            immutableMemTables = state.ImmutableMemTables;
+            var immutableMemTables = state.ImmutableMemTables;
             var tableCount = state.LevelZeroTables.Count;
             foreach (var level in state.LeveledSsTables)
             {
                 tableCount += level.Count;
             }
 
+            inputs = new List<MergeIterator.Input>(
+                (state.CurrentMemTable.Count != 0 ? 1 : 0) + immutableMemTables.Length + tableCount);
+
             if (state.CurrentMemTable.Count != 0)
             {
-                currentSnapshot = MaterializeMemTable(
-                    state.CurrentMemTable,
-                    hasFrom,
-                    fromSlice,
-                    backwards,
-                    cancellationToken);
+                if (state.CurrentMemTable is MemTable currentMemTable)
+                {
+                    inputs.Add(MergeIterator.Input.FromMemTable(currentMemTable, _currentMemTableLock, this));
+                }
+                else
+                {
+                    inputs.Add(MergeIterator.Input.FromEntries(MaterializeMemTable(
+                        state.CurrentMemTable,
+                        hasFrom,
+                        hasFrom ? ByteSlice.FromMemory(from) : null,
+                        backwards,
+                        cancellationToken)));
+                }
             }
 
-            tables = new List<SsTable>(tableCount);
+            for (var i = immutableMemTables.Length - 1; i >= 0; i--)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (immutableMemTables[i] is MemTable immutableMemTable)
+                {
+                    inputs.Add(MergeIterator.Input.FromMemTable(immutableMemTable, _currentMemTableLock));
+                }
+                else
+                {
+                    inputs.Add(MergeIterator.Input.FromIterator(immutableMemTables[i].CreateIterator()));
+                }
+            }
+
             for (var i = state.LevelZeroTables.Count - 1; i >= 0; i--)
             {
-                tables.Add(state.LevelZeroTables[i]);
+                inputs.Add(MergeIterator.Input.FromTable(state.LevelZeroTables[i]));
             }
 
             foreach (var level in state.LeveledSsTables)
             {
-                tables.AddRange(level);
+                foreach (var table in level)
+                {
+                    inputs.Add(MergeIterator.Input.FromTable(table));
+                }
             }
         }
         finally
@@ -860,24 +2138,112 @@ internal sealed partial class LsmStorageInner : IDisposable
             _currentMemTableLock.ExitReadLock();
         }
 
-        var inputs = new List<MergeIterator.Input>(
-            (currentSnapshot == null ? 0 : 1) + immutableMemTables.Length + tables.Count);
-        if (currentSnapshot != null)
-        {
-            inputs.Add(MergeIterator.Input.FromEntries(currentSnapshot));
-        }
-
-        for (var i = immutableMemTables.Length - 1; i >= 0; i--)
-        {
-            inputs.Add(MergeIterator.Input.FromIterator(immutableMemTables[i].CreateIterator()));
-        }
-
-        foreach (var table in tables)
-        {
-            inputs.Add(MergeIterator.Input.FromTable(table));
-        }
-
         return inputs;
+    }
+
+    internal ValueTask<long> ScanHybridMergeRawAsync<TArg>(
+        bool hasFrom,
+        ReadOnlyMemory<byte> from,
+        TArg arg,
+        ReadRawEntryAction<TArg> reader,
+        long maxEntries,
+        CancellationToken cancellationToken)
+    {
+        MergeIterator.Source[]? sources = null;
+        int[]? heap = null;
+        var sourceCount = 0;
+
+        _currentMemTableLock.EnterReadLock();
+        try
+        {
+            CheckHealthy();
+            var state = _state;
+            var immutableMemTables = state.ImmutableMemTables;
+            var l0Tables = state.LevelZeroTables;
+            var leveledTables = state.LeveledSsTables;
+
+            var maxSources = (state.CurrentMemTable.Count != 0 ? 1 : 0) + immutableMemTables.Length + l0Tables.Count;
+            for (var i = 0; i < leveledTables.Count; i++)
+            {
+                maxSources += leveledTables[i].Count;
+            }
+            if (maxSources == 0 || maxEntries == 0)
+            {
+                return ValueTask.FromResult(0L);
+            }
+
+            sources = ArrayPool<MergeIterator.Source>.Shared.Rent(maxSources);
+            heap = ArrayPool<int>.Shared.Rent(maxSources);
+            var fromSpan = from.Span;
+
+            if (state.CurrentMemTable.Count != 0)
+            {
+                if (state.CurrentMemTable is MemTable currentMemTable)
+                {
+                    sources[sourceCount++] = MergeIterator.Source.Create(
+                        MergeIterator.Input.FromMemTable(currentMemTable, _currentMemTableLock, this),
+                        hasFrom, from, backwards: false, cancellationToken);
+                }
+                else
+                {
+                    sources[sourceCount++] = MergeIterator.Source.Create(
+                        MergeIterator.Input.FromEntries(MaterializeMemTable(
+                            state.CurrentMemTable, hasFrom, hasFrom ? ByteSlice.FromMemory(from) : null, backwards: false, cancellationToken)),
+                        hasFrom, from, backwards: false, cancellationToken);
+                }
+            }
+
+            for (var i = immutableMemTables.Length - 1; i >= 0; i--)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (immutableMemTables[i] is MemTable immutableMemTable)
+                {
+                    sources[sourceCount++] = MergeIterator.Source.Create(
+                        MergeIterator.Input.FromMemTable(immutableMemTable, _currentMemTableLock),
+                        hasFrom, from, backwards: false, cancellationToken);
+                }
+                else
+                {
+                    sources[sourceCount++] = MergeIterator.Source.Create(
+                        MergeIterator.Input.FromIterator(immutableMemTables[i].CreateIterator()),
+                        hasFrom, from, backwards: false, cancellationToken);
+                }
+            }
+
+            for (var i = l0Tables.Count - 1; i >= 0; i--)
+            {
+                var table = l0Tables[i];
+                if (hasFrom && table.LastKey.Span.SequenceCompareTo(fromSpan) < 0)
+                {
+                    continue;
+                }
+                sources[sourceCount++] = MergeIterator.Source.Create(
+                    MergeIterator.Input.FromTable(table),
+                    hasFrom, from, backwards: false, cancellationToken);
+            }
+
+            for (var l = 0; l < leveledTables.Count; l++)
+            {
+                var level = leveledTables[l];
+                for (var t = 0; t < level.Count; t++)
+                {
+                    var table = level[t];
+                    if (hasFrom && table.LastKey.Span.SequenceCompareTo(fromSpan) < 0)
+                    {
+                        continue;
+                    }
+                    sources[sourceCount++] = MergeIterator.Source.Create(
+                        MergeIterator.Input.FromTable(table),
+                        hasFrom, from, backwards: false, cancellationToken);
+                }
+            }
+        }
+        finally
+        {
+            _currentMemTableLock.ExitReadLock();
+        }
+
+        return MergeIterator.ScanRawSourcesAsync(sources, heap, sourceCount, _blockCache, arg, reader, maxEntries, cancellationToken);
     }
 
     private static List<KeyValuePair<ByteSlice, ByteSlice>> MaterializeMemTable(
@@ -1058,6 +2424,21 @@ internal sealed partial class LsmStorageInner : IDisposable
     {
         length = 0;
 
+        if (memTable is MemTable concrete)
+        {
+            if (!concrete.TryGetSpan(key, out var spanVal, out var isTomb))
+            {
+                return RawLookup.Miss;
+            }
+            if (isTomb)
+            {
+                return RawLookup.Tombstone;
+            }
+            sink.Accept(spanVal);
+            length = spanVal.Length;
+            return RawLookup.Live;
+        }
+
         if (!memTable.TryGetRaw(key, out var value, out var isTombstone))
         {
             return RawLookup.Miss;
@@ -1234,6 +2615,22 @@ internal sealed partial class LsmStorageInner : IDisposable
         }
     }
 
+    internal bool HasPendingWrites
+    {
+        get
+        {
+            _currentMemTableLock.EnterReadLock();
+            try
+            {
+                return _state.CurrentMemTable.Count != 0 || !_state.ImmutableMemTables.IsEmpty;
+            }
+            finally
+            {
+                _currentMemTableLock.ExitReadLock();
+            }
+        }
+    }
+
     internal StorageMetrics Metrics { get; } = new();
 
     private void EnterCurrentMemTableWriteLock()
@@ -1255,30 +2652,55 @@ internal sealed partial class LsmStorageInner : IDisposable
         try
         {
             CheckHealthy();
+            InvalidateSortedSsTableRun();
             var memTable = (MemTable)_state.CurrentMemTable;
             var wal = memTable.Wal ?? throw new InvalidOperationException("Group commit requires an active WAL.");
             var submitted = false;
             try
             {
-                for (var i = 0; i < count; i++)
+                if (FaultInjector is null && count > 1)
                 {
                     try
                     {
-                        wal.AppendBatch(batches[i], synchronize: false);
+                        wal.AppendGroup(batches, outcomes, count);
                     }
                     catch
                     {
-                        outcomes[i] = wal.AppendOutcome;
-                        submitted |= wal.AppendOutcome != StorageCommitOutcome.NotCommitted;
+                        submitted = wal.AppendOutcome != StorageCommitOutcome.NotCommitted;
                         throw;
                     }
-                    outcomes[i] = StorageCommitOutcome.Indeterminate;
                     submitted = true;
                 }
-                wal.SynchronizeGroup();
+                else
+                {
+                    for (var i = 0; i < count; i++)
+                    {
+                        try
+                        {
+                            wal.AppendBatch(batches[i], synchronize: false);
+                        }
+                        catch
+                        {
+                            outcomes[i] = wal.AppendOutcome;
+                            submitted |= wal.AppendOutcome != StorageCommitOutcome.NotCommitted;
+                            throw;
+                        }
+                        outcomes[i] = StorageCommitOutcome.Indeterminate;
+                        submitted = true;
+                    }
+                }
+                wal.FlushGroup();
+                var applyMetadataOnlyOnFinal = FaultInjector is null && count > 1;
                 for (var i = 0; i < count; i++)
                 {
-                    memTable.ApplyBatch(batches[i]);
+                    if (applyMetadataOnlyOnFinal && i < count - 1)
+                    {
+                        memTable.ApplyBatchSlice(batches[i], 1, batches[i].Count - 1);
+                    }
+                    else
+                    {
+                        memTable.ApplyBatch(batches[i]);
+                    }
                     outcomes[i] = StorageCommitOutcome.Committed;
                     FaultInjector?.Invoke(StorageFaultPoint.WriteBeforePublication);
                 }
@@ -1338,14 +2760,27 @@ internal sealed partial class LsmStorageInner : IDisposable
         FaultInjector?.Invoke(after);
     }
 
+    private readonly LsmWriteBatch _coalesceBatch = new();
+
     private void WriteCore(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool isTombstone, LsmWriteBatch? batch)
     {
         using var operation = Lifetime.Enter();
-        EnterCurrentMemTableWriteLock();
+
+        if (!_currentMemTableLock.TryEnterWriteLock(0))
+        {
+            if (FaultInjector is null && batch is null && TryWriteCoalesced(key, value, isTombstone))
+            {
+                return;
+            }
+            var started = Stopwatch.GetTimestamp();
+            _currentMemTableLock.EnterWriteLock();
+            Metrics.RecordWriterWait(started);
+        }
 
         try
         {
             CheckHealthy();
+            InvalidateSortedSsTableRun();
             var memTable = (MemTable)_state.CurrentMemTable;
             try
             {
@@ -1382,6 +2817,213 @@ internal sealed partial class LsmStorageInner : IDisposable
         finally
         {
             _currentMemTableLock.ExitWriteLock();
+        }
+    }
+
+    private const int CoalesceSlotCount = 64;
+    private readonly object _coalesceLock = new();
+    private CoalescedWriteWaiter? _coalesceHead;
+    private CoalescedWriteWaiter? _coalesceTail;
+    private readonly Stack<CoalescedWriteWaiter> _coalescePool = new(CoalesceSlotCount);
+
+    private bool TryWriteCoalesced(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool isTombstone)
+    {
+        CoalescedWriteWaiter waiter;
+        bool isLeader;
+        lock (_coalesceLock)
+        {
+            waiter = _coalescePool.Count > 0 ? _coalescePool.Pop() : new CoalescedWriteWaiter();
+            waiter.Initialize(key, value, isTombstone);
+            isLeader = _coalesceHead is null;
+            if (isLeader)
+            {
+                _coalesceHead = _coalesceTail = waiter;
+            }
+            else
+            {
+                _coalesceTail!.Next = waiter;
+                _coalesceTail = waiter;
+            }
+        }
+
+        if (!isLeader)
+        {
+            waiter.Event.Wait();
+            var error = waiter.Exception;
+            lock (_coalesceLock)
+            {
+                waiter.Reset();
+                if (_coalescePool.Count < CoalesceSlotCount)
+                {
+                    _coalescePool.Push(waiter);
+                }
+            }
+            if (error is not null)
+            {
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(error).Throw();
+            }
+            return true;
+        }
+
+        while (true)
+        {
+            var started = Stopwatch.GetTimestamp();
+            _currentMemTableLock.EnterWriteLock();
+            Metrics.RecordWriterWait(started);
+            CoalescedWriteWaiter? batchHead;
+            lock (_coalesceLock)
+            {
+                batchHead = _coalesceHead;
+                _coalesceHead = _coalesceTail = null;
+            }
+
+            if (batchHead is null)
+            {
+                _currentMemTableLock.ExitWriteLock();
+                break;
+            }
+
+            Exception? groupError = null;
+            try
+            {
+                CheckHealthy();
+                InvalidateSortedSsTableRun();
+                var memTable = (MemTable)_state.CurrentMemTable;
+                try
+                {
+                    if (batchHead.Next is null)
+                    {
+                        if (batchHead.IsTombstone)
+                        {
+                            memTable.DeleteRaw(batchHead.KeySpan);
+                        }
+                        else
+                        {
+                            memTable.PutRaw(batchHead.KeySpan, batchHead.ValueSpan);
+                        }
+                        Metrics.RecordWrite(batchHead.KeyLength + batchHead.ValueLength);
+                    }
+                    else
+                    {
+                        _coalesceBatch.Clear();
+                        for (var curr = batchHead; curr is not null; curr = curr.Next)
+                        {
+                            if (curr.IsTombstone)
+                            {
+                                _coalesceBatch.Delete(curr.KeySpan);
+                            }
+                            else
+                            {
+                                _coalesceBatch.Put(curr.KeySpan, curr.ValueSpan);
+                            }
+                        }
+                        memTable.WriteBatch(_coalesceBatch);
+                        Metrics.RecordWrite(_coalesceBatch.ByteCount);
+                    }
+                    InvalidateSortedSsTableRun();
+                    if (memTable.Size >= _memTableSizeLimit)
+                    {
+                        FreezeMemTable();
+                    }
+                }
+                catch (Exception exception)
+                {
+                    var failure = new StorageOperationException(memTable.WriteOutcome, exception);
+                    if (failure.Outcome != StorageCommitOutcome.NotCommitted)
+                    {
+                        MarkFaulted(failure);
+                    }
+                    groupError = failure;
+                }
+            }
+            catch (Exception exception)
+            {
+                groupError = exception;
+            }
+            finally
+            {
+                _currentMemTableLock.ExitWriteLock();
+            }
+
+            var selfIncluded = ReferenceEquals(batchHead, waiter);
+            var follower = batchHead;
+            while (follower is not null)
+            {
+                var next = follower.Next;
+                if (ReferenceEquals(follower, waiter))
+                {
+                    selfIncluded = true;
+                }
+                else
+                {
+                    follower.Exception = groupError;
+                    follower.Event.Set();
+                }
+                follower = next;
+            }
+
+            if (selfIncluded)
+            {
+                lock (_coalesceLock)
+                {
+                    waiter.Reset();
+                    if (_coalescePool.Count < CoalesceSlotCount)
+                    {
+                        _coalescePool.Push(waiter);
+                    }
+                }
+
+                if (groupError is not null)
+                {
+                    System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(groupError).Throw();
+                }
+
+                return true;
+            }
+        }
+
+        return true;
+    }
+
+    private sealed class CoalescedWriteWaiter
+    {
+        public readonly ManualResetEventSlim Event = new(false);
+        public byte[] KeyBuffer = new byte[64];
+        public byte[] ValueBuffer = new byte[256];
+        public int KeyLength;
+        public int ValueLength;
+        public bool IsTombstone;
+        public Exception? Exception;
+        public CoalescedWriteWaiter? Next;
+
+        public ReadOnlySpan<byte> KeySpan => KeyBuffer.AsSpan(0, KeyLength);
+        public ReadOnlySpan<byte> ValueSpan => ValueBuffer.AsSpan(0, ValueLength);
+
+        public void Initialize(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool isTombstone)
+        {
+            Event.Reset();
+            if (KeyBuffer.Length < key.Length) KeyBuffer = new byte[Math.Max(key.Length, KeyBuffer.Length * 2)];
+            key.CopyTo(KeyBuffer);
+            KeyLength = key.Length;
+            IsTombstone = isTombstone;
+            if (!isTombstone)
+            {
+                if (ValueBuffer.Length < value.Length) ValueBuffer = new byte[Math.Max(value.Length, ValueBuffer.Length * 2)];
+                value.CopyTo(ValueBuffer);
+                ValueLength = value.Length;
+            }
+            else
+            {
+                ValueLength = 0;
+            }
+            Exception = null;
+            Next = null;
+        }
+
+        public void Reset()
+        {
+            Exception = null;
+            Next = null;
         }
     }
 
@@ -1724,16 +3366,22 @@ internal sealed partial class LsmStorageInner : IDisposable
                 }
 
                 var merge = new MergeIterator(mergeInputs);
-
-                await foreach (var entry in merge.EnumerateAsync(cancellationToken))
+                if (builder is BufferedSsTableBuilder bufferedBuilder)
                 {
-                    if (dropTombstones && entry.Value.IsTombstone)
+                    addedEntries = await merge.CompactToBuilderAsync(bufferedBuilder, dropTombstones, cancellationToken).ConfigureAwait(false);
+                }
+                else
+                {
+                    await foreach (var entry in merge.EnumerateAsync(cancellationToken))
                     {
-                        continue;
-                    }
+                        if (dropTombstones && entry.Value.IsTombstone)
+                        {
+                            continue;
+                        }
 
-                    await builder.AddAsync(entry.Key, entry.Value, cancellationToken);
-                    addedEntries++;
+                        await builder.AddAsync(entry.Key, entry.Value, cancellationToken);
+                        addedEntries++;
+                    }
                 }
 
                 if (addedEntries > 0)

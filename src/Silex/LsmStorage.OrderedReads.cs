@@ -24,6 +24,12 @@ public sealed partial class LsmStorage
         return new OrderedReadCursor(this, null, null, range ?? new OrderedReadRange(), direction);
     }
 
+    public ValueTask<long> ScanReverseRawAsync<TArg>(TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries = long.MaxValue, CancellationToken cancellationToken = default)
+    {
+        CheckDisposed();
+        return _inner.ScanReverseRawAsync(arg, reader, maxEntries, cancellationToken);
+    }
+
     internal async ValueTask ReadOrderedBatchAsync(OrderedReadRange range, OrderedReadDirection direction,
         byte[]? resume, OrderedReadBatch batch, bool exhausted, CancellationToken cancellationToken)
     {

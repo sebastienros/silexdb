@@ -114,8 +114,10 @@ internal sealed class BlockMetadataStore : IReadOnlyList<BlockMetadata>, IDispos
                     source.Checksum,
                     firstKeyOffset,
                     firstKey.Length,
+                    ReadPrefixWord(firstKey),
                     lastKeyOffset,
-                    lastKey.Length);
+                    lastKey.Length,
+                    ReadPrefixWord(lastKey));
             }
 
             return new BlockMetadataStore(descriptors, boundaryKeys);
@@ -151,19 +153,48 @@ internal sealed class BlockMetadataStore : IReadOnlyList<BlockMetadata>, IDispos
         return GetBoundaryKeyMemory().Slice(descriptor.LastKeyOffset, descriptor.LastKeyLength);
     }
 
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static ulong ReadPrefixWord(ReadOnlySpan<byte> key)
+    {
+        if (key.Length >= 8)
+        {
+            return System.Buffers.Binary.BinaryPrimitives.ReadUInt64BigEndian(key);
+        }
+        ulong word = 0;
+        for (var i = 0; i < key.Length; i++)
+        {
+            word |= (ulong)key[i] << (56 - (i * 8));
+        }
+        return word;
+    }
+
     internal int FindMatchingBlockIndex(ReadOnlySpan<byte> key)
     {
         var start = 0;
         var end = _descriptors.Length - 1;
         var boundaryKeys = GetBoundaryKeySpan();
+        var keyPrefix = ReadPrefixWord(key);
 
         while (start <= end)
         {
             var middle = start + (end - start) / 2;
             ref readonly var descriptor = ref _descriptors[middle];
-            var lastKey = boundaryKeys.Slice(descriptor.LastKeyOffset, descriptor.LastKeyLength);
+            int cmp;
+            if (keyPrefix != descriptor.LastKeyPrefix)
+            {
+                cmp = keyPrefix < descriptor.LastKeyPrefix ? -1 : 1;
+            }
+            else if (key.Length <= 8 && descriptor.LastKeyLength <= 8)
+            {
+                cmp = key.Length.CompareTo(descriptor.LastKeyLength);
+            }
+            else
+            {
+                var lastKey = boundaryKeys.Slice(descriptor.LastKeyOffset, descriptor.LastKeyLength);
+                cmp = key.SequenceCompareTo(lastKey);
+            }
 
-            if (key.SequenceCompareTo(lastKey) > 0)
+            if (cmp > 0)
             {
                 start = middle + 1;
             }
@@ -179,6 +210,10 @@ internal sealed class BlockMetadataStore : IReadOnlyList<BlockMetadata>, IDispos
         }
 
         ref readonly var candidate = ref _descriptors[start];
+        if (keyPrefix != candidate.FirstKeyPrefix)
+        {
+            return keyPrefix > candidate.FirstKeyPrefix ? start : -1;
+        }
         var firstKey = boundaryKeys.Slice(candidate.FirstKeyOffset, candidate.FirstKeyLength);
         return key.SequenceCompareTo(firstKey) >= 0 ? start : -1;
     }
@@ -188,13 +223,26 @@ internal sealed class BlockMetadataStore : IReadOnlyList<BlockMetadata>, IDispos
         var start = 0;
         var end = _descriptors.Length - 1;
         var boundaryKeys = GetBoundaryKeySpan();
+        var keyPrefix = ReadPrefixWord(key);
 
         while (start <= end)
         {
             var middle = start + (end - start) / 2;
             ref readonly var descriptor = ref _descriptors[middle];
-            var firstKey = boundaryKeys.Slice(descriptor.FirstKeyOffset, descriptor.FirstKeyLength);
-            var comparison = firstKey.SequenceCompareTo(key);
+            int comparison;
+            if (keyPrefix != descriptor.FirstKeyPrefix)
+            {
+                comparison = descriptor.FirstKeyPrefix < keyPrefix ? -1 : 1;
+            }
+            else if (key.Length <= 8 && descriptor.FirstKeyLength <= 8)
+            {
+                comparison = descriptor.FirstKeyLength.CompareTo(key.Length);
+            }
+            else
+            {
+                var firstKey = boundaryKeys.Slice(descriptor.FirstKeyOffset, descriptor.FirstKeyLength);
+                comparison = firstKey.SequenceCompareTo(key);
+            }
 
             if (comparison == 0)
             {
@@ -265,8 +313,10 @@ internal sealed class BlockMetadataStore : IReadOnlyList<BlockMetadata>, IDispos
             uint checksum,
             int firstKeyOffset,
             int firstKeyLength,
+            ulong firstKeyPrefix,
             int lastKeyOffset,
-            int lastKeyLength)
+            int lastKeyLength,
+            ulong lastKeyPrefix)
         {
             Offset = offset;
             UncompressedLength = uncompressedLength;
@@ -274,17 +324,22 @@ internal sealed class BlockMetadataStore : IReadOnlyList<BlockMetadata>, IDispos
             Checksum = checksum;
             FirstKeyOffset = firstKeyOffset;
             FirstKeyLength = firstKeyLength;
+            FirstKeyPrefix = firstKeyPrefix;
             LastKeyOffset = lastKeyOffset;
             LastKeyLength = lastKeyLength;
+            LastKeyPrefix = lastKeyPrefix;
         }
 
         public readonly long Offset;
+        public readonly int uncompressedLength_unused => UncompressedLength;
         public readonly int UncompressedLength;
         public readonly SstCompression Compression;
         public readonly uint Checksum;
         public readonly int FirstKeyOffset;
         public readonly int FirstKeyLength;
+        public readonly ulong FirstKeyPrefix;
         public readonly int LastKeyOffset;
         public readonly int LastKeyLength;
+        public readonly ulong LastKeyPrefix;
     }
 }

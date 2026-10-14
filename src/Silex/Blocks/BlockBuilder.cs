@@ -21,6 +21,8 @@ internal sealed class BlockBuilder : IDisposable
     private int _lastKeyLength;
     private bool _disposed;
 
+    internal IBlockEncoder Encoder => _blockEncoder;
+
     public BlockBuilder(IBlockEncoder blockEncoder)
     {
         _blockEncoder = blockEncoder;
@@ -77,6 +79,36 @@ internal sealed class BlockBuilder : IDisposable
         _lastKeyLength = actualKeyLength;
 
         return true;    
+    }
+
+    public bool AddRaw(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool isTombstone)
+    {
+        var keyLength = key.Length;
+        var valueLength = isTombstone ? 0 : value.Length;
+        var size = _blockEncoder.EstimateSize(keyLength, valueLength, isTombstone);
+
+        if (_estimatedSize > 0 && _estimatedSize + size > _blockEncoder.BlockSize)
+        {
+            return false;
+        }
+
+        var keyOffset = _keyBuffer.WrittenCount;
+        key.CopyTo(_keyBuffer.GetSpan(keyLength));
+        _keyBuffer.Advance(keyLength);
+
+        var valueOffset = _valueBuffer.WrittenCount;
+        if (!isTombstone && valueLength > 0)
+        {
+            value.CopyTo(_valueBuffer.GetSpan(valueLength));
+            _valueBuffer.Advance(valueLength);
+        }
+
+        _blockEntries.Add(new BlockEntry(keyOffset, keyLength, valueOffset, isTombstone ? -1 : valueLength));
+        _estimatedSize += size;
+        _lastKeyOffset = keyOffset;
+        _lastKeyLength = keyLength;
+
+        return true;
     }
 
     /// <summary>

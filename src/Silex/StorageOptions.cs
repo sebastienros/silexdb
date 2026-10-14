@@ -215,13 +215,14 @@ public class StorageOptions
     public bool SyncWriteAheadLogToDisk { get; set; } = false;
 
     /// <summary>
-    /// Maximum number of ready MVCC transactions sharing one WAL synchronization. One disables grouping.
+    /// Maximum number of ready MVCC transactions sharing one WAL write/synchronization group. One disables grouping.
     /// </summary>
     /// <remarks>
     /// Only used by <see cref="MvccStorage"/>; values from 1 through 64 are supported. Grouping requires
-    /// WAL and synchronous durability. At most twice this number of commits are admitted at once;
-    /// further callers wait with cancellation. Ready commits are validated in admission order, without
-    /// an intentional collection delay. Ordinary LSM writes and MVCC Put/Delete remain unchanged.
+    /// WAL (<see cref="UseWriteAheadLog"/>) and works with both synchronous and unsynchronized WAL durability.
+    /// At most twice this number of commits are admitted at once; further callers wait with cancellation.
+    /// Ready commits are validated in admission order, without an intentional collection delay. Ordinary
+    /// LSM writes and MVCC Put/Delete remain unchanged.
     /// </remarks>
     public int MvccCommitGroupSize { get; set; } = 1;
 

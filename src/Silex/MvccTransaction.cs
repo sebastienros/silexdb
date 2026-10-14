@@ -14,11 +14,14 @@ public sealed class MvccTransaction : IDisposable
 {
     private MvccStorage? _storage;
     private readonly MvccWriteBuffer _writes;
+    private readonly int _pinSlot;
+    private int _commitInFlight;
 
-    internal MvccTransaction(MvccStorage storage, long sequence, TransactionLimits limits)
+    internal MvccTransaction(MvccStorage storage, long sequence, int pinSlot, MvccWriteBuffer writes)
     {
         _storage = storage;
-        _writes = new MvccWriteBuffer(limits: limits);
+        _writes = writes;
+        _pinSlot = pinSlot;
         Sequence = sequence;
     }
 
@@ -357,13 +360,40 @@ public sealed class MvccTransaction : IDisposable
     /// publication, even if cancellation is subsequently requested. Transactions are single-consumer;
     /// do not mutate or dispose one while its commit is in flight.
     /// </remarks>
-    public async ValueTask<bool> TryCommitAsync(CancellationToken cancellationToken = default)
+    public ValueTask<bool> TryCommitAsync(CancellationToken cancellationToken = default)
     {
         var storage = GetStorage();
+        Volatile.Write(ref _commitInFlight, 1);
 
         try
         {
-            Conflict = await storage.TryCommitAsync(Sequence, _writes, cancellationToken).ConfigureAwait(false);
+            var commitTask = storage.TryCommitAsync(Sequence, _writes, cancellationToken);
+            if (commitTask.IsCompletedSuccessfully)
+            {
+                Conflict = commitTask.GetAwaiter().GetResult();
+                if (Conflict is null)
+                {
+                    CommitSequence = _writes.CommitSequence;
+                }
+                Volatile.Write(ref _commitInFlight, 0);
+                Complete(poolBuffer: true);
+                return ValueTask.FromResult(Conflict is null);
+            }
+            return AwaitTryCommitAsync(commitTask);
+        }
+        catch
+        {
+            Volatile.Write(ref _commitInFlight, 0);
+            Complete(poolBuffer: true);
+            throw;
+        }
+    }
+
+    private async ValueTask<bool> AwaitTryCommitAsync(ValueTask<MvccConflict?> commitTask)
+    {
+        try
+        {
+            Conflict = await commitTask.ConfigureAwait(false);
             if (Conflict is null)
             {
                 CommitSequence = _writes.CommitSequence;
@@ -372,7 +402,8 @@ public sealed class MvccTransaction : IDisposable
         }
         finally
         {
-            Complete();
+            Volatile.Write(ref _commitInFlight, 0);
+            Complete(poolBuffer: true);
         }
     }
 
@@ -380,15 +411,29 @@ public sealed class MvccTransaction : IDisposable
     /// Commits all buffered writes atomically, throwing on a conflict.
     /// </summary>
     /// <exception cref="MvccConflictException">A dependency conflict, with owned diagnostics in its Conflict property.</exception>
-    public async ValueTask CommitAsync(CancellationToken cancellationToken = default)
+    public ValueTask CommitAsync(CancellationToken cancellationToken = default)
     {
-        if (!await TryCommitAsync(cancellationToken).ConfigureAwait(false))
+        var task = TryCommitAsync(cancellationToken);
+        if (task.IsCompletedSuccessfully)
+        {
+            if (!task.GetAwaiter().GetResult())
+            {
+                throw new MvccConflictException(Conflict!);
+            }
+            return ValueTask.CompletedTask;
+        }
+        return AwaitCommitOrThrowAsync(task);
+    }
+
+    private async ValueTask AwaitCommitOrThrowAsync(ValueTask<bool> task)
+    {
+        if (!await task.ConfigureAwait(false))
         {
             throw new MvccConflictException(Conflict!);
         }
     }
 
-    public void Dispose() => Complete();
+    public void Dispose() => Complete(poolBuffer: Volatile.Read(ref _commitInFlight) == 0);
 
     private void TrackRead(ReadOnlySpan<byte> key)
     {
@@ -403,13 +448,20 @@ public sealed class MvccTransaction : IDisposable
         return _storage ?? throw new ObjectDisposedException(nameof(MvccTransaction));
     }
 
-    private void Complete()
+    private void Complete(bool poolBuffer)
     {
         var storage = Interlocked.Exchange(ref _storage, null);
         if (storage is not null)
         {
-            _writes.Dispose();
-            storage.ReleaseSnapshot(Sequence);
+            if (poolBuffer)
+            {
+                storage.ReturnWriteBuffer(_writes);
+            }
+            else
+            {
+                _writes.Dispose();
+            }
+            storage.ReleaseTransientRead(Sequence, _pinSlot);
         }
     }
 }

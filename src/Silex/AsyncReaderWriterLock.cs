@@ -2,7 +2,11 @@ namespace Silex;
 
 internal sealed class AsyncReaderWriterLock
 {
+    private const int StripeCount = 64;
+    private const int StrideInts = 16;
+
     private readonly object _gate = new();
+    private readonly int[] _readerStripes = new int[StripeCount * StrideInts];
     private Waiter? _queueHead;
     private Waiter? _queueTail;
     private int _activeReaders;
@@ -24,7 +28,74 @@ internal sealed class AsyncReaderWriterLock
 
     internal int ActiveReaderCount
     {
-        get => Volatile.Read(ref _activeReaders);
+        get
+        {
+            var total = Volatile.Read(ref _activeReaders);
+            for (var i = 0; i < StripeCount; i++)
+            {
+                total += Volatile.Read(ref _readerStripes[i * StrideInts]);
+            }
+            return total;
+        }
+    }
+
+    public bool TryEnterReadLock()
+    {
+        if (Volatile.Read(ref _readerGate) == 0)
+        {
+            Interlocked.Increment(ref _activeReaders);
+            if (Volatile.Read(ref _readerGate) == 0)
+            {
+                return true;
+            }
+
+            ExitReadLock();
+        }
+
+        return false;
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public bool TryEnterReadLock(out int stripeSlot)
+    {
+        if (Volatile.Read(ref _readerGate) == 0)
+        {
+            stripeSlot = StripedCounter.GetThreadStripeSlot() * 2;
+            Interlocked.Increment(ref _readerStripes[stripeSlot]);
+            if (Volatile.Read(ref _readerGate) == 0)
+            {
+                return true;
+            }
+
+            ExitReadLock(stripeSlot);
+        }
+
+        stripeSlot = -1;
+        return false;
+    }
+
+    public void ExitReadLock(int stripeSlot)
+    {
+        var remaining = Interlocked.Decrement(ref _readerStripes[stripeSlot]);
+        if (remaining < 0)
+        {
+            Interlocked.Increment(ref _readerStripes[stripeSlot]);
+            throw new SynchronizationLockException($"Invalid usage of {nameof(ExitReadLock)}(), expected {nameof(TryEnterReadLock)}() first.");
+        }
+
+        if (remaining != 0 || Volatile.Read(ref _readerGate) == 0 || ActiveReaderCount != 0)
+        {
+            return;
+        }
+
+        Waiter? granted;
+        lock (_gate)
+        {
+            granted = PromoteWaiters();
+            UpdateReaderGate();
+        }
+
+        CompleteGrantedWaiters(granted);
     }
 
     public Task EnterReadLockAsync(CancellationToken cancellationToken = default)
@@ -58,7 +129,7 @@ internal sealed class AsyncReaderWriterLock
             throw new SynchronizationLockException($"Invalid usage of {nameof(ExitReadLock)}(), expected {nameof(EnterReadLockAsync)}() first.");
         }
 
-        if (remaining != 0 || Volatile.Read(ref _readerGate) == 0)
+        if (remaining != 0 || Volatile.Read(ref _readerGate) == 0 || ActiveReaderCount != 0)
         {
             return;
         }
@@ -87,7 +158,7 @@ internal sealed class AsyncReaderWriterLock
         {
             Interlocked.Exchange(ref _readerGate, 1);
 
-            if (!_activeWriter && Volatile.Read(ref _activeReaders) == 0 && _queueHead is null)
+            if (!_activeWriter && ActiveReaderCount == 0 && _queueHead is null)
             {
                 _activeWriter = true;
                 return Task.CompletedTask;
@@ -140,7 +211,7 @@ internal sealed class AsyncReaderWriterLock
         {
             Interlocked.Exchange(ref _readerGate, 1);
 
-            if (!_activeWriter && Volatile.Read(ref _activeReaders) == 0 && _queueHead is null)
+            if (!_activeWriter && ActiveReaderCount == 0 && _queueHead is null)
             {
                 _activeWriter = true;
                 return ValueTask.FromResult(true);
@@ -231,7 +302,7 @@ internal sealed class AsyncReaderWriterLock
             return false;
         }
 
-        return enterLockType == EnterLockType.Read || Volatile.Read(ref _activeReaders) == 0;
+        return enterLockType == EnterLockType.Read || ActiveReaderCount == 0;
     }
 
     private void CancelWaiter(Waiter waiter)
@@ -276,7 +347,7 @@ internal sealed class AsyncReaderWriterLock
 
         if (_queueHead.EnterLockType == EnterLockType.Write)
         {
-            if (Volatile.Read(ref _activeReaders) != 0)
+            if (ActiveReaderCount != 0)
             {
                 return null;
             }
@@ -424,5 +495,218 @@ internal sealed class AsyncReaderWriterLock
         Queued,
         Granted,
         Canceled,
+    }
+}
+
+internal sealed class StripedReaderWriterLock : IDisposable
+{
+    private const int StripeCount = 64;
+    private const int StrideInts = 16;
+
+    private readonly object _writeLock = new();
+    private readonly object _readerDrainGate = new();
+    private readonly int[] _readerStripes = new int[StripeCount * StrideInts];
+    private int _writerGate;
+    private int _waitingWriters;
+    private int _blockedReaders;
+    private int _anyReaderEntered;
+
+    public bool IsWriteLockHeld => Monitor.IsEntered(_writeLock);
+
+    public int WaitingReadCount => Volatile.Read(ref _blockedReaders);
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public void EnterReadLock()
+    {
+        var slot = StripedCounter.GetThreadStripeSlot() * 2;
+        if (Volatile.Read(ref _writerGate) == 0)
+        {
+            Interlocked.Increment(ref _readerStripes[slot]);
+            if (Volatile.Read(ref _anyReaderEntered) == 0)
+            {
+                Volatile.Write(ref _anyReaderEntered, 1);
+            }
+            if (Volatile.Read(ref _writerGate) == 0)
+            {
+                return;
+            }
+
+            if (Interlocked.Decrement(ref _readerStripes[slot]) == 0)
+            {
+                NotifyWriterIfDrained();
+            }
+        }
+
+        EnterReadLockSlow(slot);
+    }
+
+    private void EnterReadLockSlow(int slot)
+    {
+        var spinner = new SpinWait();
+        while (Volatile.Read(ref _writerGate) != 0 && !spinner.NextSpinWillYield)
+        {
+            spinner.SpinOnce();
+        }
+
+        lock (_readerDrainGate)
+        {
+            Interlocked.Increment(ref _blockedReaders);
+            try
+            {
+                while (true)
+                {
+                    while (Volatile.Read(ref _writerGate) != 0)
+                    {
+                        Monitor.Wait(_readerDrainGate);
+                    }
+                    Interlocked.Increment(ref _readerStripes[slot]);
+                    Volatile.Write(ref _anyReaderEntered, 1);
+                    if (Volatile.Read(ref _writerGate) == 0)
+                    {
+                        return;
+                    }
+                    if (Interlocked.Decrement(ref _readerStripes[slot]) == 0 && ActiveReaders == 0)
+                    {
+                        Monitor.PulseAll(_readerDrainGate);
+                    }
+                }
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _blockedReaders);
+            }
+        }
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public void ExitReadLock()
+    {
+        var slot = StripedCounter.GetThreadStripeSlot() * 2;
+        if (Interlocked.Decrement(ref _readerStripes[slot]) == 0 && Volatile.Read(ref _writerGate) != 0)
+        {
+            NotifyWriterIfDrained();
+        }
+    }
+
+    private void NotifyWriterIfDrained()
+    {
+        lock (_readerDrainGate)
+        {
+            if (Volatile.Read(ref _writerGate) != 0 && ActiveReaders == 0)
+            {
+                Monitor.PulseAll(_readerDrainGate);
+            }
+        }
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public bool TryEnterWriteLock(int millisecondsTimeout)
+    {
+        if (Volatile.Read(ref _writerGate) != 0 || !Monitor.TryEnter(_writeLock))
+        {
+            return false;
+        }
+
+        Interlocked.Exchange(ref _writerGate, 1);
+        if (ActiveReaders == 0)
+        {
+            return true;
+        }
+
+        if (Volatile.Read(ref _waitingWriters) == 0)
+        {
+            Volatile.Write(ref _writerGate, 0);
+        }
+        Monitor.Exit(_writeLock);
+        if (Volatile.Read(ref _blockedReaders) != 0 && Volatile.Read(ref _waitingWriters) == 0)
+        {
+            lock (_readerDrainGate)
+            {
+                Monitor.PulseAll(_readerDrainGate);
+            }
+        }
+        return false;
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public void EnterWriteLock()
+    {
+        Interlocked.Increment(ref _waitingWriters);
+        Interlocked.Exchange(ref _writerGate, 1);
+        Monitor.Enter(_writeLock);
+        Interlocked.Decrement(ref _waitingWriters);
+        Interlocked.Exchange(ref _writerGate, 1);
+
+        if (ActiveReaders != 0)
+        {
+            WaitForReadersToDrain();
+        }
+    }
+
+    private void WaitForReadersToDrain()
+    {
+        var spinner = new SpinWait();
+        while (ActiveReaders != 0 && !spinner.NextSpinWillYield)
+        {
+            spinner.SpinOnce();
+        }
+
+        if (ActiveReaders == 0)
+        {
+            return;
+        }
+
+        lock (_readerDrainGate)
+        {
+            while (ActiveReaders != 0)
+            {
+                Monitor.Wait(_readerDrainGate);
+            }
+        }
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public void ExitWriteLock()
+    {
+        if (Volatile.Read(ref _waitingWriters) == 0)
+        {
+            Volatile.Write(ref _writerGate, 0);
+        }
+        Monitor.Exit(_writeLock);
+        if (Volatile.Read(ref _blockedReaders) != 0 && Volatile.Read(ref _waitingWriters) == 0)
+        {
+            lock (_readerDrainGate)
+            {
+                Monitor.PulseAll(_readerDrainGate);
+            }
+        }
+    }
+
+    private int ActiveReaders
+    {
+        get
+        {
+            if (Volatile.Read(ref _anyReaderEntered) == 0)
+            {
+                return 0;
+            }
+            Volatile.Write(ref _anyReaderEntered, 0);
+            Interlocked.MemoryBarrier();
+            var total = 0;
+            var max = StripedCounter.MaxActiveStripes;
+            for (var i = 0; i < max; i++)
+            {
+                total += Volatile.Read(ref _readerStripes[i * StrideInts]);
+            }
+            if (total != 0)
+            {
+                Volatile.Write(ref _anyReaderEntered, 1);
+            }
+            return total;
+        }
+    }
+
+    public void Dispose()
+    {
     }
 }

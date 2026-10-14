@@ -163,8 +163,92 @@ internal sealed class WriteAheadLog : IDisposable
         Metrics?.RecordWalSync(started);
     }
 
-    internal void SynchronizeGroup()
+    internal void AppendGroup(LsmWriteBatch[] batches, StorageCommitOutcome[] outcomes, int count)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        // When no fault injector is active and there are multiple batches, coalesce all frames into
+        // _buffer and write them in one FileStream.Write syscall while keeping each frame independent.
+        if (_faultInjector is null && count > 1)
+        {
+            AppendOutcome = StorageCommitOutcome.NotCommitted;
+            _buffer.Reset();
+            var validFrames = 0;
+
+            for (var b = 0; b < count; b++)
+            {
+                var batch = batches[b];
+                if (batch.Count == 0)
+                {
+                    outcomes[b] = StorageCommitOutcome.Committed;
+                    continue;
+                }
+
+                var frameStart = _buffer.WrittenCount;
+                _buffer.Advance(FrameHeaderSize);
+                var writer = new EncoderBinaryWriter(_buffer);
+                writer.WriteUInt32((uint)batch.Count);
+                for (var i = 0; i < batch.Count; i++)
+                {
+                    batch.GetEntry(i, out var key, out var value, out var isTombstone);
+                    WriteRawRecord(ref writer, key, value, isTombstone);
+                }
+                writer.Flush();
+
+                var payloadLength = checked((uint)(_buffer.WrittenCount - frameStart - FrameHeaderSize));
+                var footer = _buffer.GetSpan(FrameFooterSize);
+                BinaryPrimitives.WriteUInt32LittleEndian(footer, payloadLength);
+                BinaryPrimitives.WriteUInt32LittleEndian(footer[sizeof(uint)..], FrameCommitMarker);
+                _buffer.Advance(FrameFooterSize);
+
+                var frame = _buffer.WrittenSpan[frameStart..];
+                var payload = frame.Slice(FrameHeaderSize, (int)payloadLength);
+                BinaryPrimitives.WriteUInt32LittleEndian(frame, payloadLength);
+                BinaryPrimitives.WriteUInt32LittleEndian(frame[sizeof(uint)..], ~payloadLength);
+                BinaryPrimitives.WriteUInt32LittleEndian(frame[(2 * sizeof(uint))..], Crc32C.Compute(payload));
+                validFrames++;
+            }
+
+            if (validFrames == 0)
+            {
+                return;
+            }
+
+            AppendOutcome = StorageCommitOutcome.Indeterminate;
+            for (var b = 0; b < count; b++)
+            {
+                outcomes[b] = StorageCommitOutcome.Indeterminate;
+            }
+
+            var allFrames = _buffer.WrittenSpan;
+            _stream.Write(allFrames);
+            RecordWriteCount += validFrames;
+            Metrics?.RecordWalBytes(allFrames.Length);
+            AppendOutcome = StorageCommitOutcome.Committed;
+            return;
+        }
+
+        for (var i = 0; i < count; i++)
+        {
+            try
+            {
+                AppendBatch(batches[i], synchronize: false);
+            }
+            catch
+            {
+                outcomes[i] = AppendOutcome;
+                throw;
+            }
+            outcomes[i] = StorageCommitOutcome.Indeterminate;
+        }
+    }
+
+    internal void FlushGroup()
+    {
+        if (!_syncToDisk)
+        {
+            return;
+        }
         _faultInjector?.Invoke(StorageFaultPoint.WalBeforeSync);
         Synchronize();
         _faultInjector?.Invoke(StorageFaultPoint.WalAfterSync);

@@ -11,7 +11,7 @@ internal static class CommandLine
 {
     private static readonly Option<string> Benchmarks = new("--benchmarks")
     {
-        Description = "Comma-separated list: fillseq, fillrandom, fillsync, overwrite, readrandom, readmissing, readseq, seekrandom, deleterandom.",
+        Description = "Comma-separated list: fillseq, fillrandom, fillsync, overwrite, readrandom, readmissing, readseq, readreverse, seekrandom, scanlimit, scanskip, scancount, deleterandom.",
         DefaultValueFactory = _ => "fillseq,readrandom,readseq",
     };
 
@@ -101,6 +101,46 @@ internal static class CommandLine
     {
         Description = "Entries read after each seek in seekrandom.",
         DefaultValueFactory = _ => 0,
+    };
+
+    private static readonly Option<int> ScanSkip = new("--scan_skip")
+    {
+        Description = "Entries skipped before collecting entries in scanskip.",
+        DefaultValueFactory = _ => 5_000,
+    };
+
+    private static readonly Option<int> ScanLimit = new("--scan_limit")
+    {
+        Description = "Maximum entries returned per scan operation in scanlimit and scanskip.",
+        DefaultValueFactory = _ => 100,
+    };
+
+    private static readonly Option<long> Scans = new("--scans")
+    {
+        Description = "Number of scan iterations per thread for scanlimit/scanskip/scancount (defaults to auto-scaled).",
+        DefaultValueFactory = _ => -1,
+    };
+
+    private static readonly Option<string> Mode = new("--mode")
+    {
+        Description = "Storage facade: lsm (plain LSM) or mvcc (transactional MVCC).",
+        DefaultValueFactory = _ => "lsm",
+    };
+
+    private static readonly Option<bool> Mvcc = new("--mvcc")
+    {
+        Description = "Shortcut for --mode=mvcc.",
+    };
+
+    private static readonly Option<int> MvccCommitGroupSize = new("--mvcc_commit_group_size")
+    {
+        Description = "Maximum ready MVCC transactions sharing one synchronous WAL fsync (1..64).",
+        DefaultValueFactory = _ => 1,
+    };
+
+    private static readonly Option<bool> FlushBeforeReads = new("--flush_before_reads")
+    {
+        Description = "Flush memtables and compact SSTs before running read/scan benchmarks after a fill.",
     };
 
     // Silex-specific knobs.
@@ -230,7 +270,8 @@ internal static class CommandLine
         var root = new RootCommand("Silex DbBench — a RocksDB db_bench-style benchmark tool for the Silex LSM store.")
         {
             Benchmarks, Num, Reads, ValueSize, KeySize, Db, UseExistingDb, Seed, Histogram, Threads,
-            WriteBufferSize, MaxWriteBufferNumber, BloomBits, BlockSize, CacheSize, SeekNexts,
+            WriteBufferSize, MaxWriteBufferNumber, BloomBits, BlockSize, CacheSize,
+            SeekNexts, ScanSkip, ScanLimit, Scans, Mode, Mvcc, MvccCommitGroupSize, FlushBeforeReads,
             Compaction, CompactionStyle, Wal, WalSync,
             Level0FileNumCompactionTrigger, NumLevels, MaxBytesForLevelBase, MaxBytesForLevelMultiplier,
             TargetSstSize, TargetFileSizeBase,
@@ -284,7 +325,13 @@ internal static class CommandLine
             Compression = ParseCompressionType(parseResult.GetValue(CompressionType)!),
             CompressionLevel = parseResult.GetValue(CompressionLevel),
             CompressionRatio = ParseCompressionRatio(parseResult.GetValue(CompressionRatio)),
-            SeekNexts = parseResult.GetValue(SeekNexts),
+            SeekNexts = Math.Max(0, parseResult.GetValue(SeekNexts)),
+            ScanSkip = Math.Max(0, parseResult.GetValue(ScanSkip)),
+            ScanLimit = Math.Max(1, parseResult.GetValue(ScanLimit)),
+            Scans = parseResult.GetValue(Scans),
+            Mvcc = parseResult.GetValue(Mvcc) || ParseModeIsMvcc(parseResult.GetValue(Mode)!),
+            MvccCommitGroupSize = parseResult.GetValue(MvccCommitGroupSize),
+            FlushBeforeReads = parseResult.GetValue(FlushBeforeReads),
             Compaction = compactionStyle == null ? parseResult.GetValue(Compaction) : ParseCompactionStyle(compactionStyle),
             Wal = parseResult.GetValue(Wal),
             WalSync = parseResult.GetValue(WalSync),
@@ -309,6 +356,13 @@ internal static class CommandLine
 
         return (options, warnings);
     }
+
+    private static bool ParseModeIsMvcc(string value) => value.ToLowerInvariant() switch
+    {
+        "lsm" or "plain" => false,
+        "mvcc" => true,
+        _ => throw new ArgumentException($"Unsupported --mode='{value}'. Use lsm or mvcc."),
+    };
 
     private static CompactionStrategy ParseCompactionStyle(string value) => value.ToLowerInvariant() switch
     {

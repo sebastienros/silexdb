@@ -17,8 +17,10 @@ internal sealed class SsTable : IDisposable
     private readonly ByteSlice? _lastKey;
     private readonly BlockBuilder _blockBuilder;
     private readonly BlockMetadataStore _blockMetadata;
+    private readonly BlockCache.Entry?[] _cachedEntries;
     private readonly FileStream _stream;
     private readonly SafeFileHandle _handle;
+    private readonly long _size;
     private bool _disposed;
     private long _fileId = -1;
 
@@ -28,7 +30,9 @@ internal sealed class SsTable : IDisposable
         _filename = filename;
         _stream = stream;
         _handle = stream.SafeFileHandle;
+        _size = stream.Length;
         _blockMetadata = blockMetadata;
+        _cachedEntries = new BlockCache.Entry?[blockMetadata.Length];
         BlockMetadata = _blockMetadata;
         MetaBlockOffset = metadataBlockOffset;
         _blockBuilder = blockBuilder;
@@ -80,7 +84,7 @@ internal sealed class SsTable : IDisposable
     /// The size of the backing SST file in bytes. Used by tiered compaction to measure the size of a
     /// sorted run (tier).
     /// </summary>
-    public long Size => _stream.Length;
+    public long Size => _size;
 
     public ByteSlice FirstKey => _firstKey!;
 
@@ -243,12 +247,78 @@ internal sealed class SsTable : IDisposable
         return (offset, (int)(offsetEnd - offset));
     }
 
+    internal bool IsSingleVersionCleanMvcc { get; set; }
+
+    internal static bool SingleVersionPerKey(IReadOnlyList<SsTable> tables)
+    {
+        for (var t = 0; t + 1 < tables.Count; t++)
+        {
+            var last = tables[t].LastKey.Span;
+            var first = tables[t + 1].FirstKey.Span;
+            if (last.Length >= 11 && first.Length >= 11 && last[0] == 1 && first[0] == 1 &&
+                last[..^8].SequenceEqual(first[..^8]))
+            {
+                return false;
+            }
+        }
+        for (var t = 0; t < tables.Count; t++)
+        {
+            if (tables[t].IsSingleVersionCleanMvcc)
+            {
+                continue;
+            }
+            var meta = tables[t].BlockMetadataArray;
+            for (var b = 0; b + 1 < meta.Length; b++)
+            {
+                var last = meta.GetLastKeySpan(b);
+                var first = meta.GetFirstKeySpan(b + 1);
+                if (last.Length >= 11 && first.Length >= 11 && last[0] == 1 && first[0] == 1 &&
+                    last[..^8].SequenceEqual(first[..^8]))
+                {
+                    return false;
+                }
+            }
+            tables[t].IsSingleVersionCleanMvcc = true;
+        }
+        return true;
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    internal bool TryAcquireCachedBlock(int index, BlockCache blockCache, CancellationToken cancellationToken, out BlockLease lease)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var entry = Volatile.Read(ref _cachedEntries[index]);
+        if (entry is not null && ReferenceEquals(entry.Owner, blockCache) && blockCache.TryAcquireEntry(entry, out lease))
+        {
+            return true;
+        }
+
+        lease = default;
+        return false;
+    }
+
     internal ValueTask<BlockLease> ReadBlockCachedAsync(int index, BlockCache blockCache, CancellationToken cancellationToken = default)
     {
-        return blockCache.GetOrLoadAsync(
+        if (TryAcquireCachedBlock(index, blockCache, cancellationToken, out var cachedLease))
+        {
+            return new ValueTask<BlockLease>(cachedLease);
+        }
+
+        var task = blockCache.GetOrLoadAsync(
             new BlockCacheKey(_id, index),
             new BlockLoader(this, index),
             cancellationToken);
+        if (task.IsCompletedSuccessfully)
+        {
+            var lease = task.GetAwaiter().GetResult();
+            if (lease.Entry is { IsEvicted: false } entry)
+            {
+                Volatile.Write(ref _cachedEntries[index], entry);
+            }
+            return new ValueTask<BlockLease>(lease);
+        }
+
+        return task;
     }
 
     /// <summary>
@@ -296,6 +366,23 @@ internal sealed class SsTable : IDisposable
 
         public Block ReadNextBlock()
         {
+            var block = ReadNextBlockBorrowed(out var memory, out var count);
+            if (block != null)
+            {
+                return block;
+            }
+            return _table._blockBuilder.Decode(memory);
+        }
+
+        public bool ForEachNextBlockRaw<TArg>(TArg arg, ReadRawEntryAction<TArg> reader, bool skipTombstones)
+        {
+            ReadNextBlockBorrowed(out var memory, out var count);
+            var borrow = new Block(_table._blockBuilder.Encoder, memory, memory.Length, count);
+            return borrow.ForEachRaw(arg, reader, skipTombstones);
+        }
+
+        private Block? ReadNextBlockBorrowed(out ReadOnlyMemory<byte> memory, out int count)
+        {
             if ((uint)_index >= (uint)_table._blockMetadata.Length)
             {
                 throw new InvalidOperationException("There are no more blocks in this SST.");
@@ -316,7 +403,10 @@ internal sealed class SsTable : IDisposable
 
             if (metadata.Compression == SstCompression.None)
             {
-                return _table._blockBuilder.Decode(stored.AsMemory(0, length));
+                memory = stored.AsMemory(0, length);
+                count = System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(
+                    memory.Span.Slice(length - sizeof(ushort), sizeof(ushort)));
+                return null;
             }
 
             var uncompressed = GetBuffer(ref _uncompressedBuffer, metadata.UncompressedLength);
@@ -325,7 +415,10 @@ internal sealed class SsTable : IDisposable
                 stored.AsSpan(0, length),
                 uncompressed.AsSpan(0, metadata.UncompressedLength));
 
-            return _table._blockBuilder.Decode(uncompressed.AsMemory(0, metadata.UncompressedLength));
+            memory = uncompressed.AsMemory(0, metadata.UncompressedLength);
+            count = System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(
+                memory.Span.Slice(metadata.UncompressedLength - sizeof(ushort), sizeof(ushort)));
+            return null;
         }
 
         public void Dispose()
