@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <PackAsTool>true</PackAsTool>
+    <IsPackable>true</IsPackable>
+    <PackageId>Silex.Tool</PackageId>
+    <ToolCommandName>silex</ToolCommandName>
+    <RuntimeIdentifiers>win-x64;osx-arm64;linux-x64</RuntimeIdentifiers>
+    <ToolPackageRuntimeIdentifiers>win-x64;osx-arm64;linux-x64;any</ToolPackageRuntimeIdentifiers>
+    <PublishAot Condition="'$(Configuration)' == 'Release'">true</PublishAot>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Description>Offline and local server administration for Silex databases.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="System.CommandLine" />
+    <PackageReference Include="System.IO.Hashing" />
+    <ProjectReference Include="../Silex/Silex.csproj" />
+    <InternalsVisibleTo Include="Silex.Tool.Tests" />
+  </ItemGroup>
+  <Target Name="BuildUi" BeforeTargets="PrepareForBuild" Inputs="@(UiSource)" Outputs="Ui/dist/index.html">
+    <Exec Command="npm ci --no-audit --no-fund" WorkingDirectory="Ui" />
+    <Exec Command="npm run build" WorkingDirectory="Ui" />
+  </Target>
+  <ItemGroup>
+    <UiSource Include="Ui/src/**/*;Ui/index.html;Ui/package.json;Ui/package-lock.json;Ui/vite.config.ts;Ui/tsconfig.json" />
+    <Content Remove="Ui/**/*" />
+    <None Update="Ui/**/*" CopyToOutputDirectory="Never" CopyToPublishDirectory="Never" />
+  </ItemGroup>
+  <Target Name="EmbedUi" BeforeTargets="AssignTargetPaths" DependsOnTargets="BuildUi">
+    <ItemGroup>
+      <UiAsset Include="Ui/dist/**/*" />
+      <EmbeddedResource Include="@(UiAsset)" LogicalName="ui/%(UiAsset.RecursiveDir)%(UiAsset.Filename)%(UiAsset.Extension)" />
+    </ItemGroup>
+  </Target>
+</Project>

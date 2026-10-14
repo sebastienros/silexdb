@@ -8,6 +8,23 @@ public class BlockTests
     private static int DecodeInt32(ByteSlice value) => new Silex.Serialization.Int32Encoder().Decode(value.Span);
 
     [Test]
+    [Arguments(1024 * 1024)]
+    [Arguments(16 * 1024 * 1024 - 3)]
+    public async Task LargeBlocksRetainTheirFooterWhenTheStreamBecomesContiguous(int valueLength)
+    {
+        var encoder = new DefaultBlockEncoder();
+        using var builder = new BlockBuilder(encoder);
+        var value = new byte[valueLength];
+        value[^1] = 254;
+        await Assert.That(builder.Add(ByteSlice.FromMemory("key"u8.ToArray()), ByteSlice.FromMemory(value))).IsTrue();
+        using var encoded = builder.BuildBlock();
+        using var decoded = encoder.Decode(encoded.Memory);
+        await Assert.That(decoded.Offsets.Count).IsEqualTo(1);
+        var matches = decoded.TryGetValue("key"u8, out var bytes) && bytes.SequenceEqual(value);
+        await Assert.That(matches).IsTrue();
+    }
+
+    [Test]
     public async Task ShouldEncodeBlock()
     {
         var blockBuilder = new BlockBuilder (new DefaultBlockEncoder());

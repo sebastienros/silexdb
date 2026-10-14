@@ -21,8 +21,6 @@ internal sealed class Manifest
     private const string FileName = "manifest";
     private const string TempFileName = "manifest.tmp";
 
-    private static readonly JsonSerializerOptions _jsonOptions = new() { WriteIndented = false };
-
     /// <summary>
     /// The manifest schema version.
     /// </summary>
@@ -66,7 +64,7 @@ internal sealed class Manifest
         }
 
         var json = File.ReadAllText(path);
-        var manifest = JsonSerializer.Deserialize<Manifest>(json, _jsonOptions);
+        var manifest = JsonSerializer.Deserialize(json, StorageJsonContext.Default.Manifest);
 
         if (manifest == null || manifest.Version != 1 || manifest.L0 == null
             || manifest.Levels == null || manifest.Levels.Any(level => level == null))

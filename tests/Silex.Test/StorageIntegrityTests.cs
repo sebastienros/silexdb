@@ -8,6 +8,61 @@ public class StorageIntegrityTests
     private static StorageOptions Options => new() { FlushPeriod = TimeSpan.Zero, CompactionStrategy = CompactionStrategy.None };
 
     [Test]
+    [Arguments(false)]
+    [Arguments(true)]
+    public async Task ReadOnlyOpeningReplaysWalWithoutChangingRecoveryFiles(bool incompleteTail)
+    {
+        using var folder = TempFolder.Create();
+        var walPath = Path.Combine(folder, "999998.wal");
+        using (var wal = new WriteAheadLog(walPath, false))
+            wal.AppendRaw([1], [11]);
+        if (incompleteTail)
+        {
+            await using var tail = new FileStream(walPath, FileMode.Append, FileAccess.Write);
+            await tail.WriteAsync(new byte[] { 1, 2 });
+        }
+        var before = Snapshot(folder);
+        await using (var readOnly = await LsmStorage.OpenReadOnlyAsync(folder, Options))
+        {
+            await Assert.That(readOnly.IsReadOnly).IsTrue();
+            var value = new byte[1];
+            await Assert.That(await readOnly.GetRawAsync(new byte[] { 1 }, value)).IsEqualTo(1);
+            await Assert.That(value[0]).IsEqualTo((byte)11);
+            await Assert.That(() => readOnly.Put([1], [22])).Throws<InvalidOperationException>();
+            await Assert.That(() => readOnly.Delete([1])).Throws<InvalidOperationException>();
+            await Assert.That(async () => await readOnly.FlushAndCompactAsync()).Throws<InvalidOperationException>();
+            await Assert.That(async () => await LsmStorage.OpenReadOnlyAsync(folder, Options)).Throws<IOException>();
+        }
+        await AssertUnchangedAsync(folder, before);
+    }
+
+    [Test]
+    public async Task MvccReadOnlyOpeningDoesNotInitializeOrModifyMetadata()
+    {
+        using var folder = TempFolder.Create();
+        await using (var writable = await MvccStorage.OpenAsync(folder, Options))
+            writable.Put([1], [11]);
+        var before = Snapshot(folder);
+        await using (var readOnly = await MvccStorage.OpenReadOnlyAsync(folder, Options))
+        {
+            await Assert.That(readOnly.IsReadOnly).IsTrue();
+            var sequence = readOnly.PublishedSequence;
+            await Assert.That(() => readOnly.Put([1], [22])).Throws<InvalidOperationException>();
+            await Assert.That(readOnly.PublishedSequence).IsEqualTo(sequence);
+            var value = new byte[1];
+            await Assert.That(await readOnly.GetRawAsync(new byte[] { 1 }, value)).IsEqualTo(1);
+            await Assert.That(value[0]).IsEqualTo((byte)11);
+        }
+        await AssertUnchangedAsync(folder, before);
+        using var plain = TempFolder.Create();
+        await using (var writable = await LsmStorage.OpenAsync(plain, Options))
+            writable.Put([1], [11]);
+        var plainBefore = Snapshot(plain);
+        await Assert.That(async () => await MvccStorage.OpenReadOnlyAsync(plain, Options)).Throws<InvalidDataException>();
+        await AssertUnchangedAsync(plain, plainBefore);
+    }
+
+    [Test]
     [Arguments(false, false)]
     [Arguments(false, true)]
     [Arguments(true, false)]

@@ -30,6 +30,35 @@ public class StorageDiagnosticsTests
     }
 
     [Test]
+    public async Task PublishedTableMetadataMatchesStatisticsAndOwnsKeyCopies()
+    {
+        using var folder = TempFolder.Create();
+        await using var storage = await LsmStorage.OpenAsync(folder, Options());
+        await Assert.That((await storage.GetTablesAsync()).Length).IsEqualTo(0);
+        Fill(storage, 0, 200);
+        await storage.FlushAndCompactAsync();
+
+        var tables = await storage.GetTablesAsync();
+        var stats = await storage.GetStatisticsAsync();
+        await Assert.That(tables.Length).IsEqualTo(stats.TotalTableCount);
+        await Assert.That(tables.Sum(table => table.Bytes)).IsEqualTo(stats.TotalTableBytes);
+        foreach (var level in stats.Levels)
+        {
+            await Assert.That(tables.Count(table => table.Level == level.Level)).IsEqualTo(level.TableCount);
+            await Assert.That(tables.Where(table => table.Level == level.Level).Sum(table => table.Bytes)).IsEqualTo(level.Bytes);
+        }
+
+        var first = tables[0];
+        var expected = first.FirstKey.ToArray();
+        first.FirstKey[0] ^= 0xff;
+        first.LastKey[0] ^= 0xff;
+        var next = (await storage.GetTablesAsync()).Single(table => table.FileId == first.FileId);
+        await Assert.That(next.FirstKey.SequenceEqual(expected)).IsTrue();
+        var buffer = new byte[64];
+        await Assert.That(await storage.GetRawAsync(expected, buffer)).IsEqualTo(64);
+    }
+
+    [Test]
     public async Task WriteAndFlushCountersAreReported()
     {
         using var folder = TempFolder.Create();

@@ -182,10 +182,11 @@ internal sealed class DefaultBlockEncoder : IBlockEncoder
         // but by using MemoryPool and copy the value we ensure that all 
         // array allocations are effectively pooled.
 
+        // GetBuffer may promote the stream; commit pending bytes before it copies them.
+        writer.Flush();
+
         var memory = new MemoryStreamOwner(buffer);
 
-        writer.Flush();
-           
         return new Block(this, memory, (int)buffer.Length, offsets.Count);
     }
 
