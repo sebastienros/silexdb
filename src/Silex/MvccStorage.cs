@@ -32,6 +32,8 @@ public sealed partial class MvccStorage : IAsyncDisposable
     private readonly SemaphoreSlim _garbageCollectionGate = new(1, 1);
     private readonly object _snapshotLock = new();
     private readonly Dictionary<long, SnapshotEntry> _activeSnapshots = [];
+    private const int TransientPinSlotCount = 256;
+    private readonly TransientPinSlot[] _transientPinSlots = new TransientPinSlot[TransientPinSlotCount];
     private long _allocatedSequence;
     private long _publishedSequence;
     private int _disposeState;
@@ -41,16 +43,20 @@ public sealed partial class MvccStorage : IAsyncDisposable
     private readonly TransactionLimits _transactionLimits;
 
     private MvccStorage(LsmStorage storage, long allocatedSequence, long publishedSequence, int groupSize,
-        TransactionLimits transactionLimits)
+        bool syncWal, TransactionLimits transactionLimits)
     {
         _storage = storage;
         _allocatedSequence = allocatedSequence;
         _publishedSequence = publishedSequence;
         _openSequence = publishedSequence;
         _transactionLimits = transactionLimits;
+        for (var i = 0; i < TransientPinSlotCount; i++)
+        {
+            _transientPinSlots[i].Sequence = -1;
+        }
         if (groupSize > 1)
         {
-            _commitCoordinator = new CommitCoordinator(this, groupSize);
+            _commitCoordinator = new CommitCoordinator(this, groupSize, syncWal);
         }
     }
 
@@ -90,9 +96,9 @@ public sealed partial class MvccStorage : IAsyncDisposable
         {
             throw new ArgumentOutOfRangeException(nameof(options), "MvccCommitGroupSize must be between 1 and 64.");
         }
-        if (options.MvccCommitGroupSize > 1 && (!options.UseWriteAheadLog || !options.SyncWriteAheadLogToDisk))
+        if (options.MvccCommitGroupSize > 1 && !options.UseWriteAheadLog)
         {
-            throw new ArgumentException("MVCC group commit requires WAL and SyncWriteAheadLogToDisk.", nameof(options));
+            throw new ArgumentException("MVCC group commit requires WAL.", nameof(options));
         }
 
         var storage = readOnly
@@ -126,7 +132,7 @@ public sealed partial class MvccStorage : IAsyncDisposable
                 WriteSequence(initialization, _allocatedSequenceKey, 0);
                 WriteSequence(initialization, _publishedSequenceKey, 0);
                 storage.Write(initialization);
-                return new MvccStorage(storage, 0, 0, options.MvccCommitGroupSize, transactionLimits);
+                return new MvccStorage(storage, 0, 0, options.MvccCommitGroupSize, options.SyncWriteAheadLogToDisk, transactionLimits);
             }
 
             if (formatLength != _formatValue.Length || !format.AsSpan().SequenceEqual(_formatValue))
@@ -139,10 +145,10 @@ public sealed partial class MvccStorage : IAsyncDisposable
 
             if (allocated < published)
             {
-                throw new InvalidDataException("The MVCC allocated sequence is older than its published sequence.");
+                throw new InvalidDataException("The database's MVCC allocated sequence is older than its published sequence.");
             }
 
-            return new MvccStorage(storage, allocated, published, options.MvccCommitGroupSize, transactionLimits);
+            return new MvccStorage(storage, allocated, published, options.MvccCommitGroupSize, options.SyncWriteAheadLogToDisk, transactionLimits);
         }
         catch
         {
@@ -170,13 +176,59 @@ public sealed partial class MvccStorage : IAsyncDisposable
     /// </summary>
     public MvccTransaction BeginTransaction()
     {
-        lock (_snapshotLock)
+        var sequence = RegisterTransientRead(out var pinSlot);
+        try
         {
-            CheckDisposed();
-            var sequence = Volatile.Read(ref _publishedSequence);
-            AddSnapshot(sequence);
-            return new MvccTransaction(this, sequence, _transactionLimits);
+            return new MvccTransaction(this, sequence, pinSlot, RentWriteBuffer());
         }
+        catch
+        {
+            ReleaseTransientRead(sequence, pinSlot);
+            throw;
+        }
+    }
+
+    private const int WriteBufferPoolSize = 64;
+    private readonly MvccWriteBuffer?[] _writeBufferPool = new MvccWriteBuffer?[WriteBufferPoolSize];
+
+    private MvccWriteBuffer RentWriteBuffer()
+    {
+        var start = StripedCounter.GetThreadStripeSlot();
+        for (var i = 0; i < 4; i++)
+        {
+            var slot = (start + i) & (WriteBufferPoolSize - 1);
+            var buffer = Interlocked.Exchange(ref _writeBufferPool[slot], null);
+            if (buffer is not null)
+            {
+                buffer.Reset(_transactionLimits);
+                return buffer;
+            }
+        }
+        return new MvccWriteBuffer(limits: _transactionLimits);
+    }
+
+    internal void ReturnWriteBuffer(MvccWriteBuffer buffer)
+    {
+        if (Volatile.Read(ref _disposeState) != 0)
+        {
+            buffer.Dispose();
+            return;
+        }
+        buffer.ResetForPool();
+        var start = StripedCounter.GetThreadStripeSlot();
+        for (var i = 0; i < 4; i++)
+        {
+            var slot = (start + i) & (WriteBufferPoolSize - 1);
+            if (Interlocked.CompareExchange(ref _writeBufferPool[slot], buffer, null) is null)
+            {
+                if (Volatile.Read(ref _disposeState) != 0)
+                {
+                    Interlocked.Exchange(ref _writeBufferPool[slot], null)?.Dispose();
+                }
+                return;
+            }
+        }
+        buffer.Dispose();
     }
 
     /// <summary>
@@ -224,15 +276,23 @@ public sealed partial class MvccStorage : IAsyncDisposable
     public ValueTask<int> GetRawAsync(ReadOnlySpan<byte> key, Memory<byte> destination, CancellationToken cancellationToken = default)
     {
         CheckDisposed();
-        var sequence = RegisterCurrentRead();
+        var sequence = RegisterTransientRead(out var slot);
 
         try
         {
-            return ReleaseReadAsync(ReadAtAsync(key, sequence, new MemoryCopySink(destination), cancellationToken), sequence);
+            var read = ReadAtAsync(key, sequence, new MemoryCopySink(destination), cancellationToken);
+            if (read.IsCompletedSuccessfully)
+            {
+                var length = read.GetAwaiter().GetResult();
+                ReleaseTransientRead(sequence, slot);
+                return ValueTask.FromResult(length);
+            }
+
+            return ReleaseTransientReadAsync(read, this, sequence, slot);
         }
         catch
         {
-            ReleaseSnapshot(sequence);
+            ReleaseTransientRead(sequence, slot);
             throw;
         }
     }
@@ -253,18 +313,201 @@ public sealed partial class MvccStorage : IAsyncDisposable
         ArgumentNullException.ThrowIfNull(reader);
         CheckDisposed();
 
-        var sequence = RegisterCurrentRead();
+        var sequence = RegisterTransientRead(out var slot);
 
         try
         {
-            return ReleaseFoundReadAsync(
-                ReadAtAsync(key, sequence, new DelegateSink<TArg>(arg, reader), cancellationToken),
-                sequence);
+            var read = ReadAtAsync(key, sequence, new DelegateSink<TArg>(arg, reader), cancellationToken);
+            if (read.IsCompletedSuccessfully)
+            {
+                var found = read.GetAwaiter().GetResult() >= 0;
+                ReleaseTransientRead(sequence, slot);
+                return ValueTask.FromResult(found);
+            }
+
+            return ReleaseTransientFoundReadAsync(read, this, sequence, slot);
         }
         catch
         {
-            ReleaseSnapshot(sequence);
+            ReleaseTransientRead(sequence, slot);
             throw;
+        }
+    }
+
+    /// <summary>
+    /// Scans the latest published view in ascending user-key order, starting at the last entry.
+    /// </summary>
+    public ValueTask<long> ScanReverseRawAsync<TArg>(
+        TArg arg,
+        ReadRawEntryAction<TArg> reader,
+        long maxEntries = long.MaxValue,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(reader);
+        ArgumentOutOfRangeException.ThrowIfNegative(maxEntries);
+        CheckDisposed();
+
+        var sequence = RegisterTransientRead(out var slot);
+        try
+        {
+            var scan = ScanReverseAtAsync(sequence, arg, reader, maxEntries, cancellationToken);
+            if (scan.IsCompletedSuccessfully)
+            {
+                var count = scan.GetAwaiter().GetResult();
+                ReleaseTransientRead(sequence, slot);
+                return ValueTask.FromResult(count);
+            }
+            return ReleaseTransientScanReadAsync(scan, this, sequence, slot);
+        }
+        catch
+        {
+            ReleaseTransientRead(sequence, slot);
+            throw;
+        }
+    }
+
+    private async ValueTask<long> ScanReverseAtAsync<TArg>(
+        long sequence,
+        TArg arg,
+        ReadRawEntryAction<TArg> reader,
+        long maxEntries,
+        CancellationToken cancellationToken)
+    {
+        CheckDisposed();
+        if (maxEntries == 0)
+        {
+            return 0;
+        }
+
+        var fastCount = await _storage._inner.ScanMvccReverseRawAsync(
+            sequence, arg, reader, maxEntries, cancellationToken).ConfigureAwait(false);
+        if (fastCount >= 0)
+        {
+            return fastCount;
+        }
+
+        using var state = new ReverseScanState<TArg>(sequence, arg, reader, maxEntries);
+        await _storage._inner.ScanReverseRawAsync(
+            state,
+            static (s, key, value) => s.Accept(key, value),
+            cancellationToken: cancellationToken).ConfigureAwait(false);
+        state.Flush();
+        return state.Count;
+    }
+
+    private sealed class ReverseScanState<TArg>(
+        long snapshotSequence,
+        TArg arg,
+        ReadRawEntryAction<TArg> reader,
+        long maxEntries) : IDisposable
+    {
+        private byte[]? _keyBuffer;
+        private byte[]? _valueBuffer;
+        private int _keyLength = -1;
+        private int _valueLength;
+        private ulong _lastWord;
+        private bool _hasCandidate;
+        private bool _candidateLive;
+
+        public long Count { get; private set; }
+
+        public bool Accept(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
+        {
+            if (key.Length < 11 || key[0] != DataPrefix)
+            {
+                return true;
+            }
+
+            var terminator = key.Length - 10;
+            if (key[terminator] != 0 || key[terminator + 1] != 0)
+            {
+                throw new InvalidDataException("An MVCC data key has an invalid terminator.");
+            }
+
+            var encodedUserKey = key.Slice(1, terminator - 1);
+            var encodedSequence = BinaryPrimitives.ReadUInt64BigEndian(key[^sizeof(long)..]);
+            var decodedSequence = ~encodedSequence;
+            if (decodedSequence > long.MaxValue)
+            {
+                throw new InvalidDataException("An MVCC data key has an invalid sequence.");
+            }
+            var sequence = (long)decodedSequence;
+
+            var firstWord = encodedUserKey.Length >= 8
+                ? BinaryPrimitives.ReadUInt64LittleEndian(encodedUserKey)
+                : 0UL;
+            var sameGroup = _keyLength == encodedUserKey.Length &&
+                firstWord == _lastWord &&
+                encodedUserKey.SequenceEqual(_keyBuffer.AsSpan(0, _keyLength));
+
+            if (!sameGroup)
+            {
+                if (!Flush())
+                {
+                    return false;
+                }
+                CopyTo(ref _keyBuffer, encodedUserKey);
+                _keyLength = encodedUserKey.Length;
+                _lastWord = firstWord;
+                _hasCandidate = false;
+                _candidateLive = false;
+            }
+
+            if (sequence > snapshotSequence)
+            {
+                return true;
+            }
+
+            ValidateStoredValue(value);
+            _hasCandidate = true;
+            _candidateLive = value[0] == LiveValue;
+            if (_candidateLive)
+            {
+                var userVal = value[1..];
+                CopyTo(ref _valueBuffer, userVal);
+                _valueLength = userVal.Length;
+            }
+            return true;
+        }
+
+        public bool Flush()
+        {
+            if (!_hasCandidate || !_candidateLive || Count >= maxEntries)
+            {
+                _hasCandidate = false;
+                return Count < maxEntries;
+            }
+            _hasCandidate = false;
+            Count++;
+            return InvokeUserReader(arg, reader, _keyBuffer.AsSpan(0, _keyLength), _valueBuffer.AsSpan(0, _valueLength))
+                && Count < maxEntries;
+        }
+
+        private static void CopyTo(ref byte[]? buffer, ReadOnlySpan<byte> source)
+        {
+            if (buffer is null || buffer.Length < source.Length)
+            {
+                if (buffer is not null)
+                {
+                    ArrayPool<byte>.Shared.Return(buffer);
+                }
+                buffer = ArrayPool<byte>.Shared.Rent(Math.Max(64, source.Length));
+            }
+            source.CopyTo(buffer);
+        }
+
+        public void Dispose()
+        {
+            if (_keyBuffer is not null)
+            {
+                ArrayPool<byte>.Shared.Return(_keyBuffer);
+                _keyBuffer = null;
+            }
+            if (_valueBuffer is not null)
+            {
+                ArrayPool<byte>.Shared.Return(_valueBuffer);
+                _valueBuffer = null;
+            }
         }
     }
 
@@ -281,8 +524,29 @@ public sealed partial class MvccStorage : IAsyncDisposable
         ArgumentOutOfRangeException.ThrowIfNegative(maxEntries);
         CheckDisposed();
 
-        var sequence = RegisterCurrentRead();
-        return ReleaseReadAsync(ScanAtAsync(sequence, default, hasFrom: false, arg, reader, maxEntries, cancellationToken), sequence);
+        var sequence = RegisterTransientRead(out var slot);
+        try
+        {
+            if (_storage._inner.TryScanMvccRawSync(sequence, hasFrom: false, default, arg, reader, maxEntries, cancellationToken, out var syncCount))
+            {
+                ReleaseTransientRead(sequence, slot);
+                return ValueTask.FromResult(syncCount);
+            }
+
+            var scan = ScanAtAsync(sequence, default, hasFrom: false, arg, reader, maxEntries, cancellationToken);
+            if (scan.IsCompletedSuccessfully)
+            {
+                var count = scan.GetAwaiter().GetResult();
+                ReleaseTransientRead(sequence, slot);
+                return ValueTask.FromResult(count);
+            }
+            return ReleaseTransientScanReadAsync(scan, this, sequence, slot);
+        }
+        catch
+        {
+            ReleaseTransientRead(sequence, slot);
+            throw;
+        }
     }
 
     /// <summary>
@@ -299,27 +563,81 @@ public sealed partial class MvccStorage : IAsyncDisposable
         ArgumentOutOfRangeException.ThrowIfNegative(maxEntries);
         CheckDisposed();
 
-        var sequence = RegisterCurrentRead();
+        var sequence = RegisterTransientRead(out var slot);
 
         try
         {
+            var length = GetVersionKeyLength(from);
+            if (length <= 256)
+            {
+                Span<byte> stackFrom = stackalloc byte[256];
+                var slice = stackFrom[..length];
+                EncodeVersionKey(from, long.MaxValue, slice);
+                if (_storage._inner.TryScanMvccRawSync(sequence, hasFrom: true, slice, arg, reader, maxEntries, cancellationToken, out var syncCount))
+                {
+                    ReleaseTransientRead(sequence, slot);
+                    return ValueTask.FromResult(syncCount);
+                }
+            }
+
             var encodedFrom = EncodeVersionKey(from, long.MaxValue);
-            return ReleaseSeekReadAsync(encodedFrom, sequence, arg, reader, maxEntries, cancellationToken);
+            return ReleaseTransientSeekReadAsync(encodedFrom, sequence, slot, arg, reader, maxEntries, cancellationToken);
         }
         catch
         {
-            ReleaseSnapshot(sequence);
+            ReleaseTransientRead(sequence, slot);
             throw;
+        }
+    }
+
+    private ValueTask<long> ReleaseTransientSeekReadAsync<TArg>(
+        [Silex.Ownership.ConsumesOwnership] OwnedByteSlice encodedFrom,
+        long sequence,
+        int slot,
+        TArg arg,
+        ReadRawEntryAction<TArg> reader,
+        long maxEntries,
+        CancellationToken cancellationToken)
+    {
+        var scan = SeekEncodedAtAsync(encodedFrom, sequence, arg, reader, maxEntries, cancellationToken);
+        if (scan.IsCompletedSuccessfully)
+        {
+            var count = scan.GetAwaiter().GetResult();
+            ReleaseTransientRead(sequence, slot);
+            return ValueTask.FromResult(count);
+        }
+        return ReleaseTransientScanReadAsync(scan, this, sequence, slot);
+    }
+
+    private static async ValueTask<long> ReleaseTransientScanReadAsync(ValueTask<long> read, MvccStorage storage, long sequence, int slotIndex)
+    {
+        try
+        {
+            return await read.ConfigureAwait(false);
+        }
+        finally
+        {
+            storage.ReleaseTransientRead(sequence, slotIndex);
         }
     }
 
     /// <summary>
     /// Flushes and compacts the underlying LSM tree.
     /// </summary>
-    public Task FlushAndCompactAsync(CancellationToken cancellationToken = default)
+    public async Task FlushAndCompactAsync(CancellationToken cancellationToken = default)
     {
         CheckDisposed();
-        return _storage.FlushAndCompactAsync(cancellationToken);
+        await EnterCommitGateAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            CheckDisposed();
+            BeforeFlushAndCompact();
+        }
+        finally
+        {
+            _commitGate.Release();
+        }
+        await _storage.FlushAndCompactAsync(cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>Synchronizes recoverable file contents through all previously completed commits.</summary>
@@ -372,6 +690,10 @@ public sealed partial class MvccStorage : IAsyncDisposable
 
         try
         {
+            for (var i = 0; i < WriteBufferPoolSize; i++)
+            {
+                Interlocked.Exchange(ref _writeBufferPool[i], null)?.Dispose();
+            }
             await _storage.DisposeAsync().ConfigureAwait(false);
         }
         catch when (_storage.Health == StorageHealth.Faulted)
@@ -426,7 +748,7 @@ public sealed partial class MvccStorage : IAsyncDisposable
         return SeekEncodedAtAsync(encodedFrom, sequence, arg, reader, maxEntries, cancellationToken);
     }
 
-    internal async ValueTask<MvccConflict?> TryCommitAsync(
+    internal ValueTask<MvccConflict?> TryCommitAsync(
         long snapshotSequence,
         MvccWriteBuffer writes,
         CancellationToken cancellationToken)
@@ -434,8 +756,16 @@ public sealed partial class MvccStorage : IAsyncDisposable
         CheckDisposed();
         if (_commitCoordinator is not null)
         {
-            return await _commitCoordinator.CommitAsync(snapshotSequence, writes, cancellationToken).ConfigureAwait(false);
+            return _commitCoordinator.CommitAsync(snapshotSequence, writes, cancellationToken);
         }
+        return TryCommitUnbatchedAsync(snapshotSequence, writes, cancellationToken);
+    }
+
+    private async ValueTask<MvccConflict?> TryCommitUnbatchedAsync(
+        long snapshotSequence,
+        MvccWriteBuffer writes,
+        CancellationToken cancellationToken)
+    {
         await EnterCommitGateAsync(cancellationToken).ConfigureAwait(false);
 
         try
@@ -567,16 +897,22 @@ public sealed partial class MvccStorage : IAsyncDisposable
         public void Dispose() => _group.Dispose();
     }
 
-    private static void PrepareBatch(MvccWriteBuffer writes, LsmWriteBatch batch, long sequence)
+    private static void PrepareBatch(MvccWriteBuffer writes, LsmWriteBatch batch, long sequence, bool includeSequenceMetadata = true)
     {
         batch.Clear();
-        WriteSequence(batch, _allocatedSequenceKey, sequence);
+        if (includeSequenceMetadata)
+        {
+            WriteSequence(batch, _allocatedSequenceKey, sequence);
+        }
         for (var i = 0; i < writes.MutationCount; i++)
         {
             var mutation = writes.GetMutation(i);
             WriteVersion(batch, writes.GetKey(mutation).Span, writes.GetValue(mutation).Span, mutation.IsTombstone, sequence);
         }
-        WriteSequence(batch, _publishedSequenceKey, sequence);
+        if (includeSequenceMetadata)
+        {
+            WriteSequence(batch, _publishedSequenceKey, sequence);
+        }
     }
 
     internal void ReleaseSnapshot(long sequence)
@@ -599,6 +935,19 @@ public sealed partial class MvccStorage : IAsyncDisposable
         }
     }
 
+    internal void BeforeFlushAndCompact()
+    {
+        if (!_storage.HasPendingWrites)
+        {
+            return;
+        }
+        var batch = _commitBatch;
+        batch.Clear();
+        WriteSequence(batch, _allocatedSequenceKey, _allocatedSequence);
+        WriteSequence(batch, _publishedSequenceKey, _publishedSequence);
+        _storage.Write(batch);
+    }
+
     private void CommitSingle(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool isTombstone)
     {
         var sequence = AllocateSequence();
@@ -609,6 +958,7 @@ public sealed partial class MvccStorage : IAsyncDisposable
         WriteSequence(batch, _publishedSequenceKey, sequence);
         _storage.Write(batch);
         _storage.BeforeMvccPublication();
+        _commitCoordinator?.RecordSingleCommit(sequence, key);
         _allocatedSequence = sequence;
         Volatile.Write(ref _publishedSequence, sequence);
     }
@@ -630,51 +980,21 @@ public sealed partial class MvccStorage : IAsyncDisposable
         bool isTombstone,
         long sequence)
     {
-        var keyLength = GetVersionKeyLength(key);
-        byte[]? rentedKey = null;
-        Span<byte> internalKey = keyLength <= 256
-            ? stackalloc byte[keyLength]
-            : (rentedKey = ArrayPool<byte>.Shared.Rent(keyLength)).AsSpan(0, keyLength);
-        EncodeVersionKey(key, sequence, internalKey);
-
-        try
-        {
-            if (isTombstone)
-            {
-                Span<byte> stored = stackalloc byte[1];
-                stored[0] = TombstoneValue;
-                batch.Put(internalKey, stored);
-                return;
-            }
-
-            byte[]? rented = null;
-            Span<byte> encoded = value.Length < 256
-                ? stackalloc byte[value.Length + 1]
-                : (rented = ArrayPool<byte>.Shared.Rent(value.Length + 1)).AsSpan(0, value.Length + 1);
-
-            try
-            {
-                encoded[0] = LiveValue;
-                value.CopyTo(encoded[1..]);
-                batch.Put(internalKey, encoded);
-            }
-            finally
-            {
-                if (rented is not null) ArrayPool<byte>.Shared.Return(rented);
-            }
-        }
-        finally
-        {
-            if (rentedKey is not null) ArrayPool<byte>.Shared.Return(rentedKey);
-        }
+        batch.PutMvccVersion(key, GetVersionKeyLength(key), value, isTombstone, sequence);
     }
 
     private ValueTask<long> FindVisibleSequenceAsync(ReadOnlySpan<byte> key, long sequence, CancellationToken cancellationToken)
     {
-        return SequenceAsync(ReadPointAsync(key, sequence, default(NoOpSink), cancellationToken, 1));
+        var read = ReadPointAsync(key, sequence, default(NoOpSink), cancellationToken, 1);
+        if (read.IsCompletedSuccessfully)
+        {
+            return ValueTask.FromResult(read.GetAwaiter().GetResult().Sequence);
+        }
 
-        static async ValueTask<long> SequenceAsync(ValueTask<PointReadState<NoOpSink>> read) =>
-            (await read.ConfigureAwait(false)).Sequence;
+        return SequenceAsync(read);
+
+        static async ValueTask<long> SequenceAsync(ValueTask<PointReadState<NoOpSink>> pending) =>
+            (await pending.ConfigureAwait(false)).Sequence;
     }
 
     private ValueTask<int> ReadAtAsync<TSink>(
@@ -684,10 +1004,16 @@ public sealed partial class MvccStorage : IAsyncDisposable
         CancellationToken cancellationToken)
         where TSink : struct, IValueSink
     {
-        return LengthAsync(ReadPointAsync(key, sequence, sink, cancellationToken));
+        var read = ReadPointAsync(key, sequence, sink, cancellationToken);
+        if (read.IsCompletedSuccessfully)
+        {
+            return ValueTask.FromResult(read.GetAwaiter().GetResult().Length);
+        }
 
-        static async ValueTask<int> LengthAsync(ValueTask<PointReadState<TSink>> read) =>
-            (await read.ConfigureAwait(false)).Length;
+        return LengthAsync(read);
+
+        static async ValueTask<int> LengthAsync(ValueTask<PointReadState<TSink>> pending) =>
+            (await pending.ConfigureAwait(false)).Length;
     }
 
     private ValueTask<PointReadState<TSink>> ReadPointAsync<TSink>(
@@ -696,20 +1022,47 @@ public sealed partial class MvccStorage : IAsyncDisposable
         where TSink : struct, IValueSink
     {
         var length = GetVersionKeyLength(key);
+        if (length <= 256)
+        {
+            Span<byte> stackKey = stackalloc byte[256];
+            var slice = stackKey[..length];
+            EncodeVersionKey(key, sequence, slice);
+            var syncState = new PointReadState<TSink>(length, sequence, sink);
+            if (_storage._inner.TryReadFirstRawSync(slice, slice[..^sizeof(long)], ref syncState, cancellationToken))
+            {
+                return ValueTask.FromResult(syncState);
+            }
+        }
+
         var encodedKey = ArrayPool<byte>.Shared.Rent(length);
         EncodeVersionKey(key, sequence, encodedKey.AsSpan(0, length));
-        return ReadEncodedAsync(this, encodedKey, length, sequence, sink, cancellationToken, valuePrefixLength);
+        var memory = encodedKey.AsMemory(0, length);
+        var state = new PointReadState<TSink>(length, sequence, sink);
+        ValueTask<PointReadState<TSink>> pending;
+        try
+        {
+            pending = _storage.ReadFirstRawAsync(memory, memory[..^sizeof(long)], state, cancellationToken, valuePrefixLength);
+            if (pending.IsCompletedSuccessfully)
+            {
+                var result = pending.GetAwaiter().GetResult();
+                ArrayPool<byte>.Shared.Return(encodedKey);
+                return ValueTask.FromResult(result);
+            }
+        }
+        catch
+        {
+            ArrayPool<byte>.Shared.Return(encodedKey);
+            throw;
+        }
+
+        return ReadEncodedAsync(pending, encodedKey);
 
         static async ValueTask<PointReadState<TSink>> ReadEncodedAsync(
-            MvccStorage storage, byte[] bytes, int count, long sequence, TSink valueSink, CancellationToken ct,
-            int valuePrefixLength)
+            ValueTask<PointReadState<TSink>> task, byte[] bytes)
         {
             try
             {
-                var memory = bytes.AsMemory(0, count);
-                var state = new PointReadState<TSink>(memory[..^sizeof(long)], sequence, valueSink);
-                return await storage._storage.ReadFirstRawAsync(
-                    memory, memory[..^sizeof(long)], state, ct, valuePrefixLength).ConfigureAwait(false);
+                return await task.ConfigureAwait(false);
             }
             finally
             {
@@ -718,9 +1071,11 @@ public sealed partial class MvccStorage : IAsyncDisposable
         }
     }
 
+    private static readonly ReadOnlyMemory<byte> _dataStartKey = new byte[] { DataPrefix };
+
     private async ValueTask<long> ScanAtAsync<TArg>(
         long sequence,
-        OwnedByteSlice? encodedFrom,
+        [Silex.Ownership.ConsumesOwnership] OwnedByteSlice? encodedFrom,
         bool hasFrom,
         TArg arg,
         ReadRawEntryAction<TArg> reader,
@@ -736,19 +1091,32 @@ public sealed partial class MvccStorage : IAsyncDisposable
         }
 
         using (encodedFrom)
-        using (var state = new ScanState<TArg>(sequence, arg, reader, maxEntries))
         {
+            var fastCount = await _storage._inner.ScanMvccRawAsync(
+                sequence,
+                hasFrom,
+                hasFrom ? encodedFrom!.Memory : default,
+                arg,
+                reader,
+                maxEntries,
+                cancellationToken).ConfigureAwait(false);
+            if (fastCount >= 0)
+            {
+                return fastCount;
+            }
+
+            using var state = new ScanState<TArg>(sequence, arg, reader, maxEntries);
             if (hasFrom)
             {
-                await _storage.SeekRawAsync(
-                    encodedFrom!.Span,
+                await _storage._inner.SeekRawAsync(
+                    encodedFrom!.Memory,
                     state,
                     static (s, key, value) => s.Accept(key, value),
                     cancellationToken: cancellationToken).ConfigureAwait(false);
             }
             else
             {
-                await _storage.ScanRawAsync(
+                await _storage._inner.ScanRawAsync(
                     state,
                     static (s, key, value) => s.Accept(key, value),
                     cancellationToken: cancellationToken).ConfigureAwait(false);
@@ -759,7 +1127,7 @@ public sealed partial class MvccStorage : IAsyncDisposable
     }
 
     private ValueTask<long> SeekEncodedAtAsync<TArg>(
-        OwnedByteSlice encodedFrom,
+        [Silex.Ownership.ConsumesOwnership] OwnedByteSlice encodedFrom,
         long sequence,
         TArg arg,
         ReadRawEntryAction<TArg> reader,
@@ -770,7 +1138,7 @@ public sealed partial class MvccStorage : IAsyncDisposable
     }
 
     private ValueTask<long> ReleaseSeekReadAsync<TArg>(
-        OwnedByteSlice encodedFrom,
+        [Silex.Ownership.ConsumesOwnership] OwnedByteSlice encodedFrom,
         long sequence,
         TArg arg,
         ReadRawEntryAction<TArg> reader,
@@ -793,6 +1161,88 @@ public sealed partial class MvccStorage : IAsyncDisposable
         }
     }
 
+    private long RegisterTransientRead(out int slotIndex)
+    {
+        CheckDisposed();
+        var start = Environment.CurrentManagedThreadId & (TransientPinSlotCount - 1);
+        for (var probe = 0; probe < 8; probe++)
+        {
+            var idx = (start + probe) & (TransientPinSlotCount - 1);
+            ref var slot = ref _transientPinSlots[idx];
+            if (Volatile.Read(ref slot.Sequence) >= 0)
+            {
+                continue;
+            }
+
+            while (true)
+            {
+                var sequence = Volatile.Read(ref _publishedSequence);
+                if (Interlocked.CompareExchange(ref slot.Sequence, sequence, -1) != -1)
+                {
+                    break;
+                }
+                if (Volatile.Read(ref _publishedSequence) == sequence && Volatile.Read(ref _disposeState) == 0)
+                {
+                    slotIndex = idx;
+                    return sequence;
+                }
+                Volatile.Write(ref slot.Sequence, -1);
+                if (Volatile.Read(ref _disposeState) != 0)
+                {
+                    CheckDisposed();
+                }
+            }
+        }
+
+        slotIndex = -1;
+        return RegisterCurrentRead();
+    }
+
+    internal void ReleaseTransientRead(long sequence, int slotIndex)
+    {
+        if (slotIndex >= 0)
+        {
+            Volatile.Write(ref _transientPinSlots[slotIndex].Sequence, -1);
+        }
+        else
+        {
+            ReleaseSnapshot(sequence);
+        }
+    }
+
+    private static async ValueTask<int> ReleaseTransientReadAsync(ValueTask<int> read, MvccStorage storage, long sequence, int slotIndex)
+    {
+        try
+        {
+            return await read.ConfigureAwait(false);
+        }
+        finally
+        {
+            storage.ReleaseTransientRead(sequence, slotIndex);
+        }
+    }
+
+    private static async ValueTask<bool> ReleaseTransientFoundReadAsync(ValueTask<int> read, MvccStorage storage, long sequence, int slotIndex)
+    {
+        try
+        {
+            return await read.ConfigureAwait(false) >= 0;
+        }
+        finally
+        {
+            storage.ReleaseTransientRead(sequence, slotIndex);
+        }
+    }
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Explicit, Size = 64)]
+    private struct TransientPinSlot
+    {
+        [System.Runtime.InteropServices.FieldOffset(0)]
+        public long Sequence;
+        [System.Runtime.InteropServices.FieldOffset(8)]
+        public long PinnedAt;
+    }
+
     private void AddSnapshot(long sequence)
     {
         _activeSnapshots.TryGetValue(sequence, out var entry);
@@ -803,13 +1253,18 @@ public sealed partial class MvccStorage : IAsyncDisposable
 
     private static int GetVersionKeyLength(ReadOnlySpan<byte> userKey)
     {
+        var zeroCount = userKey.IndexOf((byte)0) < 0 ? 0 : CountZeros(userKey);
+        return checked(1 + userKey.Length + zeroCount + 2 + sizeof(long));
+    }
+
+    private static int CountZeros(ReadOnlySpan<byte> userKey)
+    {
         var zeroCount = 0;
         for (var i = 0; i < userKey.Length; i++)
         {
             zeroCount += userKey[i] == 0 ? 1 : 0;
         }
-
-        return checked(1 + userKey.Length + zeroCount + 2 + sizeof(long));
+        return zeroCount;
     }
 
     private static OwnedByteSlice EncodeVersionKey(ReadOnlySpan<byte> userKey, long sequence)
@@ -829,10 +1284,20 @@ public sealed partial class MvccStorage : IAsyncDisposable
         }
     }
 
-    private static void EncodeVersionKey(ReadOnlySpan<byte> userKey, long sequence, Span<byte> destination)
+    internal static void EncodeVersionKey(ReadOnlySpan<byte> userKey, long sequence, Span<byte> destination)
     {
-        var offset = 0;
-        destination[offset++] = DataPrefix;
+        destination[0] = DataPrefix;
+        if (userKey.Length + 11 == destination.Length)
+        {
+            userKey.CopyTo(destination[1..]);
+            var termOffset = 1 + userKey.Length;
+            destination[termOffset] = 0;
+            destination[termOffset + 1] = 0;
+            BinaryPrimitives.WriteUInt64BigEndian(destination[(termOffset + 2)..], ~(ulong)sequence);
+            return;
+        }
+
+        var offset = 1;
         foreach (var value in userKey)
         {
             destination[offset++] = value;
@@ -873,7 +1338,7 @@ public sealed partial class MvccStorage : IAsyncDisposable
         return true;
     }
 
-    private static bool InvokeUserReader<TArg>(
+    internal static bool InvokeUserReader<TArg>(
         TArg arg,
         ReadRawEntryAction<TArg> reader,
         ReadOnlySpan<byte> encodedUserKey,
@@ -1030,10 +1495,10 @@ public sealed partial class MvccStorage : IAsyncDisposable
         public void Accept(ReadOnlySpan<byte> value) => reader(arg, value);
     }
 
-    private struct PointReadState<TSink>(ReadOnlyMemory<byte> userPrefix, long snapshotSequence, TSink sink)
+    private struct PointReadState<TSink>(int expectedKeyLength, long snapshotSequence, TSink sink)
         : IRawEntrySink where TSink : struct, IValueSink
     {
-        private readonly ReadOnlyMemory<byte> _userPrefix = userPrefix;
+        private readonly int _expectedKeyLength = expectedKeyLength;
         private readonly long _snapshotSequence = snapshotSequence;
         private TSink _sink = sink;
 
@@ -1042,13 +1507,7 @@ public sealed partial class MvccStorage : IAsyncDisposable
 
         public void Accept(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
         {
-            if (!TryParseVersionKey(key, out _, out var sequence))
-            {
-                return;
-            }
-
-            var candidatePrefix = key[..^sizeof(long)];
-            if (!candidatePrefix.SequenceEqual(_userPrefix.Span) || sequence > _snapshotSequence)
+            if (key.Length != _expectedKeyLength || !TryParseVersionKey(key, out _, out var sequence) || sequence > _snapshotSequence)
             {
                 return;
             }
@@ -1075,22 +1534,59 @@ public sealed partial class MvccStorage : IAsyncDisposable
     {
         private readonly KeyGroup _group = new();
         private bool _resolved;
+        private ulong _lastWord;
+        private int _lastLength = -1;
 
         public long Count { get; private set; }
 
         public bool Accept(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
         {
-            if (!TryParseVersionKey(key, out var encodedUserKey, out var sequence))
+            if (key.Length < 11 || key[0] != DataPrefix)
             {
                 return true;
             }
 
-            if (_group.Set(encodedUserKey))
+            var terminator = key.Length - 10;
+            if (key[terminator] != 0 || key[terminator + 1] != 0)
             {
-                _resolved = false;
+                throw new InvalidDataException("An MVCC data key has an invalid terminator.");
             }
 
-            if (_resolved || sequence > snapshotSequence)
+            var encodedUserKey = key.Slice(1, terminator - 1);
+            var encodedSequence = BinaryPrimitives.ReadUInt64BigEndian(key[^sizeof(long)..]);
+            var decodedSequence = ~encodedSequence;
+            if (decodedSequence > long.MaxValue)
+            {
+                throw new InvalidDataException("An MVCC data key has an invalid sequence.");
+            }
+            var sequence = (long)decodedSequence;
+
+            var firstWord = encodedUserKey.Length >= 8
+                ? BinaryPrimitives.ReadUInt64LittleEndian(encodedUserKey)
+                : 0UL;
+            var sameGroup = _lastLength == encodedUserKey.Length &&
+                firstWord == _lastWord &&
+                (encodedUserKey.Length <= 8 || _group.EqualsCurrent(encodedUserKey));
+
+            if (sameGroup)
+            {
+                if (_resolved)
+                {
+                    return true;
+                }
+            }
+            else
+            {
+                _resolved = false;
+                _lastLength = encodedUserKey.Length;
+                _lastWord = firstWord;
+                if (encodedUserKey.Length > 8)
+                {
+                    _group.SetUnchecked(encodedUserKey);
+                }
+            }
+
+            if (sequence > snapshotSequence)
             {
                 return true;
             }
@@ -1114,6 +1610,30 @@ public sealed partial class MvccStorage : IAsyncDisposable
     {
         private byte[]? _buffer;
         private int _length = -1;
+
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+        public bool EqualsCurrent(ReadOnlySpan<byte> key) =>
+            _length == key.Length && key.SequenceEqual(_buffer.AsSpan(0, _length));
+
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+        public void SetUnchecked(ReadOnlySpan<byte> key)
+        {
+            if (_buffer is null || _buffer.Length < key.Length)
+            {
+                Grow(key.Length);
+            }
+            key.CopyTo(_buffer);
+            _length = key.Length;
+        }
+
+        private void Grow(int required)
+        {
+            if (_buffer is not null)
+            {
+                ArrayPool<byte>.Shared.Return(_buffer);
+            }
+            _buffer = ArrayPool<byte>.Shared.Rent(Math.Max(64, required));
+        }
 
         public bool Set(ReadOnlySpan<byte> key)
         {
@@ -1154,7 +1674,7 @@ internal sealed class MvccWriteBuffer : IDisposable
     private const int InitialDescriptorCapacity = 8;
     internal const int DefaultIndexThreshold = 8;
     private readonly int _indexThreshold;
-    private readonly TransactionLimits _limits;
+    private TransactionLimits _limits;
     private MvccIndexSlot[] _mutationIndex = [];
     private MvccIndexSlot[] _readIndex = [];
     private int[] _order = [];
@@ -1191,6 +1711,73 @@ internal sealed class MvccWriteBuffer : IDisposable
     {
         _indexThreshold = indexThreshold;
         _limits = limits ?? TransactionLimits.Unlimited;
+    }
+
+    internal void Reset(TransactionLimits limits)
+    {
+        _limits = limits;
+        _disposed = false;
+    }
+
+    internal void ResetForPool()
+    {
+        MutationCount = 0;
+        TrackedReadCount = 0;
+        ReadRangeCount = 0;
+        _savepointCount = 0;
+        _undoCount = 0;
+        _nextSavepointId = 0;
+        _byteCount = 0;
+        _hasVersionstamps = false;
+        _orderDirty = true;
+        CommitSequence = null;
+
+        if (_mutationIndex.Length != 0)
+        {
+            ArrayPool<MvccIndexSlot>.Shared.Return(_mutationIndex);
+            _mutationIndex = [];
+        }
+        if (_readIndex.Length != 0)
+        {
+            ArrayPool<MvccIndexSlot>.Shared.Return(_readIndex);
+            _readIndex = [];
+        }
+        if (_order.Length > 256)
+        {
+            ArrayPool<int>.Shared.Return(_order);
+            _order = [];
+        }
+        if (_savepoints.Length != 0)
+        {
+            ArrayPool<MvccCheckpoint>.Shared.Return(_savepoints);
+            _savepoints = [];
+        }
+        if (_undo.Length != 0)
+        {
+            ArrayPool<MvccUndo>.Shared.Return(_undo);
+            _undo = [];
+        }
+        if (_ranges.Length != 0)
+        {
+            ArrayPool<MvccRange>.Shared.Return(_ranges);
+            _ranges = [];
+        }
+        if (_bytes.Length > 64 * 1024)
+        {
+            ArrayPool<byte>.Shared.Return(_bytes);
+            _bytes = [];
+        }
+        if (_mutations.Length > 256)
+        {
+            ArrayPool<MvccMutation>.Shared.Return(_mutations);
+            _mutations = [];
+        }
+        if (_trackedReads.Length > 256)
+        {
+            ArrayPool<MvccKey>.Shared.Return(_trackedReads);
+            _trackedReads = [];
+        }
+        _disposed = true;
     }
 
     public MvccSavepoint CreateSavepoint()

@@ -451,7 +451,7 @@ public class OrderedReadTests
         }
         var engine = lsm ?? PrivateField<LsmStorage>(versioned!, "_storage");
         var inner = PrivateField<LsmStorageInner>(engine, "_inner");
-        var tableLock = PrivateField<ReaderWriterLockSlim>(inner, "_currentMemTableLock");
+        var tableLock = PrivateField<StripedReaderWriterLock>(inner, "_currentMemTableLock");
         using var scanTransaction = transactional ? versioned!.BeginTransaction() : null;
         scanTransaction?.Put(new byte[] { 4 }, new byte[] { 4 });
         using var cursor = transactional ? scanTransaction!.CreateOrderedReadCursor() :

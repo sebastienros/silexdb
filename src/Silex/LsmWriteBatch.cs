@@ -49,6 +49,36 @@ public sealed class LsmWriteBatch
             IsTombstone: false);
     }
 
+    internal void PutMvccVersion(ReadOnlySpan<byte> userKey, int versionKeyLength, ReadOnlySpan<byte> value, bool isTombstone, long sequence)
+    {
+        var valLen = isTombstone ? 1 : checked(1 + value.Length);
+        EnsureCapacity(checked(versionKeyLength + valLen));
+
+        var keyOffset = _byteCount;
+        MvccStorage.EncodeVersionKey(userKey, sequence, _bytes.AsSpan(keyOffset, versionKeyLength));
+        _byteCount += versionKeyLength;
+
+        var valueOffset = _byteCount;
+        if (isTombstone)
+        {
+            _bytes[valueOffset] = 0;
+            _byteCount += 1;
+        }
+        else
+        {
+            _bytes[valueOffset] = 1;
+            value.CopyTo(_bytes.AsSpan(valueOffset + 1));
+            _byteCount += valLen;
+        }
+
+        _entries[_count++] = new LsmWriteBatchEntry(
+            keyOffset,
+            versionKeyLength,
+            valueOffset,
+            valLen,
+            IsTombstone: false);
+    }
+
     /// <summary>
     /// Adds a deletion.
     /// </summary>

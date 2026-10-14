@@ -106,6 +106,28 @@ internal sealed class BufferedSsTableBuilder : ISsTableBuilder
         _stream = File.Create(_tempFilename, bufferSize, options);
     }
 
+    internal ValueTask RolloverBlockForRawAsync(CancellationToken cancellationToken)
+    {
+        return new ValueTask(FinishBlockAsync(cancellationToken));
+    }
+
+    internal bool TryAddRawFast(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool isTombstone)
+    {
+        if (_isFirstKey)
+        {
+            _firstKey = OwnedByteSlice.CopyFrom(key);
+            _isFirstKey = false;
+        }
+
+        if (_blockBuilder.AddRaw(key, value, isTombstone))
+        {
+            AddBloomKeys();
+            return true;
+        }
+
+        return false;
+    }
+
     public async Task AddAsync(ByteSlice key, ByteSlice value, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -121,7 +143,6 @@ internal sealed class BufferedSsTableBuilder : ISsTableBuilder
         {
             // The key was encoded once by the block builder; reuse those exact bytes for the bloom filter.
             AddBloomKeys();
-            ReplaceLastKey(key);
             return;
         }
 
@@ -138,7 +159,6 @@ internal sealed class BufferedSsTableBuilder : ISsTableBuilder
         AddBloomKeys();
 
         _firstKey = OwnedByteSlice.CopyFrom(key.Span);
-        ReplaceLastKey(key);
     }
 
     public long EstimatedSize => _offset;
@@ -179,7 +199,7 @@ internal sealed class BufferedSsTableBuilder : ISsTableBuilder
         _metadata ??= [];
         _metadataKeyOwners ??= [];
         var firstKey = _firstKey!;
-        var lastKey = _lastKey!;
+        var lastKey = _lastKey ?? OwnedByteSlice.CopyFrom(_blockBuilder.LastEncodedKey);
         _metadata.Add(new BlockMetadata(
             _metadata.Count,
             _offset,
@@ -199,6 +219,7 @@ internal sealed class BufferedSsTableBuilder : ISsTableBuilder
 
         _firstKey = default;
         _lastKey = default;
+        _isFirstKey = true;
         _blockBuilder.Clear();
 
         return;

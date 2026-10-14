@@ -130,12 +130,30 @@ internal sealed class StorageMetrics
 /// </summary>
 internal sealed class StripedCounter
 {
-    private const int StripeCount = 16;
+    private const int StripeCount = 64;
     private const int StrideLongs = 8;
+    internal static int s_nextStripe;
+    [ThreadStatic]
+    private static int t_stripeSlot;
     private readonly long[] _stripes = new long[StripeCount * StrideLongs];
 
+    internal static int MaxActiveStripes => Math.Min(StripeCount, Volatile.Read(ref s_nextStripe));
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    internal static int GetThreadStripeSlot()
+    {
+        var slot = t_stripeSlot;
+        if (slot == 0)
+        {
+            slot = ((Interlocked.Increment(ref s_nextStripe) & (StripeCount - 1)) * StrideLongs) + 1;
+            t_stripeSlot = slot;
+        }
+        return slot - 1;
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     public void Increment() =>
-        Interlocked.Increment(ref _stripes[(Environment.CurrentManagedThreadId & (StripeCount - 1)) * StrideLongs]);
+        Interlocked.Increment(ref _stripes[GetThreadStripeSlot()]);
 
     public long Value
     {

@@ -193,7 +193,7 @@ public sealed partial class MvccStorage
     {
         lock (_snapshotLock)
         {
-            state.SetRequired(_activeSnapshots.Keys, _activeSnapshots.Count, Volatile.Read(ref _publishedSequence));
+            state.SetRequired(_activeSnapshots.Keys, _activeSnapshots.Count, _transientPinSlots, Volatile.Read(ref _publishedSequence));
         }
     }
 
@@ -225,11 +225,12 @@ public sealed partial class MvccStorage
         public bool LastKeyPreserveGroup { get; private set; }
 
         // Sorted descending and distinct, always including the published sequence; element 0 is the largest.
-        public void SetRequired(Dictionary<long, SnapshotEntry>.KeyCollection active, int activeCount, long published)
+        public void SetRequired(Dictionary<long, SnapshotEntry>.KeyCollection active, int activeCount, TransientPinSlot[] transientSlots, long published)
         {
-            if (_required.Length < activeCount + 1)
+            var maxPossible = activeCount + transientSlots.Length + 1;
+            if (_required.Length < maxPossible)
             {
-                _required = new long[Math.Max(activeCount + 1, _required.Length * 2)];
+                _required = new long[Math.Max(maxPossible, _required.Length * 2)];
             }
 
             var n = 0;
@@ -237,6 +238,14 @@ public sealed partial class MvccStorage
             foreach (var sequence in active)
             {
                 _required[n++] = sequence;
+            }
+            for (var i = 0; i < transientSlots.Length; i++)
+            {
+                var seq = Volatile.Read(ref transientSlots[i].Sequence);
+                if (seq >= 0)
+                {
+                    _required[n++] = seq;
+                }
             }
 
             Array.Sort(_required, 0, n);

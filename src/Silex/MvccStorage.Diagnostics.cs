@@ -184,6 +184,37 @@ public sealed partial class MvccStorage
                     oldestPinnedAt = entry.PinnedAt;
                 }
             }
+            for (var i = 0; i < _transientPinSlots.Length; i++)
+            {
+                var seq = Volatile.Read(ref _transientPinSlots[i].Sequence);
+                if (seq < 0)
+                {
+                    continue;
+                }
+                views++;
+                if (!_activeSnapshots.ContainsKey(seq))
+                {
+                    var alreadyCounted = false;
+                    for (var j = 0; j < i; j++)
+                    {
+                        if (Volatile.Read(ref _transientPinSlots[j].Sequence) == seq)
+                        {
+                            alreadyCounted = true;
+                            break;
+                        }
+                    }
+                    if (!alreadyCounted)
+                    {
+                        distinct++;
+                    }
+                }
+                if (oldest is null || seq < oldest)
+                {
+                    oldest = seq;
+                    var pinned = Volatile.Read(ref _transientPinSlots[i].PinnedAt);
+                    oldestPinnedAt = pinned != 0 ? pinned : Stopwatch.GetTimestamp();
+                }
+            }
         }
 
         var engine = await _storage.GetStatisticsAsync(cancellationToken).ConfigureAwait(false);

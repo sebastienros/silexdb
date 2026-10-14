@@ -517,7 +517,7 @@ public class MvccGroupCommitTests
     [Arguments(0, true, true)]
     [Arguments(65, true, true)]
     [Arguments(8, false, true)]
-    [Arguments(8, true, false)]
+    [Arguments(8, false, false)]
     public async Task InvalidGroupingConfigurationIsRejected(int size, bool wal, bool sync)
     {
         using var folder = TempFolder.Create();
