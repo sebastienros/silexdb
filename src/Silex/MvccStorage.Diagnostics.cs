@@ -146,6 +146,16 @@ public sealed partial class MvccStorage
     }
 
     /// <summary>
+    /// Returns copied metadata of published SSTs. Key bounds are physical MVCC version keys.
+    /// </summary>
+    /// <exception cref="ObjectDisposedException">The instance is disposed or closing.</exception>
+    public Task<StorageTableStatistics[]> GetTablesAsync(CancellationToken cancellationToken = default)
+    {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposeState) != 0, this);
+        return _storage.GetTablesAsync(cancellationToken);
+    }
+
+    /// <summary>
     /// Returns cumulative counters, the retention window pinned by read views, and the engine's physical state.
     /// Works on a faulted instance so the fault and its pressure signals remain observable. Policy for
     /// admission control or timeouts is deliberately left to the caller.

@@ -70,7 +70,18 @@ public sealed partial class MvccStorage : IAsyncDisposable
     /// An existing plain <see cref="LsmStorage"/> database cannot be opened as MVCC because its key format is
     /// different. Use a separate path or migrate its entries explicitly.
     /// </remarks>
-    public static async Task<MvccStorage> OpenAsync(string path, StorageOptions options, CancellationToken cancellationToken = default)
+    public static Task<MvccStorage> OpenAsync(string path, StorageOptions options, CancellationToken cancellationToken = default)
+        => OpenCoreAsync(path, options, readOnly: false, cancellationToken);
+
+    /// <summary>Opens an existing, validated MVCC database without modifying recovery files under exclusive ownership.</summary>
+    public static Task<MvccStorage> OpenReadOnlyAsync(string path, StorageOptions options, CancellationToken cancellationToken = default)
+        => OpenCoreAsync(path, options, readOnly: true, cancellationToken);
+
+    /// <summary>Whether this facade was opened for read-only access.</summary>
+    public bool IsReadOnly => _storage.IsReadOnly;
+
+    private static async Task<MvccStorage> OpenCoreAsync(string path, StorageOptions options, bool readOnly,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(path);
         ArgumentNullException.ThrowIfNull(options);
@@ -84,7 +95,9 @@ public sealed partial class MvccStorage : IAsyncDisposable
             throw new ArgumentException("MVCC group commit requires WAL and SyncWriteAheadLogToDisk.", nameof(options));
         }
 
-        var storage = await LsmStorage.OpenAsync(path, options, cancellationToken).ConfigureAwait(false);
+        var storage = readOnly
+            ? await LsmStorage.OpenReadOnlyAsync(path, options, cancellationToken).ConfigureAwait(false)
+            : await LsmStorage.OpenAsync(path, options, cancellationToken).ConfigureAwait(false);
 
         try
         {
@@ -93,6 +106,10 @@ public sealed partial class MvccStorage : IAsyncDisposable
 
             if (formatLength < 0)
             {
+                if (readOnly)
+                {
+                    throw new InvalidDataException("The database has no MVCC format metadata.");
+                }
                 var entries = await storage.ScanRawAsync(
                     0,
                     static (_, _, _) => false,

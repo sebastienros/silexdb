@@ -5,6 +5,29 @@ namespace Silex;
 
 internal sealed partial class LsmStorageInner
 {
+    internal async Task<StorageTableStatistics[]> GetTablesAsync(CancellationToken cancellationToken)
+    {
+        using var operation = Lifetime.Enter();
+        await _level0Lock.EnterReadLockAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var result = new List<StorageTableStatistics>();
+            Add(0, _state.LevelZeroTables);
+            for (var level = 0; level < _state.LeveledSsTables.Count; level++)
+                Add(level + 1, _state.LeveledSsTables[level]);
+            return result.ToArray();
+
+            void Add(int level, List<SsTable> tables)
+            {
+                foreach (var table in tables)
+                    result.Add(new(table.FileId, level, table.Size, table.BlockMetadata.Length,
+                        table.BlockMetadata.Length == 0 ? [] : table.FirstKey.Span.ToArray(),
+                        table.BlockMetadata.Length == 0 ? [] : table.LastKey.Span.ToArray()));
+            }
+        }
+        finally { _level0Lock.ExitReadLock(); }
+    }
+
     internal async Task<LsmStorageStatistics> GetStatisticsAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();

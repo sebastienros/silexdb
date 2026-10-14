@@ -160,7 +160,7 @@ internal sealed class StorageBackup
         var filename = Path.Combine(path, FileName);
         using var output = new FileStream(filename, FileMode.CreateNew, FileAccess.Write, FileShare.None);
         created.Add(filename);
-        JsonSerializer.Serialize(output, this);
+        JsonSerializer.Serialize(output, this, StorageJsonContext.Default.StorageBackup);
         output.Flush(flushToDisk: true);
     }
 
@@ -169,7 +169,7 @@ internal sealed class StorageBackup
         var filename = Path.Combine(path, FileName);
         CheckRegularFile(filename);
         using var input = File.OpenRead(filename);
-        var backup = JsonSerializer.Deserialize<StorageBackup>(input);
+        var backup = JsonSerializer.Deserialize(input, StorageJsonContext.Default.StorageBackup);
         if (backup == null || backup.Version != 1 || backup.Mvcc != mvcc || backup.Files == null
             || backup.Files.Count == 0 || (backup.HasWal && !options.UseWriteAheadLog))
         {

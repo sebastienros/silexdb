@@ -2,6 +2,14 @@ namespace Silex;
 
 public sealed partial class LsmStorage
 {
+    /// <summary>Returns copied metadata of published SSTs without reading data blocks or retaining table handles.</summary>
+    public Task<StorageTableStatistics[]> GetTablesAsync(CancellationToken cancellationToken = default)
+    {
+        _inner.Lifetime.CheckOpen();
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        return _inner.GetTablesAsync(cancellationToken);
+    }
+
     /// <summary>
     /// Returns cumulative counters and a consistent view of the physical structure. Safe to call frequently;
     /// it never waits for the WAL, never reads data blocks and still works on a faulted instance so the fault

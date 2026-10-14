@@ -50,6 +50,9 @@ public enum StoragePressureCauses
 /// <param name="Bytes">Total SST file bytes (compressed, as stored).</param>
 public sealed record StorageLevelStatistics(int Level, int TableCount, long Bytes);
 
+/// <summary>Copied metadata of a currently published SST. Keys are physical encoded keys, including MVCC versions.</summary>
+public sealed record StorageTableStatistics(long FileId, int Level, long Bytes, int Blocks, byte[] FirstKey, byte[] LastKey);
+
 /// <summary>Cumulative flush or compaction activity since the instance was opened.</summary>
 /// <param name="Duration">Count and wall time of completed operations; failed operations are not included.</param>
 /// <param name="IsRunning">Whether one is executing right now.</param>

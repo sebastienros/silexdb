@@ -50,6 +50,295 @@ dotnet build Silex.slnx
 dotnet test  Silex.slnx
 ```
 
+## Database CLI
+
+`Silex.Tool` installs the `silex` command with .NET SDK 10 or later:
+
+```bash
+dotnet tool install --global Silex.Tool
+silex init --db ./data
+silex put --db ./data --key user:42 --value-file ./user.json
+silex get --db ./data --key user:42
+silex scan --db ./data --prefix user: --limit 100
+silex stats --db ./data --json
+silex backup --db ./data --to ./checkpoint
+silex restore --from ./checkpoint --to ./restored
+silex verify --db ./restored --json
+```
+
+Native AOT packages target **win-x64, osx-arm64, and linux-x64**. Other platforms use the
+framework-dependent `any` package, which requires the .NET 10 and ASP.NET Core 10 runtimes
+(both included in the SDK). Installation selects
+the package automatically. Build from source with `dotnet run --project src/Silex.Tool -- --help`.
+
+| Command | Purpose |
+|---|---|
+| `init` | Create a database in an empty directory. |
+| `info`, `stats` | Inspect files, physical structure, health, and since-open activity counters. |
+| `get`, `put`, `delete` | Read or mutate a byte-oriented key. |
+| `scan` | Stream ordered entries as JSONL with base64 `key` and `value` fields. |
+| `import`, `export` | Stream logical records in bounded batches using JSONL or a checksummed binary dump, optionally gzip-compressed. |
+| `backup`, `restore` | Create or restore an independently recoverable physical checkpoint. |
+| `verify` | Check offline recovery files and report integrity findings. |
+| `serve` | Host one database on authenticated loopback HTTP. |
+| `ps`, `stop NAME` | List registered servers or request identity-checked graceful shutdown. |
+
+Offline commands exclusively own the database directory and fail if an application/server
+already owns it. `get`, `scan`, `info`, and `stats` use strict read-only opening: they apply normal recovery
+validation without skipping damaged recovery, and never flush, compact, or rewrite
+recovery files. They may create the persistent `LOCK` file. They do not create missing databases.
+`init` and `serve --create` are explicit creation operations. Offline backup opens a writable
+handle for recovery and closes it normally afterward.
+
+Specify `--mode mvcc` for an MVCC database and its backups; the default is plain `lsm`.
+MVCC reads expose logical user keys, and each scan retains one snapshot. Online plain LSM
+scans are live across batches, not historical snapshots. Use `--no-wal` to match a store
+created without WAL. CLI/server WAL-enabled writes request file-content synchronization;
+the filesystem/device and directory-durability limitations of the engine still apply.
+Offline activity counters describe the inspection handle, not previous application activity;
+online statistics come from the actual running storage instance. Physical sizes are not
+logical key counts.
+
+Keys default to literal UTF-8 bytes; `--key-encoding hex` and `--key-encoding base64` are
+available. Value arguments use `--value-encoding utf8|hex|base64`. A `put` requires exactly
+one of `--value` and `--value-file`; `--value-file -` reads raw stdin. An empty `--value ""`
+is valid. `get --value-encoding raw` writes exact bytes to stdout with no trailing newline.
+Text output uses strict UTF-8 and rejects invalid text rather than replacing bytes.
+These encodings do not infer an application's typed serializers or composite-key schema.
+Scans support `--prefix` or `--from`/`--to` bounds (upper exclusive), `--reverse`, and an explicit
+limit of 1 through 1,000,000 entries (default 100). Entry payloads and point values are bounded
+at 16 MiB; scans use pooled, bounded batches rather than materializing the database.
+
+Reports are formatted JSON by default; `--json` selects compact JSON. Diagnostics go to
+stderr. Exit codes are `0` for success, `1` for errors/cancellation/invalid arguments, and `2`
+for a missing key. A failure or lost connection after submitting a mutation does not prove
+that it did not commit. The tool never automatically retries mutations.
+
+### Bulk import and export
+
+`export` transfers current logical key/value bytes, not SST files, tombstones, MVCC history,
+or application serializer definitions. `backup`/`restore` remain the physical recovery mechanism.
+Exports can move data between plain LSM and MVCC stores. Keys must be nonempty, values may be empty,
+and each record is limited to 16 MiB of decoded key plus value bytes.
+
+```bash
+silex export --db ./data --to ./dump.jsonl
+silex export --server local --to ./dump.silex.gz --format binary --gzip
+silex init --db ./other --mode mvcc
+silex import --db ./other --mode mvcc --from ./dump.silex.gz --json
+
+# Filter an export; the upper key bound is exclusive.
+silex export --db ./data --prefix user: --to ./users.jsonl
+silex export --db ./data --from user:100 --to-key user:200 --reverse --to ./range.jsonl
+
+# '-' means stdout/stdin. Enable pipefail to surface an upstream export failure.
+set -o pipefail
+silex export --db ./data --to - --format binary | silex import --db ./other --mode mvcc --from -
+```
+
+Export defaults to **JSONL**, matching `scan`: one UTF-8 object per line containing exactly
+`key` and `value` base64 strings. Import also accepts a final record without a newline and
+CRLF line endings. JSONL is inspectable and interoperable, but does not detect truncation
+exactly at a complete-record boundary. Encoded JSONL lines are bounded to
+`16 MiB * 4 / 3 + 128` bytes; unusually escaped or whitespace-heavy representations may
+reach that bound before the decoded payload limit. **Binary** avoids base64 expansion and validates
+each complete block before staging its records. Import defaults to `--format auto`, detecting
+the binary header or JSONL and optional gzip by content, not filename. `--format jsonl|binary`
+can require a particular format. Gzip imports require one complete member with a valid
+CRC32/size trailer. Use single-member gzip files; concatenated members are not supported.
+
+The version-1 binary format uses the eight ASCII bytes `SILEXKV1`, followed by blocks.
+All integers are unsigned and little-endian:
+
+| Structure | Layout |
+|---|---|
+| Block header | `uint32 payloadBytes`, `uint32 records`, `uint32 CRC32` of the payload (IEEE CRC32). |
+| Record | `uint32 keyBytes`, `uint32 valueBytes`, raw key, raw value. |
+| Completion footer | Three zero `uint32` fields, then `uint64 totalRecords`; no bytes may follow. |
+
+Writers target 1 MiB blocks, permitting a single larger record up to the entry limit.
+Readers reject blocks larger than 16 MiB plus the eight-byte record header, invalid lengths,
+record-count mismatches, checksum failures, unsupported versions, and missing completion footers.
+
+Imports require an existing database, upsert in input order (the last duplicate key wins),
+and leave other keys untouched. They commit at most 1,024 records or approximately 1 MiB of
+payload per batch; a larger permitted record occupies its own batch. LSM uses one WAL frame
+per batch and MVCC uses one transaction. WAL-enabled hosts/imports request synchronous
+file-content durability per batch. The whole import is **not atomic**: failures report the
+number of records in confirmed committed batches, discard uncommitted work, and never retry.
+A storage failure or lost connection may leave the current batch's outcome uncertain.
+Counts describe input records, not distinct keys. Normal completion diagnostics go to stderr;
+`import --json` emits the final count/batch report on stdout.
+
+Exports have no default row limit and stream using pooled buffers and bounded read batches.
+Offline exports use read-only opening and exclusive directory ownership. Online MVCC exports
+retain a snapshot; online plain-LSM exports block all host mutations until streaming completes
+or aborts. Use `export --server NAME --live` to allow concurrent writes and explicitly accept
+a non-snapshot plain-LSM traversal. Online imports serialize host mutations for the transfer
+while permitting reads. Bulk HTTP requests have a 15-minute deadline instead of the normal
+30 seconds, and use the same eight-request concurrency bound. File outputs refuse overwrite
+and are written beside the destination under a temporary name, then renamed only after
+successful completion; stdout cannot provide that publication guarantee.
+
+### Local database host
+
+The same executable can own a database and expose the operations over HTTP using
+ASP.NET Core Minimal APIs:
+
+```bash
+# Blocking foreground host. Ctrl+C drains requests and closes storage.
+silex serve --db ./data --name local --allow-writes --backup-root ./backups
+
+# Independent background process. Returns only after authenticated readiness.
+silex serve --db ./data --name local --allow-writes --backup-root ./backups --detach
+silex ps --json
+silex put --server local --key user:42 --value active
+silex get --server local --key user:42
+silex stats --server local --json
+silex backup --server local --to checkpoint-001
+silex stop local
+```
+
+The developer-only host binds exclusively to `127.0.0.1` and `::1` on the same port,
+automatically assigned unless `--port` is supplied. IPv6 URLs use brackets, for example
+`http://[::1]:12345`. The registry advertises the IPv4 URL by default; clients accept either
+literal loopback address. Non-loopback peers and wildcard/non-loopback listener configuration
+are rejected. Startup fails if either listener cannot bind; it never falls back to a public
+interface. Each process hosts one database. Writes are disabled unless `--allow-writes`
+is enabled; backup capability requires `--backup-root`. Online backup destinations are simple
+names under that root, must not already exist, and cannot contain path separators. Backups
+pause writes while copying but keep the database open. Restore and integrity verification
+remain offline.
+
+Configuration can come from a JSON file:
+
+```json
+{
+  "name": "local",
+  "database": "./data",
+  "mode": "lsm",
+  "port": 0,
+  "allowWrites": false,
+  "backupRoot": "./backups",
+  "useWriteAheadLog": true
+}
+```
+
+Run `silex serve --config ./silex.json --detach`. Explicit command-line options override
+configuration, including boolean options supplied with `true`/`false`. File-relative paths
+resolve relative to the configuration file; command-line paths resolve relative to the current
+directory. Unknown configuration properties are rejected. `--create` (or JSON `create: true`)
+requires an empty directory and is intended for first creation, not subsequent restarts.
+
+Each `serve` startup generates a fresh random 256-bit bearer token and atomically publishes
+it with the server instance ID in `.silex-server.json` inside the database directory.
+The CLI reads this sidecar without opening the database. It is removed on normal shutdown
+before database ownership is released; after a crash, the next startup replaces it with
+fresh credentials. Tokens are not database records and are excluded from logical exports
+and Silex physical backups.
+
+The database directory is the authentication trust boundary: processes that can read the
+credential file can administer the server. The sidecar uses normal file-creation permissions
+and inherits Windows directory ACLs, rather than imposing a separate current-user-only policy.
+Restrict filesystem access to the database directory to control who can connect.
+
+The per-user registry contains only discovery metadata, not tokens:
+`LocalApplicationData/Silex/servers` (override with `SILEX_STATE_DIRECTORY`). Unix registry
+directories use mode 0700 and files 0600; Windows registry state uses a current-user-only ACL.
+`ps` never prints tokens and reports unreachable records without treating them as proof of a
+running process. `stop` uses authenticated instance identity, not PID-based killing, and waits
+for directory ownership to be released. Detached startup/shutdown failures return errors;
+startup logs are stored beside the server record. Detached hosts are not installed OS services
+and do not restart automatically. Do not delete server state, credential sidecars, or lock files while a server is running.
+This host is a local developer tool, not a production database service. It does not expose
+existing application-owned databases or support remote binding. Remote access, TLS, richer
+authentication/authorization, and other production policies belong in a custom database
+provider or application-owned hosting layer.
+
+The versioned `/v1` protocol uses JSON requests, raw bytes for point-read responses, and
+base64 JSONL for scans. It provides identity, info/statistics, read, scan, put/delete, backup jobs,
+stop operations, and streaming logical imports/exports. Hosts admit at most eight concurrent
+requests, bound entry payloads and scan buffers, and normally limit requests/snapshot retention
+to 30 seconds (15 minutes for bulk transfers). Import bodies can exceed the point-request
+limit but are decoded incrementally under the per-record bounds. Backup jobs run independently
+of client polling; disconnecting the client does not cancel a submitted backup. Shutdown cancels
+and drains the job, and the last 64 job results are retained for polling. No borrowed engine
+memory is retained across network awaits.
+
+### Embedded administration UI
+
+![Silex Studio data browser with key filters, a split-pane key list, and a JSON entry viewer](docs/images/silex-studio.png)
+
+```bash
+silex ui --db ./data --name local --allow-writes --backup-root ./backups
+silex ui --server local
+# Print a credentialed URL instead of opening the browser:
+silex ui --server local --no-open
+```
+
+`ui --db` starts a detached host for an existing database; it remains running until
+`silex stop NAME`. Use `init` first for new databases. `ui --server` attaches without
+opening the database directory or changing host permissions. Writes remain opt-in.
+The URL printed by `--no-open` is a credential: do not share it or capture it in logs.
+The browser removes the token fragment from the address bar, retains it in session storage,
+and sends it only in API authorization headers. Static UI assets contain no secrets and
+are public on the loopback listener; all database APIs still require the bearer token.
+
+Silex Studio provides overview charts, byte-safe key/value editing, prefix/range scans,
+published SST metadata, logical import/export, backup jobs, and guarded flush/compaction.
+The data browser has filters above a split view: keys and exact key/value sizes on the
+left, with no value previews, and an entry inspector on the right. Text inputs disable
+autocomplete. The single **Key** field is a prefix filter for scans and an exact key for
+reads and entry creation; leave it empty to scan all keys or use From/To range bounds.
+Press Enter in a filter input to submit a scan.
+Icon toolbars select key rendering (UTF-8, hex, Base64) and value formats.
+Small copy icons beside keys, JSON scalar values, server names, database paths,
+SST filenames/bounds, and backup operation IDs copy the complete value, even when
+the display is truncated. JSON strings copy their decoded text; numbers retain
+their exact original literals.
+Successful copies show a checkmark with a "Copied" tooltip for two seconds instead
+of a notification banner; clipboard failures remain explicit errors.
+Select a scan result or read a key to inspect its stored bytes as UTF-8 text, a paged
+hex/ASCII dump, collapsible JSON, or Base64. Automatic selection prefers valid JSON,
+then UTF-8 text, then hex. JSON preserves number literals, duplicate properties, and
+escaped strings; invalid UTF-8/JSON produces explicit viewer errors. Viewing never
+rewrites data. The **Edit entry** icon turns the viewer into an inline editor in the
+currently selected format, including formatted JSON and hex bytes. Format changes
+convert draft bytes without reinterpreting them; invalid conversions are rejected.
+Saving JSON requires valid JSON. Unchanged drafts preserve the original stored bytes,
+including JSON whitespace. Leaving an editor or selecting another entry requires
+confirmation before its draft is discarded. Raw downloads always use stored bytes.
+Copy uses the displayed representation (the current hex page or text/Base64 preview);
+raw downloads contain the complete original value. Text/Base64 previews show at most
+65,536 characters. JSON previews support values up to 256 KiB and 64 nesting levels,
+with children loaded in groups of 50. Use text or raw downloads beyond those limits.
+SST metadata is copied from the engine under its structure lock, excluding obsolete files.
+Key bounds are physical encoded keys, including MVCC versions, not logical row counts.
+Browser scans are limited to 1,000 rows and 16 MiB responses; browser export downloads to
+256 MiB. Use the streaming CLI for larger transfers. Imports are batched upserts and
+may leave confirmed partial progress. Restore and integrity verification remain offline.
+
+Frontend source is in `src/Silex.Tool/Ui` (React, TypeScript, Vite). Building the tool
+requires Node 22+ and npm in addition to the .NET SDK. MSBuild builds the frontend
+incrementally and embeds all generated assets; installed native and portable tools need
+no Node, external asset directory, CDN, or network access to load the UI.
+
+### Tool packaging
+
+Build all packages at the same version with .NET SDK 10 or later:
+
+```bash
+dotnet pack src/Silex.Tool -c Release -p:Version=1.0.0 -o artifacts
+dotnet pack src/Silex.Tool -c Release -r any -p:PublishAot=false -p:Version=1.0.0 -o artifacts
+# Run each native pack on the matching operating system.
+dotnet pack src/Silex.Tool -c Release -r win-x64 -p:Version=1.0.0 -o artifacts
+dotnet pack src/Silex.Tool -c Release -r osx-arm64 -p:Version=1.0.0 -o artifacts
+dotnet pack src/Silex.Tool -c Release -r linux-x64 -p:Version=1.0.0 -o artifacts
+```
+
+Publish the RID and `any` packages first, then the top-level `Silex.Tool` pointer package.
+The release workflow builds the native packages on matching runners and enforces that order.
+
 ## Getting started
 
 Open (or create) a store, write some entries, read them back, and close it to flush to disk.
@@ -324,6 +613,12 @@ record hydration.
 Batching provides one consistent view and bounded owned results; it does not imply higher throughput.
 
 ### Recovery, integrity, and salvage
+
+For strict offline read-only access, use `LsmStorage.OpenReadOnlyAsync` or
+`MvccStorage.OpenReadOnlyAsync`. Opening applies normal recovery validation; the handle
+exclusively owns its directory and never modifies recovery files, flushes, or compacts.
+Unlike salvage, damaged recovery is not skipped. Use `VerifyIntegrityAsync` for a full
+data-block audit.
 
 Normal opening refuses a database with a missing manifest-referenced SST, even when a WAL with
 the same id survives: that WAL alone does not prove that all committed contents can be recovered.

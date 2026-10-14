@@ -124,6 +124,15 @@ public sealed partial class LsmStorage
     }
 
     /// <summary>
+    /// Opens an existing directory with normal recovery validation for read-only access under exclusive ownership.
+    /// Does not rewrite recovery files, flush, or compact; may create the persistent ownership file.
+    /// </summary>
+    /// <remarks>Unlike salvage, damaged recovery is not skipped. Use VerifyIntegrityAsync for a full data-block audit.</remarks>
+    public static Task<LsmStorage> OpenReadOnlyAsync(
+        string path, StorageOptions options, CancellationToken cancellationToken = default)
+        => OpenCoreAsync(path, options, cancellationToken, readOnly: true);
+
+    /// <summary>
     /// Opens surviving live SSTs and valid WAL prefixes for read-only, best-effort extraction.
     /// Does not change recovery files; may create the persistent ownership file.
     /// A corrupt manifest must be restored first.
@@ -154,10 +163,10 @@ public sealed partial class LsmStorage
         }
     }
 
-    /// <summary>True for a salvage handle, which cannot mutate the source database.</summary>
-    public bool IsReadOnly => RecoveryReport != null;
+    /// <summary>True for a read-only or salvage handle, which cannot mutate the source database.</summary>
+    public bool IsReadOnly { get; private init; }
 
-    /// <summary>Integrity findings captured before salvage; null for a normal handle.</summary>
+    /// <summary>Integrity findings captured before salvage; null for a normal writable or read-only handle.</summary>
     public StorageIntegrityReport? RecoveryReport { get; private init; }
 
     private static StorageIntegrityIssue MissingSstIssue(string path, long id)
@@ -212,7 +221,7 @@ public sealed partial class LsmStorage
         CheckDisposed();
         if (IsReadOnly)
         {
-            throw new InvalidOperationException("Salvage storage is read-only. Extract surviving entries to a separate database.");
+            throw new InvalidOperationException("Storage is read-only. Open a writable handle or extract entries to a separate database.");
         }
     }
 }

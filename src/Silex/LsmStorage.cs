@@ -137,12 +137,17 @@ public sealed partial class LsmStorage : IDisposable, IAsyncDisposable
         return new LsmStorageTyped<TKey, TValue>(storage);
     }
 
-    private static async Task<LsmStorage> OpenCoreAsync(string path, StorageOptions options, CancellationToken cancellationToken = default)
+    private static async Task<LsmStorage> OpenCoreAsync(string path, StorageOptions options,
+        CancellationToken cancellationToken = default, bool readOnly = false)
     {
         ArgumentNullException.ThrowIfNull(options);
         cancellationToken.ThrowIfCancellationRequested();
         if (!Directory.Exists(path))
         {
+            if (readOnly)
+            {
+                throw new DirectoryNotFoundException($"Storage directory '{path}' does not exist.");
+            }
             Directory.CreateDirectory(path);
         }
 
@@ -157,7 +162,7 @@ public sealed partial class LsmStorage : IDisposable, IAsyncDisposable
             {
                 throw new InvalidOperationException("A completed physical backup is immutable. Use RestoreBackupAsync to create a writable database.");
             }
-            return await OpenOwnedAsync(path, options, ownership, cancellationToken);
+            return await OpenOwnedAsync(path, options, ownership, cancellationToken, readOnly: readOnly);
         }
         catch
         {
@@ -167,7 +172,8 @@ public sealed partial class LsmStorage : IDisposable, IAsyncDisposable
     }
 
     private static async Task<LsmStorage> OpenOwnedAsync(string path, StorageOptions options,
-        DirectoryOwnership ownership, CancellationToken cancellationToken, StorageIntegrityReport? salvageReport = null)
+        DirectoryOwnership ownership, CancellationToken cancellationToken, StorageIntegrityReport? salvageReport = null,
+        bool readOnly = false)
     {
         // Capture the WAL files that exist *before* the inner is constructed: the inner immediately
         // creates a fresh WAL for its initial current memtable, and that one must not be replayed.
@@ -215,7 +221,8 @@ public sealed partial class LsmStorage : IDisposable, IAsyncDisposable
             }
         }
 
-        var storageInner = new LsmStorageInner(path, options, readOnly: salvageReport != null);
+        var isReadOnly = readOnly || salvageReport != null;
+        var storageInner = new LsmStorageInner(path, options, readOnly: isReadOnly);
         var opened = false;
         try
         {
@@ -375,7 +382,7 @@ public sealed partial class LsmStorage : IDisposable, IAsyncDisposable
 
             // Ensure every successfully opened store has a manifest, including manifest-less stores created by
             // older versions or by strategies that used to infer L0 from filenames.
-            if (salvageReport == null)
+            if (!isReadOnly)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 storageInner.BuildManifestSnapshot().Write(path);
@@ -402,11 +409,11 @@ public sealed partial class LsmStorage : IDisposable, IAsyncDisposable
                 }
             }
 
-            var compacter = new Compacter(storageInner, TimeProvider.System, options, enableBackgroundFlush: salvageReport == null);
-            var storage = new LsmStorage(storageInner, compacter) { RecoveryReport = salvageReport };
+            var compacter = new Compacter(storageInner, TimeProvider.System, options, enableBackgroundFlush: !isReadOnly);
+            var storage = new LsmStorage(storageInner, compacter) { RecoveryReport = salvageReport, IsReadOnly = isReadOnly };
             StorageMeter.Register(storageInner.Metrics, path);
 
-            if (salvageReport == null)
+            if (!isReadOnly)
             {
                 compacter.StartBackgroundFlush();
             }
@@ -424,7 +431,7 @@ public sealed partial class LsmStorage : IDisposable, IAsyncDisposable
             {
                 var currentWalPath = Path.Combine(path, $"{storageInner._state.CurrentMemTable.Id}.wal");
                 storageInner.Dispose();
-                if (salvageReport == null && options.UseWriteAheadLog)
+                if (!isReadOnly && options.UseWriteAheadLog)
                 {
                     TryDeleteFile(currentWalPath);
                 }
