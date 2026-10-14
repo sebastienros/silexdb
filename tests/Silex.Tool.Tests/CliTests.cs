@@ -141,6 +141,40 @@ public class CliTests
     }
 
     [Test]
+    public async Task DetachedLauncherClosesRedirectedStreamsWhileServerKeepsRunning()
+    {
+        using var folder = new TestFolder();
+        var state = Path.Combine(folder.Path, "state");
+        var db = Path.Combine(folder.Path, "db");
+        using var launcher = Process.Start(StartInfo(state,
+            ["serve", "--db", db, "--create", "--name", "pipes", "--detach"]))!;
+        var stdout = launcher.StandardOutput.ReadToEndAsync();
+        var stderr = launcher.StandardError.ReadToEndAsync();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        try
+        {
+            await launcher.WaitForExitAsync(timeout.Token);
+            await Assert.That(launcher.ExitCode).IsEqualTo(0);
+            await Task.WhenAll(stdout, stderr).WaitAsync(TimeSpan.FromSeconds(5));
+            await Assert.That(await stderr).IsEqualTo("");
+            var record = JsonSerializer.Deserialize(await File.ReadAllTextAsync(Path.Combine(state, "pipes.json")),
+                ToolJsonContext.Default.ServerRecord) ?? throw new IOException("Missing server registration.");
+            using var client = new ServerClient(record);
+            await Assert.That(await client.IsRunningAsync(timeout.Token)).IsTrue();
+        }
+        finally
+        {
+            if (!launcher.HasExited)
+            {
+                launcher.Kill(entireProcessTree: true);
+                await launcher.WaitForExitAsync();
+            }
+            if (File.Exists(Path.Combine(state, "pipes.json")))
+                await RunWithState(state, 0, "stop", "pipes");
+        }
+    }
+
+    [Test]
     public async Task DetachedHostSupportsAuthenticatedOperationsAndGracefulShutdown()
     {
         using var folder = new TestFolder();

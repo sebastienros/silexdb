@@ -1,4 +1,6 @@
+using System.ComponentModel;
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Security.AccessControl;
 using System.Security.Principal;
 using System.Text.Json;
@@ -6,7 +8,7 @@ using System.Text.Json.Serialization.Metadata;
 
 namespace Silex.Tool;
 
-internal sealed class Registry
+internal sealed partial class Registry
 {
     public string DirectoryPath { get; }
 
@@ -136,7 +138,7 @@ internal sealed class Registry
         var start = new ProcessStartInfo(executable)
         {
             UseShellExecute = false, CreateNoWindow = true,
-            RedirectStandardOutput = true, RedirectStandardError = true
+            RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true
         };
         if (Path.GetFileNameWithoutExtension(executable).Equals("dotnet", StringComparison.OrdinalIgnoreCase))
             start.ArgumentList.Add(Environment.GetCommandLineArgs()[0]);
@@ -146,6 +148,52 @@ internal sealed class Registry
         start.ArgumentList.Add("--background");
         return start;
     }
+
+    private static Process StartChild(string configurationPath)
+    {
+        var start = ChildStartInfo(configurationPath);
+        if (!OperatingSystem.IsWindows())
+            return Process.Start(start) ?? throw new IOException("Could not start the server.");
+
+        Span<nint> handles = stackalloc nint[3];
+        Span<uint> flags = stackalloc uint[3];
+        handles.Clear();
+        flags.Clear();
+        try
+        {
+            for (var i = 0; i < handles.Length; i++)
+            {
+                var handle = GetStdHandle(unchecked((uint)(-10 - i)));
+                if (handle == 0 || handle == -1) continue;
+                if (!GetHandleInformation(handle, out var original))
+                    throw new Win32Exception(Marshal.GetLastPInvokeError(), "Could not inspect launcher standard handles.");
+                if ((original & 1) == 0) continue;
+                // Windows otherwise inherits the launcher's pipes in addition to the child's redirected pipes.
+                if (!SetHandleInformation(handle, 1, 0))
+                    throw new Win32Exception(Marshal.GetLastPInvokeError(), "Could not isolate detached server standard handles.");
+                handles[i] = handle;
+                flags[i] = original & 1;
+            }
+            return Process.Start(start) ?? throw new IOException("Could not start the server.");
+        }
+        finally
+        {
+            for (var i = 0; i < handles.Length; i++)
+                if (handles[i] != 0 && !SetHandleInformation(handles[i], 1, flags[i]))
+                    throw new Win32Exception(Marshal.GetLastPInvokeError(), "Could not restore launcher standard handles.");
+        }
+    }
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    private static partial nint GetStdHandle(uint standardHandle);
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool GetHandleInformation(nint handle, out uint flags);
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool SetHandleInformation(nint handle, uint mask, uint flags);
 
     public async Task StartDetachedAsync(ServerConfiguration configuration, CancellationToken cancellationToken)
     {
@@ -160,7 +208,8 @@ internal sealed class Registry
         configuration = configuration with { InstanceId = Guid.NewGuid().ToString("N") };
         Write(configuration.Name, ".launch.json", configuration, ToolJsonContext.Default.ServerConfiguration);
         var path = FilePath(configuration.Name, ".launch.json");
-        using var process = Process.Start(ChildStartInfo(path)) ?? throw new IOException("Could not start the server.");
+        using var process = StartChild(path);
+        process.StandardInput.Close();
         try
         {
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
