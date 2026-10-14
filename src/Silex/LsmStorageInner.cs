@@ -473,23 +473,9 @@ internal sealed partial class LsmStorageInner : IDisposable
                 }
             }
 
-            if (immutableMemTables.IsEmpty && _state.LevelZeroTables.Count == 0)
-            {
-                var anyLeveled = false;
-                foreach (var level in _state.LeveledSsTables)
-                {
-                    if (level.Count != 0)
-                    {
-                        anyLeveled = true;
-                        break;
-                    }
-                }
-                if (!anyLeveled)
-                {
-                    length = -1;
-                    return true;
-                }
-            }
+            // Fast path 2: check active and immutable memtables only when no SSTs exist yet, or when a live
+            // or tombstone entry is found in MemTable. Note: checking _state.LevelZeroTables / _state.LeveledSsTables
+            // requires holding _level0Lock, so we only conclude the key is absent if we acquire _level0Lock below.
         }
         finally
         {
@@ -1168,7 +1154,7 @@ internal sealed partial class LsmStorageInner : IDisposable
             for (var i = immutableMemTables.Length - 1; i >= 0; i--)
             {
                 sources[sourceCount++] = MergeIterator.Source.Create(
-                    MergeIterator.Input.FromMemTable((MemTable)immutableMemTables[i], _currentMemTableLock),
+                    MergeIterator.Input.FromMemTable((MemTable)immutableMemTables[i], _immutableMemTablesLock),
                     hasFrom, fromMemory, backwards: false, cancellationToken);
             }
 
@@ -2112,7 +2098,7 @@ internal sealed partial class LsmStorageInner : IDisposable
                 cancellationToken.ThrowIfCancellationRequested();
                 if (immutableMemTables[i] is MemTable immutableMemTable)
                 {
-                    inputs.Add(MergeIterator.Input.FromMemTable(immutableMemTable, _currentMemTableLock));
+                    inputs.Add(MergeIterator.Input.FromMemTable(immutableMemTable, _immutableMemTablesLock));
                 }
                 else
                 {
@@ -2199,7 +2185,7 @@ internal sealed partial class LsmStorageInner : IDisposable
                 if (immutableMemTables[i] is MemTable immutableMemTable)
                 {
                     sources[sourceCount++] = MergeIterator.Source.Create(
-                        MergeIterator.Input.FromMemTable(immutableMemTable, _currentMemTableLock),
+                        MergeIterator.Input.FromMemTable(immutableMemTable, _immutableMemTablesLock),
                         hasFrom, from, backwards: false, cancellationToken);
                 }
                 else
@@ -2826,6 +2812,8 @@ internal sealed partial class LsmStorageInner : IDisposable
     private CoalescedWriteWaiter? _coalesceTail;
     private readonly Stack<CoalescedWriteWaiter> _coalescePool = new(CoalesceSlotCount);
 
+    private bool _coalesceLeaderActive;
+
     private bool TryWriteCoalesced(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool isTombstone)
     {
         CoalescedWriteWaiter waiter;
@@ -2834,8 +2822,7 @@ internal sealed partial class LsmStorageInner : IDisposable
         {
             waiter = _coalescePool.Count > 0 ? _coalescePool.Pop() : new CoalescedWriteWaiter();
             waiter.Initialize(key, value, isTombstone);
-            isLeader = _coalesceHead is null;
-            if (isLeader)
+            if (_coalesceHead is null)
             {
                 _coalesceHead = _coalesceTail = waiter;
             }
@@ -2843,6 +2830,11 @@ internal sealed partial class LsmStorageInner : IDisposable
             {
                 _coalesceTail!.Next = waiter;
                 _coalesceTail = waiter;
+            }
+            isLeader = !_coalesceLeaderActive;
+            if (isLeader)
+            {
+                _coalesceLeaderActive = true;
             }
         }
 
@@ -2875,6 +2867,10 @@ internal sealed partial class LsmStorageInner : IDisposable
             {
                 batchHead = _coalesceHead;
                 _coalesceHead = _coalesceTail = null;
+                if (batchHead is null)
+                {
+                    _coalesceLeaderActive = false;
+                }
             }
 
             if (batchHead is null)
@@ -2945,7 +2941,7 @@ internal sealed partial class LsmStorageInner : IDisposable
                 _currentMemTableLock.ExitWriteLock();
             }
 
-            var selfIncluded = ReferenceEquals(batchHead, waiter);
+            var selfIncluded = false;
             var follower = batchHead;
             while (follower is not null)
             {
@@ -2964,24 +2960,56 @@ internal sealed partial class LsmStorageInner : IDisposable
 
             if (selfIncluded)
             {
+                var canExitLeader = false;
                 lock (_coalesceLock)
                 {
-                    waiter.Reset();
-                    if (_coalescePool.Count < CoalesceSlotCount)
+                    if (_coalesceHead is null)
                     {
-                        _coalescePool.Push(waiter);
+                        _coalesceLeaderActive = false;
+                        canExitLeader = true;
+                        waiter.Reset();
+                        if (_coalescePool.Count < CoalesceSlotCount)
+                        {
+                            _coalescePool.Push(waiter);
+                        }
                     }
                 }
 
-                if (groupError is not null)
+                if (canExitLeader)
                 {
-                    System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(groupError).Throw();
+                    if (groupError is not null)
+                    {
+                        System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(groupError).Throw();
+                    }
+                    return true;
                 }
 
-                return true;
+                // More items arrived before we could clear _coalesceLeaderActive.
+                // If we had an error on our own batch, hand off leadership to the next queued waiter!
+                if (groupError is not null)
+                {
+                    lock (_coalesceLock)
+                    {
+                        _coalesceLeaderActive = false;
+                        waiter.Reset();
+                        if (_coalescePool.Count < CoalesceSlotCount)
+                        {
+                            _coalescePool.Push(waiter);
+                        }
+                    }
+                    System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(groupError).Throw();
+                }
             }
         }
 
+        lock (_coalesceLock)
+        {
+            waiter.Reset();
+            if (_coalescePool.Count < CoalesceSlotCount)
+            {
+                _coalescePool.Push(waiter);
+            }
+        }
         return true;
     }
 

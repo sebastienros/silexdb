@@ -518,14 +518,14 @@ internal sealed class StripedReaderWriterLock : IDisposable
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     public void EnterReadLock()
     {
+        if (Volatile.Read(ref _anyReaderEntered) == 0)
+        {
+            Interlocked.Exchange(ref _anyReaderEntered, 1);
+        }
         var slot = StripedCounter.GetThreadStripeSlot() * 2;
         if (Volatile.Read(ref _writerGate) == 0)
         {
             Interlocked.Increment(ref _readerStripes[slot]);
-            if (Volatile.Read(ref _anyReaderEntered) == 0)
-            {
-                Volatile.Write(ref _anyReaderEntered, 1);
-            }
             if (Volatile.Read(ref _writerGate) == 0)
             {
                 return;
@@ -560,7 +560,6 @@ internal sealed class StripedReaderWriterLock : IDisposable
                         Monitor.Wait(_readerDrainGate);
                     }
                     Interlocked.Increment(ref _readerStripes[slot]);
-                    Volatile.Write(ref _anyReaderEntered, 1);
                     if (Volatile.Read(ref _writerGate) == 0)
                     {
                         return;
@@ -690,17 +689,11 @@ internal sealed class StripedReaderWriterLock : IDisposable
             {
                 return 0;
             }
-            Volatile.Write(ref _anyReaderEntered, 0);
-            Interlocked.MemoryBarrier();
             var total = 0;
             var max = StripedCounter.MaxActiveStripes;
             for (var i = 0; i < max; i++)
             {
                 total += Volatile.Read(ref _readerStripes[i * StrideInts]);
-            }
-            if (total != 0)
-            {
-                Volatile.Write(ref _anyReaderEntered, 1);
             }
             return total;
         }
