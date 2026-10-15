@@ -1544,43 +1544,111 @@ foreach (var x in Enumerable.Range(0, 1_000_000))
 await db.CloseAsync(); // flush everything to disk
 ```
 
-## Comparisons with RocksDB
+## Comparisons with SurrealKV and RocksDB
 
-### Plain LSM: 200,000 entries, operations/s
+Measured October 14, 2026 on an Apple M4 Pro (14 cores, 48 GiB RAM, macOS):
+50,000 keys, 16-byte keys, 100-byte values, no compression, 64 MiB memtables,
+8 MiB block caches, and WAL enabled. Results are medians of three fresh-process runs,
+alternating engine order, using matched .NET and native comparison adapters.
+SurrealKV is version 1.0.0 (`6a758fd`); RocksDB is version 11.4.0.
 
-| Workload | Silex | RocksDB | Silex/RocksDB |
-|---|---:|---:|---:|
-| Sequential writes | 839,985 | 738,688 | 1.14x |
-| Random writes | 825,584 | 526,684 | 1.57x |
-| Overwrites | 853,069 | 417,377 | 2.04x |
-| Random reads, first pass | 1,711,034 | 1,378,644 | 1.24x |
-| Random reads, warm | 2,335,006 | 1,477,279 | 1.58x |
-| Sequential scan | 15,660,113 | 15,204,500 | 1.03x |
-| Random seeks, first pass | 2,240,914 | 926,676 | 2.42x |
-| Random seeks, warm | 2,537,044 | 966,080 | 2.63x |
+The comparisons are paired by the API guarantees exercised, not by storage architecture:
+all three engines use LSM storage.
 
-### MVCC: 8,192 keys
+- **Plain key/value operations: Silex LSM versus RocksDB plain DB.** Measures direct writes,
+  current-value reads, and scans without transactional conflict validation. RocksDB's snapshot
+  and transaction APIs are not exercised.
+- **Transactional operations: Silex MVCC versus SurrealKV.** Measures version-aware reads and
+  scans plus single-mutation optimistic transactions, including commit coordination and conflict
+  retries. SurrealKV uses its transactional API even with historical retention disabled.
 
-| Workload | Residency | Retained versions | Unit | Silex | RocksDB | Silex/RocksDB |
-|---|---|---:|---|---:|---:|---:|
-| Latest snapshot hit | Memtable | 1 | reads/s | 2,545,535 | 2,713,266 | 0.94x |
-| Oldest snapshot hit | Memtable | 1 | reads/s | 2,484,386 | 2,760,171 | 0.90x |
-| Snapshot miss | Memtable | 1 | reads/s | 2,477,493 | 2,696,617 | 0.92x |
-| 64-key tracked transaction | Memtable | 1 | tx/s | 42,971 | 19,047 | 2.26x |
-| Latest snapshot hit | SST | 1 | reads/s | 2,412,825 | 1,855,769 | 1.30x |
-| Oldest snapshot hit | SST | 1 | reads/s | 2,448,293 | 1,852,022 | 1.32x |
-| Snapshot miss | SST | 1 | reads/s | 5,915,721 | 8,349,423 | 0.71x |
-| 64-key tracked transaction | SST | 1 | tx/s | 40,048 | 15,736 | 2.54x |
-| Latest snapshot hit | Memtable | 8 | reads/s | 2,173,932 | 1,835,103 | 1.18x |
-| Oldest snapshot hit | Memtable | 8 | reads/s | 2,185,682 | 1,981,393 | 1.10x |
-| Snapshot miss | Memtable | 8 | reads/s | 2,197,155 | 1,893,142 | 1.16x |
-| 64-key tracked transaction | Memtable | 8 | tx/s | 38,194 | 15,335 | 2.49x |
-| Latest snapshot hit | SST | 8 | reads/s | 2,159,803 | 1,465,573 | 1.47x |
-| Oldest snapshot hit | SST | 8 | reads/s | 2,150,659 | 1,520,056 | 1.41x |
-| Snapshot miss | SST | 8 | reads/s | 5,985,092 | 8,191,670 | 0.73x |
-| 64-key tracked transaction | SST | 8 | tx/s | 35,683 | 12,727 | 2.80x |
-| Document + two indexes | Memtable | Pinned initial snapshot | tx/s | 156,120 | 100,031 | 1.56x |
-| Document + two indexes | Initially SST, then mixed | Pinned initial snapshot | tx/s | 136,818 | 97,660 | 1.40x |
+These pairs are closer comparisons, not identical implementations or isolation guarantees.
+The transactional results do not measure multi-key transactions, tracked-read validation, or
+long-lived historical snapshots.
+
+Writes partition 50,000 operations across clients; synchronized writes partition 50 operations.
+Each reader performs 50,000 reads/seeks or scans all 50,000 entries; bounded scans run 5,000
+times per reader and full counts run 50 times. MVCC writes use one transaction per mutation,
+retrying conflicts; Silex MVCC commit groups are 1 and 8 respectively. These are latest-version
+workloads without pinned historical snapshots; SurrealKV historical retention is disabled.
+Only synchronized writes request WAL synchronization. The first read pass is not a cold-cache test.
+
+Throughput is aggregate completed work per wall-clock second across all clients: **ops/s** for
+individual mutations, point reads, and seeks; **entries/s** for full forward/reverse scans; and
+**scans/s** for complete bounded scans or count queries. Higher is better. Rejected transactions
+are retried, not counted as completed operations.
+
+Memory cells report **RSS / peak RSS in MiB** for the entire indicated suite, not per operation;
+lower is better.
+RSS is sampled after the timed workloads, before closing the database; peak RSS is the OS-reported
+process high-water mark, including setup, flushing, and shutdown. Both include runtime and engine
+memory, not just managed allocations.
+
+### Plain key/value operations: Silex LSM versus RocksDB
+
+| Workload | Residency | Unit | Silex LSM, 1 thread | RocksDB, 1 thread | Silex LSM, 8 threads | RocksDB, 8 threads |
+|---|---|---|---:|---:|---:|---:|
+| Sequential writes | Memtable + WAL | ops/s | 773,216 | 735,318 | 417,013 | 585,380 |
+| Random writes | Memtable + WAL | ops/s | 774,996 | 593,392 | 423,334 | 602,568 |
+| Overwrites | Memtable + WAL | ops/s | 838,444 | 566,304 | 454,914 | 606,837 |
+| Random deletes | Memtable + WAL | ops/s | 968,502 | 561,587 | 522,170 | 680,256 |
+| Synchronized writes | WAL sync | ops/s | 220 | 245 | 816 | 987 |
+| Random reads, first pass | Memtable | ops/s | 7,614,522 | 2,116,779 | 28,071,751 | 15,987,290 |
+| Random reads, warm | Memtable | ops/s | 18,114,629 | 2,163,304 | 36,741,405 | 16,844,617 |
+| Random seeks, first pass | Memtable | ops/s | 2,788,218 | 1,260,968 | 13,635,542 | 5,214,016 |
+| Random seeks, warm | Memtable | ops/s | 4,746,355 | 1,259,296 | 14,675,129 | 5,348,368 |
+| Forward scan | Memtable | entries/s | 32,728,939 | 21,739,130 | 190,612,342 | 159,656,738 |
+| Reverse scan | Memtable | entries/s | 12,299,518 | 3,697,051 | 87,081,465 | 28,686,517 |
+| Scan 100 entries | Memtable | scans/s | 1,336,863 | 192,110 | 6,937,218 | 1,413,702 |
+| Skip 5,000, scan 100 | Memtable | scans/s | 26,971 | 4,475 | 162,608 | 34,233 |
+| Count all 50,000 keys | Memtable | scans/s | 2,755 | 452 | 16,461 | 3,386 |
+| Random reads, first pass | SST | ops/s | 3,758,127 | 1,572,092 | 14,467,645 | 4,172,230 |
+| Random reads, warm | SST | ops/s | 6,374,461 | 1,667,512 | 19,353,403 | 4,169,943 |
+| Random seeks, first pass | SST | ops/s | 2,910,361 | 857,801 | 13,553,579 | 3,043,415 |
+| Random seeks, warm | SST | ops/s | 5,213,384 | 832,486 | 18,495,485 | 3,042,390 |
+| Forward scan | SST | entries/s | 28,199,199 | 15,825,289 | 179,412,424 | 92,080,141 |
+| Reverse scan | SST | entries/s | 12,517,838 | 9,751,658 | 90,758,514 | 65,088,276 |
+| Scan 100 entries | SST | scans/s | 2,980,093 | 139,515 | 4,517,987 | 392,532 |
+| Skip 5,000, scan 100 | SST | scans/s | 53,986 | 3,384 | 196,161 | 19,114 |
+| Count all 50,000 keys | SST | scans/s | 5,429 | 345 | 19,400 | 1,967 |
+| Read-suite memory | Memtable | MiB RSS / peak | 65.3 / 72.5 | 14.9 / 15.0 | 66.5 / 73.3 | 15.8 / 16.0 |
+| Read-suite memory | SST | MiB RSS / peak | 78.8 / 79.0 | 26.0 / 26.1 | 80.5 / 81.0 | 27.5 / 27.8 |
+| Write-suite memory | Sequential fill + overwrite + delete | MiB RSS / peak | 69.5 / 76.2 | 23.1 / 23.1 | 70.1 / 76.7 | 24.0 / 24.2 |
+| Random-fill memory | Memtable + WAL | MiB RSS / peak | 61.1 / 67.4 | 14.1 / 14.2 | 62.0 / 68.5 | 15.0 / 15.1 |
+| Synchronized-write memory | WAL sync | MiB RSS / peak | 52.4 / 57.2 | 7.6 / 7.7 | 53.0 / 57.9 | 8.2 / 8.4 |
+
+### Transactional operations: Silex MVCC versus SurrealKV
+
+| Workload | Residency | Unit | Silex MVCC, 1 thread | SurrealKV, 1 thread | Silex MVCC, 8 threads | SurrealKV, 8 threads |
+|---|---|---|---:|---:|---:|---:|
+| Sequential writes | Memtable + WAL | ops/s | 607,393 | 397,342 | 525,357 | 679,602 |
+| Random writes | Memtable + WAL | ops/s | 597,586 | 384,598 | 475,513 | 655,458 |
+| Overwrites | Memtable + WAL | ops/s | 701,900 | 380,218 | 654,250 | 641,434 |
+| Random deletes | Memtable + WAL | ops/s | 749,105 | 408,541 | 590,189 | 728,153 |
+| Synchronized writes | WAL sync | ops/s | 230 | 240 | 668 | 834 |
+| Random reads, first pass | Memtable | ops/s | 4,077,472 | 6,614,668 | 19,128,963 | 2,383,936 |
+| Random reads, warm | Memtable | ops/s | 9,880,056 | 7,650,036 | 25,121,841 | 2,294,283 |
+| Random seeks, first pass | Memtable | ops/s | 1,609,451 | 1,323,925 | 9,028,388 | 1,560,938 |
+| Random seeks, warm | Memtable | ops/s | 1,882,573 | 1,336,377 | 9,007,467 | 1,554,476 |
+| Forward scan | Memtable | entries/s | 17,222,969 | 20,146,400 | 100,821,697 | 132,736,021 |
+| Reverse scan | Memtable | entries/s | 5,832,332 | 10,953,402 | 43,279,270 | 33,356,266 |
+| Scan 100 entries | Memtable | scans/s | 218,734 | 182,525 | 1,529,789 | 780,561 |
+| Skip 5,000, scan 100 | Memtable | scans/s | 4,350 | 7,259 | 29,638 | 51,487 |
+| Count all 50,000 keys | Memtable | scans/s | 438 | 712 | 3,168 | 4,662 |
+| Random reads, first pass | SST | ops/s | 2,210,287 | 853,919 | 10,651,442 | 2,406,438 |
+| Random reads, warm | SST | ops/s | 3,222,314 | 896,168 | 13,380,611 | 2,418,843 |
+| Random seeks, first pass | SST | ops/s | 2,235,096 | 580,968 | 11,145,414 | 1,286,808 |
+| Random seeks, warm | SST | ops/s | 2,795,092 | 619,436 | 11,890,783 | 1,288,314 |
+| Forward scan | SST | entries/s | 14,155,885 | 16,219,721 | 87,958,484 | 107,886,969 |
+| Reverse scan | SST | entries/s | 5,678,076 | 4,263,710 | 36,278,218 | 23,484,975 |
+| Scan 100 entries | SST | scans/s | 225,636 | 148,030 | 1,261,909 | 593,464 |
+| Skip 5,000, scan 100 | SST | scans/s | 4,410 | 5,283 | 26,296 | 31,426 |
+| Count all 50,000 keys | SST | scans/s | 450 | 487 | 2,918 | 3,148 |
+| Read-suite memory | Memtable | MiB RSS / peak | 71.0 / 79.0 | 15.7 / 80.9 | 88.0 / 96.1 | 16.8 / 81.6 |
+| Read-suite memory | SST | MiB RSS / peak | 86.1 / 86.7 | 156.5 / 156.6 | 102.7 / 103.0 | 155.2 / 155.7 |
+| Write-suite memory | Sequential fill + overwrite + delete | MiB RSS / peak | 100.8 / 114.8 | 24.7 / 89.5 | 152.4 / 166.3 | 25.5 / 90.3 |
+| Random-fill memory | Memtable + WAL | MiB RSS / peak | 69.9 / 78.1 | 14.5 / 79.5 | 87.2 / 95.5 | 15.1 / 80.1 |
+| Synchronized-write memory | WAL sync | MiB RSS / peak | 52.6 / 57.9 | 4.3 / 70.2 | 53.4 / 58.5 | 4.2 / 70.1 |
 
 ## Project layout
 
