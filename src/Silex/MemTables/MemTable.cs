@@ -8,7 +8,8 @@ namespace Silex.MemTables;
 
 /// <summary>
 /// Stores keys and values in arena slabs and keeps compact record descriptors in contiguous arrays.
-/// Point lookups use open addressing; ordered reads use a lazily built, pooled paged index of record positions.
+/// Point lookups use open addressing; ordered reads use a lazily built, pooled paged index of record positions
+/// that inserts keep current once it exists.
 /// </summary>
 /// <remarks>
 /// Writes are synchronized by <see cref="LsmStorageInner"/>. Frozen tables support concurrent readers.
@@ -18,6 +19,7 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
 {
     private const int InitialRecordCapacity = 256;
     private const int InitialBucketCapacity = 512;
+    private const int MinInsertsBeforeOrderedIndexDrop = 1024;
 
     private readonly long _id;
     private readonly WriteAheadLog? _wal;
@@ -33,6 +35,7 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
     private int _count;
     private long _size;
     private volatile bool _sortDirty;
+    private int _insertsSinceOrderedRead;
     private bool _disposed;
     private readonly Action<StorageFaultPoint>? _faultInjector;
     internal StorageCommitOutcome WriteOutcome { get; private set; }
@@ -63,6 +66,11 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (!_sortDirty && _orderedIndex is not null)
         {
+            // Reset only when an insert happened, so concurrent readers of an unchanged table never write the field.
+            if (_insertsSinceOrderedRead != 0)
+            {
+                _insertsSinceOrderedRead = 0;
+            }
             return;
         }
 
@@ -91,6 +99,7 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
                 }
                 _orderedIndex?.Dispose();
                 _orderedIndex = new OrderedIndex(this, sorted.AsSpan(0, _count));
+                _insertsSinceOrderedRead = 0;
                 _sortDirty = false;
             }
             finally
@@ -272,20 +281,60 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
             };
             _buckets[bucket] = newIndex + 1;
 
-            if (_prefixBuckets is not null)
-            {
-                var oldPrefixBuckets = _prefixBuckets;
-                _prefixBuckets = null;
-                ArrayPool<int>.Shared.Return(oldPrefixBuckets);
-            }
-            _unindexedPrefixReads = 0;
-
-            _sortDirty = true;
+            IndexNewRecord(newIndex, key);
             _singleVersionCleanMvccState = 0;
             _count++;
         }
 
         _size += key.Length + value.Length + sizeof(int);
+    }
+
+    /// <summary>
+    /// Adds a new record to the ordered and version-prefix indexes once a read has built them, so a read
+    /// after a write does not rebuild either index from every record. Before that, inserts only mark the
+    /// ordered index dirty and a write-only table pays for the hash index alone. Writers are exclusive, so
+    /// readers never observe a partial update.
+    /// </summary>
+    /// <remarks>
+    /// An insert into the ordered index costs several times its share of a rebuild, so once inserts run far
+    /// ahead of ordered reads the index is left dirty and the next ordered read rebuilds it. This bounds what
+    /// a bulk write after a single scan pays, while interleaved reads and writes keep the index current.
+    /// </remarks>
+    private void IndexNewRecord(int newIndex, ReadOnlySpan<byte> key)
+    {
+        if (_orderedIndex is null || _sortDirty ||
+            ++_insertsSinceOrderedRead > Math.Max(MinInsertsBeforeOrderedIndexDrop, _count / 8))
+        {
+            _sortDirty = true;
+        }
+        else
+        {
+            try
+            {
+                _orderedIndex.Insert(newIndex);
+            }
+            catch
+            {
+                _sortDirty = true;
+                throw;
+            }
+        }
+
+        if (_prefixBuckets is not null &&
+            (_records[newIndex].IsCleanMvccKey || VersionPrefixBloom.IsVersionKey(key)))
+        {
+            try
+            {
+                InsertVersionPrefixLive(newIndex, key[..^sizeof(long)]);
+            }
+            catch
+            {
+                var prefixBuckets = _prefixBuckets;
+                _prefixBuckets = null;
+                ArrayPool<int>.Shared.Return(prefixBuckets);
+                throw;
+            }
+        }
     }
 
     public IStorageIterator CreateIterator() => new MemTableIterator(this);

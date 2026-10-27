@@ -116,6 +116,9 @@ internal static class RngStreams
     public const int Write = 1;
     public const int Read = 2;
     public const int Seek = 3;
+    public const int Mix = 4;
+    public const int ReadMixWrite = 5;
+    public const int SeekMixWrite = 6;
 
     public static Random Create(int seed, int threadId, int stream) =>
         new(DeterministicSeed(seed, threadId, stream));

@@ -111,6 +111,82 @@ public class MemTableTests
     }
 
     [Test]
+    public async Task IndexesStayCurrentWhenWritesInterleaveWithVersionLookupsAndSeeks()
+    {
+        using var table = new MemTable(1);
+        var versions = new Dictionary<int, SortedSet<ulong>>();
+        var all = new SortedSet<byte[]>(Comparer<byte[]>.Create(static (x, y) => x.AsSpan().SequenceCompareTo(y)));
+        var random = new Random(7);
+
+        for (var i = 0; i < 6_000; i++)
+        {
+            var user = random.Next(400);
+            var trailer = (ulong)random.NextInt64(1, 1_000);
+            var key = VersionKey(user, trailer);
+            table.PutRaw(key, key);
+            all.Add(key);
+            if (!versions.TryGetValue(user, out var trailers))
+            {
+                versions[user] = trailers = [];
+            }
+            trailers.Add(trailer);
+
+            if (i % 97 == 0)
+            {
+                // Plain keys share the table without joining any version chain.
+                byte[] plain = [2, (byte)(i >> 8), (byte)i];
+                table.PutRaw(plain, plain);
+                all.Add(plain);
+            }
+
+            var probeUser = random.Next(400);
+            var from = (ulong)random.NextInt64(0, 1_001);
+            var inclusive = random.Next(2) == 0;
+            var found = table.TryGetNextVersionRaw(VersionKey(probeUser, from), Prefix(probeUser), inclusive,
+                out var actualKey, out var actualValue, out var tombstone);
+            ulong? expected = null;
+            if (versions.TryGetValue(probeUser, out var candidates))
+            {
+                foreach (var candidate in candidates)
+                {
+                    if (candidate > from || inclusive && candidate == from)
+                    {
+                        expected = candidate;
+                        break;
+                    }
+                }
+            }
+            if (found != expected.HasValue || found &&
+                (!actualKey.SequenceEqual(VersionKey(probeUser, expected!.Value)) || tombstone || !actualKey.SequenceEqual(actualValue)))
+                throw new InvalidOperationException($"Incorrect version lookup for user {probeUser} from {from}, inclusive={inclusive}, after {i + 1} writes.");
+
+            // No seeks for 2,000 writes, so the ordered index is dropped and the next seek rebuilds it.
+            if (i % 5 == 0 && (i < 2_000 || i >= 4_000))
+            {
+                var seek = VersionKey(random.Next(400), (ulong)random.NextInt64(0, 1_001));
+                var seekFound = table.TryGetNextRaw(seek, true, true, false, out var seekKey, out _, out _);
+                var seekExpected = all.Comparer.Compare(seek, all.Max!) > 0 ? null : all.GetViewBetween(seek, all.Max!).Min;
+                if (seekFound != seekExpected is not null || seekFound && !seekKey.SequenceEqual(seekExpected))
+                    throw new InvalidOperationException($"Incorrect seek after {i + 1} writes.");
+            }
+        }
+
+        var ordered = table.CreateIterator().EnumerateAsync().ToBlockingEnumerable().Select(static entry => entry.Key.Span.ToArray()).ToArray();
+        await Assert.That(ordered.Length).IsEqualTo(all.Count);
+        await Assert.That(ordered.Zip(all).All(static pair => pair.First.AsSpan().SequenceEqual(pair.Second))).IsTrue();
+
+        static byte[] Prefix(int user) => [1, (byte)(1 + user / 250), (byte)(1 + user % 250), 0, 0];
+
+        static byte[] VersionKey(int user, ulong trailer)
+        {
+            var key = new byte[13];
+            Prefix(user).CopyTo(key, 0);
+            BinaryPrimitives.WriteUInt64BigEndian(key.AsSpan(5), trailer);
+            return key;
+        }
+    }
+
+    [Test]
     public async Task OverwritingPackedTableEntryShouldNotAllocate()
     {
         using var table = new MemTable(1, arenaBlockSize: 64 * 1024);

@@ -11,7 +11,7 @@ internal static class CommandLine
 {
     private static readonly Option<string> Benchmarks = new("--benchmarks")
     {
-        Description = "Comma-separated list: fillseq, fillrandom, fillsync, overwrite, readrandom, readmissing, readseq, readreverse, seekrandom, scanlimit, scanskip, scancount, deleterandom.",
+        Description = "Comma-separated list: fillseq, fillrandom, fillsync, overwrite, readrandom, readmissing, readseq, readreverse, seekrandom, scanlimit, scanskip, scancount, deleterandom, readrandomwriterandom, seekrandomwriterandom.",
         DefaultValueFactory = _ => "fillseq,readrandom,readseq",
     };
 
@@ -101,6 +101,12 @@ internal static class CommandLine
     {
         Description = "Entries read after each seek in seekrandom.",
         DefaultValueFactory = _ => 0,
+    };
+
+    private static readonly Option<int> ReadWritePercent = new("--readwritepercent")
+    {
+        Description = "Percentage of reads (the rest are writes) in readrandomwriterandom and seekrandomwriterandom.",
+        DefaultValueFactory = _ => 90,
     };
 
     private static readonly Option<int> ScanSkip = new("--scan_skip")
@@ -271,7 +277,7 @@ internal static class CommandLine
         {
             Benchmarks, Num, Reads, ValueSize, KeySize, Db, UseExistingDb, Seed, Histogram, Threads,
             WriteBufferSize, MaxWriteBufferNumber, BloomBits, BlockSize, CacheSize,
-            SeekNexts, ScanSkip, ScanLimit, Scans, Mode, Mvcc, MvccCommitGroupSize, FlushBeforeReads,
+            SeekNexts, ReadWritePercent, ScanSkip, ScanLimit, Scans, Mode, Mvcc, MvccCommitGroupSize, FlushBeforeReads,
             Compaction, CompactionStyle, Wal, WalSync,
             Level0FileNumCompactionTrigger, NumLevels, MaxBytesForLevelBase, MaxBytesForLevelMultiplier,
             TargetSstSize, TargetFileSizeBase,
@@ -326,6 +332,7 @@ internal static class CommandLine
             CompressionLevel = parseResult.GetValue(CompressionLevel),
             CompressionRatio = ParseCompressionRatio(parseResult.GetValue(CompressionRatio)),
             SeekNexts = Math.Max(0, parseResult.GetValue(SeekNexts)),
+            ReadWritePercent = Math.Clamp(parseResult.GetValue(ReadWritePercent), 0, 100),
             ScanSkip = Math.Max(0, parseResult.GetValue(ScanSkip)),
             ScanLimit = Math.Max(1, parseResult.GetValue(ScanLimit)),
             Scans = parseResult.GetValue(Scans),

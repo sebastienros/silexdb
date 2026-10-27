@@ -46,6 +46,8 @@ internal sealed class BenchmarkOptions
 
     public int SeekNexts { get; set; }
 
+    public int ReadWritePercent { get; set; } = 90;
+
     public int ScanSkip { get; set; }
 
     public int ScanLimit { get; set; } = 100;
