@@ -59,6 +59,8 @@ internal sealed class Runner
     private const string ScanLimit = "scanlimit";
     private const string ScanSkip = "scanskip";
     private const string ScanCount = "scancount";
+    private const string ReadRandomWriteRandom = "readrandomwriterandom";
+    private const string SeekRandomWriteRandom = "seekrandomwriterandom";
     private const string Separator = "----------------------------------------------------------------";
 
     private readonly BenchmarkOptions _options;
@@ -221,6 +223,16 @@ internal sealed class Runner
                 await EnsureReadableAsync();
                 Report(await RunScanBoundedAsync(name, skip: 0, limit: int.MaxValue, countOnly: true));
                 break;
+            case ReadRandomWriteRandom:
+                await EnsureWriteableAsync();
+                Report(await RunReadWriteMixAsync(name, seek: false));
+                _needsReadBarrier = true;
+                break;
+            case SeekRandomWriteRandom:
+                await EnsureWriteableAsync();
+                Report(await RunReadWriteMixAsync(name, seek: true));
+                _needsReadBarrier = true;
+                break;
         }
     }
 
@@ -239,6 +251,8 @@ internal sealed class Runner
         if (BenchmarkEquals(value, ScanLimit)) return ScanLimit;
         if (BenchmarkEquals(value, ScanSkip)) return ScanSkip;
         if (BenchmarkEquals(value, ScanCount)) return ScanCount;
+        if (BenchmarkEquals(value, ReadRandomWriteRandom)) return ReadRandomWriteRandom;
+        if (BenchmarkEquals(value, SeekRandomWriteRandom)) return SeekRandomWriteRandom;
 
         return null;
     }
@@ -953,6 +967,137 @@ internal sealed class Runner
             Target = target;
             Read = 0;
         }
+
+        public bool Accept(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
+        {
+            if (Read == 0 && key.SequenceEqual(Target))
+            {
+                Stats.Found++;
+            }
+
+            Stats.ByteSlice += key.Length + value.Length;
+            Read++;
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Interleaves random writes with random point reads (or seeks) on one thread, so reads observe a
+    /// memtable that changed since the previous read. <see cref="BenchmarkOptions.ReadWritePercent"/> of the
+    /// operations are reads; the rest overwrite random keys in <c>[0, num)</c>, one write per commit.
+    /// </summary>
+    private Task<BenchmarkResult> RunReadWriteMixAsync(string name, bool seek)
+    {
+        var db = _db;
+        var mvccDb = _mvccDb;
+        var readPercent = _options.ReadWritePercent;
+        var entryBytes = _options.KeySize + _options.ValueSize;
+        var extra = $"(reads {readPercent}%, writes {100 - readPercent}%)";
+
+        return RunParallelAsync(name, _options.EffectiveReads, partitioned: false, extra, (threadId, start, count, stats) =>
+        {
+            var keyGen = new KeyGenerator(_options.KeySize);
+            var valueGen = new ValueGenerator(_options.Seed + threadId, _options.ValueSize, _options.CompressionRatio);
+            // Neither the fill's nor the other mix's write stream: replaying one would only overwrite keys the
+            // memtable already holds, so reads would never see a newly inserted key.
+            var writeRng = RngStreams.Create(_options.Seed, threadId, seek ? RngStreams.SeekMixWrite : RngStreams.ReadMixWrite);
+            var readRng = RngStreams.Create(_options.Seed, threadId, seek ? RngStreams.Seek : RngStreams.Read);
+            var mixRng = RngStreams.Create(_options.Seed, threadId, RngStreams.Mix);
+            var key = new byte[_options.KeySize];
+            var value = new byte[_options.ValueSize];
+            var valueBuffer = new byte[_options.ValueSize];
+            var seekState = new SeekScanState(stats);
+
+            return new ThreadWorker(op =>
+            {
+                if (mixRng.Next(100) >= readPercent)
+                {
+                    keyGen.GenerateInto(writeRng.NextInt64(_options.Num), key);
+                    valueGen.GenerateInto(value);
+                    stats.Ops++;
+                    stats.ByteSlice += entryBytes;
+
+                    if (mvccDb == null)
+                    {
+                        db!.Put(key, value);
+                        return new ValueTask<bool>(true);
+                    }
+
+                    var tx = mvccDb.BeginTransaction();
+                    tx.Put(key, value);
+                    var commitTask = tx.TryCommitAsync();
+                    if (commitTask.IsCompletedSuccessfully)
+                    {
+                        commitTask.GetAwaiter().GetResult();
+                        tx.Dispose();
+                        return new ValueTask<bool>(true);
+                    }
+                    return AwaitMixCommitAsync(commitTask, tx);
+                }
+
+                keyGen.GenerateInto(readRng.NextInt64(_options.Num), key);
+                stats.Ops++;
+
+                if (seek)
+                {
+                    seekState.Reset(key);
+                    var seekTask = mvccDb != null
+                        ? mvccDb.SeekRawAsync(key, seekState, static (s, k, v) => s.Accept(k, v), 1)
+                        : db!.SeekRawAsync(key.AsSpan(), seekState, static (s, k, v) => s.Accept(k, v), 1);
+                    if (seekTask.IsCompletedSuccessfully)
+                    {
+                        seekTask.GetAwaiter().GetResult();
+                        return new ValueTask<bool>(true);
+                    }
+                    return AwaitMixSeekAsync(seekTask);
+                }
+
+                var readTask = mvccDb != null
+                    ? mvccDb.GetRawAsync(key, valueBuffer)
+                    : db!.GetRawAsync(key.AsSpan(), valueBuffer);
+                if (readTask.IsCompletedSuccessfully)
+                {
+                    RecordRead(stats, readTask.GetAwaiter().GetResult(), _options.KeySize);
+                    return new ValueTask<bool>(true);
+                }
+                return AwaitMixReadAsync(readTask, stats, _options.KeySize);
+            });
+        });
+
+        static void RecordRead(ThreadStats stats, int length, int keySize)
+        {
+            stats.ByteSlice += keySize;
+            if (length >= 0)
+            {
+                stats.Found++;
+                stats.ByteSlice += length;
+            }
+        }
+
+        static async ValueTask<bool> AwaitMixCommitAsync(ValueTask<bool> commitTask, MvccTransaction tx)
+        {
+            try
+            {
+                await commitTask;
+            }
+            finally
+            {
+                tx.Dispose();
+            }
+            return true;
+        }
+
+        static async ValueTask<bool> AwaitMixReadAsync(ValueTask<int> task, ThreadStats stats, int keySize)
+        {
+            RecordRead(stats, await task, keySize);
+            return true;
+        }
+
+        static async ValueTask<bool> AwaitMixSeekAsync(ValueTask<long> task)
+        {
+            await task;
+            return true;
+        }
     }
 
     // ----- parallel scaffolding + reporting -----
@@ -1124,7 +1269,7 @@ internal sealed class Runner
 
         var line = $"{result.Name,-14} : {microsPerOp,11:F3} micros/op {opsPerSec,12:N0} ops/sec; {mbPerSec,8:F1} MB/s";
 
-        if (result.Name is "readrandom" or "readmissing" or "seekrandom")
+        if (result.Name is "readrandom" or "readmissing" or "seekrandom" or "readrandomwriterandom" or "seekrandomwriterandom")
         {
             line += $" (found {result.Found:N0} of {result.TotalOps:N0})";
         }

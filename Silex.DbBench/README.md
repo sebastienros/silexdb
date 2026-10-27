@@ -117,6 +117,8 @@ done
 | `readseq`      | Forward-scan the database via an iterator, up to `--reads` entries.         |
 | `seekrandom`   | Seek to a random key and read `--seek_nexts`+1 entries; one op per seek.    |
 | `deleterandom` | Delete `--num` random keys.                                                 |
+| `readrandomwriterandom` | Interleave random point reads and random overwrites (`--readwritepercent` reads) on each thread. |
+| `seekrandomwriterandom` | Like `readrandomwriterandom`, with a one-entry seek instead of each point read. |
 
 `readreverse` is intentionally unsupported — Silex iterators are forward-only.
 
@@ -136,6 +138,8 @@ preceding benchmark, so chains like `fillseq,readrandom,readseq` behave as expec
   key range, keeping the overall order ascending.
 - **Read benchmarks** (`readrandom`, `readmissing`, `readseq`, `seekrandom`) give *each* thread the full
   `--reads` budget, so total work scales with the thread count — this measures concurrent read throughput.
+- **Mixed benchmarks** (`readrandomwriterandom`, `seekrandomwriterandom`) also give each thread the full
+  `--reads` budget of operations, split between reads and writes by `--readwritepercent`.
 
 Random key streams for reads are independent of the write streams (different mixed seeds), so found counts
 reflect real key coverage rather than replaying the write sequence.
@@ -168,6 +172,7 @@ time. `--histogram` additionally prints avg / p50 / p95 / p99 / max latency per 
 | `--block_size` | `4096` | SSTable block size in bytes. |
 | `--cache_size` | `8388608` (8 MiB) | Block cache size limit in bytes. |
 | `--seek_nexts` | `0` | Entries read after each seek in `seekrandom`. |
+| `--readwritepercent` | `90` | Percentage of reads in `readrandomwriterandom` and `seekrandomwriterandom`; the rest are writes. |
 | `--compaction` | `Tiered` | Compaction strategy: `None`, `Tiered` or `Leveled`. |
 | `--wal` | `true` | Enable the write-ahead log (`--wal=false` to disable). |
 | `--wal_sync` | `false` | fsync the WAL on every write. |
