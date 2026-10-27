@@ -91,6 +91,11 @@ internal static class CommandLine
         DefaultValueFactory = _ => 4 * 1024,
     };
 
+    private static readonly Option<bool> BlockKeyWindows = new("--block_key_windows")
+    {
+        Description = "Write a key-window index in new SST blocks (newer SST format version).",
+    };
+
     private static readonly Option<long> CacheSize = new("--cache_size")
     {
         Description = "Block cache size limit in bytes.",
@@ -276,7 +281,7 @@ internal static class CommandLine
         var root = new RootCommand("Silex DbBench — a RocksDB db_bench-style benchmark tool for the Silex LSM store.")
         {
             Benchmarks, Num, Reads, ValueSize, KeySize, Db, UseExistingDb, Seed, Histogram, Threads,
-            WriteBufferSize, MaxWriteBufferNumber, BloomBits, BlockSize, CacheSize,
+            WriteBufferSize, MaxWriteBufferNumber, BloomBits, BlockSize, BlockKeyWindows, CacheSize,
             SeekNexts, ReadWritePercent, ScanSkip, ScanLimit, Scans, Mode, Mvcc, MvccCommitGroupSize, FlushBeforeReads,
             Compaction, CompactionStyle, Wal, WalSync,
             Level0FileNumCompactionTrigger, NumLevels, MaxBytesForLevelBase, MaxBytesForLevelMultiplier,
@@ -327,6 +332,7 @@ internal static class CommandLine
             MaxWriteBufferNumber = parseResult.GetValue(MaxWriteBufferNumber),
             BloomBits = parseResult.GetValue(BloomBits),
             BlockSize = parseResult.GetValue(BlockSize),
+            BlockKeyWindows = parseResult.GetValue(BlockKeyWindows),
             CacheSize = parseResult.GetValue(CacheSize),
             Compression = ParseCompressionType(parseResult.GetValue(CompressionType)!),
             CompressionLevel = parseResult.GetValue(CompressionLevel),

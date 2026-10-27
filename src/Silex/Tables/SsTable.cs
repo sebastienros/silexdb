@@ -377,7 +377,8 @@ internal sealed class SsTable : IDisposable
         public bool ForEachNextBlockRaw<TArg>(TArg arg, ReadRawEntryAction<TArg> reader, bool skipTombstones)
         {
             ReadNextBlockBorrowed(out var memory, out var count);
-            var borrow = new Block(_table._blockBuilder.Encoder, memory, memory.Length, count);
+            DefaultBlockEncoder.ReadEntryCount(memory.Span, memory.Length, out var hasKeyWindows);
+            var borrow = new Block(_table._blockBuilder.Encoder, memory, memory.Length, count, hasKeyWindows);
             return borrow.ForEachRaw(arg, reader, skipTombstones);
         }
 
@@ -404,8 +405,7 @@ internal sealed class SsTable : IDisposable
             if (metadata.Compression == SstCompression.None)
             {
                 memory = stored.AsMemory(0, length);
-                count = System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(
-                    memory.Span.Slice(length - sizeof(ushort), sizeof(ushort)));
+                count = DefaultBlockEncoder.ReadEntryCount(memory.Span, length, out _);
                 return null;
             }
 
@@ -416,8 +416,7 @@ internal sealed class SsTable : IDisposable
                 uncompressed.AsSpan(0, metadata.UncompressedLength));
 
             memory = uncompressed.AsMemory(0, metadata.UncompressedLength);
-            count = System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(
-                memory.Span.Slice(metadata.UncompressedLength - sizeof(ushort), sizeof(ushort)));
+            count = DefaultBlockEncoder.ReadEntryCount(memory.Span, metadata.UncompressedLength, out _);
             return null;
         }
 
@@ -475,7 +474,7 @@ internal sealed class SsTable : IDisposable
             }
 
             IBloomFilter? prefixBloom = null;
-            if (formatVersion >= 2)
+            if (SsTableFormat.HasVersionPrefixBloom(formatVersion))
             {
                 if (contentLength < VersionPrefixBloom.TrailerLength)
                     throw new InvalidDataException("The SST is missing its version-prefix filter trailer.");

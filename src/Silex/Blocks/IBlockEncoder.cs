@@ -50,6 +50,11 @@ internal interface IBlockEncoder
     ushort BlockSize { get; }
 
     /// <summary>
+    /// Whether encoded blocks carry a key-window index, which requires a newer SST footer version.
+    /// </summary>
+    bool WritesKeyWindows { get; }
+
+    /// <summary>
     /// Estimates the size, in bytes, that an entry with the given encoded key and value lengths takes in a block.
     /// </summary>
     int EstimateSize(int encodedKeyLength, int valueLength, bool isTombstone);

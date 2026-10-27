@@ -182,7 +182,7 @@ public sealed partial class LsmStorage
 
     private static void VerifyBlock(Block block, BlockMetadata metadata)
     {
-        var dataEnd = block.Memory.Length - (block.Offsets.Count + 1) * sizeof(ushort);
+        var dataEnd = block.DataEnd;
         if (block.Offsets.Count == 0 || dataEnd <= 0 || block.Offsets[0] != 0)
         {
             throw new InvalidDataException("The SST block has an invalid entry offset section.");
@@ -204,6 +204,13 @@ public sealed partial class LsmStorage
                 || (index == block.Offsets.Count - 1 && !metadata.LastKeySpan.SequenceEqual(key.Span)))
             {
                 throw new InvalidDataException("The SST block keys are unordered or do not match the index.");
+            }
+
+            if (block.HasKeyWindows
+                && (!key.Span.StartsWith(block.KeyPrefix)
+                    || block.GetKeyWindow(index) != BlockKeyWindows.GetWindow(key.Span, block.KeyPrefix.Length)))
+            {
+                throw new InvalidDataException("The SST block key-window index does not match its keys.");
             }
 
             var entry = block.GetEntry(offset);

@@ -88,7 +88,7 @@ internal sealed class BufferedSsTableBuilder : ISsTableBuilder
         _blockBuilder = new BlockBuilder(blockEncoder);
         _blockCompressor = new BlockCompressor(compression, compressionLevel, minimumCompressionSavingsPercent);
         if (formatVersion is < SsTableFormat.LegacyVersion or > SsTableFormat.CurrentVersion
-            || (formatVersion == SsTableFormat.LegacyVersion && compression != SstCompression.None))
+            || (formatVersion == SsTableFormat.LegacyVersion && (compression != SstCompression.None || blockEncoder.WritesKeyWindows)))
         {
             throw new ArgumentOutOfRangeException(nameof(formatVersion), formatVersion, "The requested SST format version does not support these options.");
         }
@@ -271,7 +271,7 @@ internal sealed class BufferedSsTableBuilder : ISsTableBuilder
         }
         if (_formatVersion >= 1)
         {
-            SsTableFormat.WriteFooter(ref binaryWriter, _versionPrefixBloom is null ? 1 : _formatVersion);
+            SsTableFormat.WriteFooter(ref binaryWriter, SsTableFormat.GetFooterVersion(_versionPrefixBloom is not null, _blockBuilder.Encoder.WritesKeyWindows));
         }
 
         binaryWriter.Flush();

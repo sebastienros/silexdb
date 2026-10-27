@@ -36,6 +36,8 @@ internal sealed class BenchmarkOptions
 
     public int BlockSize { get; set; } = 4 * 1024;
 
+    public bool BlockKeyWindows { get; set; }
+
     public long CacheSize { get; set; } = 8L * 1024 * 1024;
 
     public SstCompression Compression { get; set; } = SstCompression.Lz4;
@@ -105,6 +107,7 @@ internal sealed class BenchmarkOptions
             MemTableSizeLimit = Positive("--write_buffer_size", WriteBufferSize),
             MemTableMaxCount = ToUInt16("--max_write_buffer_number", MaxWriteBufferNumber),
             BlockSize = blockSize,
+            BlockKeyWindows = BlockKeyWindows,
             BlockCacheSizeLimit = NonNegative("--cache_size", CacheSize),
             Compression = Compression,
             CompressionLevel = CompressionLevel,

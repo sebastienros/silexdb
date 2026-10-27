@@ -3,13 +3,14 @@ namespace Silex.Blocks;
 internal sealed class DefaultBlockEncoderFactory : IBlockEncoderFactory
 {
     private readonly ushort _blockSize;
+    private readonly bool _writeKeyWindows;
 
     public DefaultBlockEncoderFactory()
         : this((ushort)4.KiB())
     {
     }
 
-    public DefaultBlockEncoderFactory(ushort blockSize)
+    public DefaultBlockEncoderFactory(ushort blockSize, bool writeKeyWindows = false)
     {
         if (blockSize == 0)
         {
@@ -17,7 +18,8 @@ internal sealed class DefaultBlockEncoderFactory : IBlockEncoderFactory
         }
 
         _blockSize = blockSize;
+        _writeKeyWindows = writeKeyWindows;
     }
 
-    public IBlockEncoder Create() => new DefaultBlockEncoder(_blockSize);
+    public IBlockEncoder Create() => new DefaultBlockEncoder(_blockSize, _writeKeyWindows);
 }
