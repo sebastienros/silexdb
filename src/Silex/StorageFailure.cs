@@ -83,5 +83,7 @@ internal enum StorageFaultPoint
     BackupBeforeCopy,
     BackupAfterCopy,
     BackupBeforePublish,
-    OrderedReadBeforeMemTableRead
+    OrderedReadBeforeMemTableRead,
+    MemTableBeforeOrderedIndexSplit,
+    MemTableBeforeVersionPrefixGrow
 }

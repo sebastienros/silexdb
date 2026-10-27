@@ -2,6 +2,7 @@
 
 using Silex.Collections;
 using Silex.MemTables;
+using Silex.Tables;
 using System.Buffers.Binary;
 using TUnit.Assertions.Enums;
 
@@ -183,6 +184,553 @@ public class MemTableTests
             Prefix(user).CopyTo(key, 0);
             BinaryPrimitives.WriteUInt64BigEndian(key.AsSpan(5), trailer);
             return key;
+        }
+    }
+
+    [Test]
+    [Arguments(1)]
+    [Arguments(2)]
+    [Arguments(3)]
+    public async Task IndexesKeepInvariantsUnderRandomInterleavedOperations(int seed)
+    {
+        using var table = new MemTable(1);
+        var model = new IndexModel(table);
+        var random = new Random(seed);
+        var dropped = false;
+        var rebuilt = false;
+
+        for (var step = 0; step < 12_000; step++)
+        {
+            // No seeks or scans for this stretch, so inserts run past the drop threshold while version lookups go on.
+            var quiet = step is >= 5_000 and < 8_500;
+            var operation = random.Next(100);
+            if (operation < 45)
+            {
+                model.Put(RandomKey(random), RandomValue(random));
+            }
+            else if (operation < 55)
+            {
+                model.Delete(RandomKey(random));
+            }
+            else if (operation < 75)
+            {
+                model.CheckVersionLookup(RandomVersionPrefix(random), (ulong)random.Next(25), random.Next(2) == 0);
+            }
+            else if (operation < 80 || quiet)
+            {
+                model.CheckPointLookup(RandomKey(random));
+            }
+            else if (operation < 95)
+            {
+                model.CheckSeek(RandomKey(random), random.Next(2) == 0, random.Next(2) == 0);
+            }
+            else
+            {
+                model.CheckScan(random.Next(3) == 0 ? null : RandomKey(random), random.Next(4) == 0, random.Next(1, 300));
+            }
+
+            if (quiet && table.CurrentOrderedIndex is null)
+            {
+                dropped = true;
+            }
+            else if (dropped && !quiet && table.CurrentOrderedIndex is not null)
+            {
+                rebuilt = true;
+            }
+            if (step % 250 == 0)
+            {
+                CheckIndexInvariants(table);
+            }
+        }
+
+        model.CheckAll();
+        await Assert.That(dropped).IsTrue();
+        await Assert.That(rebuilt).IsTrue();
+    }
+
+    [Test]
+    [Arguments(false, 1)]
+    [Arguments(false, 7)]
+    [Arguments(true, 1)]
+    [Arguments(true, 2)]
+    public async Task FailedOrderedIndexSplitMarksIndexForRebuild(bool branch, int occurrence)
+    {
+        // A leaf split that fails leaves an overfull leaf; a branch split that fails does so after its child split.
+        var armed = true;
+        var splitsInWrite = 0;
+        var splits = 0;
+        using var table = new MemTable(1, faultInjector: point =>
+        {
+            if (point == StorageFaultPoint.BatchBeforeApply)
+            {
+                splitsInWrite = 0;
+            }
+            else if (armed && point == StorageFaultPoint.MemTableBeforeOrderedIndexSplit &&
+                ++splitsInWrite == (branch ? 2 : 1) && ++splits == occurrence)
+            {
+                armed = false;
+                throw new IOException("Injected split failure.");
+            }
+        });
+        var model = new IndexModel(table);
+        var random = new Random(occurrence);
+        BuildIndexes(model, random);
+
+        byte[]? failedKey = null;
+        for (var i = 0; failedKey is null; i++)
+        {
+            if (i == 30_000)
+            {
+                throw new InvalidOperationException("The injected split failure never fired.");
+            }
+            // Version keys only, so the failed record also belongs in a live version chain.
+            var key = VersionKey(RandomVersionPrefix(random), (ulong)random.Next(1, 1_000));
+            var value = RandomValue(random);
+            try
+            {
+                model.Put(key, value);
+            }
+            catch (IOException)
+            {
+                failedKey = key;
+                await Assert.That(table.WriteOutcome).IsEqualTo(StorageCommitOutcome.Indeterminate);
+                await Assert.That(table.CurrentOrderedIndex).IsNull();
+                model.RecordIndeterminate(key, value);
+                break;
+            }
+            KeepIndexesLive(model, random, i);
+        }
+
+        CheckIndexInvariants(table);
+        model.CheckVersionLookup(failedKey[..^sizeof(long)], 0, true);
+        ContinueAfterFailure(model, random);
+    }
+
+    [Test]
+    [Arguments(1)]
+    [Arguments(2)]
+    [Arguments(3)]
+    public async Task FailedVersionPrefixGrowDropsVersionIndex(int occurrence)
+    {
+        var grows = 0;
+        using var table = new MemTable(1, faultInjector: point =>
+        {
+            if (point == StorageFaultPoint.MemTableBeforeVersionPrefixGrow && ++grows == occurrence)
+            {
+                throw new IOException("Injected grow failure.");
+            }
+        });
+        var model = new IndexModel(table);
+        var random = new Random(occurrence);
+        BuildIndexes(model, random);
+
+        byte[]? failedKey = null;
+        for (var i = 0; failedKey is null; i++)
+        {
+            if (i == 30_000)
+            {
+                throw new InvalidOperationException("The injected grow failure never fired.");
+            }
+            var key = RandomKey(random);
+            var value = RandomValue(random);
+            try
+            {
+                model.Put(key, value);
+            }
+            catch (IOException)
+            {
+                failedKey = key;
+                await Assert.That(table.WriteOutcome).IsEqualTo(StorageCommitOutcome.Indeterminate);
+                var versionIndexDropped = table.VersionPrefixBuckets.IsEmpty;
+                await Assert.That(versionIndexDropped).IsTrue();
+                model.RecordIndeterminate(key, value);
+                break;
+            }
+            KeepIndexesLive(model, random, i);
+        }
+
+        CheckIndexInvariants(table);
+        ContinueAfterFailure(model, random);
+    }
+
+    /// <summary>Builds the ordered index with a seek and the version-prefix index once lookups stop falling back to seeks.</summary>
+    private static void BuildIndexes(IndexModel model, Random random)
+    {
+        for (var i = 0; i < 100; i++)
+        {
+            model.Put(RandomKey(random), RandomValue(random));
+        }
+        model.CheckSeek(RandomKey(random), true, false);
+        for (var i = 0; i < 10; i++)
+        {
+            model.CheckVersionLookup(RandomVersionPrefix(random), (ulong)random.Next(25), true);
+        }
+    }
+
+    /// <summary>Reads often enough that inserts keep updating both indexes instead of leaving the ordered one to rebuild.</summary>
+    private static void KeepIndexesLive(IndexModel model, Random random, int step)
+    {
+        if (step % 200 == 0)
+        {
+            model.CheckSeek(RandomKey(random), random.Next(2) == 0, random.Next(2) == 0);
+            model.CheckVersionLookup(RandomVersionPrefix(random), (ulong)random.Next(25), random.Next(2) == 0);
+        }
+    }
+
+    private static void ContinueAfterFailure(IndexModel model, Random random)
+    {
+        for (var i = 0; i < 3_000; i++)
+        {
+            model.Put(RandomKey(random), RandomValue(random));
+            KeepIndexesLive(model, random, i);
+            if (i % 500 == 0)
+            {
+                model.CheckAll();
+            }
+        }
+        model.CheckAll();
+    }
+
+    private static byte[] RandomKey(Random random)
+    {
+        if (random.Next(4) != 0)
+        {
+            return VersionKey(RandomVersionPrefix(random), (ulong)random.Next(1, 24));
+        }
+        // Plain keys from a small alphabet share leading words across lengths.
+        var key = new byte[random.Next(1, 13)];
+        key[0] = 2;
+        for (var i = 1; i < key.Length; i++)
+        {
+            key[i] = (byte)random.Next(3);
+        }
+        return key;
+    }
+
+    private static byte[] RandomVersionPrefix(Random random) => random.Next(10) switch
+    {
+        // Clean MVCC prefixes shorter than the leading word.
+        < 8 => [1, (byte)(1 + random.Next(15)), (byte)(1 + random.Next(20)), 0, 0],
+        // An escaped user key, so a version key that is not clean MVCC.
+        8 => [1, 0, 1, (byte)(1 + random.Next(20)), 0, 0],
+        // Prefixes longer than the leading word.
+        _ => [1, .. Enumerable.Repeat((byte)'a', 9), (byte)('a' + random.Next(20)), 0, 0],
+    };
+
+    private static byte[] VersionKey(byte[] prefix, ulong trailer)
+    {
+        var key = new byte[prefix.Length + sizeof(long)];
+        prefix.CopyTo(key, 0);
+        BinaryPrimitives.WriteUInt64BigEndian(key.AsSpan(prefix.Length), trailer);
+        return key;
+    }
+
+    private static byte[] RandomValue(Random random)
+    {
+        var value = new byte[random.Next(6)];
+        random.NextBytes(value);
+        return value;
+    }
+
+    /// <summary>
+    /// Checks the structure of a table's indexes: the ordered index when it is current, and the version-prefix index
+    /// when it is built. Throws on the first violation.
+    /// </summary>
+    private static void CheckIndexInvariants(MemTable table)
+    {
+        if (table.CurrentOrderedIndex is { } index)
+        {
+            CheckOrderedIndex(table, index);
+        }
+        CheckVersionPrefixIndex(table);
+    }
+
+    private static void CheckOrderedIndex(MemTable table, MemTable.OrderedIndex index)
+    {
+        var leaves = new List<MemTable.OrderedIndex.Node>();
+        var leafDepth = -1;
+        CheckNode(index.Root, 0, -1, -1);
+
+        var seen = new bool[table.Count];
+        var total = 0;
+        var previous = -1;
+        for (var i = 0; i < leaves.Count; i++)
+        {
+            var leaf = leaves[i];
+            Require(leaf.Previous == (i == 0 ? null : leaves[i - 1]), $"leaf {i} has a wrong previous link");
+            Require(leaf.Next == (i == leaves.Count - 1 ? null : leaves[i + 1]), $"leaf {i} has a wrong next link");
+            for (var slot = 0; slot < leaf.Count; slot++)
+            {
+                var record = leaf.Keys[slot];
+                Require((uint)record < (uint)table.Count, $"record {record} is past the table's {table.Count} records");
+                Require(!seen[record], $"record {record} appears twice");
+                seen[record] = true;
+                total++;
+                Require(previous < 0 || Compare(previous, record) < 0, $"record {record} is out of order in leaf {i}");
+                previous = record;
+            }
+        }
+        Require(total == table.Count, $"the leaves hold {total} records instead of {table.Count}");
+
+        // Bounds are records, -1 when unbounded: keys are at least the lower bound and below the upper one.
+        void CheckNode(MemTable.OrderedIndex.Node node, int depth, int lower, int upper)
+        {
+            if (node.Children is null)
+            {
+                Require(node.Count <= MemTable.OrderedIndex.LeafCapacity, $"a leaf holds {node.Count} keys");
+                Require(node == index.Root || node.Count > 0, "a leaf below the root is empty");
+                Require(leafDepth < 0 || leafDepth == depth, $"leaves sit at depths {leafDepth} and {depth}");
+                leafDepth = depth;
+                for (var slot = 0; slot < node.Count; slot++)
+                {
+                    var record = node.Keys[slot];
+                    Require((lower < 0 || Compare(lower, record) <= 0) && (upper < 0 || Compare(record, upper) < 0),
+                        $"record {record} is outside its separator bounds");
+                }
+                leaves.Add(node);
+                return;
+            }
+
+            Require(node.Count <= MemTable.OrderedIndex.BranchCapacity, $"a branch holds {node.Count} separators");
+            for (var i = 0; i <= node.Count; i++)
+            {
+                var child = node.Children[i];
+                Require(child is not null, $"branch child {i} of {node.Count + 1} is missing");
+                if (i != 0)
+                {
+                    Require(Minimum(child!) == node.Keys[i - 1], $"separator {i - 1} is not the minimum of its right child");
+                }
+                CheckNode(child!, depth + 1, i == 0 ? lower : node.Keys[i - 1], i == node.Count ? upper : node.Keys[i]);
+            }
+        }
+
+        static int Minimum(MemTable.OrderedIndex.Node node)
+        {
+            while (node.Children is not null)
+            {
+                node = node.Children[0]!;
+            }
+            return node.Count == 0 ? -1 : node.Keys[0];
+        }
+
+        int Compare(int x, int y) => table.GetRecordKey(x).SequenceCompareTo(table.GetRecordKey(y));
+    }
+
+    private static void CheckVersionPrefixIndex(MemTable table)
+    {
+        var buckets = table.VersionPrefixBuckets;
+        if (buckets.IsEmpty)
+        {
+            return;
+        }
+        Require(int.IsPow2(buckets.Length), $"the version-prefix index has {buckets.Length} buckets");
+
+        var mask = buckets.Length - 1;
+        var chained = new bool[table.Count];
+        var prefixes = new HashSet<byte[]>(IndexModel.ByteEquality);
+        for (var bucket = 0; bucket < buckets.Length; bucket++)
+        {
+            var head = buckets[bucket] - 1;
+            if (head < 0)
+            {
+                continue;
+            }
+            Require(head < table.Count, $"bucket {bucket} heads record {head}, past the table's {table.Count} records");
+            var prefix = table.GetRecordKey(head)[..^sizeof(long)].ToArray();
+            Require(prefixes.Add(prefix), $"prefix {Convert.ToHexString(prefix)} heads two chains");
+            // A lookup probes from the prefix's hash and stops at the first empty bucket.
+            for (var probe = (int)MemTable.Hash(prefix) & mask; probe != bucket; probe = (probe + 1) & mask)
+            {
+                Require(buckets[probe] != 0, $"the chain for {Convert.ToHexString(prefix)} is unreachable from its hash");
+            }
+
+            ulong? newer = null;
+            for (var record = head; record >= 0; record = table.GetNextVersionRecord(record))
+            {
+                Require((uint)record < (uint)table.Count, $"a chain links record {record}, past the table's {table.Count} records");
+                Require(!chained[record], $"record {record} is linked twice");
+                chained[record] = true;
+                var key = table.GetRecordKey(record);
+                Require(key.Length == prefix.Length + sizeof(long) && key.StartsWith(prefix),
+                    $"record {record} is in the chain for {Convert.ToHexString(prefix)}");
+                // Newer versions have smaller trailers and come first.
+                var trailer = BinaryPrimitives.ReadUInt64BigEndian(key[^sizeof(long)..]);
+                Require(newer is null || trailer > newer, $"record {record} is out of version order");
+                newer = trailer;
+            }
+        }
+        for (var record = 0; record < table.Count; record++)
+        {
+            Require(chained[record] || !VersionPrefixBloom.IsVersionKey(table.GetRecordKey(record)),
+                $"version record {record} is in no chain");
+        }
+    }
+
+    private static void Require(bool condition, string violation)
+    {
+        if (!condition)
+        {
+            throw new InvalidOperationException($"Memtable index invariant violated: {violation}.");
+        }
+    }
+
+    /// <summary>The expected contents of a table, with null values for tombstones, and checks of each read against them.</summary>
+    private sealed class IndexModel(MemTable table)
+    {
+        private static readonly IComparer<byte[]> KeyOrder = Comparer<byte[]>.Create(static (x, y) => x.AsSpan().SequenceCompareTo(y));
+        public static readonly IEqualityComparer<byte[]> ByteEquality = EqualityComparer<byte[]>.Create(
+            static (x, y) => x.AsSpan().SequenceEqual(y),
+            static x =>
+            {
+                var hash = new HashCode();
+                hash.AddBytes(x);
+                return hash.ToHashCode();
+            });
+
+        private readonly SortedSet<byte[]> _keys = new(KeyOrder);
+        private readonly Dictionary<byte[], byte[]?> _values = new(ByteEquality);
+
+        public void Put(byte[] key, byte[] value)
+        {
+            table.PutRaw(key, value);
+            Record(key, value);
+        }
+
+        public void Delete(byte[] key)
+        {
+            table.DeleteRaw(key);
+            Record(key, null);
+        }
+
+        /// <summary>A write that failed may or may not have been applied; reads must agree with whichever it was.</summary>
+        public void RecordIndeterminate(byte[] key, byte[] value)
+        {
+            if (table.TryGetRaw(key, out _, out _))
+            {
+                Record(key, value);
+            }
+        }
+
+        private void Record(byte[] key, byte[]? value)
+        {
+            _keys.Add(key);
+            _values[key] = value;
+        }
+
+        public void CheckPointLookup(byte[] key)
+        {
+            var found = table.TryGetRaw(key, out var value, out var tombstone);
+            if (found != _values.TryGetValue(key, out var expected) ||
+                found && (tombstone != expected is null || !tombstone && !value.Span.SequenceEqual(expected)))
+                throw new InvalidOperationException($"Incorrect point lookup of {Convert.ToHexString(key)}.");
+        }
+
+        public void CheckSeek(byte[] from, bool inclusive, bool backwards)
+        {
+            var found = table.TryGetNextRaw(from, true, inclusive, backwards, out var key, out var value, out var tombstone);
+            CheckEntry(found, key, value, tombstone, backwards ? Previous(from, inclusive) : Next(from, inclusive),
+                $"seek from {Convert.ToHexString(from)}, inclusive={inclusive}, backwards={backwards}");
+        }
+
+        public void CheckVersionLookup(byte[] prefix, ulong trailer, bool inclusive)
+        {
+            var from = VersionKey(prefix, trailer);
+            var found = table.TryGetNextVersionRaw(from, prefix, inclusive, out var key, out var value, out var tombstone);
+            var expected = Next(from, inclusive);
+            CheckEntry(found, key, value, tombstone, expected is not null && expected.AsSpan().StartsWith(prefix) ? expected : null,
+                $"version lookup from {Convert.ToHexString(from)}, inclusive={inclusive}");
+        }
+
+        /// <summary>Scans skip tombstones and stop after <paramref name="limit"/> entries.</summary>
+        public void CheckScan(byte[]? from, bool backwards, int limit)
+        {
+            var actual = new List<(byte[] Key, byte[] Value)>();
+            ReadRawEntryAction<List<(byte[] Key, byte[] Value)>> reader = static (list, key, value) =>
+            {
+                list.Add((key.ToArray(), value.ToArray()));
+                return true;
+            };
+            IEnumerable<byte[]> keys;
+            if (backwards)
+            {
+                table.ScanReverseRaw(actual, reader, limit);
+                keys = _keys.Reverse();
+            }
+            else
+            {
+                table.ScanRaw(from is not null, from, actual, reader, limit);
+                keys = from is null ? _keys
+                    : _keys.Count == 0 || KeyOrder.Compare(from, _keys.Max!) > 0 ? [] : _keys.GetViewBetween(from, _keys.Max!);
+            }
+            var expected = keys.Where(key => _values[key] is not null).Take(limit).ToArray();
+            if (actual.Count != expected.Length ||
+                !actual.Zip(expected).All(pair => pair.First.Key.AsSpan().SequenceEqual(pair.Second) &&
+                    pair.First.Value.AsSpan().SequenceEqual(_values[pair.Second])))
+                throw new InvalidOperationException($"Incorrect scan from {(from is null ? "the start" : Convert.ToHexString(from))}, backwards={backwards}, limit={limit}.");
+        }
+
+        /// <summary>Compares a full scan, a point lookup and a version lookup of every key, and the index structure.</summary>
+        public void CheckAll()
+        {
+            CheckIndexInvariants(table);
+            var actual = table.CreateIterator().EnumerateAsync().ToBlockingEnumerable().ToArray();
+            if (actual.Length != _keys.Count)
+                throw new InvalidOperationException($"The table iterates {actual.Length} entries instead of {_keys.Count}.");
+            var i = 0;
+            foreach (var key in _keys)
+            {
+                var entry = actual[i++];
+                var expected = _values[key];
+                if (!entry.Key.Span.SequenceEqual(key) || entry.Value.IsTombstone != expected is null ||
+                    expected is not null && !entry.Value.Span.SequenceEqual(expected))
+                    throw new InvalidOperationException($"Incorrect entry {i - 1} in a full iteration.");
+                CheckPointLookup(key);
+                if (VersionPrefixBloom.IsVersionKey(key))
+                {
+                    CheckVersionLookup(key[..^sizeof(long)], BinaryPrimitives.ReadUInt64BigEndian(key.AsSpan(key.Length - sizeof(long))), true);
+                }
+            }
+            CheckIndexInvariants(table);
+        }
+
+        private void CheckEntry(bool found, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool tombstone, byte[]? expectedKey, string description)
+        {
+            var expectedValue = expectedKey is null ? null : _values[expectedKey];
+            if (found != expectedKey is not null || found &&
+                (!key.SequenceEqual(expectedKey) || tombstone != expectedValue is null || !tombstone && !value.SequenceEqual(expectedValue)))
+                throw new InvalidOperationException($"Incorrect {description}.");
+        }
+
+        private byte[]? Next(byte[] from, bool inclusive)
+        {
+            if (_keys.Count == 0 || KeyOrder.Compare(from, _keys.Max!) > 0)
+            {
+                return null;
+            }
+            foreach (var key in _keys.GetViewBetween(from, _keys.Max!))
+            {
+                if (inclusive || KeyOrder.Compare(key, from) != 0)
+                {
+                    return key;
+                }
+            }
+            return null;
+        }
+
+        private byte[]? Previous(byte[] from, bool inclusive)
+        {
+            if (_keys.Count == 0 || KeyOrder.Compare(from, _keys.Min!) < 0)
+            {
+                return null;
+            }
+            foreach (var key in _keys.GetViewBetween(_keys.Min!, from).Reverse())
+            {
+                if (inclusive || KeyOrder.Compare(key, from) != 0)
+                {
+                    return key;
+                }
+            }
+            return null;
         }
     }
 

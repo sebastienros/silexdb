@@ -64,6 +64,16 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
 
     public int Count => _count;
 
+    /// <summary>The ordered index when it is current, or null when the next ordered read rebuilds it. For invariant tests.</summary>
+    internal OrderedIndex? CurrentOrderedIndex => _sortDirty ? null : _orderedIndex;
+
+    /// <summary>The version-prefix hash buckets (record position + 1 of each chain head), or empty when not built. For invariant tests.</summary>
+    internal ReadOnlySpan<int> VersionPrefixBuckets => _prefixBuckets is { } buckets ? buckets.AsSpan(0, _prefixBucketCapacity) : default;
+
+    internal ReadOnlySpan<byte> GetRecordKey(int record) => _arena.GetSpan(_records[record].Key);
+
+    internal int GetNextVersionRecord(int record) => _records[record].NextVersionRecord;
+
     internal void EnsureSortedIndex()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
@@ -542,6 +552,7 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
     {
         if ((_count + 1) * 10 >= _prefixBucketCapacity * 7)
         {
+            _faultInjector?.Invoke(StorageFaultPoint.MemTableBeforeVersionPrefixGrow);
             var oldPrefixBuckets = _prefixBuckets!;
             var oldCap = _prefixBucketCapacity;
             var newCap = oldCap * 2;
