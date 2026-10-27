@@ -369,7 +369,7 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
     /// Only x86 exposes a prefetch instruction; elsewhere the JIT removes the call.
     /// </remarks>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private unsafe void PrefetchRecord(int[] keys, int slot, int count)
+    private unsafe void PrefetchRecord(Span<int> keys, int slot, int count)
     {
         if (Sse.IsSupported && (uint)slot < (uint)count)
         {
@@ -390,12 +390,11 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
             while (node is not null)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                var keys = node.Keys;
                 var nodeCount = node.Count;
                 for (var slot = 0; slot < nodeCount; slot++)
                 {
-                    PrefetchRecord(keys, slot + RecordPrefetchDistance, nodeCount);
-                    var recIdx = keys[slot];
+                    PrefetchRecord(node.Keys, slot + RecordPrefetchDistance, nodeCount);
+                    var recIdx = node.Keys[slot];
                     var isTomb = _records[recIdx].IsTombstone;
                     if (!bufferedBuilder.TryAddRawFast(
                         _arena.GetSpan(_records[recIdx].Key),

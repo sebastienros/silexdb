@@ -1,9 +1,15 @@
-using System.Buffers;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 
 namespace Silex.MemTables;
 
 internal sealed partial class MemTable
 {
+    /// <summary>
+    /// A B+-tree of record positions in key order. Each node is one object that holds, next to its record
+    /// positions, the prefix word of each key, so a search reads the node's own lines and touches a record only
+    /// where two prefix words tie.
+    /// </summary>
     internal sealed class OrderedIndex : IDisposable
     {
         internal const int LeafCapacity = 256;
@@ -24,170 +30,192 @@ internal sealed partial class MemTable
                 capacity *= BranchCapacity + 1;
                 height++;
             }
-            Node? previous = null;
+            Leaf? previous = null;
             _root = Build(records, height, capacity, ref previous);
         }
 
-        private static Node Build(ReadOnlySpan<int> records, int height, long capacity, ref Node? previous)
+        private Node Build(ReadOnlySpan<int> records, int height, long capacity, ref Leaf? previous)
         {
-            var node = new Node(height == 0);
-            try
+            var tableRecords = _table._records;
+            if (height == 0)
             {
-                if (height == 0)
-                {
-                    node.Count = records.Length;
-                    records.CopyTo(node.Keys);
-                    node.Previous = previous;
-                    if (previous is not null) previous.Next = node;
-                    previous = node;
-                    return node;
-                }
-                var childCapacity = capacity / (BranchCapacity + 1);
-                var children = (int)((records.Length + childCapacity - 1) / childCapacity);
-                node.Count = children - 1;
-                for (var i = 0; i < children; i++)
-                {
-                    var count = (int)Math.Min(childCapacity, records.Length);
-                    var child = Build(records[..count], height - 1, childCapacity, ref previous);
-                    node.Children![i] = child;
-                    if (i != 0) node.Keys[i - 1] = Minimum(child);
-                    records = records[count..];
-                }
-                return node;
+                var leaf = new Leaf { Count = records.Length };
+                records.CopyTo(leaf.Keys);
+                var words = leaf.Words;
+                for (var i = 0; i < records.Length; i++) words[i] = tableRecords[records[i]].KeyPrefixWord;
+                leaf.Previous = previous;
+                if (previous is not null) previous.Next = leaf;
+                previous = leaf;
+                return leaf;
             }
-            catch
+            var node = new Branch();
+            var childCapacity = capacity / (BranchCapacity + 1);
+            var children = (int)((records.Length + childCapacity - 1) / childCapacity);
+            node.Count = children - 1;
+            for (var i = 0; i < children; i++)
             {
-                Dispose(node);
-                throw;
+                var count = (int)Math.Min(childCapacity, records.Length);
+                node.Children[i] = Build(records[..count], height - 1, childCapacity, ref previous);
+                if (i != 0)
+                {
+                    node.Keys[i - 1] = records[0];
+                    node.Words[i - 1] = tableRecords[records[0]].KeyPrefixWord;
+                }
+                records = records[count..];
             }
-        }
-
-        private static int Minimum(Node node)
-        {
-            while (node.Children is not null) node = node.Children[0]!;
-            return node.Keys[0];
+            return node;
         }
 
         public Cursor Begin(bool backwards)
         {
             var node = _root;
-            while (node.Children is not null) node = node.Children[backwards ? node.Count : 0]!;
-            return new Cursor(this, node, backwards ? node.Count - 1 : 0);
+            while (!node.IsLeaf)
+            {
+                var branch = Unsafe.As<Branch>(node);
+                node = branch.Children[backwards ? branch.Count : 0]!;
+            }
+            var leaf = Unsafe.As<Leaf>(node);
+            return new Cursor(this, leaf, backwards ? leaf.Count - 1 : 0);
         }
 
         public Cursor Seek(ReadOnlySpan<byte> key, bool inclusive, bool backwards)
         {
             var node = _root;
             var keyPrefix = ReadKeyPrefixWord(key);
-            while (node.Children is not null) node = node.Children[Bound(node, key, keyPrefix, true)]!;
-            var slot = Bound(node, key, keyPrefix, false);
-            var equal = slot < node.Count && EqualsKey(node.Keys[slot], key, keyPrefix);
+            while (!node.IsLeaf)
+            {
+                var branch = Unsafe.As<Branch>(node);
+                node = branch.Children[Bound(branch.Words, branch.Keys, branch.Count, key, keyPrefix, true)]!;
+            }
+            var leaf = Unsafe.As<Leaf>(node);
+            var slot = Bound(leaf.Words, leaf.Keys, leaf.Count, key, keyPrefix, false);
+            var equal = slot < leaf.Count && leaf.Words[slot] == keyPrefix && EqualsKey(leaf.Keys[slot], key);
             if (backwards)
             {
                 if (!equal || !inclusive) slot--;
-                if (slot < 0 && node.Previous is { } previous) return new Cursor(this, previous, previous.Count - 1);
+                if (slot < 0 && leaf.Previous is { } previous) return new Cursor(this, previous, previous.Count - 1);
             }
             else
             {
                 if (equal && !inclusive) slot++;
-                if (slot == node.Count && node.Next is { } next) return new Cursor(this, next, 0);
+                if (slot == leaf.Count && leaf.Next is { } next) return new Cursor(this, next, 0);
             }
-            return new Cursor(this, node, slot);
+            return new Cursor(this, leaf, slot);
         }
 
         public void Insert(int record)
         {
             _version++;
             var key = Key(record);
-            var right = Insert(_root, record, key, _table._records[record].KeyPrefixWord, out var separator);
+            var keyPrefix = _table._records[record].KeyPrefixWord;
+            var right = Insert(_root, record, key, keyPrefix, out var separator, out var separatorWord);
             if (right is null) return;
-            var root = new Node(false) { Count = 1 };
+            var root = new Branch { Count = 1 };
             root.Keys[0] = separator;
-            root.Children![0] = _root;
+            root.Words[0] = separatorWord;
+            root.Children[0] = _root;
             root.Children[1] = right;
             _root = root;
         }
 
-        private Node? Insert(Node node, int record, ReadOnlySpan<byte> key, ulong keyPrefix, out int separator)
+        private Node? Insert(Node node, int record, ReadOnlySpan<byte> key, ulong keyPrefix, out int separator, out ulong separatorWord)
         {
             separator = 0;
-            var slot = Bound(node, key, keyPrefix, node.Children is not null);
-            if (node.Children is null)
+            separatorWord = 0;
+            if (node.IsLeaf)
             {
-                node.Keys.AsSpan(slot, node.Count - slot).CopyTo(node.Keys.AsSpan(slot + 1));
-                node.Keys[slot] = record;
+                var leaf = Unsafe.As<Leaf>(node);
+                var words = leaf.Words;
+                var keys = leaf.Keys;
+                var count = leaf.Count;
+                var slot = Bound(words, keys, count, key, keyPrefix, false);
+                words[slot..count].CopyTo(words[(slot + 1)..]);
+                keys[slot..count].CopyTo(keys[(slot + 1)..]);
+                words[slot] = keyPrefix;
+                keys[slot] = record;
+                if (++leaf.Count <= LeafCapacity) return null;
+                _table._faultInjector?.Invoke(StorageFaultPoint.MemTableBeforeOrderedIndexSplit);
+
+                var middle = leaf.Count / 2;
+                var right = new Leaf { Count = leaf.Count - middle };
+                words[middle..leaf.Count].CopyTo(right.Words);
+                keys[middle..leaf.Count].CopyTo(right.Keys);
+                separator = keys[middle];
+                separatorWord = words[middle];
+                right.Next = leaf.Next;
+                right.Previous = leaf;
+                if (leaf.Next is not null) leaf.Next.Previous = right;
+                leaf.Next = right;
+                leaf.Count = middle;
+                return right;
             }
             else
             {
-                var child = Insert(node.Children[slot]!, record, key, keyPrefix, out var childSeparator);
+                var branch = Unsafe.As<Branch>(node);
+                var words = branch.Words;
+                var keys = branch.Keys;
+                var children = branch.Children;
+                var count = branch.Count;
+                var slot = Bound(words, keys, count, key, keyPrefix, true);
+                var child = Insert(children[slot]!, record, key, keyPrefix, out var childSeparator, out var childSeparatorWord);
                 if (child is null) return null;
-                node.Keys.AsSpan(slot, node.Count - slot).CopyTo(node.Keys.AsSpan(slot + 1));
-                node.Children.AsSpan(slot + 1, node.Count - slot).CopyTo(node.Children.AsSpan(slot + 2));
-                node.Keys[slot] = childSeparator;
-                node.Children[slot + 1] = child;
+                words[slot..count].CopyTo(words[(slot + 1)..]);
+                keys[slot..count].CopyTo(keys[(slot + 1)..]);
+                children[(slot + 1)..(count + 1)].CopyTo(children[(slot + 2)..]);
+                words[slot] = childSeparatorWord;
+                keys[slot] = childSeparator;
+                children[slot + 1] = child;
+                if (++branch.Count <= BranchCapacity) return null;
+                _table._faultInjector?.Invoke(StorageFaultPoint.MemTableBeforeOrderedIndexSplit);
+
+                var middle = branch.Count / 2;
+                var right = new Branch { Count = branch.Count - middle - 1 };
+                separator = keys[middle];
+                separatorWord = words[middle];
+                words[(middle + 1)..branch.Count].CopyTo(right.Words);
+                keys[(middle + 1)..branch.Count].CopyTo(right.Keys);
+                children[(middle + 1)..(branch.Count + 1)].CopyTo(right.Children);
+                children[(middle + 1)..(branch.Count + 1)].Clear();
+                branch.Count = middle;
+                return right;
             }
-            node.Count++;
-            var leaf = node.Children is null;
-            if (node.Count <= (leaf ? LeafCapacity : BranchCapacity)) return null;
-            _table._faultInjector?.Invoke(StorageFaultPoint.MemTableBeforeOrderedIndexSplit);
-            var middle = node.Count / 2;
-            var right = new Node(leaf);
-            if (leaf)
-            {
-                right.Count = node.Count - middle;
-                node.Keys.AsSpan(middle, right.Count).CopyTo(right.Keys);
-                separator = right.Keys[0];
-                right.Next = node.Next;
-                right.Previous = node;
-                if (node.Next is not null) node.Next.Previous = right;
-                node.Next = right;
-            }
-            else
-            {
-                separator = node.Keys[middle];
-                right.Count = node.Count - middle - 1;
-                node.Keys.AsSpan(middle + 1, right.Count).CopyTo(right.Keys);
-                node.Children!.AsSpan(middle + 1, right.Count + 1).CopyTo(right.Children);
-                node.Children.AsSpan(middle + 1, right.Count + 1).Clear();
-            }
-            node.Count = middle;
-            return right;
         }
 
         private ReadOnlySpan<byte> Key(int record) => _table._arena.GetSpan(_table._records[record].Key);
 
-        private bool EqualsKey(int record, ReadOnlySpan<byte> key, ulong keyPrefix)
+        private bool EqualsKey(int record, ReadOnlySpan<byte> key)
         {
             ref var rec = ref _table._records[record];
-            if (rec.KeyPrefixWord != keyPrefix || rec.Key.Length != key.Length)
-            {
-                return false;
-            }
-            return key.Length <= 8 || _table._arena.GetSpan(rec.Key)[8..].SequenceEqual(key[8..]);
+            return rec.Key.Length == key.Length && (key.Length <= 8 || _table._arena.GetSpan(rec.Key)[8..].SequenceEqual(key[8..]));
         }
 
-        private int Bound(Node node, ReadOnlySpan<byte> key, ulong keyPrefix, bool upper)
+        /// <summary>Compares the key of <paramref name="record"/> with <paramref name="key"/>, whose prefix words are equal.</summary>
+        private int CompareTied(int record, ReadOnlySpan<byte> key)
+        {
+            ref var rec = ref _table._records[record];
+            if (rec.Key.Length <= 8 && key.Length <= 8)
+            {
+                return rec.Key.Length.CompareTo(key.Length);
+            }
+            return _table._arena.GetSpan(rec.Key).SequenceCompareTo(key);
+        }
+
+        private int Bound(Span<ulong> words, Span<int> keys, int count, ReadOnlySpan<byte> key, ulong keyPrefix, bool upper)
         {
             var low = 0;
-            var high = node.Count;
-            var records = _table._records;
+            var high = count;
             while (low < high)
             {
                 var middle = low + ((high - low) >> 1);
-                ref var rec = ref records[node.Keys[middle]];
-                var recPrefix = rec.KeyPrefixWord;
+                var word = words[middle];
                 int comparison;
-                if (recPrefix != keyPrefix)
+                if (word != keyPrefix)
                 {
-                    comparison = recPrefix < keyPrefix ? -1 : 1;
-                }
-                else if (rec.Key.Length <= 8 && key.Length <= 8)
-                {
-                    comparison = rec.Key.Length.CompareTo(key.Length);
+                    comparison = word < keyPrefix ? -1 : 1;
                 }
                 else
                 {
-                    comparison = _table._arena.GetSpan(rec.Key).SequenceCompareTo(key);
+                    comparison = CompareTied(keys[middle], key);
                 }
                 if (comparison < 0 || upper && comparison == 0) low = middle + 1;
                 else high = middle;
@@ -195,54 +223,68 @@ internal sealed partial class MemTable
             return low;
         }
 
-        public void Dispose() => Dispose(_root);
-
-        private static void Dispose(Node node)
+        public void Dispose()
         {
-            if (node.Children is not null)
-            {
-                for (var i = 0; i <= node.Count; i++)
-                    if (node.Children[i] is { } child) Dispose(child);
-                ArrayPool<Node?>.Shared.Return(node.Children, clearArray: true);
-            }
-            ArrayPool<int>.Shared.Return(node.Keys);
         }
 
-        public sealed class Node
+        public abstract class Node(bool isLeaf)
         {
-            public readonly int[] Keys;
-            public readonly Node?[]? Children;
+            public readonly bool IsLeaf = isLeaf;
             public int Count;
-            public Node? Previous;
-            public Node? Next;
-
-            public Node(bool leaf)
-            {
-                Keys = ArrayPool<int>.Shared.Rent((leaf ? LeafCapacity : BranchCapacity) + 1);
-                if (!leaf)
-                {
-                    try
-                    {
-                        Children = ArrayPool<Node?>.Shared.Rent(BranchCapacity + 2);
-                        Children.AsSpan().Clear();
-                    }
-                    catch
-                    {
-                        ArrayPool<int>.Shared.Return(Keys);
-                        throw;
-                    }
-                }
-            }
         }
+
+        public sealed class Leaf() : Node(true)
+        {
+            public Leaf? Previous;
+            public Leaf? Next;
+            private LeafWords _words;
+            private LeafKeys _keys;
+
+            /// <summary>The prefix word of each key, in key order.</summary>
+            public Span<ulong> Words => MemoryMarshal.CreateSpan(ref Unsafe.As<LeafWords, ulong>(ref _words), LeafCapacity + 1);
+
+            /// <summary>The record position of each key, in key order.</summary>
+            public Span<int> Keys => MemoryMarshal.CreateSpan(ref Unsafe.As<LeafKeys, int>(ref _keys), LeafCapacity + 1);
+        }
+
+        public sealed class Branch() : Node(false)
+        {
+            private BranchWords _words;
+            private BranchKeys _keys;
+            private BranchChildren _children;
+
+            /// <summary>The prefix word of each separator.</summary>
+            public Span<ulong> Words => MemoryMarshal.CreateSpan(ref Unsafe.As<BranchWords, ulong>(ref _words), BranchCapacity + 1);
+
+            /// <summary>The record position of each separator: the least key of the child to its right when it was made.</summary>
+            public Span<int> Keys => MemoryMarshal.CreateSpan(ref Unsafe.As<BranchKeys, int>(ref _keys), BranchCapacity + 1);
+
+            public Span<Node?> Children => MemoryMarshal.CreateSpan(ref Unsafe.As<BranchChildren, Node?>(ref _children), BranchCapacity + 2);
+        }
+
+        [InlineArray(LeafCapacity + 1)]
+        private struct LeafWords { private ulong _element; }
+
+        [InlineArray(LeafCapacity + 1)]
+        private struct LeafKeys { private int _element; }
+
+        [InlineArray(BranchCapacity + 1)]
+        private struct BranchWords { private ulong _element; }
+
+        [InlineArray(BranchCapacity + 1)]
+        private struct BranchKeys { private int _element; }
+
+        [InlineArray(BranchCapacity + 2)]
+        private struct BranchChildren { private Node? _element; }
 
         public struct Cursor
         {
             private OrderedIndex _index;
             private long _version;
-            private Node _node;
+            private Leaf _node;
             private int _slot;
-            public Cursor(OrderedIndex index, Node node, int slot) { _index = index; _version = index._version; _node = node; _slot = slot; }
-            public readonly Node CurrentNode => _node;
+            public Cursor(OrderedIndex index, Leaf node, int slot) { _index = index; _version = index._version; _node = node; _slot = slot; }
+            public readonly Leaf CurrentNode => _node;
             public readonly int CurrentSlot => _slot;
             public readonly bool IsCurrent(OrderedIndex index) => ReferenceEquals(_index, index) && _version == index._version;
             public readonly bool IsValid => (uint)_slot < (uint)_node.Count;
