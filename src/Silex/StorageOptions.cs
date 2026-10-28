@@ -104,8 +104,8 @@ public class StorageOptions
 
     /// <summary>
     /// Gets or sets whether new SST blocks carry a key-window index: the prefix shared by the block's keys and a
-    /// dense array of the next eight key bytes of every entry, which point lookups and seeks binary-search instead
-    /// of decoding entries. It costs eight bytes per entry. SSTs written with it use a newer format version that
+    /// dense array of the next four key bytes of every entry, which point lookups and seeks binary-search instead
+    /// of decoding entries. It costs four bytes per entry. SSTs written with it use a newer format version that
     /// older Silex versions cannot open; SSTs written without it stay readable either way.
     /// </summary>
     /// <value>The default value is <see langword="false"/>.</value>

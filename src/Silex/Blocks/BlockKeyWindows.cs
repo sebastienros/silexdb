@@ -8,8 +8,10 @@ namespace Silex.Blocks;
 /// </summary>
 /// <remarks>
 /// <para>
-/// The index strips the prefix shared by every key of the block and keeps, for each entry, the next eight key
-/// bytes as a big-endian number zero-padded on the right (the entry's "window"). Windows are non-decreasing in
+/// The index strips the prefix shared by every key of the block and keeps, for each entry, the next four key
+/// bytes as a big-endian number zero-padded on the right (the entry's "window"). Four bytes are enough to tell
+/// apart the keys of one block once their shared prefix is gone, and cost half as much space as eight, which
+/// matters when blocks are read from disk rather than from the block cache. Windows are non-decreasing in
 /// key order, so a search can binary-search the dense window array without decoding the varint-prefixed
 /// entries, and only touches an entry when two windows tie or to confirm a hit.
 /// </para>
@@ -28,7 +30,7 @@ internal static class BlockKeyWindows
     /// <summary>The largest shared prefix stored for a block; longer shared prefixes are truncated.</summary>
     public const int MaxPrefixLength = byte.MaxValue;
 
-    public const int WindowLength = sizeof(ulong);
+    public const int WindowLength = sizeof(uint);
 
     /// <summary>The bytes the index adds to a block besides the per-entry windows: the shared prefix and its length.</summary>
     public static int GetFixedOverhead(int prefixLength) => prefixLength + 1;
@@ -39,23 +41,23 @@ internal static class BlockKeyWindows
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static ulong GetWindow(ReadOnlySpan<byte> key, int prefixLength)
+    public static uint GetWindow(ReadOnlySpan<byte> key, int prefixLength)
     {
         var remaining = key.Length - prefixLength;
         if (remaining >= WindowLength)
         {
-            return BinaryPrimitives.ReadUInt64BigEndian(key.Slice(prefixLength, WindowLength));
+            return BinaryPrimitives.ReadUInt32BigEndian(key.Slice(prefixLength, WindowLength));
         }
 
         return GetShortWindow(key[prefixLength..]);
     }
 
-    private static ulong GetShortWindow(ReadOnlySpan<byte> tail)
+    private static uint GetShortWindow(ReadOnlySpan<byte> tail)
     {
-        ulong window = 0;
+        uint window = 0;
         for (var i = 0; i < tail.Length; i++)
         {
-            window |= (ulong)tail[i] << (56 - (i * 8));
+            window |= (uint)tail[i] << (24 - (i * 8));
         }
 
         return window;

@@ -50,7 +50,7 @@ namespace Silex.Blocks;
 /// --------------------------------------------------------------------------------------------------
 /// 
 /// shared_prefix is the prefix every key of the block starts with (at most 255 bytes) and each window is
-/// a little-endian ulong holding the eight key bytes that follow it, read big-endian and zero-padded (see
+/// a little-endian uint holding the four key bytes that follow it, read big-endian and zero-padded (see
 /// <see cref="BlockKeyWindows"/>). Blocks without the flag use the original layout, so both kinds are
 /// readable by the same code. SSTs that may contain flagged blocks use a newer footer version
 /// (<see cref="Tables.SsTableFormat.GetFooterVersion"/>) so that older readers reject them.
@@ -210,7 +210,7 @@ internal sealed class DefaultBlockEncoder : IBlockEncoder
 
             foreach (var entry in entries)
             {
-                writer.WriteUInt64(BlockKeyWindows.GetWindow(keysSpan.Slice(entry.KeyOffset, entry.KeyLength), prefixLength));
+                writer.WriteUInt32(BlockKeyWindows.GetWindow(keysSpan.Slice(entry.KeyOffset, entry.KeyLength), prefixLength));
             }
         }
 

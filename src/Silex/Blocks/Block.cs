@@ -122,8 +122,8 @@ internal sealed class Block : IDisposable
 
     internal ReadOnlySpan<byte> KeyPrefix => HasKeyWindows ? Memory.Span.Slice(_keyPrefixStart, _keyPrefixLength) : default;
 
-    internal ulong GetKeyWindow(int index) =>
-        System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(Memory.Span.Slice(_keyWindowStart + index * BlockKeyWindows.WindowLength, BlockKeyWindows.WindowLength));
+    internal uint GetKeyWindow(int index) =>
+        System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(Memory.Span.Slice(_keyWindowStart + index * BlockKeyWindows.WindowLength, BlockKeyWindows.WindowLength));
 
     /// <summary>
     /// Returns a descriptor of a key/value in a block.
@@ -620,8 +620,8 @@ internal sealed class Block : IDisposable
 
         return start;
 
-        static ulong ReadWindow(ReadOnlySpan<byte> windows, int index) =>
-            System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(windows.Slice(index * BlockKeyWindows.WindowLength, BlockKeyWindows.WindowLength));
+        static uint ReadWindow(ReadOnlySpan<byte> windows, int index) =>
+            System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(windows.Slice(index * BlockKeyWindows.WindowLength, BlockKeyWindows.WindowLength));
     }
 
     internal bool ScanMvccRaw<TArg>(

@@ -79,13 +79,13 @@ public class BlockKeyWindowTests
         var trailer = BinaryPrimitives.ReadUInt16LittleEndian(span[^2..]);
         await Assert.That(trailer).IsEqualTo((ushort)(2 | BlockKeyWindows.CountFlag));
         await Assert.That(block.KeyPrefix.SequenceEqual("prefix-"u8)).IsTrue();
-        await Assert.That(block.GetKeyWindow(0)).IsEqualTo(BinaryPrimitives.ReadUInt64BigEndian("a1\0\0\0\0\0\0"u8));
-        await Assert.That(block.GetKeyWindow(1)).IsEqualTo(BinaryPrimitives.ReadUInt64BigEndian("b22\0\0\0\0\0"u8));
+        await Assert.That(block.GetKeyWindow(0)).IsEqualTo(BinaryPrimitives.ReadUInt32BigEndian("a1\0\0"u8));
+        await Assert.That(block.GetKeyWindow(1)).IsEqualTo(BinaryPrimitives.ReadUInt32BigEndian("b22\0"u8));
 
         // data | "prefix-" | 7 | 2 windows | 2 offsets | count
         var dataLength = (1 + 9 + 1 + 1) + (1 + 10 + 1 + 1);
         await Assert.That(block.DataEnd).IsEqualTo(dataLength);
-        await Assert.That(block.Memory.Length).IsEqualTo(dataLength + 7 + 1 + 2 * 8 + 2 * 2 + 2);
+        await Assert.That(block.Memory.Length).IsEqualTo(dataLength + 7 + 1 + 2 * BlockKeyWindows.WindowLength + 2 * 2 + 2);
     }
 
     [Test]
