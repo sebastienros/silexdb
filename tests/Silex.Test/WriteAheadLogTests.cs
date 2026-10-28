@@ -262,6 +262,147 @@ public class WriteAheadLogTests
         await reopened.CloseAsync();
     }
 
+    [Test]
+    public async Task ConcurrentWritesRecoverFromTheirWal()
+    {
+        using var folder = TempFolder.Create();
+        using var crashed = TempFolder.Create();
+        const int Threads = 8;
+        const int EntriesPerThread = 3_000;
+        var options = new StorageOptions { FlushPeriod = TimeSpan.Zero, MemTableSizeLimit = 64 * 1024 };
+
+        var storage = await LsmStorage.OpenAsync(folder, options);
+        WriteConcurrently(storage, Threads, EntriesPerThread);
+
+        // Every acknowledged write has reached the OS, so the files as they stand are what a process crash leaves.
+        foreach (var file in Directory.GetFiles(folder))
+        {
+            if (Path.GetFileName(file) != DirectoryOwnership.FileName)
+            {
+                using var source = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                using var target = File.Create(Path.Combine(crashed, Path.GetFileName(file)));
+                source.CopyTo(target);
+            }
+        }
+        await storage.CloseAsync();
+
+        var recovered = await LsmStorage.OpenAsync(crashed, options);
+        await AssertConcurrentWrites(recovered, Threads, EntriesPerThread);
+        await recovered.CloseAsync();
+    }
+
+    [Test]
+    [Arguments(false)]
+    [Arguments(true)]
+    public async Task ConcurrentWritesSurviveMemTableFreezesAndReopen(bool syncWal)
+    {
+        using var folder = TempFolder.Create();
+        const int Threads = 8;
+        var entriesPerThread = syncWal ? 300 : 2_000;
+        var options = new StorageOptions
+        {
+            FlushPeriod = TimeSpan.Zero,
+            MemTableSizeLimit = 16 * 1024,
+            SyncWriteAheadLogToDisk = syncWal,
+        };
+
+        var storage = await LsmStorage.OpenAsync(folder, options);
+        WriteConcurrently(storage, Threads, entriesPerThread);
+        await AssertConcurrentWrites(storage, Threads, entriesPerThread);
+        await storage.CloseAsync();
+
+        var reopened = await LsmStorage.OpenAsync(folder, options);
+        await AssertConcurrentWrites(reopened, Threads, entriesPerThread);
+        await reopened.CloseAsync();
+    }
+
+    /// <summary>
+    /// Each thread puts its own keys with values of varying length, overwrites every third one and deletes every
+    /// fourth, so the threads' writes share write groups. <see cref="ExpectedConcurrentValue"/> gives the final state.
+    /// </summary>
+    private static void WriteConcurrently(LsmStorage storage, int threads, int entriesPerThread)
+    {
+        using var start = new Barrier(threads);
+        var errors = new Exception?[threads];
+        var workers = Enumerable.Range(0, threads).Select(thread => new Thread(() =>
+        {
+            try
+            {
+                var key = new byte[ConcurrentKeyLength(thread)];
+                start.SignalAndWait();
+                for (var i = 0; i < entriesPerThread; i++)
+                {
+                    FormatConcurrentKey(thread, i, key);
+                    storage.Put(key, ConcurrentValue(thread, i, generation: 0));
+                    if (i % 3 == 0)
+                    {
+                        storage.Put(key, ConcurrentValue(thread, i, generation: 1));
+                    }
+                    if (i % 4 == 3)
+                    {
+                        storage.Delete(key);
+                    }
+                }
+            }
+            catch (Exception exception)
+            {
+                errors[thread] = exception;
+            }
+        })).ToArray();
+        foreach (var worker in workers)
+        {
+            worker.Start();
+        }
+        foreach (var worker in workers)
+        {
+            worker.Join();
+        }
+        if (errors.FirstOrDefault(error => error is not null) is { } failure)
+        {
+            throw failure;
+        }
+    }
+
+    private static int ConcurrentKeyLength(int thread) => 5 + thread % 3 * 40;
+
+    private static void FormatConcurrentKey(int thread, int i, byte[] key)
+    {
+        key[0] = (byte)thread;
+        BinaryPrimitives.WriteInt32BigEndian(key.AsSpan(1), i);
+    }
+
+    private static byte[]? ExpectedConcurrentValue(int thread, int i) =>
+        i % 4 == 3 ? null : ConcurrentValue(thread, i, i % 3 == 0 ? 1 : 0);
+
+    private static byte[] ConcurrentValue(int thread, int i, int generation)
+    {
+        var value = new byte[i % 400];
+        value.AsSpan().Fill((byte)(thread * 7 + i + generation));
+        return value;
+    }
+
+    private static async Task AssertConcurrentWrites(LsmStorage storage, int threads, int entriesPerThread)
+    {
+        var buffer = new byte[400];
+        var mismatches = 0;
+        for (var thread = 0; thread < threads; thread++)
+        {
+            var key = new byte[ConcurrentKeyLength(thread)];
+            for (var i = 0; i < entriesPerThread; i++)
+            {
+                FormatConcurrentKey(thread, i, key);
+                var expected = ExpectedConcurrentValue(thread, i);
+                var length = await storage.GetRawAsync(key, buffer);
+                if (expected is null ? length != -1 : length != expected.Length || !buffer.AsSpan(0, length).SequenceEqual(expected))
+                {
+                    mismatches++;
+                }
+            }
+        }
+
+        await Assert.That(mismatches).IsEqualTo(0);
+    }
+
     private static async Task AssertValue(MemTable memTable, byte[] keyBytes, byte[] expected)
     {
         using var key = OwnedByteSlice.CopyFrom(keyBytes);

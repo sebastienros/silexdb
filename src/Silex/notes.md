@@ -170,6 +170,18 @@ not in the individual collections.
   pooled buffer via `EncoderBinaryWriter`. Tombstones use a distinct length code, so live empty values are
   journaled too. Each append is flushed to the OS; `SyncWriteAheadLogToDisk` additionally `fsync`s
   per append (survives power loss, slower). Appends are serialized by the current-memtable write lock.
+- **Contended writes form groups.** A `Put`/`Delete` that finds the write lock taken, or writes already
+  queued, joins a lock-free queue (one CAS) instead of waiting for the lock. The write that finds the
+  queue empty leads: under the lock it journals every queued write as one WAL frame, applies them in
+  that order, and releases each writer as soon as its entry is visible; it keeps applying the groups
+  queued meanwhile until the queue drains or it has applied 64 writes, then promotes the oldest queued
+  write. Followers spin on their own slot, then yield, then sleep. Writes that never meet contention
+  keep the single-write path (one frame per write). With `SyncWriteAheadLogToDisk`, every write queues
+  (a lone write would pay for a whole sync), a leader hands over after one group, and a new leader waits
+  briefly (at most half the last group's duration) for as many queued writes as the last group had;
+  otherwise the writers settle into two alternating halves that each pay a sync for half of them. Keeping the lock and the memtable on one core per
+  group is what lets several writer threads match one: when the lock changed hands on every write,
+  the cache misses of moving the memtable and WAL state between cores cost more than the write itself.
 - **WAL lifecycle / cleanup:** the file is deleted only once its data is durable elsewhere —
   `ForceFlushNextImmutableMemTableAsync` deletes `{id}.wal` *after* the SST is durable and visible in
   L0, and a clean `CloseAsync` deletes the (empty) current memtable's WAL. Deletion never happens from

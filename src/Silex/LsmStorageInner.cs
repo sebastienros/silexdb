@@ -2956,18 +2956,26 @@ internal sealed partial class LsmStorageInner : IDisposable
         FaultInjector?.Invoke(after);
     }
 
-    private readonly LsmWriteBatch _coalesceBatch = new();
+    private readonly LsmWriteBatch _writeGroupBatch = new();
 
     private void WriteCore(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool isTombstone, LsmWriteBatch? batch)
     {
         using var operation = Lifetime.Enter();
 
-        if (!_currentMemTableLock.TryEnterWriteLock(0))
+        if (FaultInjector is null && batch is null)
         {
-            if (FaultInjector is null && batch is null && TryWriteCoalesced(key, value, isTombstone))
+            // A queued group means the lock is contended: join it rather than barge past its leader, so the lock
+            // and the memtable stay with one thread for a whole group instead of moving between cores on every
+            // write. A synced write always queues, since a lone write would pay for a whole sync.
+            if (_syncsWal || Volatile.Read(ref _newestPendingWrite) is not null ||
+                !_currentMemTableLock.TryEnterWriteLock(0))
             {
+                WriteGrouped(key, value, isTombstone);
                 return;
             }
+        }
+        else if (!_currentMemTableLock.TryEnterWriteLock(0))
+        {
             var started = Stopwatch.GetTimestamp();
             _currentMemTableLock.EnterWriteLock();
             Metrics.RecordWriterWait(started);
@@ -3016,252 +3024,376 @@ internal sealed partial class LsmStorageInner : IDisposable
         }
     }
 
-    private const int CoalesceSlotCount = 64;
-    private readonly object _coalesceLock = new();
-    private CoalescedWriteWaiter? _coalesceHead;
-    private CoalescedWriteWaiter? _coalesceTail;
-    private readonly Stack<CoalescedWriteWaiter> _coalescePool = new(CoalesceSlotCount);
+    /// <summary>The most recently queued contended write; each one links to the write queued before it.</summary>
+    private PendingWrite? _newestPendingWrite;
 
-    private bool _coalesceLeaderActive;
+    /// <summary>Whether every write syncs the WAL, so a group's cost is mostly its sync.</summary>
+    private bool _syncsWal => _useWriteAheadLog && _syncWriteAheadLogToDisk;
 
-    private bool TryWriteCoalesced(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool isTombstone)
+    /// <summary>The size and duration of the last applied group; used only by leaders, under the lock.</summary>
+    private int _lastGroupSize;
+    private long _lastGroupTicks;
+
+    /// <summary>The writes of the group being applied, newest first; used only by the leader, under the lock.</summary>
+    private readonly List<PendingWrite> _writeGroup = new();
+
+    /// <summary>
+    /// A thread waits for one write at a time, so each thread reuses one <see cref="PendingWrite"/> for every store.
+    /// </summary>
+    [ThreadStatic]
+    private static PendingWrite? t_pendingWrite;
+
+    /// <summary>
+    /// Most writes one leader applies before it promotes the next queued writer, bounding how long the leader's
+    /// own call keeps running for others.
+    /// </summary>
+    private const int WriteGroupLeaderLimit = 64;
+
+    /// <summary>
+    /// Queues a contended write. The write that finds the queue empty leads: it takes the memtable lock and
+    /// applies every write queued behind it with one WAL frame, then the writes queued meanwhile, until the queue
+    /// drains or it has applied <see cref="WriteGroupLeaderLimit"/> writes and promotes the oldest queued one.
+    /// Joining is one compare-and-swap and a follower spins on its own <see cref="PendingWrite"/>, so waiting
+    /// threads share no lock or counter.
+    /// </summary>
+    private unsafe void WriteGrouped(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool isTombstone)
     {
-        CoalescedWriteWaiter waiter;
-        bool isLeader;
-        lock (_coalesceLock)
+        // The leader reads the caller's spans in place: they stay pinned until this write ends.
+        fixed (byte* keyPointer = key)
+        fixed (byte* valuePointer = value)
         {
-            waiter = _coalescePool.Count > 0 ? _coalescePool.Pop() : new CoalescedWriteWaiter();
-            waiter.Initialize(key, value, isTombstone);
-            if (_coalesceHead is null)
-            {
-                _coalesceHead = _coalesceTail = waiter;
-            }
-            else
-            {
-                _coalesceTail!.Next = waiter;
-                _coalesceTail = waiter;
-            }
-            isLeader = !_coalesceLeaderActive;
-            if (isLeader)
-            {
-                _coalesceLeaderActive = true;
-            }
-        }
+            var write = t_pendingWrite ??= new PendingWrite();
+            write.Initialize(keyPointer, key.Length, valuePointer, value.Length, isTombstone);
 
-        if (!isLeader)
-        {
-            waiter.Event.Wait();
-            var error = waiter.Exception;
-            lock (_coalesceLock)
+            var older = Volatile.Read(ref _newestPendingWrite);
+            while (true)
             {
-                waiter.Reset();
-                if (_coalescePool.Count < CoalesceSlotCount)
+                write.Older = older;
+                var observed = Interlocked.CompareExchange(ref _newestPendingWrite, write, older);
+                if (ReferenceEquals(observed, older))
                 {
-                    _coalescePool.Push(waiter);
+                    break;
                 }
+                older = observed;
             }
+
+            if (older is null || write.WaitForTurn() == PendingWrite.Leading)
+            {
+                LeadWriteGroups(write);
+            }
+
+            var error = write.Exception;
+            write.Clear();
             if (error is not null)
             {
                 System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(error).Throw();
             }
-            return true;
         }
+    }
 
-        while (true)
+    /// <summary>
+    /// Applies the group that starts at <paramref name="leader"/>, then the groups queued after it until the queue
+    /// drains or the leader limit is reached.
+    /// </summary>
+    private void LeadWriteGroups(PendingWrite leader)
+    {
+        var first = leader;
+        var applied = 0;
+        var started = Stopwatch.GetTimestamp();
+        _currentMemTableLock.EnterWriteLock();
+        Metrics.RecordWriterWait(started);
+        var locked = true;
+        try
         {
-            var started = Stopwatch.GetTimestamp();
-            _currentMemTableLock.EnterWriteLock();
-            Metrics.RecordWriterWait(started);
-            CoalescedWriteWaiter? batchHead;
-            lock (_coalesceLock)
+            while (true)
             {
-                batchHead = _coalesceHead;
-                _coalesceHead = _coalesceTail = null;
-                if (batchHead is null)
+                if (_syncsWal)
                 {
-                    _coalesceLeaderActive = false;
+                    WaitForSyncedGroup(first);
                 }
-            }
 
-            if (batchHead is null)
+                // Writes queued after `last` link to it, and the writes from `last` down to `first` are this group.
+                var groupStarted = Stopwatch.GetTimestamp();
+                var last = Volatile.Read(ref _newestPendingWrite)!;
+                _writeGroup.Clear();
+                for (var write = last; ; write = write.Older!)
+                {
+                    _writeGroup.Add(write);
+                    if (ReferenceEquals(write, first))
+                    {
+                        break;
+                    }
+                }
+
+                var error = ApplyWriteGroup(leader);
+                applied += _writeGroup.Count;
+                _lastGroupSize = _writeGroup.Count;
+                _lastGroupTicks = Stopwatch.GetTimestamp() - groupStarted;
+
+                // `last` is still waiting, so it cannot be queued again and exactly one queued write links to it.
+                PendingWrite? next = null;
+                if (!ReferenceEquals(Interlocked.CompareExchange(ref _newestPendingWrite, null, last), last))
+                {
+                    next = Volatile.Read(ref _newestPendingWrite)!;
+                    while (!ReferenceEquals(next.Older, last))
+                    {
+                        next = next.Older!;
+                    }
+                }
+
+                // A synced group costs far more than handing the lock over, so its leader writes again at once.
+                if (next is null || _syncsWal || applied >= WriteGroupLeaderLimit)
+                {
+                    // Unlock first, so the next leader, or a released write finding the queue empty, can take it.
+                    locked = false;
+                    _currentMemTableLock.ExitWriteLock();
+                    next?.Release(PendingWrite.Leading, null);
+                    Finish(last, leader, error);
+                    return;
+                }
+                Finish(last, leader, error);
+                first = next;
+            }
+        }
+        finally
+        {
+            // Applying a group reports failures through its writes, so only a bug leaves the lock held here.
+            if (locked)
             {
                 _currentMemTableLock.ExitWriteLock();
-                break;
             }
+        }
+    }
 
-            Exception? groupError = null;
+    /// <summary>
+    /// Before a synced group, waits until as many writes are queued as the last group had, for at most half as
+    /// long as that group took. The writers it released queue again within microseconds; a sync started without
+    /// them would leave them waiting for a whole second sync, and the writers would settle into alternating
+    /// halves that each sync for half of them.
+    /// </summary>
+    private void WaitForSyncedGroup(PendingWrite first)
+    {
+        var target = _lastGroupSize;
+        if (target <= 1)
+        {
+            return;
+        }
+        var deadline = Stopwatch.GetTimestamp() + _lastGroupTicks / 2;
+        while (true)
+        {
+            var queued = 0;
+            for (var write = Volatile.Read(ref _newestPendingWrite)!; ; write = write.Older!)
+            {
+                if (++queued >= target || ReferenceEquals(write, first))
+                {
+                    break;
+                }
+            }
+            if (queued >= target || Stopwatch.GetTimestamp() >= deadline)
+            {
+                return;
+            }
+            // Yield rather than spin: with more writers than cores, the ones awaited need this core to queue.
+            Thread.Yield();
+        }
+    }
+
+    private static void Finish(PendingWrite write, PendingWrite leader, Exception? error)
+    {
+        if (ReferenceEquals(write, leader))
+        {
+            write.Exception = error;
+        }
+        else
+        {
+            write.Release(PendingWrite.Completed, error);
+        }
+    }
+
+    /// <summary>
+    /// Journals <see cref="_writeGroup"/> as one WAL frame, then applies it oldest first, releasing each write once
+    /// it is visible so that it can queue its next write while the rest apply. The newest write is left waiting
+    /// for the caller to finish with the returned failure, which also covers a failed memtable freeze.
+    /// </summary>
+    private Exception? ApplyWriteGroup(PendingWrite leader)
+    {
+        var group = _writeGroup;
+        var released = 0;
+        Exception? error = null;
+        try
+        {
+            CheckHealthy();
+            InvalidateSortedSsTableRun();
+            var memTable = (MemTable)_state.CurrentMemTable;
             try
             {
-                CheckHealthy();
-                InvalidateSortedSsTableRun();
-                var memTable = (MemTable)_state.CurrentMemTable;
-                try
+                if (group.Count == 1)
                 {
-                    if (batchHead.Next is null)
+                    var write = group[0];
+                    if (write.IsTombstone)
                     {
-                        if (batchHead.IsTombstone)
-                        {
-                            memTable.DeleteRaw(batchHead.KeySpan);
-                        }
-                        else
-                        {
-                            memTable.PutRaw(batchHead.KeySpan, batchHead.ValueSpan);
-                        }
-                        Metrics.RecordWrite(batchHead.KeyLength + batchHead.ValueLength);
+                        memTable.DeleteRaw(write.KeySpan);
                     }
                     else
                     {
-                        _coalesceBatch.Clear();
-                        for (var curr = batchHead; curr is not null; curr = curr.Next)
-                        {
-                            if (curr.IsTombstone)
-                            {
-                                _coalesceBatch.Delete(curr.KeySpan);
-                            }
-                            else
-                            {
-                                _coalesceBatch.Put(curr.KeySpan, curr.ValueSpan);
-                            }
-                        }
-                        memTable.WriteBatch(_coalesceBatch, atomic: false);
-                        Metrics.RecordWrite(_coalesceBatch.ByteCount);
+                        memTable.PutRaw(write.KeySpan, write.ValueSpan);
                     }
-                    InvalidateSortedSsTableRun();
-                    if (memTable.Size >= _memTableSizeLimit)
-                    {
-                        FreezeMemTable();
-                    }
+                    Metrics.RecordWrite(write.KeyLength + write.ValueLength);
                 }
-                catch (Exception exception)
+                else
                 {
-                    var failure = new StorageOperationException(memTable.WriteOutcome, exception);
-                    if (failure.Outcome != StorageCommitOutcome.NotCommitted)
+                    var batch = _writeGroupBatch;
+                    batch.Clear();
+                    for (var i = group.Count - 1; i >= 0; i--)
                     {
-                        MarkFaulted(failure);
+                        var write = group[i];
+                        if (write.IsTombstone)
+                        {
+                            batch.Delete(write.KeySpan);
+                        }
+                        else
+                        {
+                            batch.Put(write.KeySpan, write.ValueSpan);
+                        }
                     }
-                    groupError = failure;
+                    memTable.JournalBatch(batch);
+                    for (var i = 0; i < batch.Count - 1; i++)
+                    {
+                        memTable.ApplyBatchSlice(batch, i, i + 1, atomic: false);
+                        released++;
+                        Finish(group[group.Count - 1 - i], leader, null);
+                    }
+                    memTable.ApplyBatchSlice(batch, batch.Count - 1, batch.Count, atomic: false);
+                    Metrics.RecordWrite(batch.ByteCount);
+                }
+                InvalidateSortedSsTableRun();
+                if (memTable.Size >= _memTableSizeLimit)
+                {
+                    FreezeMemTable();
                 }
             }
             catch (Exception exception)
             {
-                groupError = exception;
-            }
-            finally
-            {
-                _currentMemTableLock.ExitWriteLock();
-            }
-
-            var selfIncluded = false;
-            var follower = batchHead;
-            while (follower is not null)
-            {
-                var next = follower.Next;
-                if (ReferenceEquals(follower, waiter))
+                var failure = new StorageOperationException(memTable.WriteOutcome, exception);
+                if (failure.Outcome != StorageCommitOutcome.NotCommitted)
                 {
-                    selfIncluded = true;
+                    MarkFaulted(failure);
                 }
-                else
-                {
-                    follower.Exception = groupError;
-                    follower.Event.Set();
-                }
-                follower = next;
-            }
-
-            if (selfIncluded)
-            {
-                var canExitLeader = false;
-                lock (_coalesceLock)
-                {
-                    if (_coalesceHead is null)
-                    {
-                        _coalesceLeaderActive = false;
-                        canExitLeader = true;
-                        waiter.Reset();
-                        if (_coalescePool.Count < CoalesceSlotCount)
-                        {
-                            _coalescePool.Push(waiter);
-                        }
-                    }
-                }
-
-                if (canExitLeader)
-                {
-                    if (groupError is not null)
-                    {
-                        System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(groupError).Throw();
-                    }
-                    return true;
-                }
-
-                // More items arrived before we could clear _coalesceLeaderActive.
-                // If we had an error on our own batch, hand off leadership to the next queued waiter!
-                if (groupError is not null)
-                {
-                    lock (_coalesceLock)
-                    {
-                        _coalesceLeaderActive = false;
-                        waiter.Reset();
-                        if (_coalescePool.Count < CoalesceSlotCount)
-                        {
-                            _coalescePool.Push(waiter);
-                        }
-                    }
-                    System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(groupError).Throw();
-                }
+                error = failure;
             }
         }
-
-        lock (_coalesceLock)
+        catch (Exception exception)
         {
-            waiter.Reset();
-            if (_coalescePool.Count < CoalesceSlotCount)
-            {
-                _coalescePool.Push(waiter);
-            }
+            error = exception;
         }
-        return true;
+
+        // Writes the failure overtook end with it; the newest is finished by the caller.
+        for (var i = group.Count - 1 - released; i > 0; i--)
+        {
+            Finish(group[i], leader, error);
+        }
+        return error;
     }
 
-    private sealed class CoalescedWriteWaiter
+    /// <summary>A contended write waiting in the queue, reused by its thread for every write it queues.</summary>
+    private sealed unsafe class PendingWrite
     {
-        public readonly ManualResetEventSlim Event = new(false);
-        public byte[] KeyBuffer = new byte[64];
-        public byte[] ValueBuffer = new byte[256];
+        public const int Waiting = 0;
+        public const int Completed = 1;
+        public const int Leading = 2;
+
+        private static readonly long SpinTicks = Stopwatch.Frequency / 50_000;
+        private static readonly long YieldTicks = Stopwatch.Frequency / 5_000;
+
+        private readonly ManualResetEventSlim _event = new(false);
+        private int _state;
+        private int _sleeping;
+        private byte* _key;
+        private byte* _value;
         public int KeyLength;
         public int ValueLength;
         public bool IsTombstone;
         public Exception? Exception;
-        public CoalescedWriteWaiter? Next;
+        public PendingWrite? Older;
 
-        public ReadOnlySpan<byte> KeySpan => KeyBuffer.AsSpan(0, KeyLength);
-        public ReadOnlySpan<byte> ValueSpan => ValueBuffer.AsSpan(0, ValueLength);
+        public ReadOnlySpan<byte> KeySpan => new(_key, KeyLength);
+        public ReadOnlySpan<byte> ValueSpan => new(_value, ValueLength);
 
-        public void Initialize(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool isTombstone)
+        public void Initialize(byte* key, int keyLength, byte* value, int valueLength, bool isTombstone)
         {
-            Event.Reset();
-            if (KeyBuffer.Length < key.Length) KeyBuffer = new byte[Math.Max(key.Length, KeyBuffer.Length * 2)];
-            key.CopyTo(KeyBuffer);
-            KeyLength = key.Length;
+            if (_sleeping != 0)
+            {
+                _sleeping = 0;
+                _event.Reset();
+            }
+            _state = Waiting;
+            _key = key;
+            KeyLength = keyLength;
+            _value = value;
+            ValueLength = isTombstone ? 0 : valueLength;
             IsTombstone = isTombstone;
-            if (!isTombstone)
-            {
-                if (ValueBuffer.Length < value.Length) ValueBuffer = new byte[Math.Max(value.Length, ValueBuffer.Length * 2)];
-                value.CopyTo(ValueBuffer);
-                ValueLength = value.Length;
-            }
-            else
-            {
-                ValueLength = 0;
-            }
             Exception = null;
-            Next = null;
         }
 
-        public void Reset()
+        /// <summary>Drops the references to the caller's buffers and the outcome once the write has ended.</summary>
+        public void Clear()
         {
+            _key = null;
+            _value = null;
             Exception = null;
-            Next = null;
+            Older = null;
+        }
+
+        /// <summary>
+        /// Spins, since a group usually completes within microseconds and a writer that notices late joins a later
+        /// group; yields once spinning has run long, and sleeps after that.
+        /// </summary>
+        public int WaitForTurn()
+        {
+            var started = Stopwatch.GetTimestamp();
+            var spins = 0;
+            int state;
+            while ((state = Volatile.Read(ref _state)) == Waiting)
+            {
+                if ((++spins & 31) != 0)
+                {
+                    Thread.SpinWait(1);
+                    continue;
+                }
+                var elapsed = Stopwatch.GetTimestamp() - started;
+                if (elapsed < SpinTicks)
+                {
+                    continue;
+                }
+                if (elapsed < YieldTicks)
+                {
+                    Thread.Yield();
+                    continue;
+                }
+
+                Interlocked.Exchange(ref _sleeping, 1);
+                while ((state = Volatile.Read(ref _state)) == Waiting)
+                {
+                    _event.Wait();
+                    // The release of this writer's previous write can set the event late; wait again.
+                    if (Volatile.Read(ref _state) == Waiting)
+                    {
+                        _event.Reset();
+                    }
+                }
+                break;
+            }
+            return state;
+        }
+
+        public void Release(int state, Exception? error)
+        {
+            Exception = error;
+            Interlocked.Exchange(ref _state, state);
+            if (Volatile.Read(ref _sleeping) != 0)
+            {
+                _event.Set();
+            }
         }
     }
 

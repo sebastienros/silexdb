@@ -706,6 +706,15 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
             return;
         }
 
+        JournalBatch(batch);
+        ApplyBatchSlice(batch, 0, batch.Count, atomic);
+    }
+
+    /// <summary>Writes <paramref name="batch"/> to the WAL as one frame; the caller then applies its entries.</summary>
+    internal void JournalBatch(LsmWriteBatch batch)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
         WriteOutcome = StorageCommitOutcome.NotCommitted;
         try
         {
@@ -716,7 +725,6 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
             WriteOutcome = _wal!.AppendOutcome;
             throw;
         }
-        ApplyBatchSlice(batch, 0, batch.Count, atomic);
     }
 
     internal void ApplyBatch(LsmWriteBatch batch) => ApplyBatchSlice(batch, 0, batch.Count);
