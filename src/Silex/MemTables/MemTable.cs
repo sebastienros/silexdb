@@ -382,13 +382,45 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
 
     /// <summary>
     /// Lock-free counterpart of <see cref="ScanRaw"/> with one entry: finds the first live entry at or after
-    /// <paramref name="from"/>. Every leaf the search crosses (past tombstones) is validated again at the end, so
-    /// the result is a consistent read even though the writer keeps running. Returns false when the ordered index
-    /// is not current, the search crosses too many leaves, or no consistent read succeeded; the caller then
-    /// takes the lock. A multi-entry scan keeps using the lock so it still reads one snapshot of the table.
+    /// <paramref name="from"/>. Returns false when no consistent read succeeded; the caller then takes the lock.
+    /// A multi-entry scan keeps using the lock so it still reads one snapshot of the table.
     /// </summary>
     internal bool TrySeekFirstRawOptimistic(ReadOnlySpan<byte> from, out bool found, out ReadOnlySpan<byte> key,
         out ReadOnlySpan<byte> value)
+    {
+        var visitor = new FirstLiveVisitor();
+        return TrySeekFirstOptimistic(from, ref visitor, out found, out key, out value);
+    }
+
+    /// <summary>
+    /// Lock-free counterpart of <see cref="ScanMvccRaw"/> with one entry: finds the first user key at or after
+    /// <paramref name="from"/> whose newest version visible at <paramref name="snapshotSequence"/> is live, and
+    /// returns its encoded user key and value without the kind marker. <paramref name="isCleanKey"/> is false
+    /// when the user key still needs <see cref="MvccStorage.InvokeUserReader"/> to decode it.
+    /// </summary>
+    internal bool TrySeekFirstMvccOptimistic(long snapshotSequence, ReadOnlySpan<byte> from, out bool found,
+        out ReadOnlySpan<byte> encodedUserKey, out ReadOnlySpan<byte> value, out bool isCleanKey)
+    {
+        var visitor = new FirstVisibleMvccVisitor(snapshotSequence);
+        var result = TrySeekFirstOptimistic(from, ref visitor, out found, out var key, out value);
+        isCleanKey = visitor.IsCleanKey;
+        encodedUserKey = found ? key.Slice(1, key.Length - 11) : default;
+        if (found)
+        {
+            value = value[1..];
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Walks the ordered index from <paramref name="from"/> without a lock until <paramref name="visitor"/>
+    /// accepts a record. Every leaf the walk crosses is validated again at the end, so the result is a consistent
+    /// read even though the writer keeps running. Returns false when the ordered index is not current, the walk
+    /// crosses too many leaves, the visitor reports torn state too often, or no consistent read succeeded.
+    /// </summary>
+    private bool TrySeekFirstOptimistic<TVisitor>(ReadOnlySpan<byte> from, scoped ref TVisitor visitor, out bool found,
+        out ReadOnlySpan<byte> key, out ReadOnlySpan<byte> value)
+        where TVisitor : struct, IOptimisticSeekVisitor
     {
         const int MaxLeaves = 4;
         var visited = new VisitedLeaves();
@@ -413,10 +445,12 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
                 continue;
             }
 
+            visitor.Reset();
             var leaves = 0;
             var result = SeekStep.Retry;
-            found = false;
-            key = value = default;
+            var acceptedKey = default(MemTableArena.ArenaSlice);
+            var acceptedValue = default(MemTableArena.ArenaSlice);
+            var accepted = false;
             while (true)
             {
                 visited[leaves++] = (node, version);
@@ -426,31 +460,37 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
                 {
                     break;
                 }
+                var step = SeekStep.Continue;
                 for (; slot < nodeCount; slot++)
                 {
                     var recordIndex = keys[slot];
                     if ((uint)recordIndex >= (uint)records.Length)
                     {
+                        step = SeekStep.Retry;
                         break;
                     }
                     ref var record = ref records[recordIndex];
                     if (!TryReadRecordValue(ref record, out var valueSlice, out var isTombstone))
                     {
+                        step = SeekStep.Retry;
                         break;
                     }
-                    if (isTombstone)
+                    step = visitor.Visit(_arena, ref record, valueSlice, isTombstone);
+                    if (step == SeekStep.Done)
                     {
-                        continue;
+                        acceptedKey = record.Key;
+                        acceptedValue = valueSlice;
+                        accepted = true;
+                        break;
                     }
-                    if (_arena.TryGetSpanOptimistic(record.Key, out key) && _arena.TryGetSpanOptimistic(valueSlice, out value))
+                    if (step != SeekStep.Continue)
                     {
-                        found = true;
-                        result = SeekStep.Done;
+                        break;
                     }
-                    break;
                 }
-                if (result == SeekStep.Done || slot < nodeCount)
+                if (step != SeekStep.Continue)
                 {
+                    result = step;
                     break;
                 }
 
@@ -488,7 +528,15 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
             {
                 valid = Volatile.Read(ref visited[i].Node.Version) == visited[i].Version;
             }
-            if (valid)
+            if (!valid)
+            {
+                continue;
+            }
+            found = accepted;
+            key = value = default;
+            // The validated slices point at bytes that never change while the table is alive.
+            if (!accepted ||
+                (_arena.TryGetSpanOptimistic(acceptedKey, out key) && _arena.TryGetSpanOptimistic(acceptedValue, out value)))
             {
                 return true;
             }
@@ -500,9 +548,126 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
 
     private enum SeekStep : byte
     {
+        Continue,
         Retry,
         Done,
         GiveUp,
+    }
+
+    /// <summary>Decides, record by record, where an optimistic seek stops; it may see torn state.</summary>
+    private interface IOptimisticSeekVisitor
+    {
+        void Reset();
+
+        /// <returns>
+        /// <see cref="SeekStep.Done"/> to accept the record, <see cref="SeekStep.Continue"/> to skip it, or
+        /// <see cref="SeekStep.Retry"/> when it cannot be interpreted, which may only mean the read was torn.
+        /// </returns>
+        SeekStep Visit(MemTableArena arena, ref MemTableRecord record, MemTableArena.ArenaSlice value, bool isTombstone);
+    }
+
+    private struct FirstLiveVisitor : IOptimisticSeekVisitor
+    {
+        public void Reset()
+        {
+        }
+
+        public readonly SeekStep Visit(MemTableArena arena, ref MemTableRecord record, MemTableArena.ArenaSlice value, bool isTombstone) =>
+            isTombstone ? SeekStep.Continue : SeekStep.Done;
+    }
+
+    /// <summary>The version-group logic of <see cref="ScanMvccRaw"/>, for one entry.</summary>
+    private struct FirstVisibleMvccVisitor(long snapshotSequence) : IOptimisticSeekVisitor
+    {
+        private MemTableArena.ArenaSlice _lastKeySlice;
+        private ulong _lastWord;
+        private uint _lastPrefixHash;
+        private bool _hasGroup;
+        private bool _resolved;
+        public bool IsCleanKey;
+
+        public void Reset()
+        {
+            _lastKeySlice = default;
+            _lastWord = 0;
+            _lastPrefixHash = 0;
+            _hasGroup = _resolved = IsCleanKey = false;
+        }
+
+        public SeekStep Visit(MemTableArena arena, ref MemTableRecord record, MemTableArena.ArenaSlice valueSlice, bool isTombstone)
+        {
+            if (isTombstone)
+            {
+                return SeekStep.Continue;
+            }
+            if (!arena.TryGetSpanOptimistic(record.Key, out var key))
+            {
+                return SeekStep.Retry;
+            }
+            if (key.Length < 11 || key[0] != 1)
+            {
+                return SeekStep.Continue;
+            }
+            var terminator = key.Length - 10;
+            var decodedSequence = ~System.Buffers.Binary.BinaryPrimitives.ReadUInt64BigEndian(key[^sizeof(long)..]);
+            if (key[terminator] != 0 || key[terminator + 1] != 0 || decodedSequence > long.MaxValue)
+            {
+                // Invalid data: let the locked scan report it.
+                return SeekStep.Retry;
+            }
+            var encodedUserKey = key.Slice(1, terminator - 1);
+            var sameGroup = false;
+            if (_hasGroup && record.Key.Length == _lastKeySlice.Length && record.KeyPrefixWord == _lastWord &&
+                (record.PrefixHash == 0 || record.PrefixHash == _lastPrefixHash))
+            {
+                if (encodedUserKey.Length <= 7)
+                {
+                    sameGroup = true;
+                }
+                else if (!arena.TryGetSpanOptimistic(_lastKeySlice, out var lastKey))
+                {
+                    return SeekStep.Retry;
+                }
+                else
+                {
+                    sameGroup = encodedUserKey.SequenceEqual(lastKey.Slice(1, terminator - 1));
+                }
+            }
+            if (sameGroup)
+            {
+                if (_resolved)
+                {
+                    return SeekStep.Continue;
+                }
+            }
+            else
+            {
+                _hasGroup = true;
+                _resolved = false;
+                _lastKeySlice = record.Key;
+                _lastWord = record.KeyPrefixWord;
+                _lastPrefixHash = record.PrefixHash;
+            }
+            if ((long)decodedSequence > snapshotSequence)
+            {
+                return SeekStep.Continue;
+            }
+            if (!arena.TryGetSpanOptimistic(valueSlice, out var value))
+            {
+                return SeekStep.Retry;
+            }
+            if (value.IsEmpty || value[0] > 1)
+            {
+                return SeekStep.Retry;
+            }
+            _resolved = true;
+            if (value[0] == 0)
+            {
+                return SeekStep.Continue;
+            }
+            IsCleanKey = record.IsCleanMvccKey;
+            return SeekStep.Done;
+        }
     }
 
     [InlineArray(4)]

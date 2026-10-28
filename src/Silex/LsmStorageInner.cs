@@ -1542,6 +1542,10 @@ internal sealed partial class LsmStorageInner : IDisposable
         long snapshotSequence, bool hasFrom, ReadOnlySpan<byte> from, TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries, out long count)
     {
         count = 0;
+        if (hasFrom && maxEntries == 1 && TrySeekSingleMemTableMvccOptimistic(snapshotSequence, from, arg, reader, out count))
+        {
+            return true;
+        }
         _currentMemTableLock.EnterReadLock();
         try
         {
@@ -1944,18 +1948,9 @@ internal sealed partial class LsmStorageInner : IDisposable
         try
         {
             CheckHealthy();
-            var state = _state;
-            if (!state.ImmutableMemTables.IsEmpty || state.LevelZeroTables.Count != 0 ||
-                state.CurrentMemTable is not MemTable memTable)
+            if (SoleMemTableOrNull() is not { } memTable)
             {
                 return false;
-            }
-            foreach (var level in state.LeveledSsTables)
-            {
-                if (level.Count != 0)
-                {
-                    return false;
-                }
             }
             if (memTable.Count == 0)
             {
@@ -1976,6 +1971,72 @@ internal sealed partial class LsmStorageInner : IDisposable
         {
             _immutableMemTablesLock.ExitReadLock();
         }
+    }
+
+    /// <summary>
+    /// The one-entry MVCC seek of <see cref="TryScanSingleMemTableMvccRaw"/> without
+    /// <see cref="_currentMemTableLock"/>; see <see cref="TrySeekSingleMemTableOptimistic"/>.
+    /// </summary>
+    private bool TrySeekSingleMemTableMvccOptimistic<TArg>(long snapshotSequence, ReadOnlySpan<byte> from, TArg arg,
+        ReadRawEntryAction<TArg> reader, out long count)
+    {
+        count = 0;
+        _immutableMemTablesLock.EnterReadLock();
+        try
+        {
+            CheckHealthy();
+            if (SoleMemTableOrNull() is not { } memTable)
+            {
+                return false;
+            }
+            if (memTable.Count == 0)
+            {
+                return true;
+            }
+            if (!memTable.TrySeekFirstMvccOptimistic(snapshotSequence, from, out var found, out var userKey, out var value, out var isCleanKey))
+            {
+                return false;
+            }
+            if (found)
+            {
+                if (isCleanKey)
+                {
+                    reader(arg, userKey, value);
+                }
+                else
+                {
+                    MvccStorage.InvokeUserReader(arg, reader, userKey, value);
+                }
+                count = 1;
+            }
+            return true;
+        }
+        finally
+        {
+            _immutableMemTablesLock.ExitReadLock();
+        }
+    }
+
+    /// <summary>
+    /// The active memtable when it holds all the data: no frozen memtable and no SST. Callers hold the
+    /// immutable-memtable read lock and the level-0 read lock, so the answer stays true while they read.
+    /// </summary>
+    private MemTable? SoleMemTableOrNull()
+    {
+        var state = _state;
+        if (!state.ImmutableMemTables.IsEmpty || state.LevelZeroTables.Count != 0 ||
+            state.CurrentMemTable is not MemTable memTable)
+        {
+            return null;
+        }
+        foreach (var level in state.LeveledSsTables)
+        {
+            if (level.Count != 0)
+            {
+                return null;
+            }
+        }
+        return memTable;
     }
 
     private bool TryScanSingleMemTableRaw<TArg>(
@@ -2102,6 +2163,20 @@ internal sealed partial class LsmStorageInner : IDisposable
         }
     }
 
+    private bool HasLiveMvccDataOptimistic()
+    {
+        _immutableMemTablesLock.EnterReadLock();
+        try
+        {
+            return _state.CurrentMemTable is MemTable current && current.Count != 0 &&
+                current.TrySeekFirstRawOptimistic([1], out var found, out _, out _) && found;
+        }
+        finally
+        {
+            _immutableMemTablesLock.ExitReadLock();
+        }
+    }
+
     private void InvalidateSortedSsTableRun()
     {
         Volatile.Write(ref _sortedSsTableRun, null);
@@ -2116,6 +2191,14 @@ internal sealed partial class LsmStorageInner : IDisposable
         {
             tables = cached;
             return true;
+        }
+
+        // Pending MVCC data seen without the lock rules the run out (a memtable only gains entries); any other
+        // view still goes through the locked check below.
+        if (!_state.ImmutableMemTables.IsEmpty || HasLiveMvccDataOptimistic())
+        {
+            tables = [];
+            return false;
         }
 
         _currentMemTableLock.EnterReadLock();

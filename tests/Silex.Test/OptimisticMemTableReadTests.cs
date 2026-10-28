@@ -104,15 +104,21 @@ public class OptimisticMemTableReadTests
         await Assert.That(seeks).IsGreaterThan(0);
     }
 
+    /// <summary>
+    /// Small memtables freeze and flush while readers run; a large one keeps every read on the memtable-only
+    /// paths, where seeks are optimistic too.
+    /// </summary>
     [Test]
-    [Arguments(false)]
-    [Arguments(true)]
-    public async Task StorageReadsStayConsistentAcrossFreezesAndFlushes(bool mvcc)
+    [Arguments(false, true)]
+    [Arguments(false, false)]
+    [Arguments(true, true)]
+    [Arguments(true, false)]
+    public async Task StorageReadsStayConsistentWhileOneWriterRuns(bool mvcc, bool smallMemTables)
     {
         using var folder = TempFolder.Create();
         var options = new StorageOptions
         {
-            MemTableSizeLimit = 64 * 1024,
+            MemTableSizeLimit = smallMemTables ? 64 * 1024 : 256 * 1024 * 1024,
             UseWriteAheadLog = false,
         };
         await using var lsm = mvcc ? null : await LsmStorage.OpenAsync(folder, options);
