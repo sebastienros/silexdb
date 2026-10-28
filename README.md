@@ -1550,8 +1550,8 @@ Measured October 27, 2026 on an Apple M4 Pro (10 performance and 4 efficiency co
 macOS 15.8) at Silex `0c12718`: 50,000 keys, 16-byte keys, 100-byte values, no compression, 64 MiB
 memtables, 8 MiB block caches, and WAL enabled. Results are medians of three fresh-process runs,
 alternating engine order. Every run started with the CPU at least 85% idle, and a run was repeated
-when other processes averaged more than 3 cores while it ran (macOS background work alone uses about 1.7). SurrealKV is version
-1.0.0 (`6a758fd`); RocksDB is version 11.4.0 (`26a501b`). Silex ran on .NET 10.0.11, the RocksDB
+when other processes averaged more than 3 cores while it ran (macOS background work alone uses
+about 1.7). SurrealKV is version 1.0.0 (`6a758fd`); RocksDB is version 11.4.0 (`26a501b`). Silex ran on .NET 10.0.11, the RocksDB
 adapter was built with Apple clang 17, and the SurrealKV adapter with Rust 1.95.
 
 The adapters, the workload specification and the runner are in
