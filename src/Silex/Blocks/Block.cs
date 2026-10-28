@@ -13,6 +13,11 @@ internal sealed class Block : IDisposable
     private bool _disposed;
     private int _mvccCleanState; // 0 = unknown, 1 = clean & distinct single-version keys, 2 = general MVCC block
 
+    // Key-window index (see BlockKeyWindows); _keyWindowStart is -1 when the block has none.
+    private readonly int _keyWindowStart = -1;
+    private readonly int _keyPrefixStart;
+    private readonly int _keyPrefixLength;
+
     internal bool ScanMvccSingleVersionRaw<TArg>(
         long snapshotSequence,
         TArg arg,
@@ -71,24 +76,54 @@ internal sealed class Block : IDisposable
         return true;
     }
 
-    public Block(IBlockEncoder encoder, IMemoryOwner<byte> blockData, int length, int count)
+    public Block(IBlockEncoder encoder, IMemoryOwner<byte> blockData, int length, int count, bool hasKeyWindows = false)
+        : this(encoder, blockData, blockData.Memory, length, count, hasKeyWindows)
     {
-        _encoder = encoder;
-        _memoryOwner = blockData;
-        Memory = _memoryOwner.Memory[..length];
-        Offsets = new BlockOffsets(Memory, length - (count + 1) * sizeof(ushort), count);
     }
 
-    public Block(IBlockEncoder encoder, ReadOnlyMemory<byte> blockData, int length, int count)
+    public Block(IBlockEncoder encoder, ReadOnlyMemory<byte> blockData, int length, int count, bool hasKeyWindows = false)
+        : this(encoder, null, blockData, length, count, hasKeyWindows)
+    {
+    }
+
+    private Block(IBlockEncoder encoder, IMemoryOwner<byte>? memoryOwner, ReadOnlyMemory<byte> blockData, int length, int count, bool hasKeyWindows)
     {
         _encoder = encoder;
-        _memoryOwner = null;
+        _memoryOwner = memoryOwner;
         Memory = blockData[..length];
-        Offsets = new BlockOffsets(Memory, length - (count + 1) * sizeof(ushort), count);
+        var offsetsStart = length - (count + 1) * sizeof(ushort);
+        Offsets = new BlockOffsets(Memory, offsetsStart, count);
+        DataEnd = offsetsStart;
+
+        if (hasKeyWindows)
+        {
+            var windowStart = offsetsStart - count * BlockKeyWindows.WindowLength;
+            var prefixLength = windowStart > 0 ? Memory.Span[windowStart - 1] : -1;
+            var prefixStart = windowStart - BlockKeyWindows.GetFixedOverhead(prefixLength);
+            if (prefixLength < 0 || prefixStart < 0)
+            {
+                throw new InvalidDataException("The block key-window index does not fit in the block.");
+            }
+
+            _keyWindowStart = windowStart;
+            _keyPrefixStart = prefixStart;
+            _keyPrefixLength = prefixLength;
+            DataEnd = prefixStart;
+        }
     }
 
     public ReadOnlyMemory<byte> Memory { get; }
     public BlockOffsets Offsets { get; }
+
+    /// <summary>The byte position where the data section (the encoded entries) ends.</summary>
+    internal int DataEnd { get; }
+
+    internal bool HasKeyWindows => _keyWindowStart >= 0;
+
+    internal ReadOnlySpan<byte> KeyPrefix => HasKeyWindows ? Memory.Span.Slice(_keyPrefixStart, _keyPrefixLength) : default;
+
+    internal uint GetKeyWindow(int index) =>
+        System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(Memory.Span.Slice(_keyWindowStart + index * BlockKeyWindows.WindowLength, BlockKeyWindows.WindowLength));
 
     /// <summary>
     /// Returns a descriptor of a key/value in a block.
@@ -161,6 +196,25 @@ internal sealed class Block : IDisposable
     {
         var span = Memory.Span;
         var offsets = Offsets;
+
+        if (_keyWindowStart >= 0)
+        {
+            var index = SearchKeyWindows(span, encodedKey, out var found);
+            if (found)
+            {
+                var entryCursor = (int)offsets[index];
+                var entryKeyLength = Read7BitLength(span, ref entryCursor);
+                entryCursor += entryKeyLength;
+                var entryValueLength = RecordValueEncoding.DecodeLength(Read7BitLength(span, ref entryCursor), out isTombstone);
+                value = span.Slice(entryCursor, entryValueLength);
+                return true;
+            }
+
+            value = default;
+            isTombstone = false;
+            return false;
+        }
+
         var start = 0;
         var end = offsets.Count - 1;
         var hasPrefix = encodedKey.Length >= 8;
@@ -371,6 +425,14 @@ internal sealed class Block : IDisposable
     {
         var span = Memory.Span;
         var offsets = Offsets;
+
+        if (_keyWindowStart >= 0)
+        {
+            // Keys are unique within a block, so the upper bound is just past an exact match.
+            var index = SearchKeyWindows(span, encodedKey, out var found);
+            return found ? index + 1 : index;
+        }
+
         var start = 0;
         var end = offsets.Count;
         var hasPrefix = encodedKey.Length >= 8;
@@ -417,6 +479,12 @@ internal sealed class Block : IDisposable
     {
         var span = memory.Span;
         var offsets = Offsets;
+
+        if (_keyWindowStart >= 0)
+        {
+            return SearchKeyWindows(span, encodedKey, out _);
+        }
+
         var start = 0;
         var end = offsets.Count;
         var hasPrefix = encodedKey.Length >= 8;
@@ -452,6 +520,108 @@ internal sealed class Block : IDisposable
         }
 
         return start;
+    }
+
+    /// <summary>
+    /// Lower-bound search over the key-window index: returns the index of the first entry whose key is greater
+    /// than or equal to <paramref name="encodedKey"/> (or the entry count), and whether that entry equals it.
+    /// Entries are only decoded when their window ties with the key's window.
+    /// </summary>
+    private int SearchKeyWindows(ReadOnlySpan<byte> span, ReadOnlySpan<byte> encodedKey, out bool found)
+    {
+        found = false;
+        var count = Offsets.Count;
+        var prefixLength = _keyPrefixLength;
+
+        if (prefixLength > 0)
+        {
+            // Every key of the block starts with the shared prefix, so a key that sorts outside it sorts before or
+            // after the whole block.
+            var compared = Math.Min(prefixLength, encodedKey.Length);
+            var prefixCmp = encodedKey[..compared].SequenceCompareTo(span.Slice(_keyPrefixStart, compared));
+            if (prefixCmp != 0)
+            {
+                return prefixCmp < 0 ? 0 : count;
+            }
+
+            if (encodedKey.Length < prefixLength)
+            {
+                return 0;
+            }
+        }
+
+        var target = BlockKeyWindows.GetWindow(encodedKey, prefixLength);
+        var windows = span.Slice(_keyWindowStart, count * BlockKeyWindows.WindowLength);
+
+        // First window >= target.
+        var start = 0;
+        var length = count;
+        while (length > 0)
+        {
+            var half = length >> 1;
+            if (ReadWindow(windows, start + half) < target)
+            {
+                start += half + 1;
+                length -= half + 1;
+            }
+            else
+            {
+                length = half;
+            }
+        }
+
+        if (start == count || ReadWindow(windows, start) != target)
+        {
+            return start;
+        }
+
+        // Windows tie: resolve with full keys, past the shared prefix. Usually a single entry ties.
+        var end = start + 1;
+        if (end < count && ReadWindow(windows, end) == target)
+        {
+            // First window > target.
+            length = count - end;
+            while (length > 0)
+            {
+                var half = length >> 1;
+                if (ReadWindow(windows, end + half) <= target)
+                {
+                    end += half + 1;
+                    length -= half + 1;
+                }
+                else
+                {
+                    length = half;
+                }
+            }
+        }
+
+        while (start < end)
+        {
+            var m = start + (end - start) / 2;
+            var cursor = (int)Offsets[m];
+            var keyLength = Read7BitLength(span, ref cursor);
+            var cmp = span.Slice(cursor + prefixLength, keyLength - prefixLength).SequenceCompareTo(encodedKey[prefixLength..]);
+            if (cmp == 0)
+            {
+                found = true;
+                return m;
+            }
+
+            if (cmp < 0)
+            {
+                start = m + 1;
+            }
+            else
+            {
+                end = m;
+            }
+        }
+
+        return start;
+
+        static uint ReadWindow(ReadOnlySpan<byte> windows, int index) =>
+            System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(windows.Slice(index * BlockKeyWindows.WindowLength, BlockKeyWindows.WindowLength));
     }
 
     internal bool ScanMvccRaw<TArg>(

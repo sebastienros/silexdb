@@ -40,18 +40,33 @@ namespace Silex.Blocks;
 /// -------------------------------
 /// 
 /// The footer of the block will be as above. Each of the number is stored as ushort (UInt16).
+/// 
+/// When the encoder writes key windows (<see cref="WritesKeyWindows"/>), a key-window index is inserted
+/// between the data section and the offset section, and the high bit of num_of_elements
+/// (<see cref="BlockKeyWindows.CountFlag"/>) is set:
+/// 
+/// --------------------------------------------------------------------------------------------------
+/// | Data Section | shared_prefix | prefix_len (1 byte) | Window #1 | ... | Window #N | Offsets | Extra |
+/// --------------------------------------------------------------------------------------------------
+/// 
+/// shared_prefix is the prefix every key of the block starts with (at most 255 bytes) and each window is
+/// a little-endian uint holding the four key bytes that follow it, read big-endian and zero-padded (see
+/// <see cref="BlockKeyWindows"/>). Blocks without the flag use the original layout, so both kinds are
+/// readable by the same code. SSTs that may contain flagged blocks use a newer footer version
+/// (<see cref="Tables.SsTableFormat.GetFooterVersion"/>) so that older readers reject them.
 /// </summary>
 internal sealed class DefaultBlockEncoder : IBlockEncoder
 {
     private static readonly IBinaryEncoder<ByteSlice> _keySerializer = BinaryEncoderFactory<ByteSlice>.BinarySerializer;
     private readonly ushort _blockSize;
+    private readonly bool _writeKeyWindows;
 
     public DefaultBlockEncoder()
         : this((ushort)4.KiB())
     {
     }
 
-    public DefaultBlockEncoder(ushort blockSize)
+    public DefaultBlockEncoder(ushort blockSize, bool writeKeyWindows = false)
     {
         if (blockSize == 0)
         {
@@ -59,33 +74,41 @@ internal sealed class DefaultBlockEncoder : IBlockEncoder
         }
 
         _blockSize = blockSize;
+        _writeKeyWindows = writeKeyWindows;
     }
 
     public ushort BlockSize => _blockSize;
 
+    public bool WritesKeyWindows => _writeKeyWindows;
+
     public Block Decode(ReadOnlyMemory<byte> buffer)
     {
-        var count = ReadEntryCount(buffer, buffer.Length);
+        var count = ReadEntryCount(buffer.Span, buffer.Length, out var hasKeyWindows);
 
         var memoryOwner = MemoryPool<byte>.Shared.Rent(buffer.Length);
         buffer.CopyTo(memoryOwner.Memory);
 
-        return new Block(this, memoryOwner, buffer.Length, count);
+        return new Block(this, memoryOwner, buffer.Length, count, hasKeyWindows);
     }
 
     public Block Decode(IMemoryOwner<byte> owner, int length)
     {
         // The block bytes were already read into the owned buffer, so build the block over it directly
         // instead of renting a second buffer and copying. The offset section is read in place by the block.
-        var count = ReadEntryCount(owner.Memory, length);
+        var count = ReadEntryCount(owner.Memory.Span, length, out var hasKeyWindows);
 
-        return new Block(this, owner, length, count);
+        return new Block(this, owner, length, count, hasKeyWindows);
     }
 
-    private static int ReadEntryCount(ReadOnlyMemory<byte> buffer, int length)
+    /// <summary>
+    /// Reads the number of entries stored as the trailing ushort of a block, and whether the block carries a
+    /// key-window index (flagged in the high bit of that ushort).
+    /// </summary>
+    internal static int ReadEntryCount(ReadOnlySpan<byte> block, int length, out bool hasKeyWindows)
     {
-        // The total number of entries is stored as the trailing ushort of the block.
-        return BinaryPrimitives.ReadUInt16LittleEndian(buffer.Span.Slice(length - sizeof(ushort), sizeof(ushort)));
+        var raw = BinaryPrimitives.ReadUInt16LittleEndian(block.Slice(length - sizeof(ushort), sizeof(ushort)));
+        hasKeyWindows = (raw & BlockKeyWindows.CountFlag) != 0;
+        return raw & ~BlockKeyWindows.CountFlag;
     }
 
     public RecordLocation DecodeEntry(ReadOnlyMemory<byte> data, int offset)
@@ -169,14 +192,36 @@ internal sealed class DefaultBlockEncoder : IBlockEncoder
             writer.WriteRaw(valuesSpan.Slice(entry.ValueOffset, entry.StoredValueLength));
         }
 
+        var count = offsets.Count;
+        var hasKeyWindows = _writeKeyWindows && count > 0;
+        if (hasKeyWindows)
+        {
+            if (count >= BlockKeyWindows.CountFlag)
+            {
+                throw new InvalidOperationException($"A block with a key-window index cannot hold {count} entries.");
+            }
+
+            var firstKey = keysSpan.Slice(entries[0].KeyOffset, entries[0].KeyLength);
+            var lastKey = keysSpan.Slice(entries[count - 1].KeyOffset, entries[count - 1].KeyLength);
+            var prefixLength = BlockKeyWindows.GetPrefixLength(firstKey, lastKey);
+
+            writer.WriteRaw(firstKey[..prefixLength]);
+            writer.Write((byte)prefixLength);
+
+            foreach (var entry in entries)
+            {
+                writer.WriteUInt32(BlockKeyWindows.GetWindow(keysSpan.Slice(entry.KeyOffset, entry.KeyLength), prefixLength));
+            }
+        }
+
         foreach (var offset in offsets)
         {
             // 2 bytes for each offset (ushort)
             writer.WriteUInt16(offset);
         }
 
-        // 2 bytes for the number of elements
-        writer.WriteUInt16((ushort)offsets.Count);
+        // 2 bytes for the number of elements, flagged when the block carries a key-window index
+        writer.WriteUInt16((ushort)(hasKeyWindows ? count | BlockKeyWindows.CountFlag : count));
 
         // The internal array could be kept if buffer was not disposed,
         // but by using MemoryPool and copy the value we ensure that all 
@@ -187,7 +232,7 @@ internal sealed class DefaultBlockEncoder : IBlockEncoder
 
         var memory = new MemoryStreamOwner(buffer);
 
-        return new Block(this, memory, (int)buffer.Length, offsets.Count);
+        return new Block(this, memory, (int)buffer.Length, count, hasKeyWindows);
     }
 
     public int EstimateSize(int encodedKeyLength, int valueLength, bool isTombstone)
@@ -197,6 +242,7 @@ internal sealed class DefaultBlockEncoder : IBlockEncoder
             + RecordValueEncoding.GetEncodedLengthSize(valueLength, isTombstone)
             + valueLength
             + 2 // offset
+            + (_writeKeyWindows ? BlockKeyWindows.WindowLength : 0)
             ;
     }
 }

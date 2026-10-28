@@ -418,6 +418,8 @@ public class TransactionalOrderedReadTests
         public Action? OnRead;
         public int Reads;
         public ushort BlockSize => _inner.BlockSize;
+
+        public bool WritesKeyWindows => _inner.WritesKeyWindows;
         public Block Encode(ReadOnlyMemory<byte> keys, ReadOnlyMemory<byte> values, IReadOnlyList<BlockEntry> entries) =>
             _inner.Encode(keys, values, entries);
         public Block Decode(ReadOnlyMemory<byte> buffer)
