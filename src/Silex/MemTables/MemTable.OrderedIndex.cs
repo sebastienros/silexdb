@@ -1,5 +1,6 @@
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
 
 namespace Silex.MemTables;
 
@@ -307,28 +308,75 @@ internal sealed partial class MemTable
             return _table._arena.GetSpan(rec.Key).SequenceCompareTo(key);
         }
 
+        /// <summary>Finds where <paramref name="key"/> goes among the first <paramref name="count"/> keys of a node.</summary>
+        /// <param name="upper">Whether a key equal to <paramref name="key"/> goes before it, as branches route equal keys right.</param>
+        /// <remarks>
+        /// Counts the windows below the key's, then orders the key among the keys whose windows equal its own, which are
+        /// next to each other and the only ones read from the arena.
+        /// </remarks>
         private int Bound(Span<ulong> words, Span<int> keys, int count, ReadOnlySpan<byte> key, int prefixLength, bool upper)
         {
             var target = Window(key, prefixLength);
-            var low = 0;
-            var high = count;
+            var low = CountBelow(words, count, target);
+            var high = low;
+            while (high < count && words[high] == target) high++;
             while (low < high)
             {
                 var middle = low + ((high - low) >> 1);
-                var word = words[middle];
-                int comparison;
-                if (word != target)
-                {
-                    comparison = word < target ? -1 : 1;
-                }
-                else
-                {
-                    comparison = CompareTied(keys[middle], key, prefixLength);
-                }
+                var comparison = CompareTied(keys[middle], key, prefixLength);
                 if (comparison < 0 || upper && comparison == 0) low = middle + 1;
                 else high = middle;
             }
             return low;
+        }
+
+        /// <summary>The windows that a vector count compares once a binary search has narrowed the range to them.</summary>
+        private const int CountBlock = 16;
+
+        /// <summary>Counts the windows below <paramref name="target"/> among the first <paramref name="count"/>, which are sorted.</summary>
+        /// <remarks>
+        /// Where 32-byte vectors are fast (x64) comparing every window measured faster than any binary search; elsewhere
+        /// (Arm64) a branch-free binary search down to <see cref="CountBlock"/> windows and a vector count of those measured best.
+        /// </remarks>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static int CountBelow(Span<ulong> words, int count, ulong target)
+        {
+            ref var first = ref MemoryMarshal.GetReference(words);
+            if (Vector256.IsHardwareAccelerated) return CountBelowLinear(ref first, count, target);
+            nint start = 0;
+            nint length = count;
+            while (length > CountBlock)
+            {
+                var half = length >> 1;
+                start = Unsafe.Add(ref first, start + half) < target ? start + half : start;
+                length -= half;
+            }
+            return (int)start + CountBelowLinear(ref Unsafe.Add(ref first, start), (int)length, target);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static int CountBelowLinear(ref ulong first, int count, ulong target)
+        {
+            var i = 0;
+            long less = 0;
+            if (Vector256.IsHardwareAccelerated)
+            {
+                var targets = Vector256.Create(target);
+                var sum = Vector256<long>.Zero;
+                for (; i + Vector256<ulong>.Count <= count; i += Vector256<ulong>.Count)
+                    sum -= Vector256.LessThan(Vector256.LoadUnsafe(ref first, (nuint)i), targets).AsInt64();
+                less = Vector256.Sum(sum);
+            }
+            else if (Vector128.IsHardwareAccelerated)
+            {
+                var targets = Vector128.Create(target);
+                var sum = Vector128<long>.Zero;
+                for (; i + Vector128<ulong>.Count <= count; i += Vector128<ulong>.Count)
+                    sum -= Vector128.LessThan(Vector128.LoadUnsafe(ref first, (nuint)i), targets).AsInt64();
+                less = Vector128.Sum(sum);
+            }
+            for (; i < count; i++) less += Unsafe.Add(ref first, i) < target ? 1 : 0;
+            return (int)less;
         }
 
         public void Dispose()
