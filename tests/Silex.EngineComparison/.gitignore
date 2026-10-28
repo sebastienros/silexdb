@@ -1,0 +1,4 @@
+silex/bin/
+silex/obj/
+rocksdb/build/
+surrealkv/target/

@@ -1,0 +1,26 @@
+[package]
+name = "surrealkv-adapter"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "SurrealKV adapter for the Silex engine comparison harness (see ../README.md)"
+
+[[bin]]
+name = "surrealkv-adapter"
+path = "src/main.rs"
+
+[dependencies]
+# SurrealKV 1.0.0, pinned. Default features are off: the only one is `encryption` (encryption at
+# rest), which the comparison does not use.
+surrealkv = { git = "https://github.com/surrealdb/surrealkv", rev = "6a758fd", default-features = false }
+# SurrealKV's background flusher, memtable flush and compaction run as tokio tasks.
+tokio = { version = "1.36", features = ["rt-multi-thread"] }
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+debug = false
+
+# Standalone crate: not part of any parent workspace.
+[workspace]
