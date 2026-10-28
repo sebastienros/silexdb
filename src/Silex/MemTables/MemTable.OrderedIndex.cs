@@ -13,18 +13,18 @@ internal sealed partial class MemTable
     /// </summary>
     /// <remarks>
     /// <para>
-    /// A node's window starts past <see cref="Node.PrefixLength"/> bytes that every key a search routes to it
+    /// A node's windows start past <see cref="Node.PrefixLength"/> bytes that every key a search routes to it
     /// shares, so keys with a long common prefix (MVCC keys, or application keys such as <c>user:</c>) still
-    /// differ in it. The prefix of a node is the common prefix of its fences, the separators beside it in its
-    /// ancestors; a node with no fence on one side lies on an edge of the tree and takes the prefix that every
-    /// key of the tree shares.
+    /// differ in them. A node starts at prefix 0, where a window is the record's prefix word, and takes the common
+    /// prefix of its fences, the separators beside it in its ancestors, once two of its windows tie. A node with no
+    /// fence on one side lies on an edge of the tree and takes the prefix that every key of the tree shares.
     /// </para>
     /// <para>
     /// A window holds the bytes big-endian and zero-padded, so windows order as their keys do and equal windows
     /// leave the keys to be compared from the arena.
     /// </para>
     /// </remarks>
-    internal sealed class OrderedIndex : IDisposable
+    internal sealed class OrderedIndex
     {
         internal const int LeafCapacity = 256;
         internal const int BranchCapacity = 32;
@@ -60,19 +60,19 @@ internal sealed partial class MemTable
 
         private Node Build(ReadOnlySpan<int> records, int height, long capacity, int low, int high, ref Leaf? previous)
         {
-            var prefixLength = PrefixLength(low, high);
             if (height == 0)
             {
-                var leaf = new Leaf { Count = records.Length, PrefixLength = prefixLength };
+                var leaf = new Leaf { Count = records.Length };
                 records.CopyTo(leaf.Keys);
                 var words = leaf.Words;
-                for (var i = 0; i < records.Length; i++) words[i] = Window(records[i], prefixLength);
+                for (var i = 0; i < records.Length; i++) words[i] = Window(records[i], 0);
+                GrowPrefixIfTied(leaf, low, high);
                 leaf.Previous = previous;
                 if (previous is not null) previous.Next = leaf;
                 previous = leaf;
                 return leaf;
             }
-            var node = new Branch { PrefixLength = prefixLength };
+            var node = new Branch();
             var childCapacity = capacity / (BranchCapacity + 1);
             var children = (int)((records.Length + childCapacity - 1) / childCapacity);
             node.Count = children - 1;
@@ -85,10 +85,11 @@ internal sealed partial class MemTable
                 if (i != 0)
                 {
                     node.Keys[i - 1] = records[0];
-                    node.Words[i - 1] = Window(records[0], prefixLength);
+                    node.Words[i - 1] = Window(records[0], 0);
                 }
                 records = records[count..];
             }
+            GrowPrefixIfTied(node, low, high);
             return node;
         }
 
@@ -163,7 +164,6 @@ internal sealed partial class MemTable
             {
                 _prefixRecord = record;
                 _prefixLength = key.Length;
-                _root.PrefixLength = key.Length;
             }
             else if (_prefixLength != 0)
             {
@@ -172,9 +172,9 @@ internal sealed partial class MemTable
             }
             var right = Insert(_root, record, key, NoFence, NoFence, out var separator);
             if (right is null) return;
-            var root = new Branch { Count = 1, PrefixLength = _prefixLength };
+            var root = new Branch { Count = 1 };
             root.Keys[0] = separator;
-            root.Words[0] = Window(separator, _prefixLength);
+            root.Words[0] = Window(separator, 0);
             root.Children[0] = _root;
             root.Children[1] = right;
             _root = root;
@@ -213,11 +213,13 @@ internal sealed partial class MemTable
                 keys[slot..count].CopyTo(keys[(slot + 1)..]);
                 words[slot] = word;
                 keys[slot] = record;
-                if (++leaf.Count <= LeafCapacity) return null;
+                leaf.Count++;
+                if (IsTied(words, slot, leaf.Count)) GrowPrefix(leaf, low, high);
+                if (leaf.Count <= LeafCapacity) return null;
                 _table._faultInjector?.Invoke(StorageFaultPoint.MemTableBeforeOrderedIndexSplit);
 
                 var middle = leaf.Count / 2;
-                var right = new Leaf { Count = leaf.Count - middle, PrefixLength = prefixLength };
+                var right = new Leaf { Count = leaf.Count - middle, PrefixLength = leaf.PrefixLength };
                 words[middle..leaf.Count].CopyTo(right.Words);
                 keys[middle..leaf.Count].CopyTo(right.Keys);
                 separator = keys[middle];
@@ -226,8 +228,8 @@ internal sealed partial class MemTable
                 if (leaf.Next is not null) leaf.Next.Previous = right;
                 leaf.Next = right;
                 leaf.Count = middle;
-                GrowPrefix(leaf, low, separator);
-                GrowPrefix(right, separator, high);
+                SplitPrefix(leaf, low, separator);
+                SplitPrefix(right, separator, high);
                 return right;
             }
             else
@@ -248,19 +250,21 @@ internal sealed partial class MemTable
                 words[slot] = Window(childSeparator, prefixLength);
                 keys[slot] = childSeparator;
                 children[slot + 1] = child;
-                if (++branch.Count <= BranchCapacity) return null;
+                branch.Count++;
+                if (IsTied(words, slot, branch.Count)) GrowPrefix(branch, low, high);
+                if (branch.Count <= BranchCapacity) return null;
                 _table._faultInjector?.Invoke(StorageFaultPoint.MemTableBeforeOrderedIndexSplit);
 
                 var middle = branch.Count / 2;
-                var right = new Branch { Count = branch.Count - middle - 1, PrefixLength = prefixLength };
+                var right = new Branch { Count = branch.Count - middle - 1, PrefixLength = branch.PrefixLength };
                 separator = keys[middle];
                 words[(middle + 1)..branch.Count].CopyTo(right.Words);
                 keys[(middle + 1)..branch.Count].CopyTo(right.Keys);
                 children[(middle + 1)..(branch.Count + 1)].CopyTo(right.Children);
                 children[(middle + 1)..(branch.Count + 1)].Clear();
                 branch.Count = middle;
-                GrowPrefix(branch, low, separator);
-                GrowPrefix(right, separator, high);
+                SplitPrefix(branch, low, separator);
+                SplitPrefix(right, separator, high);
                 return right;
             }
         }
@@ -269,11 +273,44 @@ internal sealed partial class MemTable
         private int PrefixLength(int low, int high) =>
             low == NoFence || high == NoFence ? _prefixLength : Key(low).CommonPrefixLength(Key(high));
 
-        /// <summary>Lengthens the prefix of a node that a split narrowed to the fences <paramref name="low"/> and <paramref name="high"/>.</summary>
+        /// <summary>Whether the window in <paramref name="slot"/> equals a neighbor's, so the two keys must be read to be ordered.</summary>
+        private static bool IsTied(Span<ulong> words, int slot, int count) =>
+            slot > 0 && words[slot - 1] == words[slot] || slot + 1 < count && words[slot + 1] == words[slot];
+
+        /// <summary>
+        /// Lengthens the prefix of <paramref name="node"/> to that of its fences <paramref name="low"/> and <paramref name="high"/>,
+        /// so that its windows hold bytes that tell its keys apart.
+        /// </summary>
+        /// <remarks>
+        /// A node keeps a shorter prefix while its windows do not tie: rewriting them reads every key from the arena, and a
+        /// window at prefix 0 is the record's own prefix word. Once grown, the node stays at its fences until a split narrows them.
+        /// </remarks>
         private void GrowPrefix(Node node, int low, int high)
         {
+            if (node.PrefixAtFences) return;
+            node.PrefixAtFences = true;
             var prefixLength = PrefixLength(low, high);
             if (prefixLength > node.PrefixLength) SetPrefix(node, prefixLength);
+        }
+
+        private void GrowPrefixIfTied(Node node, int low, int high)
+        {
+            var words = node.IsLeaf ? Unsafe.As<Leaf>(node).Words : Unsafe.As<Branch>(node).Words;
+            for (var i = 1; i < node.Count; i++)
+            {
+                if (words[i - 1] == words[i])
+                {
+                    GrowPrefix(node, low, high);
+                    return;
+                }
+            }
+        }
+
+        /// <summary>Resets the prefix state of a node that a split gave the fences <paramref name="low"/> and <paramref name="high"/>.</summary>
+        private void SplitPrefix(Node node, int low, int high)
+        {
+            node.PrefixAtFences = false;
+            GrowPrefixIfTied(node, low, high);
         }
 
         private void SetPrefix(Node node, int prefixLength)
@@ -379,10 +416,6 @@ internal sealed partial class MemTable
             return (int)less;
         }
 
-        public void Dispose()
-        {
-        }
-
         public abstract class Node(bool isLeaf)
         {
             public readonly bool IsLeaf = isLeaf;
@@ -390,6 +423,9 @@ internal sealed partial class MemTable
 
             /// <summary>The leading bytes that every key a search routes to the node shares, which its windows skip.</summary>
             public int PrefixLength;
+
+            /// <summary>Whether <see cref="PrefixLength"/> is the common prefix of the node's fences, the longest it can be.</summary>
+            public bool PrefixAtFences;
         }
 
         public sealed class Leaf() : Node(true)
