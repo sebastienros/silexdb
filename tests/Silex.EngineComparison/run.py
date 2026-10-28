@@ -12,6 +12,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -96,6 +97,30 @@ MEMORY_ROWS = [
 UNITS = {}
 
 
+def cpu_idle_percent():
+    """Idle CPU over the last second on macOS (`top`), or None elsewhere."""
+    if sys.platform != "darwin":
+        return None
+    sample = subprocess.run(["top", "-l", "2", "-s", "1", "-n", "0"], capture_output=True, text=True).stdout
+    lines = [line for line in sample.splitlines() if line.startswith("CPU usage:")]
+    return float(lines[-1].split(",")[2].split("%")[0]) if lines else None
+
+
+def wait_for_idle(min_idle):
+    """Waits until the machine is at least min_idle percent idle, so other work does not skew a run."""
+    waited = False
+    while True:
+        idle = cpu_idle_percent()
+        if idle is None or idle >= min_idle:
+            if waited:
+                print(f"  resumed at {idle:.0f}% idle", flush=True)
+            return idle
+        if not waited:
+            print(f"  waiting: {idle:.0f}% idle < {min_idle}%", flush=True)
+            waited = True
+        time.sleep(5)
+
+
 def run_one(engine, suite, threads, command, work_root):
     directory = tempfile.mkdtemp(prefix=f"{engine}-{suite}-{threads}-", dir=work_root)
     try:
@@ -139,10 +164,12 @@ def run(args):
                     for engine in order:
                         if engines_filter and engine not in engines_filter:
                             continue
+                        idle_before = wait_for_idle(args.min_idle) if args.min_idle else None
                         load_before = os.getloadavg()[0]
                         records = run_one(engine, suite, threads, adapters[engine], work_root)
                         for record in records:
                             record["load1"] = load_before
+                            record["idle_before"] = idle_before
                             record["rep"] = rep
                             record["label"] = engine + args.label_suffix
                             log.write(json.dumps(record) + "\n")
@@ -212,6 +239,8 @@ def main():
     parser.add_argument("--reps", type=int, default=3)
     parser.add_argument("--adapter", action="append", default=[], metavar="ENGINE=COMMAND",
                         help="run ENGINE with another adapter build, e.g. silex-lsm=/path/to/silex-bench")
+    parser.add_argument("--min-idle", type=float, default=85,
+                        help="before each run, wait until the CPU is at least this percent idle (macOS; 0 disables)")
     parser.add_argument("--label-suffix", default="", help="record runs as ENGINE + suffix, e.g. silex-lsm@baseline")
     args = parser.parse_args()
     if args.render:

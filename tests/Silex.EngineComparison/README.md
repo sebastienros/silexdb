@@ -24,7 +24,17 @@ python3 tests/Silex.EngineComparison/run.py --render /tmp/engine-comparison
 ```
 
 `run.py --help` lists the filters (`--pairs`, `--threads`, `--suites`, `--reps`) and lets one adapter be
-replaced by another build, for example Silex compiled from an older commit.
+replaced by another build, for example Silex compiled from an older commit:
+
+```bash
+python3 tests/Silex.EngineComparison/run.py --out /tmp/silex-old --engines silex-lsm,silex-mvcc \
+  --label-suffix @old --adapter silex-lsm=/path/to/old/silex-bench --adapter silex-mvcc=/path/to/old/silex-bench
+python3 tests/Silex.EngineComparison/run.py --render /tmp/engine-comparison /tmp/silex-old \
+  --columns silex-lsm@old,silex-lsm,silex-mvcc@old,silex-mvcc
+```
+
+On macOS the runner waits before each run until the CPU is at least 85% idle (`--min-idle`), and records
+the idle level and load average with each result, so other work on the machine does not skew a run.
 
 ## Adapter contract
 
