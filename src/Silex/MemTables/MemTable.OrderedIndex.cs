@@ -6,12 +6,13 @@ internal sealed partial class MemTable
 {
     internal sealed class OrderedIndex : IDisposable
     {
-        private const int LeafCapacity = 256;
-        private const int BranchCapacity = 32;
+        internal const int LeafCapacity = 256;
+        internal const int BranchCapacity = 32;
         private readonly MemTable _table;
         private Node _root;
         private long _version;
         public long Version => _version;
+        internal Node Root => _root;
 
         public OrderedIndex(MemTable table, ReadOnlySpan<int> records)
         {
@@ -128,6 +129,7 @@ internal sealed partial class MemTable
             node.Count++;
             var leaf = node.Children is null;
             if (node.Count <= (leaf ? LeafCapacity : BranchCapacity)) return null;
+            _table._faultInjector?.Invoke(StorageFaultPoint.MemTableBeforeOrderedIndexSplit);
             var middle = node.Count / 2;
             var right = new Node(leaf);
             if (leaf)
