@@ -33,8 +33,11 @@ python3 tests/Silex.EngineComparison/run.py --render /tmp/engine-comparison /tmp
   --columns silex-lsm@old,silex-lsm,silex-mvcc@old,silex-mvcc
 ```
 
-On macOS the runner waits before each run until the CPU is at least 85% idle (`--min-idle`), and records
-the idle level and load average with each result, so other work on the machine does not skew a run.
+So other work on the machine does not skew a run, the runner waits before each run until the CPU is at least
+85% idle (`--min-idle`, macOS only). It also measures the CPU time every other process used while the run
+was going, and reruns the suite when they averaged more than 3 cores (`--max-other-cores`). macOS
+background work alone uses about 1.7 cores on a quiet M4 Pro. Each result records the idle level, the
+load average and that CPU use.
 
 ## Adapter contract
 
