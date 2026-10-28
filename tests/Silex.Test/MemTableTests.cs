@@ -449,6 +449,11 @@ public class MemTableTests
     {
         var leaves = new List<MemTable.OrderedIndex.Leaf>();
         var leafDepth = -1;
+        var treePrefix = int.MaxValue;
+        for (var record = 1; record < table.Count; record++)
+        {
+            treePrefix = Math.Min(treePrefix, table.GetRecordKey(0).CommonPrefixLength(table.GetRecordKey(record)));
+        }
         CheckNode(index.Root, 0, -1, -1);
 
         var seen = new bool[table.Count];
@@ -475,7 +480,7 @@ public class MemTableTests
         // Bounds are records, -1 when unbounded: keys are at least the lower bound and below the upper one.
         void CheckNode(MemTable.OrderedIndex.Node node, int depth, int lower, int upper)
         {
-            CheckWords(node);
+            CheckWords(node, lower, upper);
             if (node is MemTable.OrderedIndex.Leaf leaf)
             {
                 Require(leaf.Count <= MemTable.OrderedIndex.LeafCapacity, $"a leaf holds {leaf.Count} keys");
@@ -506,14 +511,19 @@ public class MemTableTests
             }
         }
 
-        // Each node keeps the prefix word of each of its keys next to the key's record.
-        void CheckWords(MemTable.OrderedIndex.Node node)
+        // A node's windows skip a prefix that every key between its bounds shares: the bounds' common prefix, or on an
+        // edge of the tree the prefix that all keys share.
+        void CheckWords(MemTable.OrderedIndex.Node node, int lower, int upper)
         {
+            var shared = lower >= 0 && upper >= 0
+                ? table.GetRecordKey(lower).CommonPrefixLength(table.GetRecordKey(upper))
+                : treePrefix;
+            Require(node.PrefixLength <= shared, $"a node skips {node.PrefixLength} bytes where its keys share {shared}");
             var words = node is MemTable.OrderedIndex.Leaf leaf ? leaf.Words : ((MemTable.OrderedIndex.Branch)node).Words;
             var keys = node is MemTable.OrderedIndex.Leaf l ? l.Keys : ((MemTable.OrderedIndex.Branch)node).Keys;
             for (var slot = 0; slot < node.Count; slot++)
             {
-                Require(words[slot] == Window(table.GetRecordKey(keys[slot]), 0), $"the word of record {keys[slot]} is stale");
+                Require(words[slot] == Window(table.GetRecordKey(keys[slot]), node.PrefixLength), $"the window of record {keys[slot]} is stale");
             }
         }
 
