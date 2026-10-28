@@ -15,6 +15,17 @@ namespace Silex.MemTables;
 /// <remarks>
 /// Writes are synchronized by <see cref="LsmStorageInner"/>. Frozen tables support concurrent readers.
 /// A MemTable only owns writes and tombstones; it is not a read cache.
+/// <para>
+/// The active table also supports optimistic readers that run alongside the single writer without a lock
+/// (<see cref="TryGetSpanOptimistic"/>, <see cref="TryGetNextVersionOptimistic"/>, <see cref="TryScanRawOptimistic"/>).
+/// They read without blocking, then validate versions and retry: <c>_layoutVersion</c> is odd while the writer
+/// replaces an array or drops an index, <c>_batchVersion</c> is odd while an atomic batch of several entries
+/// applies (so no reader sees part of it), each record's flags carry a sequence that is odd while its value is
+/// rewritten, and each ordered index node has its own version. Inserts publish a fully written record with a
+/// release store, and arena bytes never change while the table is alive, so a validated slice reads stable bytes.
+/// Optimistic reads bound every index and loop, because a reader can see torn state before it validates.
+/// The caller keeps the table from being disposed while it reads.
+/// </para>
 /// </remarks>
 internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
 {
@@ -23,6 +34,9 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
     private const int MinInsertsBeforeOrderedIndexDrop = 1024;
     /// <summary>The slots ahead of a leaf scan whose record is prefetched; 8 measured best of 4, 8 and 16 on x64.</summary>
     private const int RecordPrefetchDistance = 8;
+    /// <summary>Added to a record's flags around a value rewrite; the flag bits below it are left intact.</summary>
+    private const uint RecordWriteStep = 4;
+    private const int MaxOptimisticAttempts = 16;
 
     private readonly long _id;
     private readonly WriteAheadLog? _wal;
@@ -39,6 +53,8 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
     private long _size;
     private volatile bool _sortDirty;
     private int _insertsSinceOrderedRead;
+    private int _layoutVersion;
+    private int _batchVersion;
     private bool _disposed;
     private readonly Action<StorageFaultPoint>? _faultInjector;
     internal StorageCommitOutcome WriteOutcome { get; private set; }
@@ -110,9 +126,12 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
                 {
                     Array.Sort(sorted, 0, _count, _recordComparer);
                 }
-                _orderedIndex = new OrderedIndex(this, sorted.AsSpan(0, _count));
+                var rebuilt = new OrderedIndex(this, sorted.AsSpan(0, _count));
+                BeginLayoutChange();
+                Volatile.Write(ref _orderedIndex, rebuilt);
                 _insertsSinceOrderedRead = 0;
                 _sortDirty = false;
+                EndLayoutChange();
             }
             finally
             {
@@ -164,6 +183,499 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
         return true;
     }
 
+    /// <summary>
+    /// Point lookup that runs alongside the writer without a lock. Returns false when it could not get a
+    /// consistent read after a few attempts; the caller then takes the lock and uses <see cref="TryGetSpan"/>.
+    /// </summary>
+    internal bool TryGetSpanOptimistic(ReadOnlySpan<byte> key, out bool found, out ReadOnlySpan<byte> value, out bool isTombstone)
+    {
+        var hash = Hash(key);
+        var keyPrefixWord = ReadKeyPrefixWord(key);
+        var spinner = new SpinWait();
+        for (var attempt = 0; attempt < MaxOptimisticAttempts; attempt++)
+        {
+            if (TryReadVersions(out var layout, out var batch) &&
+                TryFindOptimistic(key, hash, keyPrefixWord, out found, out value, out isTombstone) &&
+                ValidateVersions(layout, batch))
+            {
+                return true;
+            }
+            spinner.SpinOnce(sleep1Threshold: -1);
+        }
+        found = isTombstone = false;
+        value = default;
+        return false;
+    }
+
+    private bool TryFindOptimistic(ReadOnlySpan<byte> key, uint hash, ulong keyPrefixWord,
+        out bool found, out ReadOnlySpan<byte> value, out bool isTombstone)
+    {
+        found = isTombstone = false;
+        value = default;
+        var buckets = Volatile.Read(ref _buckets);
+        var mask = _bucketCapacity - 1;
+        var records = Volatile.Read(ref _records);
+        if ((uint)mask >= (uint)buckets.Length)
+        {
+            return false;
+        }
+        var bucket = (int)hash & mask;
+        for (var probes = 0; probes <= mask; probes++)
+        {
+            var recordIndex = Volatile.Read(ref buckets[bucket]) - 1;
+            if (recordIndex < 0)
+            {
+                return true;
+            }
+            if ((uint)recordIndex >= (uint)records.Length)
+            {
+                return false;
+            }
+            ref var record = ref records[recordIndex];
+            if (record.Hash == hash && record.KeyPrefixWord == keyPrefixWord && record.Key.Length == key.Length)
+            {
+                if (key.Length > 8)
+                {
+                    if (!_arena.TryGetSpanOptimistic(record.Key, out var stored))
+                    {
+                        return false;
+                    }
+                    if (!key[8..].SequenceEqual(stored[8..]))
+                    {
+                        bucket = (bucket + 1) & mask;
+                        continue;
+                    }
+                }
+                if (!TryReadRecordValue(ref record, out var slice, out isTombstone) ||
+                    (!isTombstone && !_arena.TryGetSpanOptimistic(slice, out value)))
+                {
+                    return false;
+                }
+                found = true;
+                return true;
+            }
+            bucket = (bucket + 1) & mask;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Lock-free counterpart of <see cref="TryGetNextVersionRaw"/> over the version-prefix index. Returns false,
+    /// without touching the outputs' meaning, when the index is not built or no consistent read succeeded.
+    /// </summary>
+    internal bool TryGetNextVersionOptimistic(ReadOnlySpan<byte> from, ReadOnlySpan<byte> prefix, bool inclusive,
+        out bool found, out ReadOnlySpan<byte> key, out ReadOnlySpan<byte> value, out bool tombstone)
+    {
+        var prefixHash = Hash(prefix);
+        var keyPrefixWord = ReadKeyPrefixWord(prefix);
+        var spinner = new SpinWait();
+        for (var attempt = 0; attempt < MaxOptimisticAttempts; attempt++)
+        {
+            if (TryReadVersions(out var layout, out var batch))
+            {
+                if (Volatile.Read(ref _prefixBuckets) is null)
+                {
+                    break;
+                }
+                if (TryFindNextVersionOptimistic(from, prefix, prefixHash, keyPrefixWord, inclusive,
+                        out found, out key, out value, out tombstone) &&
+                    ValidateVersions(layout, batch))
+                {
+                    return true;
+                }
+            }
+            spinner.SpinOnce(sleep1Threshold: -1);
+        }
+        found = tombstone = false;
+        key = value = default;
+        return false;
+    }
+
+    private bool TryFindNextVersionOptimistic(ReadOnlySpan<byte> from, ReadOnlySpan<byte> prefix, uint prefixHash,
+        ulong keyPrefixWord, bool inclusive, out bool found, out ReadOnlySpan<byte> key, out ReadOnlySpan<byte> value,
+        out bool tombstone)
+    {
+        found = tombstone = false;
+        key = value = default;
+        var buckets = Volatile.Read(ref _prefixBuckets);
+        var mask = _prefixBucketCapacity - 1;
+        var records = Volatile.Read(ref _records);
+        if (buckets is null || (uint)mask >= (uint)buckets.Length)
+        {
+            return false;
+        }
+        var expectedKeyLength = prefix.Length + sizeof(long);
+        var bucket = (int)prefixHash & mask;
+        var curr = -1;
+        for (var probes = 0; ; probes++)
+        {
+            if (probes > mask)
+            {
+                return false;
+            }
+            var headIndex = Volatile.Read(ref buckets[bucket]) - 1;
+            if (headIndex < 0)
+            {
+                return true;
+            }
+            if ((uint)headIndex >= (uint)records.Length)
+            {
+                return false;
+            }
+            ref var head = ref records[headIndex];
+            if (head.PrefixHash == prefixHash && head.Key.Length == expectedKeyLength)
+            {
+                if (!_arena.TryGetSpanOptimistic(head.Key, out var headKey))
+                {
+                    return false;
+                }
+                if (prefix.Length >= 8
+                        ? head.KeyPrefixWord == keyPrefixWord && headKey.Slice(8, prefix.Length - 8).SequenceEqual(prefix[8..])
+                        : headKey[..prefix.Length].SequenceEqual(prefix))
+                {
+                    curr = headIndex;
+                    break;
+                }
+            }
+            bucket = (bucket + 1) & mask;
+        }
+
+        var compareTrailers = from.Length == expectedKeyLength;
+        var fromTrailer = compareTrailers ? System.Buffers.Binary.BinaryPrimitives.ReadUInt64BigEndian(from[^sizeof(long)..]) : 0;
+        for (var steps = 0; curr >= 0; steps++)
+        {
+            if (steps >= records.Length || (uint)curr >= (uint)records.Length)
+            {
+                return false;
+            }
+            ref var rec = ref records[curr];
+            if (!_arena.TryGetSpanOptimistic(rec.Key, out var candidateKey) || candidateKey.Length != expectedKeyLength)
+            {
+                return false;
+            }
+            bool match;
+            if (compareTrailers)
+            {
+                var candidateTrailer = System.Buffers.Binary.BinaryPrimitives.ReadUInt64BigEndian(candidateKey[^sizeof(long)..]);
+                match = candidateTrailer > fromTrailer || (inclusive && candidateTrailer == fromTrailer);
+            }
+            else
+            {
+                var cmp = candidateKey.SequenceCompareTo(from);
+                match = cmp > 0 || (inclusive && cmp == 0);
+            }
+            if (match)
+            {
+                if (!TryReadRecordValue(ref rec, out var slice, out tombstone) ||
+                    (!tombstone && !_arena.TryGetSpanOptimistic(slice, out value)))
+                {
+                    return false;
+                }
+                key = candidateKey;
+                found = true;
+                return true;
+            }
+            curr = Volatile.Read(ref rec.NextVersionRecord);
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Lock-free counterpart of <see cref="ScanRaw"/> with one entry: finds the first live entry at or after
+    /// <paramref name="from"/>. Returns false when no consistent read succeeded; the caller then takes the lock.
+    /// A multi-entry scan keeps using the lock so it still reads one snapshot of the table.
+    /// </summary>
+    internal bool TrySeekFirstRawOptimistic(ReadOnlySpan<byte> from, out bool found, out ReadOnlySpan<byte> key,
+        out ReadOnlySpan<byte> value)
+    {
+        var visitor = new FirstLiveVisitor();
+        return TrySeekFirstOptimistic(from, ref visitor, out found, out key, out value);
+    }
+
+    /// <summary>
+    /// Lock-free counterpart of <see cref="ScanMvccRaw"/> with one entry: finds the first user key at or after
+    /// <paramref name="from"/> whose newest version visible at <paramref name="snapshotSequence"/> is live, and
+    /// returns its encoded user key and value without the kind marker. <paramref name="isCleanKey"/> is false
+    /// when the user key still needs <see cref="MvccStorage.InvokeUserReader"/> to decode it.
+    /// </summary>
+    internal bool TrySeekFirstMvccOptimistic(long snapshotSequence, ReadOnlySpan<byte> from, out bool found,
+        out ReadOnlySpan<byte> encodedUserKey, out ReadOnlySpan<byte> value, out bool isCleanKey)
+    {
+        var visitor = new FirstVisibleMvccVisitor(snapshotSequence);
+        var result = TrySeekFirstOptimistic(from, ref visitor, out found, out var key, out value);
+        isCleanKey = visitor.IsCleanKey;
+        encodedUserKey = found ? key.Slice(1, key.Length - 11) : default;
+        if (found)
+        {
+            value = value[1..];
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Walks the ordered index from <paramref name="from"/> without a lock until <paramref name="visitor"/>
+    /// accepts a record. Every leaf the walk crosses is validated again at the end, so the result is a consistent
+    /// read even though the writer keeps running. Returns false when the ordered index is not current, the walk
+    /// crosses too many leaves, the visitor reports torn state too often, or no consistent read succeeded.
+    /// </summary>
+    private bool TrySeekFirstOptimistic<TVisitor>(ReadOnlySpan<byte> from, scoped ref TVisitor visitor, out bool found,
+        out ReadOnlySpan<byte> key, out ReadOnlySpan<byte> value)
+        where TVisitor : struct, IOptimisticSeekVisitor
+    {
+        const int MaxLeaves = 4;
+        var visited = new VisitedLeaves();
+        var spinner = new SpinWait();
+        for (var attempt = 0; attempt < MaxOptimisticAttempts; attempt++, spinner.SpinOnce(sleep1Threshold: -1))
+        {
+            if (!TryReadVersions(out var layout, out var batch))
+            {
+                continue;
+            }
+            if (_sortDirty || Volatile.Read(ref _orderedIndex) is not { } index)
+            {
+                break;
+            }
+            if (_insertsSinceOrderedRead != 0)
+            {
+                _insertsSinceOrderedRead = 0;
+            }
+            var records = Volatile.Read(ref _records);
+            if (!index.TrySeekOptimistic(from, records, out var node, out var slot, out var version))
+            {
+                continue;
+            }
+
+            visitor.Reset();
+            var leaves = 0;
+            var result = SeekStep.Retry;
+            var acceptedKey = default(MemTableArena.ArenaSlice);
+            var acceptedValue = default(MemTableArena.ArenaSlice);
+            var accepted = false;
+            while (true)
+            {
+                visited[leaves++] = (node, version);
+                var keys = node.Keys;
+                var nodeCount = node.Count;
+                if ((uint)nodeCount > (uint)keys.Length)
+                {
+                    break;
+                }
+                var step = SeekStep.Continue;
+                for (; slot < nodeCount; slot++)
+                {
+                    var recordIndex = keys[slot];
+                    if ((uint)recordIndex >= (uint)records.Length)
+                    {
+                        step = SeekStep.Retry;
+                        break;
+                    }
+                    ref var record = ref records[recordIndex];
+                    if (!TryReadRecordValue(ref record, out var valueSlice, out var isTombstone))
+                    {
+                        step = SeekStep.Retry;
+                        break;
+                    }
+                    step = visitor.Visit(_arena, ref record, valueSlice, isTombstone);
+                    if (step == SeekStep.Done)
+                    {
+                        acceptedKey = record.Key;
+                        acceptedValue = valueSlice;
+                        accepted = true;
+                        break;
+                    }
+                    if (step != SeekStep.Continue)
+                    {
+                        break;
+                    }
+                }
+                if (step != SeekStep.Continue)
+                {
+                    result = step;
+                    break;
+                }
+
+                var next = Volatile.Read(ref node.Next);
+                if (next is null)
+                {
+                    result = SeekStep.Done;
+                    break;
+                }
+                if (leaves == MaxLeaves)
+                {
+                    result = SeekStep.GiveUp;
+                    break;
+                }
+                var nextVersion = Volatile.Read(ref next.Version);
+                if ((nextVersion & 1) != 0)
+                {
+                    break;
+                }
+                node = next;
+                version = nextVersion;
+                slot = 0;
+            }
+
+            if (result == SeekStep.GiveUp)
+            {
+                break;
+            }
+            if (result == SeekStep.Retry)
+            {
+                continue;
+            }
+            var valid = ValidateVersions(layout, batch);
+            for (var i = 0; valid && i < leaves; i++)
+            {
+                valid = Volatile.Read(ref visited[i].Node.Version) == visited[i].Version;
+            }
+            if (!valid)
+            {
+                continue;
+            }
+            found = accepted;
+            key = value = default;
+            // The validated slices point at bytes that never change while the table is alive.
+            if (!accepted ||
+                (_arena.TryGetSpanOptimistic(acceptedKey, out key) && _arena.TryGetSpanOptimistic(acceptedValue, out value)))
+            {
+                return true;
+            }
+        }
+        found = false;
+        key = value = default;
+        return false;
+    }
+
+    private enum SeekStep : byte
+    {
+        Continue,
+        Retry,
+        Done,
+        GiveUp,
+    }
+
+    /// <summary>Decides, record by record, where an optimistic seek stops; it may see torn state.</summary>
+    private interface IOptimisticSeekVisitor
+    {
+        void Reset();
+
+        /// <returns>
+        /// <see cref="SeekStep.Done"/> to accept the record, <see cref="SeekStep.Continue"/> to skip it, or
+        /// <see cref="SeekStep.Retry"/> when it cannot be interpreted, which may only mean the read was torn.
+        /// </returns>
+        SeekStep Visit(MemTableArena arena, ref MemTableRecord record, MemTableArena.ArenaSlice value, bool isTombstone);
+    }
+
+    private struct FirstLiveVisitor : IOptimisticSeekVisitor
+    {
+        public void Reset()
+        {
+        }
+
+        public readonly SeekStep Visit(MemTableArena arena, ref MemTableRecord record, MemTableArena.ArenaSlice value, bool isTombstone) =>
+            isTombstone ? SeekStep.Continue : SeekStep.Done;
+    }
+
+    /// <summary>The version-group logic of <see cref="ScanMvccRaw"/>, for one entry.</summary>
+    private struct FirstVisibleMvccVisitor(long snapshotSequence) : IOptimisticSeekVisitor
+    {
+        private MemTableArena.ArenaSlice _lastKeySlice;
+        private ulong _lastWord;
+        private uint _lastPrefixHash;
+        private bool _hasGroup;
+        private bool _resolved;
+        public bool IsCleanKey;
+
+        public void Reset()
+        {
+            _lastKeySlice = default;
+            _lastWord = 0;
+            _lastPrefixHash = 0;
+            _hasGroup = _resolved = IsCleanKey = false;
+        }
+
+        public SeekStep Visit(MemTableArena arena, ref MemTableRecord record, MemTableArena.ArenaSlice valueSlice, bool isTombstone)
+        {
+            if (isTombstone)
+            {
+                return SeekStep.Continue;
+            }
+            if (!arena.TryGetSpanOptimistic(record.Key, out var key))
+            {
+                return SeekStep.Retry;
+            }
+            if (key.Length < 11 || key[0] != 1)
+            {
+                return SeekStep.Continue;
+            }
+            var terminator = key.Length - 10;
+            var decodedSequence = ~System.Buffers.Binary.BinaryPrimitives.ReadUInt64BigEndian(key[^sizeof(long)..]);
+            if (key[terminator] != 0 || key[terminator + 1] != 0 || decodedSequence > long.MaxValue)
+            {
+                // Invalid data: let the locked scan report it.
+                return SeekStep.Retry;
+            }
+            var encodedUserKey = key.Slice(1, terminator - 1);
+            var sameGroup = false;
+            if (_hasGroup && record.Key.Length == _lastKeySlice.Length && record.KeyPrefixWord == _lastWord &&
+                (record.PrefixHash == 0 || record.PrefixHash == _lastPrefixHash))
+            {
+                if (encodedUserKey.Length <= 7)
+                {
+                    sameGroup = true;
+                }
+                else if (!arena.TryGetSpanOptimistic(_lastKeySlice, out var lastKey))
+                {
+                    return SeekStep.Retry;
+                }
+                else
+                {
+                    sameGroup = encodedUserKey.SequenceEqual(lastKey.Slice(1, terminator - 1));
+                }
+            }
+            if (sameGroup)
+            {
+                if (_resolved)
+                {
+                    return SeekStep.Continue;
+                }
+            }
+            else
+            {
+                _hasGroup = true;
+                _resolved = false;
+                _lastKeySlice = record.Key;
+                _lastWord = record.KeyPrefixWord;
+                _lastPrefixHash = record.PrefixHash;
+            }
+            if ((long)decodedSequence > snapshotSequence)
+            {
+                return SeekStep.Continue;
+            }
+            if (!arena.TryGetSpanOptimistic(valueSlice, out var value))
+            {
+                return SeekStep.Retry;
+            }
+            if (value.IsEmpty || value[0] > 1)
+            {
+                return SeekStep.Retry;
+            }
+            _resolved = true;
+            if (value[0] == 0)
+            {
+                return SeekStep.Continue;
+            }
+            IsCleanKey = record.IsCleanMvccKey;
+            return SeekStep.Done;
+        }
+    }
+
+    [InlineArray(4)]
+    private struct VisitedLeaves
+    {
+        private (OrderedIndex.Leaf Node, int Version) _element;
+    }
+
     public void Put(ByteSlice key, ByteSlice value)
     {
         if (value.IsTombstone)
@@ -182,7 +694,10 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
     public void DeleteRaw(ReadOnlySpan<byte> key) =>
         PutRawCore(key, default, isTombstone: true);
 
-    internal void WriteBatch(LsmWriteBatch batch)
+    /// <param name="atomic">
+    /// False when the batch only coalesces independent writes, so optimistic readers may see its entries one by one.
+    /// </param>
+    internal void WriteBatch(LsmWriteBatch batch, bool atomic = true)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
@@ -201,31 +716,34 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
             WriteOutcome = _wal!.AppendOutcome;
             throw;
         }
-        ApplyBatch(batch);
+        ApplyBatchSlice(batch, 0, batch.Count, atomic);
     }
 
-    internal void ApplyBatch(LsmWriteBatch batch)
+    internal void ApplyBatch(LsmWriteBatch batch) => ApplyBatchSlice(batch, 0, batch.Count);
+
+    /// <summary>
+    /// Applies entries of a batch. An atomic batch of several entries keeps <c>_batchVersion</c> odd while it
+    /// applies, so optimistic readers wait for it rather than see part of it; a batch that fails midway leaves
+    /// it odd, sending readers to the lock, where they find the store faulted.
+    /// </summary>
+    internal void ApplyBatchSlice(LsmWriteBatch batch, int startInclusive, int endExclusive, bool atomic = true)
     {
         WriteOutcome = StorageCommitOutcome.Indeterminate;
         _faultInjector?.Invoke(StorageFaultPoint.BatchBeforeApply);
-        for (var i = 0; i < batch.Count; i++)
+        var bracket = atomic && endExclusive - startInclusive > 1;
+        if (bracket)
         {
-            batch.GetEntry(i, out var key, out var value, out var isTombstone);
-            ApplyRaw(key, value, isTombstone);
-            _faultInjector?.Invoke(StorageFaultPoint.BatchAfterApplyEntry);
+            Interlocked.Increment(ref _batchVersion);
         }
-        WriteOutcome = StorageCommitOutcome.Committed;
-    }
-
-    internal void ApplyBatchSlice(LsmWriteBatch batch, int startInclusive, int endExclusive)
-    {
-        WriteOutcome = StorageCommitOutcome.Indeterminate;
-        _faultInjector?.Invoke(StorageFaultPoint.BatchBeforeApply);
         for (var i = startInclusive; i < endExclusive; i++)
         {
             batch.GetEntry(i, out var key, out var value, out var isTombstone);
             ApplyRaw(key, value, isTombstone);
             _faultInjector?.Invoke(StorageFaultPoint.BatchAfterApplyEntry);
+        }
+        if (bracket)
+        {
+            Volatile.Write(ref _batchVersion, _batchVersion + 1);
         }
         WriteOutcome = StorageCommitOutcome.Committed;
     }
@@ -268,8 +786,11 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
 
         if (recordIndex >= 0)
         {
-            _records[recordIndex].Value = storedValue;
-            _records[recordIndex].IsTombstone = isTombstone;
+            ref var record = ref _records[recordIndex];
+            var flags = record.Flags;
+            Interlocked.Exchange(ref record.Flags, flags + RecordWriteStep);
+            record.Value = storedValue;
+            Volatile.Write(ref record.Flags, ((flags + (2 * RecordWriteStep)) & ~1u) | (isTombstone ? 1u : 0u));
         }
         else
         {
@@ -291,7 +812,7 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
                 NextVersionRecord = -1,
                 KeyPrefixWord = keyPrefixWord,
             };
-            _buckets[bucket] = newIndex + 1;
+            Volatile.Write(ref _buckets[bucket], newIndex + 1);
             _singleVersionCleanMvccState = 0;
             _count++;
 
@@ -318,7 +839,7 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
         if (_orderedIndex is null || _sortDirty ||
             ++_insertsSinceOrderedRead > Math.Max(MinInsertsBeforeOrderedIndexDrop, _count / 8))
         {
-            _sortDirty = true;
+            MarkSortDirty();
         }
         else
         {
@@ -329,7 +850,7 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
             catch
             {
                 // The version-prefix insert below is skipped, so that index would miss the record too.
-                _sortDirty = true;
+                MarkSortDirty();
                 DropVersionPrefixIndex();
                 throw;
             }
@@ -354,9 +875,71 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
     {
         if (_prefixBuckets is { } prefixBuckets)
         {
+            BeginLayoutChange();
             _prefixBuckets = null;
             ArrayPool<int>.Shared.Return(prefixBuckets);
+            EndLayoutChange();
         }
+    }
+
+    /// <summary>Stops maintaining the ordered index; an optimistic reader of the old one fails validation.</summary>
+    private void MarkSortDirty()
+    {
+        if (!_sortDirty)
+        {
+            BeginLayoutChange();
+            _sortDirty = true;
+            EndLayoutChange();
+        }
+    }
+
+    /// <summary>
+    /// Makes <c>_layoutVersion</c> odd before the writer replaces an array, returns one to the pool or swaps an
+    /// index. The interlocked increment is a full fence, so no store that follows is visible before it.
+    /// </summary>
+    private void BeginLayoutChange() => Interlocked.Increment(ref _layoutVersion);
+
+    private void EndLayoutChange() => Volatile.Write(ref _layoutVersion, _layoutVersion + 1);
+
+    /// <summary>Reads the table-wide versions an optimistic read starts from; false while either is odd.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool TryReadVersions(out int layout, out int batch)
+    {
+        layout = Volatile.Read(ref _layoutVersion);
+        batch = Volatile.Read(ref _batchVersion);
+        return ((layout | batch) & 1) == 0;
+    }
+
+    /// <summary>Checks that no array was replaced and no atomic batch applied since <see cref="TryReadVersions"/>.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool ValidateVersions(int layout, int batch)
+    {
+        ReadBarrier();
+        return Volatile.Read(ref _layoutVersion) == layout && Volatile.Read(ref _batchVersion) == batch;
+    }
+
+    /// <summary>Orders the loads before it ahead of the version load after it, for seqlock-style validation.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void ReadBarrier()
+    {
+#if NET10_0_OR_GREATER
+        Volatile.ReadBarrier();
+#else
+        Interlocked.MemoryBarrier();
+#endif
+    }
+
+    /// <summary>
+    /// Reads a consistent value and tombstone flag from a record whose value the writer may be rewriting.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool TryReadRecordValue(ref MemTableRecord record, out MemTableArena.ArenaSlice value, out bool isTombstone)
+    {
+        var flags = Volatile.Read(ref record.Flags);
+        value = record.Value;
+        ReadBarrier();
+        isTombstone = (flags & 1) != 0;
+        return (flags & RecordWriteStep) == 0 && Volatile.Read(ref record.Flags) == flags;
     }
 
     /// <summary>
@@ -499,22 +1082,26 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
         }
 
         var oldBuckets = _buckets;
-        _bucketCapacity *= 2;
-        _buckets = ArrayPool<int>.Shared.Rent(_bucketCapacity);
-        _buckets.AsSpan(0, _bucketCapacity).Clear();
-        var mask = _bucketCapacity - 1;
+        var capacity = _bucketCapacity * 2;
+        var buckets = ArrayPool<int>.Shared.Rent(capacity);
+        buckets.AsSpan(0, capacity).Clear();
+        var mask = capacity - 1;
 
         for (var i = 0; i < _count; i++)
         {
             var bucket = (int)_records[i].Hash & mask;
-            while (_buckets[bucket] != 0)
+            while (buckets[bucket] != 0)
             {
                 bucket = (bucket + 1) & mask;
             }
-            _buckets[bucket] = i + 1;
+            buckets[bucket] = i + 1;
         }
 
+        BeginLayoutChange();
+        Volatile.Write(ref _buckets, buckets);
+        _bucketCapacity = capacity;
         ArrayPool<int>.Shared.Return(oldBuckets);
+        EndLayoutChange();
         return true;
     }
 
@@ -526,9 +1113,12 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
         }
 
         var oldRecords = _records;
-        _records = ArrayPool<MemTableRecord>.Shared.Rent(oldRecords.Length * 2);
-        oldRecords.AsSpan(0, _count).CopyTo(_records);
+        var records = ArrayPool<MemTableRecord>.Shared.Rent(oldRecords.Length * 2);
+        oldRecords.AsSpan(0, _count).CopyTo(records);
+        BeginLayoutChange();
+        Volatile.Write(ref _records, records);
         ArrayPool<MemTableRecord>.Shared.Return(oldRecords);
+        EndLayoutChange();
     }
 
     private int FindPrefixBucket(ReadOnlySpan<byte> prefix, uint prefixHash, ulong keyPrefixWord, out int headIndex)
@@ -580,9 +1170,11 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
                     newBuckets[slot] = head + 1;
                 }
             }
-            _prefixBucketCapacity = newCap;
+            BeginLayoutChange();
             Volatile.Write(ref _prefixBuckets, newBuckets);
+            _prefixBucketCapacity = newCap;
             ArrayPool<int>.Shared.Return(oldPrefixBuckets);
+            EndLayoutChange();
         }
 
         IndexVersionPrefixInto(_prefixBuckets!, _prefixBucketCapacity, newIndex, prefix);
@@ -637,7 +1229,7 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
             headIndex = buckets[bucket] - 1;
             if (headIndex < 0)
             {
-                buckets[bucket] = newIndex + 1;
+                Volatile.Write(ref buckets[bucket], newIndex + 1);
                 return;
             }
             ref var record = ref _records[headIndex];
@@ -661,7 +1253,7 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
         if (newTrailer <= headTrailer)
         {
             newRec.NextVersionRecord = headIndex;
-            buckets[bucket] = newIndex + 1;
+            Volatile.Write(ref buckets[bucket], newIndex + 1);
             return;
         }
 
@@ -674,7 +1266,7 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
             curr = _records[curr].NextVersionRecord;
         }
         newRec.NextVersionRecord = curr;
-        _records[prev].NextVersionRecord = newIndex;
+        Volatile.Write(ref _records[prev].NextVersionRecord, newIndex);
     }
 
     private int _unindexedPrefixReads;
@@ -1212,7 +1804,7 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
         }
     }
 
-    private struct MemTableRecord
+    internal struct MemTableRecord
     {
         public MemTableArena.ArenaSlice Key;
         public MemTableArena.ArenaSlice Value;

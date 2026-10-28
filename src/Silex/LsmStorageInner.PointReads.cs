@@ -41,19 +41,28 @@ internal sealed partial class LsmStorageInner
             }
         }
 
-        // Fast path 2: check active and immutable memtables before acquiring _level0Lock.
-        _currentMemTableLock.EnterReadLock();
-        try
+        // Fast path 2: check active and immutable memtables before acquiring _level0Lock, reading the active one
+        // optimistically when its version-prefix index exists.
+        var optimistic = TryReadLiveMemTableRawOptimistic(from, prefix, ref sink);
+        if (optimistic == OptimisticLookup.Live)
         {
-            CheckHealthy();
-            if (TryReadLiveMemTableRaw(from, prefix, ref sink, out var hitTombstone) && !hitTombstone)
-            {
-                return true;
-            }
+            return true;
         }
-        finally
+        if (optimistic == OptimisticLookup.Unresolved)
         {
-            _currentMemTableLock.ExitReadLock();
+            _currentMemTableLock.EnterReadLock();
+            try
+            {
+                CheckHealthy();
+                if (TryReadLiveMemTableRaw(from, prefix, ref sink, out var hitTombstone) && !hitTombstone)
+                {
+                    return true;
+                }
+            }
+            finally
+            {
+                _currentMemTableLock.ExitReadLock();
+            }
         }
 
         if (_level0Lock.TryEnterReadLock(out var stripeSlot2))
@@ -122,6 +131,65 @@ internal sealed partial class LsmStorageInner
         }
 
         return ReadFirstRawSlowAsync(from, prefix, sink, cancellationToken, valuePrefixLength);
+    }
+
+    /// <summary>
+    /// <see cref="TryReadLiveMemTableRaw"/> without <see cref="_currentMemTableLock"/>: the active memtable is read
+    /// optimistically and the frozen ones as before, all under the immutable-memtable read lock that keeps them
+    /// from being disposed. <see cref="OptimisticLookup.Unresolved"/> sends the caller to the locked path.
+    /// </summary>
+    private OptimisticLookup TryReadLiveMemTableRawOptimistic<TSink>(
+        ReadOnlySpan<byte> from, ReadOnlySpan<byte> prefix, ref TSink sink)
+        where TSink : struct, IRawEntrySink
+    {
+        _immutableMemTablesLock.EnterReadLock();
+        try
+        {
+            CheckHealthy();
+            ReadOnlySpan<byte> bestKey = default;
+            ReadOnlySpan<byte> bestValue = default;
+            var found = false;
+            var tombstone = false;
+            if (_state.CurrentMemTable is not MemTable current)
+            {
+                return OptimisticLookup.Unresolved;
+            }
+            if (current.Count != 0)
+            {
+                if (!current.TryGetNextVersionOptimistic(from, prefix, inclusive: true, out found, out bestKey, out bestValue, out tombstone))
+                {
+                    return OptimisticLookup.Unresolved;
+                }
+            }
+            var immutableMemTables = _state.ImmutableMemTables;
+            for (var i = immutableMemTables.Length - 1; i >= 0; i--)
+            {
+                var table = (MemTable)immutableMemTables[i];
+                if (table.Count != 0 &&
+                    table.TryGetNextVersionRaw(from, prefix, true, out var key, out var value, out var deleted) &&
+                    (!found || key.SequenceCompareTo(bestKey) < 0))
+                {
+                    bestKey = key;
+                    bestValue = value;
+                    found = true;
+                    tombstone = deleted;
+                }
+            }
+            if (!found)
+            {
+                return OptimisticLookup.Miss;
+            }
+            if (tombstone)
+            {
+                return OptimisticLookup.Tombstone;
+            }
+            sink.Accept(bestKey, bestValue);
+            return OptimisticLookup.Live;
+        }
+        finally
+        {
+            _immutableMemTablesLock.ExitReadLock();
+        }
     }
 
     private bool TryReadLiveMemTableRaw<TSink>(
