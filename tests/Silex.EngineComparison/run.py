@@ -121,6 +121,40 @@ def wait_for_idle(min_idle):
         time.sleep(5)
 
 
+def parse_cpu_time(text):
+    """Parses a `ps` cumulative CPU time: [[dd-]hh:]mm:ss.ss."""
+    days, _, text = text.rpartition("-")
+    seconds = 0.0
+    for part in text.split(":"):
+        seconds = seconds * 60 + float(part)
+    return (int(days) if days else 0) * 86400 + seconds
+
+
+def cpu_times():
+    """Cumulative CPU seconds of every process, by pid."""
+    out = subprocess.run(["ps", "-A", "-o", "pid=,time="], capture_output=True, text=True).stdout
+    return {int(pid): parse_cpu_time(t) for pid, t in (line.split() for line in out.splitlines())}
+
+
+def measured_run(engine, suite, threads, command, work_root, min_idle, max_other_cores, tries=5):
+    """Runs one suite; reruns it when other processes used more than max_other_cores on average meanwhile."""
+    for _ in range(tries):
+        idle = wait_for_idle(min_idle) if min_idle else None
+        load = os.getloadavg()[0]
+        before, start = cpu_times(), time.monotonic()
+        records = run_one(engine, suite, threads, command, work_root)
+        wall = time.monotonic() - start
+        after = cpu_times()
+        # The adapter has exited by now, so its CPU time is not in either snapshot.
+        others = sum(t - before.get(pid, 0.0) for pid, t in after.items() if pid not in (0, os.getpid())) / wall
+        if not max_other_cores or others <= max_other_cores:
+            for record in records:
+                record.update(load1=load, idle_before=idle, other_cores=others)
+            return records
+        print(f"  rerun {engine} {suite} t{threads}: other processes used {others:.2f} cores", flush=True)
+    raise RuntimeError(f"{engine} {suite} t{threads}: other processes kept using more than {max_other_cores} cores")
+
+
 def run_one(engine, suite, threads, command, work_root):
     directory = tempfile.mkdtemp(prefix=f"{engine}-{suite}-{threads}-", dir=work_root)
     try:
@@ -164,12 +198,9 @@ def run(args):
                     for engine in order:
                         if engines_filter and engine not in engines_filter:
                             continue
-                        idle_before = wait_for_idle(args.min_idle) if args.min_idle else None
-                        load_before = os.getloadavg()[0]
-                        records = run_one(engine, suite, threads, adapters[engine], work_root)
+                        records = measured_run(engine, suite, threads, adapters[engine], work_root,
+                                               args.min_idle, args.max_other_cores)
                         for record in records:
-                            record["load1"] = load_before
-                            record["idle_before"] = idle_before
                             record["rep"] = rep
                             record["label"] = engine + args.label_suffix
                             log.write(json.dumps(record) + "\n")
@@ -241,6 +272,8 @@ def main():
                         help="run ENGINE with another adapter build, e.g. silex-lsm=/path/to/silex-bench")
     parser.add_argument("--min-idle", type=float, default=85,
                         help="before each run, wait until the CPU is at least this percent idle (macOS; 0 disables)")
+    parser.add_argument("--max-other-cores", type=float, default=3,
+                        help="rerun a suite when other processes averaged more than this many cores during it (0 disables)")
     parser.add_argument("--label-suffix", default="", help="record runs as ENGINE + suffix, e.g. silex-lsm@baseline")
     args = parser.parse_args()
     if args.render:
