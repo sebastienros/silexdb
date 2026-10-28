@@ -29,9 +29,14 @@ internal sealed partial class MemTable
         internal const int LeafCapacity = 256;
         internal const int BranchCapacity = 32;
         private const int NoFence = -1;
+        /// <summary>Deeper than any real tree (a height of 6 already holds billions of records).</summary>
+        private const int MaxOptimisticDepth = 16;
         private readonly MemTable _table;
         private Node _root;
         private long _version;
+        private Node[] _insertPath = new Node[8];
+        private int _lockedFrom;
+        private int _lockedTo;
 
         /// <summary>A record whose first <see cref="_prefixLength"/> bytes every key of the tree shares, or <see cref="NoFence"/> while the tree is empty.</summary>
         private int _prefixRecord = NoFence;
@@ -156,32 +161,176 @@ internal sealed partial class MemTable
             return key.StartsWith(prefix) ? 0 : key.SequenceCompareTo(prefix) < 0 ? -1 : 1;
         }
 
+        /// <summary>
+        /// Inserts a record. Once the descent reaches the leaf, and before changing anything, it locks from the top
+        /// down every node the insert rewrites: the leaf, and each ancestor that receives a separator because the
+        /// node below it splits (re-prefixing a node only ever happens to one of those). An optimistic reader that
+        /// crosses one of them while it changes restarts.
+        /// </summary>
         public void Insert(int record)
         {
             _version++;
             var key = Key(record);
             if (_prefixRecord == NoFence)
             {
+                // The tree prefix and the edge nodes that take it change together; optimistic readers validate the
+                // table's layout version, which covers both.
+                _table.BeginLayoutChange();
                 _prefixRecord = record;
                 _prefixLength = key.Length;
+                _table.EndLayoutChange();
             }
             else if (_prefixLength != 0)
             {
                 var shared = key.CommonPrefixLength(Key(_prefixRecord)[.._prefixLength]);
                 if (shared < _prefixLength) ShrinkTreePrefix(shared);
             }
-            var right = Insert(_root, record, key, NoFence, NoFence, out var separator);
-            if (right is null) return;
-            var root = new Branch { Count = 1 };
-            root.Keys[0] = separator;
-            root.Words[0] = Window(separator, 0);
-            root.Children[0] = _root;
-            root.Children[1] = right;
-            _root = root;
+            _lockedFrom = _lockedTo = 0;
+            try
+            {
+                var right = Insert(_root, 0, record, key, NoFence, NoFence, out var separator);
+                if (right is null) return;
+                var root = new Branch { Count = 1 };
+                root.Keys[0] = separator;
+                root.Words[0] = Window(separator, 0);
+                root.Children[0] = _root;
+                root.Children[1] = right;
+                Volatile.Write(ref _root, root);
+            }
+            finally
+            {
+                for (var i = _lockedFrom; i < _lockedTo; i++) Unlock(_insertPath[i]);
+                _insertPath.AsSpan(0, _lockedTo).Clear();
+            }
         }
 
-        /// <summary>Shortens the tree prefix to <paramref name="length"/> bytes and rewrites the windows of the nodes on the edges, which take it.</summary>
+        /// <summary>Locks the nodes of <c>_insertPath</c> that the insert into the leaf at <paramref name="depth"/> rewrites.</summary>
+        private void LockInsertPath(int depth)
+        {
+            var top = depth;
+            while (top > 0 && WillSplit(_insertPath[top])) top--;
+            _lockedFrom = top;
+            _lockedTo = depth + 1;
+            for (var i = top; i <= depth; i++) Lock(_insertPath[i]);
+        }
+
+        private static bool WillSplit(Node node) => node.Count + 1 > (node.IsLeaf ? LeafCapacity : BranchCapacity);
+
+        private static void Lock(Node node) => Interlocked.Increment(ref node.Version);
+
+        private static void Unlock(Node node) => Volatile.Write(ref node.Version, node.Version + 1);
+
+        /// <summary>
+        /// Finds the leaf and slot of the first record at or after <paramref name="key"/> without a lock, in the
+        /// style of optimistic lock coupling: each child's version is read before its parent is validated, so the
+        /// descent only follows pointers that were current. Any node may be read mid-change (count, windows,
+        /// record positions, children or prefix), so every read is bounded and a failure returns false. The caller
+        /// validates <paramref name="version"/> after reading the leaf, and the table's layout version, which
+        /// covers the tree prefix and the edge nodes that take it.
+        /// </summary>
+        public bool TrySeekOptimistic(ReadOnlySpan<byte> key, MemTableRecord[] records, out Leaf leaf, out int slot, out int version)
+        {
+            leaf = null!;
+            slot = 0;
+            version = 0;
+            var outside = CompareToTreePrefixOptimistic(key, records);
+            if (outside == int.MinValue) return false;
+            var node = Volatile.Read(ref _root);
+            var nodeVersion = Volatile.Read(ref node.Version);
+            if ((nodeVersion & 1) != 0 || !ReferenceEquals(node, Volatile.Read(ref _root))) return false;
+            for (var depth = 0; !node.IsLeaf; depth++)
+            {
+                var branch = Unsafe.As<Branch>(node);
+                var children = branch.Children;
+                var childSlot = outside == 0
+                    ? BoundOptimistic(branch.Words, branch.Keys, branch.Count, key, branch.PrefixLength, true, records)
+                    : outside < 0 ? 0 : branch.Count;
+                if (depth == MaxOptimisticDepth || (uint)childSlot >= (uint)children.Length) return false;
+                var child = Volatile.Read(ref children[childSlot]);
+                if (child is null) return false;
+                var childVersion = Volatile.Read(ref child.Version);
+                ReadBarrier();
+                if ((childVersion & 1) != 0 || Volatile.Read(ref node.Version) != nodeVersion) return false;
+                node = child;
+                nodeVersion = childVersion;
+            }
+            leaf = Unsafe.As<Leaf>(node);
+            slot = outside == 0
+                ? BoundOptimistic(leaf.Words, leaf.Keys, leaf.Count, key, leaf.PrefixLength, false, records)
+                : outside < 0 ? 0 : leaf.Count;
+            if ((uint)slot > LeafCapacity + 1) return false;
+            version = nodeVersion;
+            ReadBarrier();
+            return Volatile.Read(ref leaf.Version) == nodeVersion;
+        }
+
+        /// <summary><see cref="CompareToTreePrefix"/> over state that may be torn: <see cref="int.MinValue"/> when it cannot tell.</summary>
+        private int CompareToTreePrefixOptimistic(ReadOnlySpan<byte> key, MemTableRecord[] records)
+        {
+            var prefixLength = _prefixLength;
+            if (prefixLength == 0) return 0;
+            var prefixRecord = _prefixRecord;
+            if ((uint)prefixRecord >= (uint)records.Length ||
+                !_table._arena.TryGetSpanOptimistic(records[prefixRecord].Key, out var prefixKey) ||
+                (uint)prefixLength > (uint)prefixKey.Length)
+            {
+                return int.MinValue;
+            }
+            var prefix = prefixKey[..prefixLength];
+            return key.StartsWith(prefix) ? 0 : key.SequenceCompareTo(prefix) < 0 ? -1 : 1;
+        }
+
+        /// <summary><see cref="Bound"/> over a node that may be torn: returns -1 instead of reading out of range.</summary>
+        private int BoundOptimistic(Span<ulong> words, Span<int> keys, int count, ReadOnlySpan<byte> key, int prefixLength,
+            bool upper, MemTableRecord[] records)
+        {
+            if ((uint)count > (uint)words.Length || (uint)count > (uint)keys.Length || prefixLength < 0) return -1;
+            var target = Window(key, prefixLength);
+            var low = CountBelow(words, count, target);
+            var high = low;
+            while (high < count && words[high] == target) high++;
+            var arena = _table._arena;
+            var end = prefixLength + sizeof(ulong);
+            while (low < high)
+            {
+                var middle = low + ((high - low) >> 1);
+                var recordIndex = keys[middle];
+                if ((uint)recordIndex >= (uint)records.Length) return -1;
+                ref var rec = ref records[recordIndex];
+                int comparison;
+                if (rec.Key.Length <= end && key.Length <= end)
+                {
+                    comparison = rec.Key.Length.CompareTo(key.Length);
+                }
+                else
+                {
+                    if (!arena.TryGetSpanOptimistic(rec.Key, out var recKey)) return -1;
+                    comparison = recKey.SequenceCompareTo(key);
+                }
+                if (comparison < 0 || upper && comparison == 0) low = middle + 1;
+                else high = middle;
+            }
+            return low;
+        }
+
+        /// <summary>
+        /// Shortens the tree prefix to <paramref name="length"/> bytes and rewrites the windows of the nodes on the edges, which take it.
+        /// Those nodes are not on the insert path, so the table's layout version, odd meanwhile, covers them for optimistic readers.
+        /// </summary>
         private void ShrinkTreePrefix(int length)
+        {
+            _table.BeginLayoutChange();
+            try
+            {
+                ShrinkTreePrefixCore(length);
+            }
+            finally
+            {
+                _table.EndLayoutChange();
+            }
+        }
+
+        private void ShrinkTreePrefixCore(int length)
         {
             _prefixLength = length;
             for (var side = 0; side < 2; side++)
@@ -197,9 +346,11 @@ internal sealed partial class MemTable
             }
         }
 
-        private Node? Insert(Node node, int record, ReadOnlySpan<byte> key, int low, int high, out int separator)
+        private Node? Insert(Node node, int depth, int record, ReadOnlySpan<byte> key, int low, int high, out int separator)
         {
             separator = 0;
+            if (depth == _insertPath.Length) Array.Resize(ref _insertPath, depth * 2);
+            _insertPath[depth] = node;
             var prefixLength = node.PrefixLength;
             var word = Window(key, prefixLength);
             if (node.IsLeaf)
@@ -209,6 +360,7 @@ internal sealed partial class MemTable
                 var keys = leaf.Keys;
                 var count = leaf.Count;
                 var slot = Bound(words, keys, count, key, prefixLength, false);
+                LockInsertPath(depth);
                 words[slot..count].CopyTo(words[(slot + 1)..]);
                 keys[slot..count].CopyTo(keys[(slot + 1)..]);
                 words[slot] = word;
@@ -223,13 +375,14 @@ internal sealed partial class MemTable
                 words[middle..leaf.Count].CopyTo(right.Words);
                 keys[middle..leaf.Count].CopyTo(right.Keys);
                 separator = keys[middle];
+                // The new leaf is complete, prefix included, before a reader can reach it through Next.
+                SplitPrefix(right, separator, high);
                 right.Next = leaf.Next;
                 right.Previous = leaf;
                 if (leaf.Next is not null) leaf.Next.Previous = right;
-                leaf.Next = right;
+                Volatile.Write(ref leaf.Next, right);
                 leaf.Count = middle;
                 SplitPrefix(leaf, low, separator);
-                SplitPrefix(right, separator, high);
                 return right;
             }
             else
@@ -242,14 +395,14 @@ internal sealed partial class MemTable
                 var slot = Bound(words, keys, count, key, prefixLength, true);
                 var childLow = slot == 0 ? low : keys[slot - 1];
                 var childHigh = slot == count ? high : keys[slot];
-                var child = Insert(children[slot]!, record, key, childLow, childHigh, out var childSeparator);
+                var child = Insert(children[slot]!, depth + 1, record, key, childLow, childHigh, out var childSeparator);
                 if (child is null) return null;
                 words[slot..count].CopyTo(words[(slot + 1)..]);
                 keys[slot..count].CopyTo(keys[(slot + 1)..]);
                 children[(slot + 1)..(count + 1)].CopyTo(children[(slot + 2)..]);
                 words[slot] = Window(childSeparator, prefixLength);
                 keys[slot] = childSeparator;
-                children[slot + 1] = child;
+                Volatile.Write(ref children[slot + 1], child);
                 branch.Count++;
                 if (IsTied(words, slot, branch.Count)) GrowPrefix(branch, low, high);
                 if (branch.Count <= BranchCapacity) return null;
@@ -420,6 +573,9 @@ internal sealed partial class MemTable
         {
             public readonly bool IsLeaf = isLeaf;
             public int Count;
+
+            /// <summary>Odd while the writer changes the node, its windows and prefix included; optimistic readers validate against it.</summary>
+            public int Version;
 
             /// <summary>The leading bytes that every key a search routes to the node shares, which its windows skip.</summary>
             public int PrefixLength;

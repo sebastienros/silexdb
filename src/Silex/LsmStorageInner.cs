@@ -377,6 +377,60 @@ internal sealed partial class LsmStorageInner : IDisposable
     // instead of letting an older live value resurface.
     // ---------------------------------------------------------------------------------------------
 
+    private enum OptimisticLookup
+    {
+        Unresolved,
+        Miss,
+        Tombstone,
+        Live,
+    }
+
+    /// <summary>
+    /// Looks <paramref name="key"/> up in the active memtable without <see cref="_currentMemTableLock"/>.
+    /// The immutable-memtable read lock, which writers only take to freeze or flush a table, keeps the
+    /// table from being frozen and disposed underneath the read; <see cref="MemTable"/> validates against
+    /// the concurrent writer. <see cref="OptimisticLookup.Unresolved"/> sends the caller to the locked path.
+    /// </summary>
+    private OptimisticLookup TryResolveCurrentMemTableOptimistic<TSink>(
+        ReadOnlySpan<byte> key, TSink sink, out int length, out ImmutableArray<IMemTable> immutableMemTables)
+        where TSink : struct, IValueByteSink
+    {
+        length = 0;
+        _immutableMemTablesLock.EnterReadLock();
+        try
+        {
+            CheckHealthy();
+            immutableMemTables = _state.ImmutableMemTables;
+            if (_state.CurrentMemTable is not MemTable memTable)
+            {
+                return OptimisticLookup.Unresolved;
+            }
+            if (memTable.Count == 0)
+            {
+                return OptimisticLookup.Miss;
+            }
+            if (!memTable.TryGetSpanOptimistic(key, out var found, out var value, out var isTombstone))
+            {
+                return OptimisticLookup.Unresolved;
+            }
+            if (!found)
+            {
+                return OptimisticLookup.Miss;
+            }
+            if (isTombstone)
+            {
+                return OptimisticLookup.Tombstone;
+            }
+            sink.Accept(value);
+            length = value.Length;
+            return OptimisticLookup.Live;
+        }
+        finally
+        {
+            _immutableMemTablesLock.ExitReadLock();
+        }
+    }
+
     private enum RawLookup
     {
         // The key is absent from this source; keep searching older sources.
@@ -450,36 +504,50 @@ internal sealed partial class LsmStorageInner : IDisposable
             }
         }
 
-        // Fast path 2: check active and immutable memtables.
+        // Fast path 2: check active and immutable memtables. The active one is read optimistically first, so a
+        // reader neither waits for the writer nor makes it wait.
         ImmutableArray<IMemTable> immutableMemTables;
-        _currentMemTableLock.EnterReadLock();
-        try
+        var optimistic = TryResolveCurrentMemTableOptimistic(key, sink, out length, out immutableMemTables);
+        if (optimistic == OptimisticLookup.Live)
         {
-            CheckHealthy();
-            var currentMemTable = _state.CurrentMemTable;
-            immutableMemTables = _state.ImmutableMemTables;
-
-            if (currentMemTable.Count != 0)
-            {
-                var memResult = TryResolveMemTableRaw(currentMemTable, key, sink, out length);
-                if (memResult == RawLookup.Live)
-                {
-                    return true;
-                }
-                if (memResult == RawLookup.Tombstone)
-                {
-                    length = -1;
-                    return true;
-                }
-            }
-
-            // Fast path 2: check active and immutable memtables only when no SSTs exist yet, or when a live
-            // or tombstone entry is found in MemTable. Note: checking _state.LevelZeroTables / _state.LeveledSsTables
-            // requires holding _level0Lock, so we only conclude the key is absent if we acquire _level0Lock below.
+            return true;
         }
-        finally
+        if (optimistic == OptimisticLookup.Tombstone)
         {
-            _currentMemTableLock.ExitReadLock();
+            length = -1;
+            return true;
+        }
+        if (optimistic == OptimisticLookup.Unresolved)
+        {
+            _currentMemTableLock.EnterReadLock();
+            try
+            {
+                CheckHealthy();
+                var currentMemTable = _state.CurrentMemTable;
+                immutableMemTables = _state.ImmutableMemTables;
+
+                if (currentMemTable.Count != 0)
+                {
+                    var memResult = TryResolveMemTableRaw(currentMemTable, key, sink, out length);
+                    if (memResult == RawLookup.Live)
+                    {
+                        return true;
+                    }
+                    if (memResult == RawLookup.Tombstone)
+                    {
+                        length = -1;
+                        return true;
+                    }
+                }
+
+                // Fast path 2: check active and immutable memtables only when no SSTs exist yet, or when a live
+                // or tombstone entry is found in MemTable. Note: checking _state.LevelZeroTables / _state.LeveledSsTables
+                // requires holding _level0Lock, so we only conclude the key is absent if we acquire _level0Lock below.
+            }
+            finally
+            {
+                _currentMemTableLock.ExitReadLock();
+            }
         }
 
         if (!immutableMemTables.IsEmpty)
@@ -1864,10 +1932,60 @@ internal sealed partial class LsmStorageInner : IDisposable
         return total;
     }
 
+    /// <summary>
+    /// The one-entry seek of <see cref="TryScanSingleMemTableRaw"/> without <see cref="_currentMemTableLock"/>,
+    /// under the immutable-memtable read lock that keeps the active table from being disposed. Callers hold the
+    /// level-0 read lock, so the SST lists checked here are stable. Returns false to take the locked path.
+    /// </summary>
+    private bool TrySeekSingleMemTableOptimistic<TArg>(ReadOnlySpan<byte> from, TArg arg, ReadRawEntryAction<TArg> reader, out long count)
+    {
+        count = 0;
+        _immutableMemTablesLock.EnterReadLock();
+        try
+        {
+            CheckHealthy();
+            var state = _state;
+            if (!state.ImmutableMemTables.IsEmpty || state.LevelZeroTables.Count != 0 ||
+                state.CurrentMemTable is not MemTable memTable)
+            {
+                return false;
+            }
+            foreach (var level in state.LeveledSsTables)
+            {
+                if (level.Count != 0)
+                {
+                    return false;
+                }
+            }
+            if (memTable.Count == 0)
+            {
+                return true;
+            }
+            if (!memTable.TrySeekFirstRawOptimistic(from, out var found, out var key, out var value))
+            {
+                return false;
+            }
+            if (found)
+            {
+                reader(arg, key, value);
+                count = 1;
+            }
+            return true;
+        }
+        finally
+        {
+            _immutableMemTablesLock.ExitReadLock();
+        }
+    }
+
     private bool TryScanSingleMemTableRaw<TArg>(
         bool hasFrom, ReadOnlySpan<byte> from, TArg arg, ReadRawEntryAction<TArg> reader, long maxEntries, out long count)
     {
         count = 0;
+        if (hasFrom && maxEntries == 1 && TrySeekSingleMemTableOptimistic(from, arg, reader, out count))
+        {
+            return true;
+        }
         _currentMemTableLock.EnterReadLock();
         try
         {
@@ -1912,6 +2030,15 @@ internal sealed partial class LsmStorageInner : IDisposable
         {
             tables = cached;
             return true;
+        }
+
+        // A memtable's count only grows, so pending writes seen without the lock rule the run out; a stale
+        // empty view still goes through the locked check below.
+        var unlockedState = _state;
+        if (unlockedState.CurrentMemTable.Count != 0 || !unlockedState.ImmutableMemTables.IsEmpty)
+        {
+            tables = Array.Empty<SsTable>();
+            return false;
         }
 
         _currentMemTableLock.EnterReadLock();
@@ -2913,7 +3040,7 @@ internal sealed partial class LsmStorageInner : IDisposable
                                 _coalesceBatch.Put(curr.KeySpan, curr.ValueSpan);
                             }
                         }
-                        memTable.WriteBatch(_coalesceBatch);
+                        memTable.WriteBatch(_coalesceBatch, atomic: false);
                         Metrics.RecordWrite(_coalesceBatch.ByteCount);
                     }
                     InvalidateSortedSsTableRun();
