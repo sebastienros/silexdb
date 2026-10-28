@@ -105,6 +105,101 @@ public class OptimisticMemTableReadTests
     }
 
     /// <summary>
+    /// Keys that share a 17-byte prefix tie at the window a node starts with, so nodes take their fences'
+    /// prefix as they fill and again after each split, rewriting every window; keys of other prefixes, inserted
+    /// now and then, shorten the tree prefix and rewrite the nodes on its edges. Seeks run throughout.
+    /// </summary>
+    [Test]
+    public async Task OptimisticSeeksStayConsistentWhileNodesChangePrefix()
+    {
+        using var table = new MemTable(1);
+        var value = new byte[64];
+        for (var k = 0; k < InitialKeys; k++)
+        {
+            table.PutRaw(PrefixedKey(Family, k * 2), WriteValue(value, k * 2, 0).Span);
+        }
+        table.EnsureSortedIndex();
+
+        using var stop = new CancellationTokenSource();
+        var failures = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        long seeks = 0;
+        var readers = Enumerable.Range(0, Math.Max(2, Environment.ProcessorCount - 1)).Select(id => Task.Run(() =>
+        {
+            var random = new Random(id);
+            var lastSeen = new int[InitialKeys * 4];
+            while (!stop.IsCancellationRequested)
+            {
+                var k = random.Next(InitialKeys) * 2;
+                var key = PrefixedKey(Family, k);
+                if (!table.TrySeekFirstRawOptimistic(key, out var found, out var foundKey, out var read))
+                {
+                    continue;
+                }
+                Interlocked.Increment(ref seeks);
+                if (!found || !foundKey.SequenceEqual(key))
+                {
+                    failures.Enqueue($"seek to {k} written before the readers started did not land on it");
+                }
+                else
+                {
+                    Check(failures, lastSeen, k, read);
+                }
+            }
+        })).ToArray();
+
+        string[] shorterPrefixes = ["tenant/0001/userz", "tenant/0001/v", "tenant/0002/", "tenant/1", "u", "a"];
+        var versions = new int[InitialKeys * 4];
+        var writerRandom = new Random(1234);
+        var started = DateTime.UtcNow;
+        var deadline = started.AddSeconds(2);
+        var nextPrefix = 0;
+        while (DateTime.UtcNow < deadline)
+        {
+            for (var i = 0; i < 256; i++)
+            {
+                var k = writerRandom.Next(InitialKeys * 4);
+                table.PutRaw(PrefixedKey(Family, k), WriteValue(value, k, ++versions[k]).Span);
+            }
+            if (nextPrefix < shorterPrefixes.Length && DateTime.UtcNow > started.AddMilliseconds(250 * (nextPrefix + 1)))
+            {
+                table.PutRaw(System.Text.Encoding.ASCII.GetBytes(shorterPrefixes[nextPrefix++]), value.AsSpan(0, 8));
+            }
+            table.EnsureSortedIndex();
+        }
+        stop.Cancel();
+        await Task.WhenAll(readers);
+
+        await Assert.That(failures.IsEmpty ? null : failures.First()).IsNull();
+        await Assert.That(seeks).IsGreaterThan(0);
+        // Nodes took a prefix past the start of the keys, so the windows were rewritten while readers ran.
+        await Assert.That(MaxLeafPrefix(table.CurrentOrderedIndex!.Root)).IsGreaterThanOrEqualTo(Family.Length);
+
+        static int MaxLeafPrefix(MemTable.OrderedIndex.Node node)
+        {
+            if (node is not MemTable.OrderedIndex.Branch branch)
+            {
+                return node.PrefixLength;
+            }
+            var max = 0;
+            for (var i = 0; i <= branch.Count; i++)
+            {
+                max = Math.Max(max, MaxLeafPrefix(branch.Children[i]!));
+            }
+            return max;
+        }
+    }
+
+    private static readonly byte[] Family = System.Text.Encoding.ASCII.GetBytes("tenant/0001/user/");
+
+    private static byte[] PrefixedKey(byte[] prefix, int k)
+    {
+        var key = new byte[prefix.Length + sizeof(int)];
+        prefix.CopyTo(key, 0);
+        BinaryPrimitives.WriteInt32BigEndian(key.AsSpan(prefix.Length), k);
+        return key;
+    }
+
+    /// <summary>
     /// Small memtables freeze and flush while readers run; a large one keeps every read on the memtable-only
     /// paths, where seeks are optimistic too.
     /// </summary>
