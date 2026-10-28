@@ -9,7 +9,7 @@ namespace Silex.MemTables;
 
 /// <summary>
 /// Stores keys and values in arena slabs and keeps compact record descriptors in contiguous arrays.
-/// Point lookups use open addressing; ordered reads use a lazily built, pooled paged index of record positions
+/// Point lookups use open addressing; ordered reads use a lazily built B+-tree of record positions
 /// that inserts keep current once it exists.
 /// </summary>
 /// <remarks>
@@ -110,7 +110,6 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
                 {
                     Array.Sort(sorted, 0, _count, _recordComparer);
                 }
-                _orderedIndex?.Dispose();
                 _orderedIndex = new OrderedIndex(this, sorted.AsSpan(0, _count));
                 _insertsSinceOrderedRead = 0;
                 _sortDirty = false;
@@ -369,7 +368,7 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
     /// Only x86 exposes a prefetch instruction; elsewhere the JIT removes the call.
     /// </remarks>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private unsafe void PrefetchRecord(int[] keys, int slot, int count)
+    private unsafe void PrefetchRecord(Span<int> keys, int slot, int count)
     {
         if (Sse.IsSupported && (uint)slot < (uint)count)
         {
@@ -390,12 +389,11 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
             while (node is not null)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                var keys = node.Keys;
                 var nodeCount = node.Count;
                 for (var slot = 0; slot < nodeCount; slot++)
                 {
-                    PrefetchRecord(keys, slot + RecordPrefetchDistance, nodeCount);
-                    var recIdx = keys[slot];
+                    PrefetchRecord(node.Keys, slot + RecordPrefetchDistance, nodeCount);
+                    var recIdx = node.Keys[slot];
                     var isTomb = _records[recIdx].IsTombstone;
                     if (!bufferedBuilder.TryAddRawFast(
                         _arena.GetSpan(_records[recIdx].Key),
@@ -1199,7 +1197,6 @@ internal sealed partial class MemTable : IMemTable, IRawBytesMemTable
             ArrayPool<int>.Shared.Return(prefixBuckets);
         }
 
-        _orderedIndex?.Dispose();
         _orderedIndex = null;
     }
 

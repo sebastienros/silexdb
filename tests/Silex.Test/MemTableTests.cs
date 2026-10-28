@@ -447,8 +447,13 @@ public class MemTableTests
 
     private static void CheckOrderedIndex(MemTable table, MemTable.OrderedIndex index)
     {
-        var leaves = new List<MemTable.OrderedIndex.Node>();
+        var leaves = new List<MemTable.OrderedIndex.Leaf>();
         var leafDepth = -1;
+        var treePrefix = int.MaxValue;
+        for (var record = 1; record < table.Count; record++)
+        {
+            treePrefix = Math.Min(treePrefix, table.GetRecordKey(0).CommonPrefixLength(table.GetRecordKey(record)));
+        }
         CheckNode(index.Root, 0, -1, -1);
 
         var seen = new bool[table.Count];
@@ -475,42 +480,72 @@ public class MemTableTests
         // Bounds are records, -1 when unbounded: keys are at least the lower bound and below the upper one.
         void CheckNode(MemTable.OrderedIndex.Node node, int depth, int lower, int upper)
         {
-            if (node.Children is null)
+            CheckWords(node, lower, upper);
+            if (node is MemTable.OrderedIndex.Leaf leaf)
             {
-                Require(node.Count <= MemTable.OrderedIndex.LeafCapacity, $"a leaf holds {node.Count} keys");
-                Require(node == index.Root || node.Count > 0, "a leaf below the root is empty");
+                Require(leaf.Count <= MemTable.OrderedIndex.LeafCapacity, $"a leaf holds {leaf.Count} keys");
+                Require(leaf == index.Root || leaf.Count > 0, "a leaf below the root is empty");
                 Require(leafDepth < 0 || leafDepth == depth, $"leaves sit at depths {leafDepth} and {depth}");
                 leafDepth = depth;
-                for (var slot = 0; slot < node.Count; slot++)
+                for (var slot = 0; slot < leaf.Count; slot++)
                 {
-                    var record = node.Keys[slot];
+                    var record = leaf.Keys[slot];
                     Require((lower < 0 || Compare(lower, record) <= 0) && (upper < 0 || Compare(record, upper) < 0),
                         $"record {record} is outside its separator bounds");
                 }
-                leaves.Add(node);
+                leaves.Add(leaf);
                 return;
             }
 
-            Require(node.Count <= MemTable.OrderedIndex.BranchCapacity, $"a branch holds {node.Count} separators");
-            for (var i = 0; i <= node.Count; i++)
+            var branch = (MemTable.OrderedIndex.Branch)node;
+            Require(branch.Count <= MemTable.OrderedIndex.BranchCapacity, $"a branch holds {branch.Count} separators");
+            for (var i = 0; i <= branch.Count; i++)
             {
-                var child = node.Children[i];
-                Require(child is not null, $"branch child {i} of {node.Count + 1} is missing");
+                var child = branch.Children[i];
+                Require(child is not null, $"branch child {i} of {branch.Count + 1} is missing");
                 if (i != 0)
                 {
-                    Require(Minimum(child!) == node.Keys[i - 1], $"separator {i - 1} is not the minimum of its right child");
+                    Require(Minimum(child!) == branch.Keys[i - 1], $"separator {i - 1} is not the minimum of its right child");
                 }
-                CheckNode(child!, depth + 1, i == 0 ? lower : node.Keys[i - 1], i == node.Count ? upper : node.Keys[i]);
+                CheckNode(child!, depth + 1, i == 0 ? lower : branch.Keys[i - 1], i == branch.Count ? upper : branch.Keys[i]);
+            }
+        }
+
+        // A node's windows skip a prefix that every key between its bounds shares: the bounds' common prefix, or on an
+        // edge of the tree the prefix that all keys share.
+        void CheckWords(MemTable.OrderedIndex.Node node, int lower, int upper)
+        {
+            var shared = lower >= 0 && upper >= 0
+                ? table.GetRecordKey(lower).CommonPrefixLength(table.GetRecordKey(upper))
+                : treePrefix;
+            Require(node.PrefixLength <= shared, $"a node skips {node.PrefixLength} bytes where its keys share {shared}");
+            var words = node is MemTable.OrderedIndex.Leaf leaf ? leaf.Words : ((MemTable.OrderedIndex.Branch)node).Words;
+            var keys = node is MemTable.OrderedIndex.Leaf l ? l.Keys : ((MemTable.OrderedIndex.Branch)node).Keys;
+            for (var slot = 0; slot < node.Count; slot++)
+            {
+                Require(words[slot] == Window(table.GetRecordKey(keys[slot]), node.PrefixLength), $"the window of record {keys[slot]} is stale");
             }
         }
 
         static int Minimum(MemTable.OrderedIndex.Node node)
         {
-            while (node.Children is not null)
+            while (node is MemTable.OrderedIndex.Branch branch)
             {
-                node = node.Children[0]!;
+                node = branch.Children[0]!;
             }
-            return node.Count == 0 ? -1 : node.Keys[0];
+            return node.Count == 0 ? -1 : ((MemTable.OrderedIndex.Leaf)node).Keys[0];
+        }
+
+        static ulong Window(ReadOnlySpan<byte> key, int prefixLength)
+        {
+            Span<byte> window = stackalloc byte[sizeof(ulong)];
+            window.Clear();
+            if (prefixLength < key.Length)
+            {
+                var rest = key[prefixLength..];
+                rest[..Math.Min(rest.Length, window.Length)].CopyTo(window);
+            }
+            return System.Buffers.Binary.BinaryPrimitives.ReadUInt64BigEndian(window);
         }
 
         int Compare(int x, int y) => table.GetRecordKey(x).SequenceCompareTo(table.GetRecordKey(y));
