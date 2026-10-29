@@ -1546,8 +1546,8 @@ await db.CloseAsync(); // flush everything to disk
 
 ## Comparisons with SurrealKV and RocksDB
 
-Measured October 27, 2026 on an Apple M4 Pro (10 performance and 4 efficiency cores, 48 GiB RAM,
-macOS 15.8) at Silex `0c12718`: 50,000 keys, 16-byte keys, 100-byte values, no compression, 64 MiB
+Measured October 28, 2026 on an Apple M4 Pro (10 performance and 4 efficiency cores, 48 GiB RAM,
+macOS 15.8.2) at Silex `e97fe19`: 50,000 keys, 16-byte keys, 100-byte values, no compression, 64 MiB
 memtables, 8 MiB block caches, and WAL enabled. Results are medians of three fresh-process runs,
 alternating engine order. Every run started with the CPU at least 85% idle, and a run was repeated
 when other processes averaged more than 3 cores while it ran (macOS background work alone uses
@@ -1599,71 +1599,71 @@ memory, not just managed allocations.
 
 | Workload | Residency | Unit | Silex LSM, 1 thread | RocksDB, 1 thread | Silex LSM, 8 threads | RocksDB, 8 threads |
 |---|---|---|---:|---:|---:|---:|
-| Sequential writes | Memtable + WAL | ops/s | 659,017 | 667,724 | 310,758 | 531,342 |
-| Random writes | Memtable + WAL | ops/s | 659,757 | 570,499 | 308,984 | 482,458 |
-| Overwrites | Memtable + WAL | ops/s | 680,833 | 604,441 | 302,939 | 606,376 |
-| Random deletes | Memtable + WAL | ops/s | 837,950 | 612,942 | 322,402 | 681,030 |
-| Synchronized writes | WAL sync | ops/s | 245 | 248 | 710 | 1,264 |
-| 90% reads, 10% overwrites | Memtable + WAL | ops/s | 2,306,326 | 1,664,942 | 2,582,936 | 4,302,860 |
-| Random reads, first pass | Memtable | ops/s | 3,817,114 | 2,291,900 | 14,551,010 | 13,870,287 |
-| Random reads, warm | Memtable | ops/s | 5,578,240 | 2,355,125 | 16,767,973 | 14,850,520 |
-| Random seeks, first pass | Memtable | ops/s | 1,180,905 | 1,378,711 | 5,825,282 | 5,778,698 |
-| Random seeks, warm | Memtable | ops/s | 1,755,939 | 1,373,850 | 8,874,611 | 5,630,172 |
-| Forward scan | Memtable | entries/s | 17,005,646 | 24,472,819 | 92,919,532 | 125,393,500 |
-| Reverse scan | Memtable | entries/s | 21,638,465 | 4,363,351 | 118,042,850 | 26,628,795 |
-| Scan 100 entries | Memtable | scans/s | 213,434 | 207,226 | 656,572 | 1,184,901 |
-| Skip 5,000, scan 100 | Memtable | scans/s | 25,039 | 4,922 | 111,803 | 34,798 |
-| Count all 50,000 keys | Memtable | scans/s | 5,063 | 513 | 38,439 | 3,159 |
-| Random reads, first pass | SST | ops/s | 1,113,355 | 1,569,768 | 5,963,723 | 4,229,369 |
-| Random reads, warm | SST | ops/s | 1,836,986 | 1,823,977 | 8,181,047 | 4,189,143 |
-| Random seeks, first pass | SST | ops/s | 1,297,926 | 827,043 | 6,242,889 | 3,211,807 |
-| Random seeks, warm | SST | ops/s | 1,522,325 | 847,974 | 7,573,190 | 3,178,466 |
-| Forward scan | SST | entries/s | 27,953,262 | 16,616,590 | 61,877,359 | 78,622,796 |
-| Reverse scan | SST | entries/s | 16,583,748 | 10,791,561 | 45,243,239 | 60,714,924 |
-| Scan 100 entries | SST | scans/s | 250,999 | 131,406 | 833,891 | 578,292 |
-| Skip 5,000, scan 100 | SST | scans/s | 14,246 | 3,319 | 110,839 | 18,505 |
-| Count all 50,000 keys | SST | scans/s | 1,456 | 339 | 4,281 | 1,804 |
-| Read-suite memory | Memtable | MiB RSS / peak | 63.9 / 71.1 | 13.6 / 13.7 | 65.4 / 72.6 | 14.1 / 14.3 |
-| Read-suite memory | SST | MiB RSS / peak | 79.2 / 80.2 | 22.3 / 22.3 | 83.3 / 84.3 | 22.8 / 23.0 |
-| Write-suite memory | Sequential fill + overwrite + delete | MiB RSS / peak | 66.9 / 73.6 | 23.0 / 23.0 | 68.1 / 74.7 | 23.7 / 23.8 |
-| Random-fill memory | Memtable + WAL | MiB RSS / peak | 61.8 / 70.1 | 13.8 / 13.8 | 62.1 / 70.4 | 14.4 / 14.5 |
-| Synchronized-write memory | WAL sync | MiB RSS / peak | 49.7 / 54.9 | 7.0 / 7.0 | 49.6 / 54.8 | 7.1 / 7.2 |
-| Mixed-suite memory | Memtable + WAL | MiB RSS / peak | 62.2 / 70.2 | 14.1 / 14.1 | 65.7 / 73.7 | 19.3 / 19.4 |
+| Sequential writes | Memtable + WAL | ops/s | 606,008 | 631,983 | 892,738 | 549,103 |
+| Random writes | Memtable + WAL | ops/s | 611,793 | 544,578 | 908,419 | 543,761 |
+| Overwrites | Memtable + WAL | ops/s | 615,500 | 567,233 | 991,735 | 591,443 |
+| Random deletes | Memtable + WAL | ops/s | 747,633 | 554,907 | 1,261,540 | 658,122 |
+| Synchronized writes | WAL sync | ops/s | 211 | 212 | 1,285 | 900 |
+| 90% reads, 10% overwrites | Memtable + WAL | ops/s | 2,110,372 | 1,638,572 | 6,707,819 | 4,607,567 |
+| Random reads, first pass | Memtable | ops/s | 3,615,904 | 2,117,298 | 15,750,388 | 14,312,998 |
+| Random reads, warm | Memtable | ops/s | 5,400,968 | 2,206,012 | 18,606,295 | 14,947,241 |
+| Random seeks, first pass | Memtable | ops/s | 1,122,844 | 1,250,132 | 5,867,193 | 6,222,348 |
+| Random seeks, warm | Memtable | ops/s | 1,690,903 | 1,272,798 | 8,114,380 | 6,111,322 |
+| Forward scan | Memtable | entries/s | 15,882,091 | 23,483,362 | 88,232,050 | 116,151,034 |
+| Reverse scan | Memtable | entries/s | 21,326,509 | 3,814,198 | 119,825,055 | 23,607,699 |
+| Scan 100 entries | Memtable | scans/s | 197,916 | 188,814 | 689,118 | 1,181,810 |
+| Skip 5,000, scan 100 | Memtable | scans/s | 17,694 | 4,525 | 124,218 | 34,772 |
+| Count all 50,000 keys | Memtable | scans/s | 4,666 | 464 | 38,792 | 3,061 |
+| Random reads, first pass | SST | ops/s | 1,065,494 | 1,557,645 | 6,565,180 | 4,161,892 |
+| Random reads, warm | SST | ops/s | 1,727,217 | 1,714,646 | 8,303,734 | 4,170,769 |
+| Random seeks, first pass | SST | ops/s | 1,221,696 | 796,274 | 6,041,128 | 3,166,333 |
+| Random seeks, warm | SST | ops/s | 1,414,079 | 791,074 | 7,288,165 | 3,131,730 |
+| Forward scan | SST | entries/s | 26,588,673 | 15,745,968 | 60,848,533 | 81,499,593 |
+| Reverse scan | SST | entries/s | 16,056,003 | 10,210,420 | 43,764,155 | 59,314,910 |
+| Scan 100 entries | SST | scans/s | 229,979 | 120,709 | 826,033 | 568,974 |
+| Skip 5,000, scan 100 | SST | scans/s | 15,682 | 3,104 | 91,357 | 18,431 |
+| Count all 50,000 keys | SST | scans/s | 1,388 | 319 | 4,261 | 1,781 |
+| Read-suite memory | Memtable | MiB RSS / peak | 63.9 / 71.1 | 13.8 / 13.8 | 65.7 / 72.9 | 14.2 / 14.4 |
+| Read-suite memory | SST | MiB RSS / peak | 79.5 / 80.5 | 22.7 / 22.7 | 83.8 / 84.9 | 22.8 / 23.1 |
+| Write-suite memory | Sequential fill + overwrite + delete | MiB RSS / peak | 67.4 / 74.1 | 23.0 / 23.0 | 68.0 / 74.6 | 23.7 / 23.8 |
+| Random-fill memory | Memtable + WAL | MiB RSS / peak | 62.1 / 70.2 | 13.9 / 13.9 | 62.6 / 70.7 | 14.3 / 14.4 |
+| Synchronized-write memory | WAL sync | MiB RSS / peak | 50.3 / 55.6 | 7.0 / 7.0 | 50.0 / 55.0 | 7.0 / 7.2 |
+| Mixed-suite memory | Memtable + WAL | MiB RSS / peak | 62.6 / 70.6 | 14.1 / 14.1 | 66.2 / 74.2 | 19.3 / 19.4 |
 
 ### Transactional operations: Silex MVCC versus SurrealKV
 
 | Workload | Residency | Unit | Silex MVCC, 1 thread | SurrealKV, 1 thread | Silex MVCC, 8 threads | SurrealKV, 8 threads |
 |---|---|---|---:|---:|---:|---:|
-| Sequential writes | Memtable + WAL | ops/s | 383,781 | 459,358 | 435,944 | 561,727 |
-| Random writes | Memtable + WAL | ops/s | 398,054 | 460,328 | 437,462 | 546,583 |
-| Overwrites | Memtable + WAL | ops/s | 406,750 | 467,772 | 520,666 | 530,000 |
-| Random deletes | Memtable + WAL | ops/s | 464,394 | 501,864 | 546,639 | 567,381 |
-| Synchronized writes | WAL sync | ops/s | 243 | 247 | 822 | 782 |
-| 90% reads, 10% overwrites | Memtable + WAL | ops/s | 1,193,839 | 2,209,945 | 2,891,036 | 2,964,951 |
-| Random reads, first pass | Memtable | ops/s | 2,072,797 | 4,677,433 | 8,767,930 | 3,199,183 |
-| Random reads, warm | Memtable | ops/s | 3,149,170 | 5,164,089 | 13,948,120 | 3,180,800 |
-| Random seeks, first pass | Memtable | ops/s | 753,685 | 1,215,000 | 3,827,129 | 1,693,667 |
-| Random seeks, warm | Memtable | ops/s | 955,782 | 1,131,131 | 5,381,371 | 1,675,020 |
-| Forward scan | Memtable | entries/s | 11,114,075 | 19,215,678 | 63,757,213 | 145,761,493 |
-| Reverse scan | Memtable | entries/s | 15,701,052 | 7,453,972 | 95,244,898 | 50,108,309 |
-| Scan 100 entries | Memtable | scans/s | 133,000 | 173,123 | 545,337 | 736,360 |
-| Skip 5,000, scan 100 | Memtable | scans/s | 13,355 | 7,063 | 126,480 | 50,468 |
-| Count all 50,000 keys | Memtable | scans/s | 4,150 | 746 | 25,609 | 5,243 |
-| Random reads, first pass | SST | ops/s | 929,665 | 259,590 | 4,981,196 | 1,071,125 |
-| Random reads, warm | SST | ops/s | 1,394,848 | 265,938 | 6,573,282 | 1,065,635 |
-| Random seeks, first pass | SST | ops/s | 1,339,901 | 224,071 | 6,446,082 | 811,328 |
-| Random seeks, warm | SST | ops/s | 1,451,295 | 227,200 | 6,709,271 | 749,489 |
-| Forward scan | SST | entries/s | 15,413,545 | 16,449,170 | 46,062,784 | 61,853,276 |
-| Reverse scan | SST | entries/s | 16,470,666 | 4,009,596 | 45,179,362 | 23,536,276 |
-| Scan 100 entries | SST | scans/s | 213,192 | 97,835 | 776,159 | 422,019 |
-| Skip 5,000, scan 100 | SST | scans/s | 13,242 | 5,643 | 91,207 | 33,933 |
-| Count all 50,000 keys | SST | scans/s | 1,098 | 573 | 2,254 | 3,317 |
-| Read-suite memory | Memtable | MiB RSS / peak | 66.7 / 74.3 | 15.1 / 79.8 | 67.9 / 75.5 | 15.5 / 80.2 |
-| Read-suite memory | SST | MiB RSS / peak | 83.9 / 84.9 | 103.1 / 103.5 | 85.0 / 86.1 | 415.5 / 415.9 |
-| Write-suite memory | Sequential fill + overwrite + delete | MiB RSS / peak | 97.7 / 112.1 | 25.6 / 90.3 | 162.5 / 176.4 | 26.9 / 91.7 |
-| Random-fill memory | Memtable + WAL | MiB RSS / peak | 66.8 / 75.5 | 15.3 / 80.1 | 89.2 / 97.7 | 15.9 / 80.7 |
-| Synchronized-write memory | WAL sync | MiB RSS / peak | 50.0 / 55.4 | 3.3 / 69.1 | 50.2 / 55.4 | 3.5 / 69.3 |
-| Mixed-suite memory | Memtable + WAL | MiB RSS / peak | 65.1 / 74.2 | 15.8 / 80.6 | 94.9 / 106.5 | 22.1 / 87.0 |
+| Sequential writes | Memtable + WAL | ops/s | 367,725 | 428,761 | 434,599 | 545,787 |
+| Random writes | Memtable + WAL | ops/s | 370,654 | 442,827 | 447,431 | 551,898 |
+| Overwrites | Memtable + WAL | ops/s | 387,386 | 442,549 | 503,164 | 510,873 |
+| Random deletes | Memtable + WAL | ops/s | 365,724 | 487,833 | 517,948 | 553,078 |
+| Synchronized writes | WAL sync | ops/s | 211 | 212 | 687 | 673 |
+| 90% reads, 10% overwrites | Memtable + WAL | ops/s | 1,136,005 | 2,136,410 | 2,841,204 | 2,729,199 |
+| Random reads, first pass | Memtable | ops/s | 1,912,711 | 4,252,409 | 8,551,193 | 3,060,450 |
+| Random reads, warm | Memtable | ops/s | 2,828,966 | 5,196,807 | 12,173,373 | 3,217,535 |
+| Random seeks, first pass | Memtable | ops/s | 696,091 | 1,142,617 | 3,820,921 | 1,757,958 |
+| Random seeks, warm | Memtable | ops/s | 900,009 | 1,102,396 | 5,018,663 | 1,848,758 |
+| Forward scan | Memtable | entries/s | 10,499,790 | 18,097,091 | 62,776,609 | 137,950,823 |
+| Reverse scan | Memtable | entries/s | 15,223,017 | 7,189,116 | 92,172,270 | 49,823,283 |
+| Scan 100 entries | Memtable | scans/s | 131,684 | 161,777 | 539,283 | 809,398 |
+| Skip 5,000, scan 100 | Memtable | scans/s | 11,068 | 6,698 | 110,921 | 50,488 |
+| Count all 50,000 keys | Memtable | scans/s | 3,951 | 688 | 26,290 | 5,246 |
+| Random reads, first pass | SST | ops/s | 883,612 | 249,295 | 5,082,786 | 1,072,317 |
+| Random reads, warm | SST | ops/s | 1,329,063 | 239,976 | 6,954,466 | 1,032,727 |
+| Random seeks, first pass | SST | ops/s | 1,262,706 | 215,094 | 6,417,775 | 814,256 |
+| Random seeks, warm | SST | ops/s | 1,361,359 | 216,074 | 6,656,792 | 778,880 |
+| Forward scan | SST | entries/s | 14,236,497 | 16,821,333 | 45,033,888 | 69,654,048 |
+| Reverse scan | SST | entries/s | 16,044,668 | 3,697,609 | 44,774,282 | 22,516,184 |
+| Scan 100 entries | SST | scans/s | 204,501 | 90,391 | 766,486 | 440,235 |
+| Skip 5,000, scan 100 | SST | scans/s | 13,730 | 5,316 | 81,663 | 33,596 |
+| Count all 50,000 keys | SST | scans/s | 1,054 | 543 | 2,300 | 3,285 |
+| Read-suite memory | Memtable | MiB RSS / peak | 71.3 / 78.9 | 15.1 / 79.8 | 69.1 / 76.7 | 15.5 / 80.4 |
+| Read-suite memory | SST | MiB RSS / peak | 84.6 / 85.7 | 104.9 / 105.2 | 85.1 / 86.2 | 304.3 / 304.6 |
+| Write-suite memory | Sequential fill + overwrite + delete | MiB RSS / peak | 98.5 / 112.5 | 25.6 / 90.3 | 162.8 / 177.2 | 27.1 / 91.9 |
+| Random-fill memory | Memtable + WAL | MiB RSS / peak | 67.3 / 75.9 | 15.4 / 80.2 | 89.4 / 98.0 | 16.1 / 81.0 |
+| Synchronized-write memory | WAL sync | MiB RSS / peak | 50.7 / 55.9 | 3.3 / 69.1 | 50.9 / 56.2 | 3.5 / 69.2 |
+| Mixed-suite memory | Memtable + WAL | MiB RSS / peak | 65.6 / 74.4 | 16.1 / 80.8 | 95.4 / 106.8 | 22.1 / 86.9 |
 
 ## Project layout
 
