@@ -54,10 +54,10 @@ jobs:
 
       - name: Build
         run: |
-          dotnet build src/Silex/Silex.csproj --configuration Release -p:VersionSuffix=preview-${{ github.run_number }} -p:ContinuousIntegrationBuild=True
-          dotnet build src/Silex.Keys/Silex.Keys.csproj --configuration Release -p:VersionSuffix=preview-${{ github.run_number }} -p:ContinuousIntegrationBuild=True
-          dotnet build tests/Silex.Test/Silex.Test.csproj --configuration Release -p:VersionSuffix=preview-${{ github.run_number }} -p:ContinuousIntegrationBuild=True
-          dotnet build tests/Silex.Tool.Tests/Silex.Tool.Tests.csproj --configuration Release -p:VersionSuffix=preview-${{ github.run_number }} -p:ContinuousIntegrationBuild=True
+          dotnet build src/Silex/Silex.csproj --configuration Release -p:VersionSuffix=preview.${{ github.run_number }} -p:ContinuousIntegrationBuild=True
+          dotnet build src/Silex.Keys/Silex.Keys.csproj --configuration Release -p:VersionSuffix=preview.${{ github.run_number }} -p:ContinuousIntegrationBuild=True
+          dotnet build tests/Silex.Test/Silex.Test.csproj --configuration Release -p:VersionSuffix=preview.${{ github.run_number }} -p:ContinuousIntegrationBuild=True
+          dotnet build tests/Silex.Tool.Tests/Silex.Tool.Tests.csproj --configuration Release -p:VersionSuffix=preview.${{ github.run_number }} -p:ContinuousIntegrationBuild=True
 
       - name: Test
         run: |
@@ -68,9 +68,9 @@ jobs:
       - name: Pack and install native tool
         shell: bash
         run: |
-          dotnet pack src/Silex.Tool/Silex.Tool.csproj -c Release -r "${{ matrix.rid }}" -o tool-artifacts -p:VersionSuffix=preview-${{ github.run_number }} -p:ContinuousIntegrationBuild=True
-          dotnet pack src/Silex.Tool/Silex.Tool.csproj -c Release -o tool-artifacts -p:VersionSuffix=preview-${{ github.run_number }} -p:ContinuousIntegrationBuild=True
-          dotnet tool install Silex.Tool --tool-path tool-installed --add-source "$PWD/tool-artifacts" --version "1.0.0-preview-${{ github.run_number }}"
+          dotnet pack src/Silex.Tool/Silex.Tool.csproj -c Release -r "${{ matrix.rid }}" -o tool-artifacts -p:VersionSuffix=preview.${{ github.run_number }} -p:ContinuousIntegrationBuild=True
+          dotnet pack src/Silex.Tool/Silex.Tool.csproj -c Release -o tool-artifacts -p:VersionSuffix=preview.${{ github.run_number }} -p:ContinuousIntegrationBuild=True
+          dotnet tool install Silex.Tool --tool-path tool-installed --add-source "$PWD/tool-artifacts" --version "1.0.0-preview.${{ github.run_number }}"
 
       - name: Test native tool
         shell: bash
@@ -98,7 +98,7 @@ jobs:
       - name: Pack portable tool and pointer
         if: matrix.os == 'ubuntu-latest'
         run: |
-          dotnet pack src/Silex.Tool/Silex.Tool.csproj -c Release -r any -p:PublishAot=false -o tool-artifacts -p:VersionSuffix=preview-${{ github.run_number }} -p:ContinuousIntegrationBuild=True
+          dotnet pack src/Silex.Tool/Silex.Tool.csproj -c Release -r any -p:PublishAot=false -o tool-artifacts -p:VersionSuffix=preview.${{ github.run_number }} -p:ContinuousIntegrationBuild=True
 
       - name: Upload preview tool packages
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -110,8 +110,8 @@ jobs:
       - name: Pack preview packages
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.os == 'ubuntu-latest'
         run: |
-          dotnet pack src/Silex/Silex.csproj --output artifacts --configuration Release --no-build -p:VersionSuffix=preview-${{ github.run_number }} -p:ContinuousIntegrationBuild=True
-          dotnet pack src/Silex.Keys/Silex.Keys.csproj --output artifacts --configuration Release --no-build -p:VersionSuffix=preview-${{ github.run_number }} -p:ContinuousIntegrationBuild=True
+          dotnet pack src/Silex/Silex.csproj --output artifacts --configuration Release --no-build -p:VersionSuffix=preview.${{ github.run_number }} -p:ContinuousIntegrationBuild=True
+          dotnet pack src/Silex.Keys/Silex.Keys.csproj --output artifacts --configuration Release --no-build -p:VersionSuffix=preview.${{ github.run_number }} -p:ContinuousIntegrationBuild=True
 
       - name: Push preview packages to Feedz
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.os == 'ubuntu-latest'
@@ -122,6 +122,14 @@ jobs:
           set -euo pipefail
           for package in artifacts/*.nupkg; do
             dotnet nuget push "$package" --api-key "$FEEDZ_IO_API_KEY" --source https://f.feedz.io/sebastienros/silexdb/nuget/index.json --skip-duplicate
+          done
+          # Previews used to be versioned <prefix>-preview-<run number>, which NuGet orders as text (preview-999 is
+          # newer than preview-1000) and above every <prefix>-preview.<run number>. Delete them so they don't shadow newer builds.
+          for package in artifacts/*.nupkg; do
+            id=$(basename "$package" | sed -E 's/\.[0-9]+\.[0-9]+\.[0-9]+-.*$//' | tr '[:upper:]' '[:lower:]')
+            for version in $(curl -fsS "https://f.feedz.io/sebastienros/silexdb/nuget/v3/packages/$id/index.json" | jq -r '.versions[] | select(test("-preview-[0-9]+$"))'); do
+              dotnet nuget delete "$id" "$version" --api-key "$FEEDZ_IO_API_KEY" --source https://f.feedz.io/sebastienros/silexdb/nuget/index.json --non-interactive
+            done
           done
 
   tool-preview:
@@ -143,13 +151,20 @@ jobs:
           FEEDZ_IO_API_KEY: ${{ secrets.FEEDZ_IO_API_KEY }}
         run: |
           set -euo pipefail
-          VERSION="1.0.0-preview-${{ github.run_number }}"
+          VERSION="1.0.0-preview.${{ github.run_number }}"
           for package in artifacts/*.nupkg; do
             if [[ "$package" != "artifacts/Silex.Tool.$VERSION.nupkg" ]]; then
               dotnet nuget push "$package" --api-key "$FEEDZ_IO_API_KEY" --source https://f.feedz.io/sebastienros/silexdb/nuget/index.json --skip-duplicate
             fi
           done
           dotnet nuget push "artifacts/Silex.Tool.$VERSION.nupkg" --api-key "$FEEDZ_IO_API_KEY" --source https://f.feedz.io/sebastienros/silexdb/nuget/index.json --skip-duplicate
+          # Delete the <prefix>-preview-<run number> versions of the tool packages (see the build job).
+          for package in artifacts/*.nupkg; do
+            id=$(basename "$package" | sed -E 's/\.[0-9]+\.[0-9]+\.[0-9]+-.*$//' | tr '[:upper:]' '[:lower:]')
+            for version in $(curl -fsS "https://f.feedz.io/sebastienros/silexdb/nuget/v3/packages/$id/index.json" | jq -r '.versions[] | select(test("-preview-[0-9]+$"))'); do
+              dotnet nuget delete "$id" "$version" --api-key "$FEEDZ_IO_API_KEY" --source https://f.feedz.io/sebastienros/silexdb/nuget/index.json --non-interactive
+            done
+          done
 
   jepsen:
     strategy:
