@@ -1665,6 +1665,57 @@ memory, not just managed allocations.
 | Synchronized-write memory | WAL sync | MiB RSS / peak | 50.7 / 55.9 | 3.3 / 69.1 | 50.9 / 56.2 | 3.5 / 69.2 |
 | Mixed-suite memory | Memtable + WAL | MiB RSS / peak | 65.6 / 74.4 | 16.1 / 80.8 | 95.4 / 106.8 | 22.1 / 86.9 |
 
+## Comparison with SlateDB
+
+Measured November 9, 2026 on a 4-vCPU Linux cloud VM (Intel Xeon @ 2.10 GHz, 15 GiB RAM, kernel 6.18) at
+Silex `07b598c`, with the same workloads, data and settings as the comparisons above. Silex ran on .NET
+10.0.14; SlateDB is version 0.18.1, built with Rust 1.97. Results are medians of three fresh-process
+runs, alternating engine order, at 1 and 4 threads (the VM has 4 cores). Other processes used at most
+0.03 cores during any run, but individual cells still varied by up to 1.6× between repetitions on this
+VM, so treat small differences as noise. These numbers come from a different machine than the tables
+above and cannot be compared with them.
+
+SlateDB is an LSM engine that writes its WAL, SSTs and manifest to an object store. The adapter gives it
+the local-filesystem object store with `fsync` on and an 8 MiB block cache, and it is paired with Silex
+LSM: plain puts, deletes, latest-value reads and scans. SlateDB's `put` returns once the write is in its
+in-memory WAL buffer and memtable, and a background task writes that buffer to the object store every
+100 ms. A synchronized write is a put followed by `Db::flush`. SlateDB is designed for object storage,
+where latency and request cost dominate, so CPU efficiency on a local disk is not its target workload.
+See [`tests/Silex.EngineComparison`](tests/Silex.EngineComparison/README.md) for the adapter.
+
+| Workload | Residency | Unit | Silex LSM, 1 thread | SlateDB, 1 thread | Silex LSM, 4 threads | SlateDB, 4 threads |
+|---|---|---|---:|---:|---:|---:|
+| Sequential writes | Memtable + WAL | ops/s | 434,190 | 269,775 | 318,041 | 166,425 |
+| Random writes | Memtable + WAL | ops/s | 392,501 | 215,761 | 262,269 | 116,645 |
+| Overwrites | Memtable + WAL | ops/s | 483,859 | 175,730 | 375,553 | 108,231 |
+| Random deletes | Memtable + WAL | ops/s | 671,257 | 160,107 | 455,534 | 109,231 |
+| Synchronized writes | WAL sync | ops/s | 1,696 | 678 | 1,822 | 778 |
+| 90% reads, 10% overwrites | Memtable + WAL | ops/s | 891,506 | 248,774 | 1,764,909 | 419,818 |
+| Random reads, first pass | Memtable | ops/s | 782,027 | 272,976 | 3,626,743 | 637,372 |
+| Random reads, warm | Memtable | ops/s | 938,567 | 287,641 | 4,402,183 | 656,171 |
+| Random seeks, first pass | Memtable | ops/s | 353,774 | 127,268 | 1,156,771 | 360,890 |
+| Random seeks, warm | Memtable | ops/s | 546,237 | 130,326 | 1,770,886 | 331,817 |
+| Forward scan | Memtable | entries/s | 5,305,265 | 1,071,137 | 11,991,486 | 3,539,462 |
+| Reverse scan | Memtable | entries/s | 6,557,463 | 870,786 | 15,293,560 | 2,667,117 |
+| Scan 100 entries | Memtable | scans/s | 96,476 | 8,247 | 79,954 | 28,943 |
+| Skip 5,000, scan 100 | Memtable | scans/s | 15,786 | 195 | 58,656 | 718 |
+| Count all 50,000 keys | Memtable | scans/s | 1,994 | 20 | 5,091 | 69 |
+| Random reads, first pass | SST | ops/s | 442,458 | 88,963 | 1,193,025 | 180,177 |
+| Random reads, warm | SST | ops/s | 295,858 | 92,687 | 1,028,124 | 171,774 |
+| Random seeks, first pass | SST | ops/s | 432,676 | 72,514 | 1,158,290 | 167,658 |
+| Random seeks, warm | SST | ops/s | 643,579 | 77,248 | 1,758,192 | 173,656 |
+| Forward scan | SST | entries/s | 8,644,686 | 854,326 | 13,833,937 | 2,194,756 |
+| Reverse scan | SST | entries/s | 6,337,778 | 695,232 | 11,212,774 | 1,906,357 |
+| Scan 100 entries | SST | scans/s | 109,803 | 6,449 | 202,570 | 20,144 |
+| Skip 5,000, scan 100 | SST | scans/s | 9,190 | 147 | 27,874 | 476 |
+| Count all 50,000 keys | SST | scans/s | 428 | 15 | 793 | 42 |
+| Read-suite memory | Memtable | MiB RSS / peak | 57.1 / 65.1 | 35.3 / 46.1 | 60.4 / 69.2 | 38.1 / 49.2 |
+| Read-suite memory | SST | MiB RSS / peak | 72.4 / 73.6 | 41.5 / 42.1 | 76.8 / 78.1 | 46.5 / 46.1 |
+| Write-suite memory | Sequential fill + overwrite + delete | MiB RSS / peak | 59.7 / 67.2 | 62.4 / 63.1 | 61.6 / 69.2 | 68.3 / 69.0 |
+| Random-fill memory | Memtable + WAL | MiB RSS / peak | 54.5 / 63.8 | 37.3 / 41.2 | 56.3 / 65.4 | 34.9 / 48.2 |
+| Synchronized-write memory | WAL sync | MiB RSS / peak | 41.7 / 48.1 | 9.4 / 16.0 | 42.2 / 48.2 | 9.7 / 16.0 |
+| Mixed-suite memory | Memtable + WAL | MiB RSS / peak | 54.8 / 63.6 | 35.3 / 45.3 | 56.6 / 65.4 | 43.8 / 55.1 |
+
 ## Project layout
 
 | Project                         | Description                                        |
@@ -1675,7 +1726,7 @@ memory, not just managed allocations.
 | `Silex.DbBench`                 | Database benchmarking harness.                     |
 | `tests/Silex.Test`              | Unit tests (TUnit).                                |
 | `tests/Silex.Benchmarks`        | Micro-benchmarks (BenchmarkDotNet).                |
-| `tests/Silex.EngineComparison`  | Paired Silex, RocksDB and SurrealKV adapters.      |
+| `tests/Silex.EngineComparison`  | Paired Silex, RocksDB, SurrealKV and SlateDB adapters. |
 
 ## Thread-safety and lifetime notes
 
