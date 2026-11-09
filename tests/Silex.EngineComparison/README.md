@@ -1,6 +1,6 @@
 # Engine comparison harness
 
-Paired adapters that run the same workloads against Silex and two native engines, and the runner that
+Paired adapters that run the same workloads against Silex and three native engines, and the runner that
 produced the comparison tables in the repository [README](../../README.md#comparisons-with-surrealkv-and-rocksdb).
 
 | Adapter | Engine | Paired with | Folder |
@@ -9,6 +9,10 @@ produced the comparison tables in the repository [README](../../README.md#compar
 | `silex-mvcc` | Silex `MvccStorage` | `surrealkv` | [`silex/`](silex/) |
 | `rocksdb` | RocksDB plain `DB` (C++) | `silex-lsm` | [`rocksdb/`](rocksdb/) |
 | `surrealkv` | SurrealKV transactions (Rust) | `silex-mvcc` | [`surrealkv/`](surrealkv/) |
+| `slatedb` | SlateDB plain `Db` on a local-filesystem object store (Rust) | `silex-lsm` | [`slatedb/`](slatedb/) |
+
+The pairs are `lsm` (`silex-lsm`, `rocksdb`), `mvcc` (`silex-mvcc`, `surrealkv`) and `slatedb`
+(`silex-lsm`, `slatedb`). `run.py` runs `lsm,mvcc` unless `--pairs` says otherwise.
 
 ## Running
 
@@ -17,11 +21,18 @@ produced the comparison tables in the repository [README](../../README.md#compar
 dotnet build tests/Silex.EngineComparison/silex -c Release
 ROCKSDB_DIR=~/github/rocksdb tests/Silex.EngineComparison/rocksdb/build.sh
 cargo build --release --manifest-path tests/Silex.EngineComparison/surrealkv/Cargo.toml
+cargo build --release --manifest-path tests/Silex.EngineComparison/slatedb/Cargo.toml
 
 # Run every pair, thread count, suite and repetition, then print the README tables.
 python3 tests/Silex.EngineComparison/run.py --out /tmp/engine-comparison
 python3 tests/Silex.EngineComparison/run.py --render /tmp/engine-comparison
+
+# Silex LSM against SlateDB only, at 1 and 4 threads.
+python3 tests/Silex.EngineComparison/run.py --out /tmp/slatedb-comparison --pairs slatedb --threads 1,4
+python3 tests/Silex.EngineComparison/run.py --render /tmp/slatedb-comparison
 ```
+
+The rendered tables have one column per engine and thread count found in the results.
 
 `run.py --help` lists the filters (`--pairs`, `--threads`, `--suites`, `--reps`) and lets one adapter be
 replaced by another build, for example Silex compiled from an older commit:
@@ -44,7 +55,7 @@ load average and that CPU use.
 Every adapter is a command-line program:
 
 ```
-<adapter> --engine <silex-lsm|silex-mvcc|rocksdb|surrealkv> --suite <suite> --threads <T> --dir <path>
+<adapter> --engine <silex-lsm|silex-mvcc|rocksdb|surrealkv|slatedb> --suite <suite> --threads <T> --dir <path>
 ```
 
 `--dir` is an empty directory the adapter owns for the run. One process runs one suite and exits.
@@ -86,14 +97,14 @@ Each timed phase prints one JSON line to standard output, and the suite ends wit
 
 ## Engine configuration
 
-| Setting | Silex | RocksDB | SurrealKV |
-|---|---|---|---|
-| Memtable | `MemTableSizeLimit` 64 MiB | `write_buffer_size` 64 MiB | max memtable size 64 MiB |
-| Block cache | `BlockCacheSizeLimit` 8 MiB | LRU cache 8 MiB | block cache 8 MiB |
-| Compression | `SstCompression.None` | `kNoCompression` | none |
-| WAL | on; synchronized only in `sync` | on; `WriteOptions.sync` only in `sync` | on; `Durability::Immediate` only in `sync` |
-| Filters | default Bloom filter | 10 bits/key Bloom filter | default |
-| Other | MVCC: `MvccCommitGroupSize = T` | defaults | versioning (historical retention) off |
+| Setting | Silex | RocksDB | SurrealKV | SlateDB |
+|---|---|---|---|---|
+| Memtable | `MemTableSizeLimit` 64 MiB | `write_buffer_size` 64 MiB | max memtable size 64 MiB | `l0_sst_size_bytes` 64 MiB |
+| Block cache | `BlockCacheSizeLimit` 8 MiB | LRU cache 8 MiB | block cache 8 MiB | Foyer block cache 8 MiB; index/filter blocks in the default metadata cache |
+| Compression | `SstCompression.None` | `kNoCompression` | none | `compression_codec: None` |
+| WAL | on; synchronized only in `sync` | on; `WriteOptions.sync` only in `sync` | on; `Durability::Immediate` only in `sync` | on, written to the object store every 100 ms; `Db::flush` after each write only in `sync` |
+| Filters | default Bloom filter | 10 bits/key Bloom filter | default | default (10 bits/key Bloom filter) |
+| Other | MVCC: `MvccCommitGroupSize = T` | defaults | versioning (historical retention) off | `LocalFileSystem` object store with `fsync` on; scans set `cache_blocks` |
 
 Everything else is each engine's default.
 
@@ -101,6 +112,13 @@ Everything else is each engine's default.
 
 - **Plain engines** (`silex-lsm`, `rocksdb`) write with direct puts and deletes and read the current value.
   RocksDB's snapshot and transaction APIs are not used.
+- **SlateDB** writes with `Db::put` and `Db::delete`, which return once the write is in its in-memory WAL buffer
+  and memtable, and reads the latest version including writes not yet in the object store
+  (`DurabilityLevel::Memory`). A synchronized write is a put followed by `Db::flush`, which writes the
+  WAL buffer to the object store (fsynced) before returning. Workers run as tokio tasks on a runtime with
+  exactly `T` worker threads, which SlateDB's background tasks share, as for SurrealKV. SlateDB's
+  iterator always yields key and value, so counting receives a value handle (a reference-counted
+  `Bytes`) without reading it.
 - **Transactional engines** (`silex-mvcc`, `surrealkv`): each write is its own transaction (begin, one
   put or delete, commit), retried from a new transaction on a conflict, which disjoint partitions never
   cause. A point read or seek in SurrealKV runs in its own read transaction, and a scan in one read
@@ -136,8 +154,10 @@ full amount, so total work is `T` times the per-thread amount.
 For `read-sst` the engine then flushes its memtable to SSTs and waits for compaction to finish (Silex
 `FlushAndCompactAsync`, RocksDB `Flush` and `CompactRange` over everything). SurrealKV 1.0.0 has no
 public flush or compaction call, so its adapter calls `create_checkpoint`, which flushes every memtable
-to level-0 SSTs before copying them, and deletes the copy. The 50,000 entries become one SST in every
-engine; RocksDB moves it to its last level, SurrealKV keeps it in level 0.
+to level-0 SSTs before copying them, and deletes the copy. SlateDB flushes with
+`Db::flush_with_options(FlushType::MemTable)`, which waits until the L0 SST is written and recorded; it
+has no public call that forces a compaction. The 50,000 entries become one SST in every engine; RocksDB
+moves it to its last level, SurrealKV and SlateDB keep it in level 0.
 
 | Phase | Work per thread | Unit | `check` (summed over threads) |
 |---|---|---|---|
@@ -159,6 +179,6 @@ engine; RocksDB moves it to its last level, SurrealKV keeps it in level 0.
 
 ## Runner
 
-`run.py` runs every pair, thread count (1 and 8), suite and repetition (3) as fresh processes, alternating
+`run.py` runs every selected pair (`lsm,mvcc` by default), thread count (1 and 8 by default), suite and repetition (3) as fresh processes, alternating
 which engine of a pair runs first in each repetition. It rejects any run whose `check` differs from the
 expected value, and reports medians. Memory cells are RSS / peak RSS of the indicated suite in MiB.

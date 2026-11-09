@@ -26,6 +26,7 @@ SYNC_WRITES = 50
 PAIRS = {
     "lsm": ("silex-lsm", "rocksdb"),
     "mvcc": ("silex-mvcc", "surrealkv"),
+    "slatedb": ("silex-lsm", "slatedb"),
 }
 
 ADAPTERS = {
@@ -33,6 +34,7 @@ ADAPTERS = {
     "silex-mvcc": [str(HERE / "silex/bin/Release/net10.0/silex-bench")],
     "rocksdb": [str(HERE / "rocksdb/build/rocksdb_bench")],
     "surrealkv": [str(HERE / "surrealkv/target/release/surrealkv-adapter")],
+    "slatedb": [str(HERE / "slatedb/target/release/slatedb-adapter")],
 }
 
 SUITES = ["write", "randomfill", "sync", "read-memtable", "read-sst", "mixed"]
@@ -236,11 +238,12 @@ def render(args):
         peak.update(p)
 
     labels = sorted({k[0] for k in throughput})
+    thread_counts = sorted({k[1] for k in throughput})
     pairs = [p for p in PAIRS.values() if all(e in labels for e in p)]
     if args.columns:
         pairs = [tuple(args.columns.split(","))]
     for pair in pairs:
-        columns = [(engine, threads) for threads in (1, 8) for engine in pair]
+        columns = [(engine, threads) for threads in thread_counts for engine in pair]
         print("| Workload | Residency | Unit | " + " | ".join(f"{e}, {t} thread{'s' if t > 1 else ''}" for e, t in columns) + " |")
         print("|---|---|---|" + "---:|" * len(columns))
         for label, residency, suite, phase in THROUGHPUT_ROWS:
